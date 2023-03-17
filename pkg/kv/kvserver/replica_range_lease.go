@@ -75,6 +75,13 @@ var transferExpirationLeasesFirstEnabled = settings.RegisterBoolSetting(
 	true,
 )
 
+var expirationLeasesOnly = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.expiration_leases_only.enabled",
+	"only use expiration-based leases, never epoch-based ones (experimental, affects performance)",
+	false,
+)
+
 var leaseStatusLogLimiter = func() *log.EveryN {
 	e := log.Every(15 * time.Second)
 	e.ShouldLog() // waste the first shot
@@ -95,8 +102,10 @@ func (h *leaseRequestHandle) C() <-chan *kvpb.Error {
 	return h.c
 }
 
-// Cancel cancels the request handle. It also cancels the asynchronous
-// lease request task if its reference count drops to zero.
+// Cancel cancels the request handle. The asynchronous lease request will
+// continue until it completes, to ensure leases can be acquired even if the
+// client goes away (in particular in the face of IO delays which may trigger
+// client timeouts).
 func (h *leaseRequestHandle) Cancel() {
 	h.p.repl.mu.Lock()
 	defer h.p.repl.mu.Unlock()
@@ -104,10 +113,6 @@ func (h *leaseRequestHandle) Cancel() {
 		// Our lease request is ongoing...
 		// Unregister handle.
 		delete(h.p.llHandles, h)
-		// Cancel request, if necessary.
-		if len(h.p.llHandles) == 0 {
-			h.p.cancelLocked()
-		}
 	}
 	// Mark handle as canceled.
 	h.c = nil
@@ -141,13 +146,6 @@ type pendingLeaseRequest struct {
 	// Set of request handles attached to the lease acquisition.
 	// All accesses require repl.mu to be exclusively locked.
 	llHandles map[*leaseRequestHandle]struct{}
-	// cancelLocked is a context cancellation function for the async lease
-	// request, if one exists. It cancels an ongoing lease request and cleans up
-	// the requests state, including setting the cancelLocked function itself to
-	// nil. It will be called when a lease request is canceled because all
-	// handles cancel or when a lease request completes. If nil, then no request
-	// is in progress. repl.mu to be exclusively locked to call the function.
-	cancelLocked func()
 	// nextLease is the pending RequestLease request, if any. It can be used to
 	// figure out if we're in the process of extending our own lease, or
 	// transferring it to another replica.
@@ -166,11 +164,7 @@ func makePendingLeaseRequest(repl *Replica) pendingLeaseRequest {
 //
 // Requires repl.mu is read locked.
 func (p *pendingLeaseRequest) RequestPending() (roachpb.Lease, bool) {
-	pending := p.cancelLocked != nil
-	if pending {
-		return p.nextLease, true
-	}
-	return roachpb.Lease{}, false
+	return p.nextLease, p.nextLease != roachpb.Lease{}
 }
 
 // InitOrJoinRequest executes a RequestLease command asynchronously and returns a
@@ -257,25 +251,25 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 		ProposedTS: &status.Now,
 	}
 
-	if p.repl.requiresExpiringLeaseRLocked() ||
+	if p.repl.shouldUseExpirationLeaseRLocked() ||
 		(transfer &&
 			transferExpirationLeasesFirstEnabled.Get(&p.repl.store.ClusterSettings().SV) &&
 			p.repl.store.ClusterSettings().Version.IsActive(ctx, clusterversion.TODODelete_V22_2EnableLeaseUpgrade)) {
-		// In addition to ranges that unconditionally require expiration-based
-		// leases (node liveness and earlier), we also use them during lease
-		// transfers for all other ranges. After acquiring these expiration
-		// based leases, the leaseholders are expected to upgrade them to the
-		// more efficient epoch-based ones. But by transferring an
-		// expiration-based lease, we can limit the effect of an ill-advised
-		// lease transfer since the incoming leaseholder needs to recognize
-		// itself as such within a few seconds; if it doesn't (we accidentally
-		// sent the lease to a replica in need of a snapshot or far behind on
-		// its log), the lease is up for grabs. If we simply transferred epoch
-		// based leases, it's possible for the new leaseholder that's delayed
-		// in applying the lease transfer to maintain its lease (assuming the
-		// node it's on is able to heartbeat its liveness record).
+		// In addition to ranges that should be using expiration-based leases
+		// (typically the meta and liveness ranges), we also use them during lease
+		// transfers for all other ranges. After acquiring these expiration based
+		// leases, the leaseholders are expected to upgrade them to the more
+		// efficient epoch-based ones. But by transferring an expiration-based
+		// lease, we can limit the effect of an ill-advised lease transfer since the
+		// incoming leaseholder needs to recognize itself as such within a few
+		// seconds; if it doesn't (we accidentally sent the lease to a replica in
+		// need of a snapshot or far behind on its log), the lease is up for grabs.
+		// If we simply transferred epoch based leases, it's possible for the new
+		// leaseholder that's delayed in applying the lease transfer to maintain its
+		// lease (assuming the node it's on is able to heartbeat its liveness
+		// record).
 		reqLease.Expiration = &hlc.Timestamp{}
-		*reqLease.Expiration = status.Now.ToTimestamp().Add(int64(p.repl.store.cfg.RangeLeaseActiveDuration()), 0)
+		*reqLease.Expiration = status.Now.ToTimestamp().Add(int64(p.repl.store.cfg.RangeLeaseDuration), 0)
 	} else {
 		// Get the liveness for the next lease holder and set the epoch in the lease request.
 		l, ok := p.repl.store.cfg.NodeLiveness.GetLiveness(nextLeaseHolder.NodeID)
@@ -349,10 +343,9 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 	status kvserverpb.LeaseStatus,
 	leaseReq kvpb.Request,
 ) error {
-	// Create a new context. We multiplex the cancellation of all contexts onto
-	// this new one, canceling it if all coalesced requests timeout/cancel.
-	// p.cancelLocked (defined below) is the cancel function that must be called;
-	// calling just cancel is insufficient.
+	// Create a new context. We run the request to completion even if all callers
+	// go away, to ensure leases can be acquired e.g. in the face of IO delays
+	// which may trigger client timeouts).
 	ctx := p.repl.AnnotateCtx(context.Background())
 
 	const opName = "request range lease"
@@ -372,16 +365,6 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 		)
 	} else {
 		ctx, sp = tr.StartSpanCtx(ctx, opName, tagsOpt)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-
-	// Make sure we clean up the context and request state. This will be called
-	// either when the request completes cleanly or when it is terminated early.
-	p.cancelLocked = func() {
-		cancel()
-		p.cancelLocked = nil
-		p.nextLease = roachpb.Lease{}
 	}
 
 	err := p.repl.store.Stopper().RunAsyncTaskEx(
@@ -410,12 +393,6 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 			// extend the existing lease in the future.
 			p.repl.mu.Lock()
 			defer p.repl.mu.Unlock()
-			if ctx.Err() != nil {
-				// We were canceled and this request was already cleaned up
-				// under lock. At this point, another async request could be
-				// active so we don't want to do anything else.
-				return
-			}
 			// Send result of lease to all waiter channels and cleanup request.
 			for llHandle := range p.llHandles {
 				// Don't send the same transaction object twice; this can lead to races.
@@ -429,10 +406,10 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 				}
 				delete(p.llHandles, llHandle)
 			}
-			p.cancelLocked()
+			p.nextLease = roachpb.Lease{}
 		})
 	if err != nil {
-		p.cancelLocked()
+		p.nextLease = roachpb.Lease{}
 		sp.Finish()
 		return err
 	}
@@ -793,15 +770,26 @@ func (r *Replica) ownsValidLeaseRLocked(ctx context.Context, now hlc.ClockTimest
 	return st.IsValid() && st.OwnedBy(r.store.StoreID())
 }
 
-// requiresExpiringLeaseRLocked returns whether this range unconditionally uses
-// an expiration-based lease. Ranges located before or including the node
+// requiresExpirationLeaseRLocked returns whether this range unconditionally
+// uses an expiration-based lease. Ranges located before or including the node
 // liveness table must always use expiration leases to avoid circular
 // dependencies on the node liveness table. All other ranges typically use
 // epoch-based leases, but may temporarily use expiration based leases during
 // lease transfers.
-func (r *Replica) requiresExpiringLeaseRLocked() bool {
+//
+// TODO(erikgrinaker): It isn't always clear when to use this and when to use
+// shouldUseExpirationLeaseRLocked. We can merge these once there are no more
+// callers: when expiration leases don't quiesce and are always eagerly renewed.
+func (r *Replica) requiresExpirationLeaseRLocked() bool {
 	return r.store.cfg.NodeLiveness == nil ||
 		r.mu.state.Desc.StartKey.Less(roachpb.RKey(keys.NodeLivenessKeyMax))
+}
+
+// shouldUseExpirationLeaseRLocked returns true if this range should be using an
+// expiration-based lease, either because it requires one or because
+// kv.expiration_leases_only.enabled is enabled.
+func (r *Replica) shouldUseExpirationLeaseRLocked() bool {
+	return expirationLeasesOnly.Get(&r.ClusterSettings().SV) || r.requiresExpirationLeaseRLocked()
 }
 
 // requestLeaseLocked executes a request to obtain or extend a lease
@@ -1033,7 +1021,7 @@ func NewLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(
 // lease's expiration (and stasis period).
 func (r *Replica) checkRequestTimeRLocked(now hlc.ClockTimestamp, reqTS hlc.Timestamp) error {
 	var leaseRenewal time.Duration
-	if r.requiresExpiringLeaseRLocked() {
+	if r.shouldUseExpirationLeaseRLocked() {
 		_, leaseRenewal = r.store.cfg.RangeLeaseDurations()
 	} else {
 		_, leaseRenewal = r.store.cfg.NodeLivenessDurations()
@@ -1196,6 +1184,13 @@ func (r *Replica) TestingAcquireLease(ctx context.Context) (kvserverpb.LeaseStat
 	return l, pErr.GoError()
 }
 
+func (s *Store) rangeLeaseAcquireTimeout() time.Duration {
+	if d := s.cfg.TestingKnobs.RangeLeaseAcquireTimeoutOverride; d != 0 {
+		return d
+	}
+	return s.cfg.RangeLeaseAcquireTimeout()
+}
+
 // redirectOnOrAcquireLeaseForRequest is like redirectOnOrAcquireLease,
 // but it accepts a specific request timestamp instead of assuming that
 // the request is operating at the current time.
@@ -1204,7 +1199,7 @@ func (r *Replica) redirectOnOrAcquireLeaseForRequest(
 ) (status kvserverpb.LeaseStatus, pErr *kvpb.Error) {
 	// Does not use RunWithTimeout(), because we do not want to mask the
 	// NotLeaseHolderError on context cancellation.
-	ctx, cancel := context.WithTimeout(ctx, r.store.cfg.RangeLeaseAcquireTimeout()) // nolint:context
+	ctx, cancel := context.WithTimeout(ctx, r.store.rangeLeaseAcquireTimeout()) // nolint:context
 	defer cancel()
 
 	// Try fast-path.
@@ -1444,13 +1439,49 @@ func (r *Replica) maybeExtendLeaseAsyncLocked(ctx context.Context, st kvserverpb
 	if log.ExpensiveLogEnabled(ctx, 2) {
 		log.Infof(ctx, "extending lease %s at %s", st.Lease, st.Now)
 	}
-	// We explicitly ignore the returned handle as we won't block on it.
-	//
-	// TODO(tbg): this ctx is likely cancelled very soon, which will in turn
-	// cancel the lease acquisition (unless joined by another more long-lived
-	// ctx). So this possibly isn't working as advertised (which only plays a role
-	// for expiration-based leases, at least).
+	// We explicitly ignore the returned handle as we won't block on it. This
+	// context will likely be cancelled soon (when the originating request
+	// completes), but the lease request will continue to completion independently
+	// of the caller's context
 	_ = r.requestLeaseLocked(ctx, st)
+}
+
+// maybeSwitchLeaseType will synchronously renew a lease using the appropriate
+// type if it is (or was) owned by this replica and has an incorrect type. This
+// typically happens when changing kv.expiration_leases_only.enabled.
+func (r *Replica) maybeSwitchLeaseType(ctx context.Context, st kvserverpb.LeaseStatus) *kvpb.Error {
+	if !st.OwnedBy(r.store.StoreID()) {
+		return nil
+	}
+
+	var llHandle *leaseRequestHandle
+	r.mu.Lock()
+	if !r.hasCorrectLeaseTypeRLocked(st.Lease) {
+		llHandle = r.requestLeaseLocked(ctx, st)
+	}
+	r.mu.Unlock()
+
+	if llHandle != nil {
+		select {
+		case pErr := <-llHandle.C():
+			return pErr
+		case <-ctx.Done():
+			return kvpb.NewError(ctx.Err())
+		}
+	}
+	return nil
+}
+
+// hasCorrectLeaseType returns true if the lease type is correct for this replica.
+func (r *Replica) hasCorrectLeaseType(lease roachpb.Lease) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.hasCorrectLeaseTypeRLocked(lease)
+}
+
+func (r *Replica) hasCorrectLeaseTypeRLocked(lease roachpb.Lease) bool {
+	hasExpirationLease := lease.Type() == roachpb.LeaseExpiration
+	return hasExpirationLease == r.shouldUseExpirationLeaseRLocked()
 }
 
 // leaseViolatesPreferences checks if current replica owns the lease and if it

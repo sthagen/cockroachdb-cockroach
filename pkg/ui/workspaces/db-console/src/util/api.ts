@@ -19,11 +19,6 @@ import * as protos from "src/js/protos";
 import { FixLong } from "src/util/fixLong";
 import { propsToQueryString } from "src/util/query";
 
-export type DatabaseDetailsRequestMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsRequest;
-export type DatabaseDetailsResponseMessage =
-  protos.cockroach.server.serverpb.DatabaseDetailsResponse;
-
 export type TableDetailsRequestMessage =
   protos.cockroach.server.serverpb.TableDetailsRequest;
 export type TableDetailsResponseMessage =
@@ -181,7 +176,7 @@ export type MetricMetadataResponseMessage =
   protos.cockroach.server.serverpb.MetricMetadataResponse;
 
 export type StatementsRequestMessage =
-  protos.cockroach.server.serverpb.StatementsRequest;
+  protos.cockroach.server.serverpb.CombinedStatementsStatsRequest;
 export type StatementDetailsRequestMessage =
   protos.cockroach.server.serverpb.StatementDetailsRequest;
 
@@ -349,25 +344,6 @@ export type APIRequestFn<TReq, TResponse> = (
 
 const serverpb = protos.cockroach.server.serverpb;
 const tspb = protos.cockroach.ts.tspb;
-
-// getDatabaseDetails gets details for a specific database
-export function getDatabaseDetails(
-  req: DatabaseDetailsRequestMessage,
-  timeout?: moment.Duration,
-): Promise<DatabaseDetailsResponseMessage> {
-  const queryString = req.include_stats ? "?include_stats=true" : "";
-
-  const promiseErr = IsValidateUriName(req.database);
-  if (promiseErr) {
-    return promiseErr;
-  }
-  return timeoutFetch(
-    serverpb.DatabaseDetailsResponse,
-    `${API_PREFIX}/databases/${EncodeUriName(req.database)}${queryString}`,
-    null,
-    timeout,
-  );
-}
 
 // getTableDetails gets details for a specific table
 export function getTableDetails(
@@ -774,13 +750,12 @@ export function getCombinedStatements(
   timeout?: moment.Duration,
 ): Promise<StatementsResponseMessage> {
   const queryStr = propsToQueryString({
-    combined: req.combined,
     start: req.start.toInt(),
     end: req.end.toInt(),
   });
   return timeoutFetch(
     serverpb.StatementsResponse,
-    `${STATUS_PREFIX}/statements?${queryStr}`,
+    `${STATUS_PREFIX}/combinedstmts?${queryStr}`,
     null,
     timeout,
   );

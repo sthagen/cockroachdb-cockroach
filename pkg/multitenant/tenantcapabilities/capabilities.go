@@ -13,7 +13,6 @@ package tenantcapabilities
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -36,8 +35,10 @@ type Watcher interface {
 // Reader provides access to the global tenant capability state. The global
 // tenant capability state may be arbitrarily stale.
 type Reader interface {
+	// GetCapabilities returns the tenant capabilities for the specified tenant.
 	GetCapabilities(id roachpb.TenantID) (_ TenantCapabilities, found bool)
-	GetCapabilitiesMap() map[roachpb.TenantID]TenantCapabilities
+	// GetGlobalCapabilityState returns the capability state for all tenants.
+	GetGlobalCapabilityState() map[roachpb.TenantID]TenantCapabilities
 }
 
 // Authorizer performs various kinds of capability checks for requests issued
@@ -73,6 +74,10 @@ type Authorizer interface {
 	// HasTSDBQueryCapability returns an error if a tenant, referenced by its ID,
 	// is not allowed to query the TSDB for metrics.
 	HasTSDBQueryCapability(ctx context.Context, tenID roachpb.TenantID) error
+
+	// IsExemptFromRateLimiting returns true of the tenant should
+	// not be subject to rate limiting.
+	IsExemptFromRateLimiting(ctx context.Context, tenID roachpb.TenantID) bool
 }
 
 // Entry ties together a tenantID with its capabilities.
@@ -94,25 +99,18 @@ func (u Update) String() string {
 	return fmt.Sprintf("update: %v", u.Entry)
 }
 
-// AllCapabilitiesString prints all capability values. This is different from
-// TenantCapabilities.String which only prints non-zero value fields.
-func AllCapabilitiesString(capabilities TenantCapabilities) string {
-	var builder strings.Builder
-	builder.WriteByte('{')
-	for i, capID := range CapabilityIDs {
-		if i > 0 {
-			builder.WriteByte(' ')
-		}
-		builder.WriteString(capID.String())
-		builder.WriteByte(':')
-		builder.WriteString(capabilities.Cap(capID).Get().String())
-	}
-	builder.WriteByte('}')
-	return builder.String()
+var defaultCaps TenantCapabilities
+
+// DefaultCapabilities returns the default state of capabilities.
+func DefaultCapabilities() TenantCapabilities {
+	return defaultCaps
 }
 
+// RegisterDefaultCapabilities is called from the tenantcapabilitiespb package.
+func RegisterDefaultCapabilities(caps TenantCapabilities) { defaultCaps = caps }
+
 func (u Entry) String() string {
-	return fmt.Sprintf("ten=%v cap=%v", u.TenantID, AllCapabilitiesString(u.TenantCapabilities))
+	return fmt.Sprintf("ten=%v cap=%v", u.TenantID, u.TenantCapabilities)
 }
 
 // CapabilityID represents a handle to a tenant capability.
@@ -160,10 +158,20 @@ type TenantCapabilities interface {
 const (
 	_ CapabilityID = iota
 
-	// CanAdminSplit describes the ability of a tenant to perform manual
-	// KV range split requests. These operations need a capability
-	// because excessive KV range splits can overwhelm the storage
+	// CanAdminRelocateRange describes the ability of a tenant to perform manual
+	// KV relocate range requests. These operations need a capability
+	// because excessive KV range relocation can overwhelm the storage
 	// cluster.
+	CanAdminRelocateRange // can_admin_relocate_range
+
+	// CanAdminScatter describes the ability of a tenant to scatter ranges using
+	// an AdminScatter request. By default, secondary tenants are allowed to
+	// scatter as doing so is integral to the performance of IMPORT/RESTORE.
+	CanAdminScatter // can_admin_scatter
+
+	// CanAdminSplit describes the ability of a tenant to perform KV requests to
+	// split ranges. By default, secondary tenants are allowed to perform splits
+	// as doing so is integral to performance of IMPORT/RESTORE.
 	CanAdminSplit // can_admin_split
 
 	// CanAdminUnsplit describes the ability of a tenant to perform manual
@@ -183,6 +191,11 @@ const (
 	// capability because excessive TS queries can overwhelm the storage
 	// cluster.
 	CanViewTSDBMetrics // can_view_tsdb_metrics
+
+	// ExemptFromRateLimiting describes the ability of a tenant to
+	// make requests without being subject to the KV-side tenant
+	// rate limiter.
+	ExemptFromRateLimiting // exempt_from_rate_limiting
 
 	// TenantSpanConfigBounds contains the bounds for the tenant's
 	// span configs.
@@ -222,10 +235,14 @@ const (
 func (c CapabilityID) CapabilityType() Type {
 	switch c {
 	case
+		CanAdminRelocateRange,
+		CanAdminScatter,
 		CanAdminSplit,
 		CanAdminUnsplit,
 		CanViewNodeInfo,
-		CanViewTSDBMetrics:
+		CanViewTSDBMetrics,
+		ExemptFromRateLimiting:
+
 		return Bool
 
 	default:

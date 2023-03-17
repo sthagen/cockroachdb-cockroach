@@ -32,16 +32,16 @@ CREATE TENANT "invalid.name"
 statement ok
 CREATE TENANT three
 
-query IBTT colnames
-SELECT id, active, name, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBT colnames
+SELECT id, active, name
 FROM system.tenants
 ORDER BY id
 ----
-id  active  name        crdb_internal.pb_to_json
-1   true    system      {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "1", "droppedName": "", "tenantReplicationJobId": "0"}
-2   true    tenant-one  {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "2", "droppedName": "", "tenantReplicationJobId": "0"}
-3   true    two         {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "3", "droppedName": "", "tenantReplicationJobId": "0"}
-4   true    three       {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "4", "droppedName": "", "tenantReplicationJobId": "0"}
+id  active  name
+1   true    system
+2   true    tenant-one
+3   true    two
+4   true    three
 
 query ITTT colnames
 SHOW TENANT system
@@ -112,14 +112,14 @@ SELECT * FROM [SHOW TENANTS] WHERE id = 4
 id  name   data_state  service_mode
 4   three  ready       none
 
+query ITTTT colnames
+SELECT id, name, data_state, service_mode, source_tenant_name FROM [SHOW TENANTS WITH REPLICATION STATUS] WHERE id = 4
+----
+id  name   data_state  service_mode  source_tenant_name
+4   three  ready       none          NULL
+
 statement error tenant "seven" does not exist
 SHOW TENANT seven
-
-statement error pq: tenant "tenant-one" does not have an active replication job
-SHOW TENANT "tenant-one" WITH REPLICATION STATUS
-
-statement error pq: tenant "two" does not have an active replication job
-SHOW TENANT two WITH REPLICATION STATUS
 
 # Test creating a tenant with the same name as an existing tenant, but a unique
 # ID.
@@ -152,23 +152,23 @@ DROP TENANT IF EXISTS dne
 statement ok
 CREATE TENANT four
 
-query IBTT colnames
-SELECT id, active, name, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBT colnames
+SELECT id, active, name
 FROM system.tenants WHERE name = 'four'
 ORDER BY id
 ----
-id  active  name  crdb_internal.pb_to_json
-5   true    four  {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "5", "droppedName": "", "tenantReplicationJobId": "0"}
+id  active  name
+5   true    four
 
 statement ok
 DROP TENANT four
 
-query IBTT colnames
-SELECT id, active, name, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBT colnames
+SELECT id, active, name
 FROM system.tenants WHERE name = 'four'
 ORDER BY id
 ----
-id  active  name  crdb_internal.pb_to_json
+id  active  name
 
 statement error tenant "four" does not exist
 SHOW TENANT four
@@ -226,20 +226,25 @@ DROP TENANT "to-be-reclaimed"
 statement ok
 CREATE TENANT "to-be-reclaimed"
 
-query IBTT colnames
-SELECT id, active, name, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true)
+query IBTTT colnames
+SELECT
+  id,
+  active,
+  name,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'deprecatedDataState') AS deprecated_data_state,
+  json_extract_path_text(crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info, true), 'droppedName') AS dropped_name
 FROM system.tenants
 ORDER BY id
 ----
-id  active  name             crdb_internal.pb_to_json
-1   true    system           {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "1", "droppedName": "", "tenantReplicationJobId": "0"}
-2   true    tenant-one       {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "2", "droppedName": "", "tenantReplicationJobId": "0"}
-3   true    two              {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "3", "droppedName": "", "tenantReplicationJobId": "0"}
-4   true    three            {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "4", "droppedName": "", "tenantReplicationJobId": "0"}
-5   false   NULL             {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "DROP", "deprecatedId": "5", "droppedName": "four", "tenantReplicationJobId": "0"}
-6   false   NULL             {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "DROP", "deprecatedId": "6", "droppedName": "five-requiring-quotes", "tenantReplicationJobId": "0"}
-7   false   NULL             {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "DROP", "deprecatedId": "7", "droppedName": "to-be-reclaimed", "tenantReplicationJobId": "0"}
-8   true    to-be-reclaimed  {"capabilities": {"canAdminSplit": false, "canAdminUnsplit": false, "canViewNodeInfo": false, "canViewTsdbMetrics": false, "spanConfigBounds": null}, "deprecatedDataState": "READY", "deprecatedId": "8", "droppedName": "", "tenantReplicationJobId": "0"}
+id  active  name             deprecated_data_state  dropped_name
+1   true    system           READY                  ·
+2   true    tenant-one       READY                  ·
+3   true    two              READY                  ·
+4   true    three            READY                  ·
+5   false   NULL             DROP                   four
+6   false   NULL             DROP                   five-requiring-quotes
+7   false   NULL             DROP                   to-be-reclaimed
+8   true    to-be-reclaimed  READY                  ·
 
 # More valid tenant names.
 statement ok
@@ -324,3 +329,116 @@ DROP TENANT two
 
 statement ok
 DROP TENANT 'tenant-one'
+
+subtest tenant_templates
+
+query T
+SHOW CLUSTER SETTING sql.create_tenant.default_template
+----
+·
+
+# Check we can't use the system tenant as template.
+statement error using the system tenant as config template
+CREATE TENANT othertenant LIKE system
+
+# Create some "interesting" tenant template.
+statement ok
+CREATE TENANT tmpl;
+ALTER TENANT tmpl GRANT CAPABILITY can_view_node_info; -- will be copied
+ALTER TENANT tmpl SET CLUSTER SETTING trace.debug.enable = true; -- will be copied
+-- Simulate resource limits. Will be copied.
+-- Note: we cannot use the update_tenant_resource_limits() builtin
+-- directly here because it can only be used from a CCL binary.
+INSERT INTO system.tenant_usage(
+        tenant_id, instance_id, next_instance_id, last_update,
+        ru_burst_limit, ru_refill_rate, ru_current, current_share_sum, total_consumption)
+VALUES ((SELECT id FROM system.tenants WHERE name = 'tmpl'), 0, 0, now(),
+        11, 22, 33, 44, ''::BYTES);
+ALTER TENANT tmpl START SERVICE SHARED; -- will not be copied.
+
+# Use it to create a new tenant.
+statement ok
+CREATE TENANT othertenant LIKE tmpl
+
+# Verify the service mode was not copied.
+query ITTT
+SHOW TENANT othertenant
+----
+13  othertenant  ready  none
+
+# Verify the new tenant has the same caps as the template
+# (by showing there's no difference between the two)
+query TT
+SELECT capability_name, capability_value FROM [SHOW TENANT tmpl WITH CAPABILITIES]
+EXCEPT SELECT capability_name, capability_value FROM [SHOW TENANT othertenant WITH CAPABILITIES];
+----
+
+# Check that the setting overrides were copied.
+query TTTT
+SELECT variable, value, type, origin FROM [SHOW CLUSTER SETTINGS FOR TENANT othertenant]
+WHERE origin != 'no-override'
+----
+trace.debug.enable  true  b  per-tenant-override
+
+# Check that the resource usage parameters were copied.
+query IIRRRRI
+SELECT instance_id, next_instance_id,
+       ru_burst_limit, ru_refill_rate, ru_current,
+       current_share_sum, length(total_consumption)
+FROM system.tenant_usage WHERE tenant_id = (SELECT id FROM system.tenants WHERE name = 'othertenant')
+----
+0  0  11  22  33  0  0
+
+# Clean up.
+statement ok
+DROP TENANT othertenant
+
+# Now set the default template and try again.
+statement ok
+SET CLUSTER SETTING sql.create_tenant.default_template = 'nonexistent';
+
+statement error retrieving default tenant configuration template.*tenant "nonexistent" does not exist
+CREATE TENANT othertenant
+
+statement ok
+SET CLUSTER SETTING sql.create_tenant.default_template = 'tmpl';
+
+# Create a new tenant - this should use the template implicitly now.
+statement ok
+CREATE TENANT othertenant
+
+# Verify the service mode was not copied.
+query ITTT
+SHOW TENANT othertenant
+----
+14  othertenant  ready  none
+
+query TT
+SELECT capability_name, capability_value FROM [SHOW TENANT tmpl WITH CAPABILITIES]
+EXCEPT SELECT capability_name, capability_value FROM [SHOW TENANT othertenant WITH CAPABILITIES];
+----
+
+# Check the setting overrides were taken over.
+query TTTT
+SELECT variable, value, type, origin FROM [SHOW CLUSTER SETTINGS FOR TENANT othertenant]
+WHERE origin != 'no-override'
+----
+trace.debug.enable  true  b  per-tenant-override
+
+# Check that the resource usage parameters were copied.
+query IIRRRRI
+SELECT instance_id, next_instance_id,
+       ru_burst_limit, ru_refill_rate, ru_current,
+       current_share_sum, length(total_consumption)
+FROM system.tenant_usage WHERE tenant_id = (SELECT id FROM system.tenants WHERE name = 'othertenant')
+----
+0  0  11  22  33  0  0
+
+# Clean up.
+statement ok
+DROP TENANT othertenant;
+ALTER TENANT tmpl STOP SERVICE;
+DROP TENANT tmpl
+
+statement ok
+RESET CLUSTER SETTING sql.create_tenant.default_template

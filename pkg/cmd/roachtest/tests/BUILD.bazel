@@ -88,6 +88,7 @@ go_library(
         "liquibase_blocklist.go",
         "loss_of_quorum_recovery.go",
         "many_splits.go",
+        "mixed_version_backup.go",
         "mixed_version_cdc.go",
         "mixed_version_change_replicas.go",
         "mixed_version_decl_schemachange_compat.go",
@@ -267,6 +268,7 @@ go_library(
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_protobuf//proto",
+        "@org_golang_x_oauth2//clientcredentials",
         "@org_golang_x_sync//errgroup",
     ],
 )

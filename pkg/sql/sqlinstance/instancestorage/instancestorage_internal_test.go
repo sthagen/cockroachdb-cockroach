@@ -20,8 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
@@ -50,19 +51,24 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	getAvailableInstanceID := func(storage *Storage, region []byte) (id base.SQLInstanceID, err error) {
 		err = storage.db.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
-			id, err = storage.getAvailableInstanceIDForRegion(ctx, region, txn)
+			version, err := storage.versionGuard(ctx, txn)
+			if err != nil {
+				return err
+			}
+
+			id, err = storage.getAvailableInstanceIDForRegion(ctx, region, txn, &version)
 			return err
 		})
 		return
 	}
 
 	t.Run("no rows", func(t *testing.T) {
-		stopper, storage, _, _ := setup(t, sqlDB, kvDB, s.Codec(), s.ClusterSettings())
+		stopper, storage, _, _ := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		id, err := getAvailableInstanceID(storage, nil)
@@ -72,7 +78,7 @@ func TestGetAvailableInstanceIDForRegion(t *testing.T) {
 
 	t.Run("preallocated rows", func(t *testing.T) {
 		const expiration = time.Minute
-		stopper, storage, slStorage, clock := setup(t, sqlDB, kvDB, s.Codec(), s.ClusterSettings())
+		stopper, storage, slStorage, clock := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		// Pre-allocate four instances.
@@ -287,7 +293,7 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	const expiration = time.Minute
@@ -297,7 +303,7 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	regions := [][]byte{enum.One}
 
 	t.Run("nothing preallocated", func(t *testing.T) {
-		stopper, storage, _, clock := setup(t, sqlDB, kvDB, s.Codec(), s.ClusterSettings())
+		stopper, storage, _, clock := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
@@ -317,7 +323,7 @@ func TestReclaimAndGenerateInstanceRows(t *testing.T) {
 	})
 
 	t.Run("with some preallocated", func(t *testing.T) {
-		stopper, storage, slStorage, clock := setup(t, sqlDB, kvDB, s.Codec(), s.ClusterSettings())
+		stopper, storage, slStorage, clock := setup(t, sqlDB, s)
 		defer stopper.Stop(ctx)
 
 		sessionExpiry := clock.Now().Add(expiration.Nanoseconds(), 0)
@@ -439,18 +445,19 @@ func sortInstancesForTest(instances []sqlinstance.InstanceInfo) {
 }
 
 func setup(
-	t *testing.T, sqlDB *gosql.DB, kvDB *kv.DB, codec keys.SQLCodec, settings *cluster.Settings,
+	t *testing.T, sqlDB *gosql.DB, s serverutils.TestServerInterface,
 ) (*stop.Stopper, *Storage, *slstorage.FakeStorage, *hlc.Clock) {
 	dbName := t.Name()
 	tDB := sqlutils.MakeSQLRunner(sqlDB)
 	tDB.Exec(t, `CREATE DATABASE "`+dbName+`"`)
 	schema := GetTableSQLForDatabase(dbName)
 	tDB.Exec(t, schema)
-	table := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, dbName, "sql_instances")
+	table := desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), dbName, "sql_instances")
 	clock := hlc.NewClockForTesting(nil)
 	stopper := stop.NewStopper()
 	slStorage := slstorage.NewFakeStorage()
-	storage := NewTestingStorage(kvDB, keys.SystemSQLCodec, table, slStorage, settings)
+	f := s.RangeFeedFactory().(*rangefeed.Factory)
+	storage := NewTestingStorage(s.DB(), keys.SystemSQLCodec, table, slStorage, s.ClusterSettings(), clock, f, s.SettingsWatcher().(*settingswatcher.SettingsWatcher))
 	return stopper, storage, slStorage, clock
 }
 

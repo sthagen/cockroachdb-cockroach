@@ -920,7 +920,7 @@ func TestReplicaLease(t *testing.T) {
 
 	// Test that leases with invalid times are rejected.
 	// Start leases at a point that avoids overlapping with the existing lease.
-	leaseDuration := tc.store.cfg.RangeLeaseActiveDuration()
+	leaseDuration := tc.store.cfg.RangeLeaseDuration
 	start := hlc.ClockTimestamp{WallTime: (time.Second + leaseDuration).Nanoseconds(), Logical: 0}
 	for _, lease := range []roachpb.Lease{
 		{Start: start, Expiration: &hlc.Timestamp{}},
@@ -1049,11 +1049,6 @@ func TestReplicaLeaseCounters(t *testing.T) {
 
 	var tc testContext
 	cfg := TestStoreConfig(nil)
-	// Disable reasonNewLeader and reasonNewLeaderOrConfigChange proposal
-	// refreshes so that our lease proposal does not risk being rejected
-	// with an AmbiguousResultError.
-	cfg.TestingKnobs.DisableRefreshReasonNewLeader = true
-	cfg.TestingKnobs.DisableRefreshReasonNewLeaderOrConfigChange = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	assert := func(actual, min, max int64) error {
@@ -1999,6 +1994,86 @@ func TestLeaseConcurrent(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestLeaseCallerCancelled tests that lease requests continue to completion
+// even when all callers have cancelled.
+func TestLeaseCallerCancelled(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const num = 5
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	var active, seen int32
+	var wg sync.WaitGroup
+	errC := make(chan error, 1)
+
+	tc := testContext{manualClock: timeutil.NewManualTime(timeutil.Unix(0, 123))}
+	cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
+	// Disable reasonNewLeader and reasonNewLeaderOrConfigChange proposal
+	// refreshes so that our lease proposal does not risk being rejected
+	// with an AmbiguousResultError.
+	cfg.TestingKnobs.DisableRefreshReasonNewLeader = true
+	cfg.TestingKnobs.DisableRefreshReasonNewLeaderOrConfigChange = true
+	cfg.TestingKnobs.TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+		ll, ok := args.Req.Requests[0].GetInner().(*kvpb.RequestLeaseRequest)
+		if !ok || atomic.LoadInt32(&active) == 0 {
+			return nil
+		}
+		if c := atomic.AddInt32(&seen, 1); c > 1 {
+			// Morally speaking, this is an error, but reproposals can happen and so
+			// we warn (in case this trips the test up in more unexpected ways).
+			t.Logf("reproposal of %+v", ll)
+		}
+		// Wait for all lease requests to join the same LeaseRequest command
+		// and cancel.
+		wg.Wait()
+
+		// The lease request's context should not be cancelled. Propagate it up to
+		// the main test.
+		select {
+		case <-args.Ctx.Done():
+		case <-time.After(time.Second):
+		}
+		select {
+		case errC <- args.Ctx.Err():
+		default:
+		}
+		return nil
+	}
+	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
+
+	atomic.StoreInt32(&active, 1)
+	tc.manualClock.MustAdvanceTo(leaseExpiry(tc.repl))
+	now := tc.Clock().NowAsClockTimestamp()
+	var llHandles []*leaseRequestHandle
+	for i := 0; i < num; i++ {
+		wg.Add(1)
+		tc.repl.mu.Lock()
+		status := tc.repl.leaseStatusAtRLocked(ctx, now)
+		llHandles = append(llHandles, tc.repl.requestLeaseLocked(ctx, status))
+		tc.repl.mu.Unlock()
+	}
+	for _, llHandle := range llHandles {
+		select {
+		case <-llHandle.C():
+			t.Fatal("lease request unexpectedly completed")
+		default:
+		}
+		llHandle.Cancel()
+		wg.Done()
+	}
+
+	select {
+	case err := <-errC:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for lease request")
+	}
 }
 
 // TestReplicaUpdateTSCache verifies that reads and ranged writes update the
@@ -6874,70 +6949,80 @@ func TestRequestLeaderEncounterGroupDeleteError(t *testing.T) {
 	}
 }
 
-func TestIntentIntersect(t *testing.T) {
+func TestIntersectSpan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	iPt := roachpb.Span{
+	spPt := roachpb.Span{
 		Key:    roachpb.Key("asd"),
 		EndKey: nil,
 	}
-	iRn := roachpb.Span{
+	spRn := roachpb.Span{
 		Key:    roachpb.Key("c"),
 		EndKey: roachpb.Key("x"),
 	}
 
 	suffix := roachpb.RKey("abcd")
-	iLc := roachpb.Span{
+	spLc := roachpb.Span{
 		Key:    keys.MakeRangeKey(roachpb.RKey("c"), suffix, nil),
 		EndKey: keys.MakeRangeKey(roachpb.RKey("x"), suffix, nil),
 	}
-	kl1 := string(iLc.Key)
-	kl2 := string(iLc.EndKey)
+	kl1 := string(spLc.Key)
+	kl2 := string(spLc.EndKey)
 
-	for i, tc := range []struct {
-		intent   roachpb.Span
+	for _, tc := range []struct {
+		span     roachpb.Span
 		from, to string
 		exp      []string
 	}{
-		{intent: iPt, from: "", to: "z", exp: []string{"", "", "asd", ""}},
+		{span: spRn, from: "", to: "a", exp: []string{"", "", "c", "x"}},
+		{span: spRn, from: "", to: "c", exp: []string{"", "", "c", "x"}},
+		{span: spRn, from: "a", to: "z", exp: []string{"c", "x"}},
+		{span: spRn, from: "c", to: "d", exp: []string{"c", "d", "d", "x"}},
+		{span: spRn, from: "c", to: "x", exp: []string{"c", "x"}},
+		{span: spRn, from: "d", to: "x", exp: []string{"d", "x", "c", "d"}},
+		{span: spRn, from: "d", to: "w", exp: []string{"d", "w", "c", "d", "w", "x"}},
+		{span: spRn, from: "c", to: "w", exp: []string{"c", "w", "w", "x"}},
+		{span: spRn, from: "w", to: "x", exp: []string{"w", "x", "c", "w"}},
+		{span: spRn, from: "x", to: "z", exp: []string{"", "", "c", "x"}},
+		{span: spRn, from: "y", to: "z", exp: []string{"", "", "c", "x"}},
 
-		{intent: iRn, from: "", to: "a", exp: []string{"", "", "c", "x"}},
-		{intent: iRn, from: "", to: "c", exp: []string{"", "", "c", "x"}},
-		{intent: iRn, from: "a", to: "z", exp: []string{"c", "x"}},
-		{intent: iRn, from: "c", to: "d", exp: []string{"c", "d", "d", "x"}},
-		{intent: iRn, from: "c", to: "x", exp: []string{"c", "x"}},
-		{intent: iRn, from: "d", to: "x", exp: []string{"d", "x", "c", "d"}},
-		{intent: iRn, from: "d", to: "w", exp: []string{"d", "w", "c", "d", "w", "x"}},
-		{intent: iRn, from: "c", to: "w", exp: []string{"c", "w", "w", "x"}},
-		{intent: iRn, from: "w", to: "x", exp: []string{"w", "x", "c", "w"}},
-		{intent: iRn, from: "x", to: "z", exp: []string{"", "", "c", "x"}},
-		{intent: iRn, from: "y", to: "z", exp: []string{"", "", "c", "x"}},
-
-		// A local intent range always comes back in one piece, either inside
+		// A local span range always comes back in one piece, either inside
 		// or outside of the Range.
-		{intent: iLc, from: "a", to: "b", exp: []string{"", "", kl1, kl2}},
-		{intent: iLc, from: "d", to: "z", exp: []string{"", "", kl1, kl2}},
-		{intent: iLc, from: "f", to: "g", exp: []string{"", "", kl1, kl2}},
-		{intent: iLc, from: "c", to: "x", exp: []string{kl1, kl2}},
-		{intent: iLc, from: "a", to: "z", exp: []string{kl1, kl2}},
+		{span: spLc, from: "a", to: "b", exp: []string{"", "", kl1, kl2}},
+		{span: spLc, from: "d", to: "z", exp: []string{"", "", kl1, kl2}},
+		{span: spLc, from: "f", to: "g", exp: []string{"", "", kl1, kl2}},
+		{span: spLc, from: "c", to: "x", exp: []string{kl1, kl2}},
+		{span: spLc, from: "a", to: "z", exp: []string{kl1, kl2}},
 	} {
-		var all []string
-		in, out := kvserverbase.IntersectSpan(tc.intent, &roachpb.RangeDescriptor{
+		desc := &roachpb.RangeDescriptor{
 			StartKey: roachpb.RKey(tc.from),
 			EndKey:   roachpb.RKey(tc.to),
+		}
+		name := fmt.Sprintf("span=%v,desc=%v", tc.span, desc.RSpan())
+		t.Run(name, func(t *testing.T) {
+			var all []string
+			in, out := kvserverbase.IntersectSpan(tc.span, desc)
+			if in != nil {
+				all = append(all, string(in.Key), string(in.EndKey))
+			} else {
+				all = append(all, "", "")
+			}
+			for _, o := range out {
+				all = append(all, string(o.Key), string(o.EndKey))
+			}
+			require.Equal(t, tc.exp, all)
 		})
-		if in != nil {
-			all = append(all, string(in.Key), string(in.EndKey))
-		} else {
-			all = append(all, "", "")
-		}
-		for _, o := range out {
-			all = append(all, string(o.Key), string(o.EndKey))
-		}
-		if !reflect.DeepEqual(all, tc.exp) {
-			t.Errorf("%d: wanted %v, got %v", i, tc.exp, all)
-		}
 	}
+
+	t.Run("point", func(t *testing.T) {
+		desc := &roachpb.RangeDescriptor{
+			StartKey: roachpb.RKey("a"),
+			EndKey:   roachpb.RKey("z"),
+		}
+		require.Panics(t, func() {
+			_, _ = kvserverbase.IntersectSpan(spPt, desc)
+		})
+	})
 }
 
 // TestBatchErrorWithIndex tests that when an individual entry in a
@@ -7861,7 +7946,7 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 	var tc testContext
 	cfg := TestStoreConfig(nil)
 	// Disable ticks which would interfere with the manual ticking in this test.
-	cfg.RaftTickInterval = math.MaxInt32
+	cfg.RaftTickInterval = time.Hour
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
@@ -7876,16 +7961,14 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 	}
 
 	r := tc.repl
-	electionTicks := tc.store.cfg.RaftElectionTimeoutTicks
+	reproposalTicks := tc.store.cfg.RaftReproposalTimeoutTicks
 	{
 		// The verifications of the reproposal counts below rely on r.mu.ticks
-		// starting with a value of 0 (modulo electionTicks). Move the replica into
-		// that state in case the replica was ticked before we grabbed
-		// processRaftMu.
+		// starting with a value of 0 modulo reproposalTicks.
 		r.mu.Lock()
 		ticks := r.mu.ticks
 		r.mu.Unlock()
-		for ; (ticks % electionTicks) != 0; ticks++ {
+		for ; (ticks % reproposalTicks) != 0; ticks++ {
 			if _, err := r.tick(ctx, nil, nil); err != nil {
 				t.Fatal(err)
 			}
@@ -7907,9 +7990,8 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 	}
 	r.mu.Unlock()
 
-	// We tick the replica 2*RaftElectionTimeoutTicks. RaftElectionTimeoutTicks
-	// is special in that it controls how often pending commands are reproposed.
-	for i := 0; i < 2*electionTicks; i++ {
+	// We tick the replica 3*RaftReproposalTimeoutTicks.
+	for i := 0; i < 3*reproposalTicks; i++ {
 		// Add another pending command on each iteration.
 		id := fmt.Sprintf("%08d", i)
 		ba := &kvpb.BatchRequest{}
@@ -7919,24 +8001,6 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 		cmd, pErr := r.requestToProposal(ctx, kvserverbase.CmdIDKey(id), ba, allSpansGuard(), &st, uncertainty.Interval{})
 		if pErr != nil {
 			t.Fatal(pErr)
-		}
-
-		g, _, pErr := r.concMgr.SequenceReq(ctx, nil /* guard */, concurrency.Request{
-			Txn:             ba.Txn,
-			Timestamp:       ba.Timestamp,
-			NonTxnPriority:  ba.UserPriority,
-			ReadConsistency: ba.ReadConsistency,
-			WaitPolicy:      ba.WaitPolicy,
-			LockTimeout:     ba.LockTimeout,
-			Requests:        ba.Requests,
-			LatchSpans:      spanset.New(),
-			LockSpans:       spanset.New(),
-		}, concurrency.PessimisticEval)
-		require.NoError(t, pErr.GoError())
-
-		cmd.ec = endCmds{
-			repl: r,
-			g:    g,
 		}
 
 		dropProposals.Lock()
@@ -7978,11 +8042,13 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 		dropProposals.Unlock()
 		r.mu.Unlock()
 
-		// Reproposals are only performed every electionTicks. We'll need
-		// to fix this test if that changes.
-		if (ticks % electionTicks) == 0 {
-			if len(reproposed) != i-1 {
-				t.Fatalf("%d: expected %d reproposed commands, but found %d", i, i-1, len(reproposed))
+		// Reproposals are only performed every reproposalTicks, and only for
+		// commands proposed at least reproposalTicks ago (inclusive). The first
+		// time, this will be 1 reproposal (the one at ticks=0 for the reproposal at
+		// ticks=reproposalTicks), then +reproposalTicks reproposals each time.
+		if (ticks % reproposalTicks) == 0 {
+			if exp := i + 2 - reproposalTicks; len(reproposed) != exp { // +1 to offset i, +1 for inclusive
+				t.Fatalf("%d: expected %d reproposed commands, but found %d", i, exp, len(reproposed))
 			}
 		} else {
 			if len(reproposed) != 0 {
@@ -8054,19 +8120,6 @@ func TestReplicaRefreshMultiple(t *testing.T) {
 	ba.Add(inc)
 	ba.Timestamp = tc.Clock().Now()
 
-	g, _, pErr := repl.concMgr.SequenceReq(ctx, nil /* guard */, concurrency.Request{
-		Txn:             ba.Txn,
-		Timestamp:       ba.Timestamp,
-		NonTxnPriority:  ba.UserPriority,
-		ReadConsistency: ba.ReadConsistency,
-		WaitPolicy:      ba.WaitPolicy,
-		LockTimeout:     ba.LockTimeout,
-		Requests:        ba.Requests,
-		LatchSpans:      spanset.New(),
-		LockSpans:       spanset.New(),
-	}, concurrency.PessimisticEval)
-	require.NoError(t, pErr.GoError())
-
 	st := repl.CurrentLeaseStatus(ctx)
 	proposal, pErr := repl.requestToProposal(ctx, incCmdID, ba, allSpansGuard(), &st, uncertainty.Interval{})
 	if pErr != nil {
@@ -8074,11 +8127,6 @@ func TestReplicaRefreshMultiple(t *testing.T) {
 	}
 	// Save this channel; it may get reset to nil before we read from it.
 	proposalDoneCh := proposal.doneCh
-
-	proposal.ec = endCmds{
-		repl: repl,
-		g:    g,
-	}
 
 	repl.mu.Lock()
 	ai := repl.mu.state.LeaseAppliedIndex
@@ -11208,6 +11256,84 @@ func TestReplicaNotifyLockTableOn1PC(t *testing.T) {
 	}
 }
 
+// TestReplicaAsyncIntentResolutionOn1PC runs a transaction that acquires one or
+// more unreplicated locks and then performs a one-phase commit. It tests that
+// async resolution is performed for any unreplicated lock that is external to
+// the range that the transaction is anchored on, but not for any unreplicated
+// lock that is local to that range.
+func TestReplicaAsyncIntentResolutionOn1PC(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testutils.RunTrueAndFalse(t, "external", func(t *testing.T, external bool) {
+		// Intercept async intent resolution for the test's transaction.
+		var storeKnobs StoreTestingKnobs
+		var txnIDAtomic atomic.Value
+		txnIDAtomic.Store(uuid.Nil)
+		resIntentC := make(chan *kvpb.ResolveIntentRequest)
+		storeKnobs.TestingRequestFilter = func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+			for _, req := range ba.Requests {
+				riReq := req.GetResolveIntent()
+				if riReq != nil && riReq.IntentTxn.ID == txnIDAtomic.Load().(uuid.UUID) {
+					resIntentC <- riReq
+				}
+			}
+			return nil
+		}
+
+		ctx := context.Background()
+		s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+			Knobs: base.TestingKnobs{Store: &storeKnobs}})
+		defer s.Stopper().Stop(ctx)
+
+		// Perform a range split between key A and B.
+		keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
+		_, _, err := s.SplitRange(keyB)
+		require.NoError(t, err)
+
+		// Write a value to a key A and B.
+		_, err = kvDB.Inc(ctx, keyA, 1)
+		require.Nil(t, err)
+		_, err = kvDB.Inc(ctx, keyB, 1)
+		require.Nil(t, err)
+
+		// Create a new transaction.
+		txn := kvDB.NewTxn(ctx, "test")
+		txnIDAtomic.Store(txn.ID())
+
+		// Perform one or more "for update" gets. This should acquire unreplicated,
+		// exclusive locks on the keys.
+		b := txn.NewBatch()
+		b.GetForUpdate(keyA)
+		if external {
+			b.GetForUpdate(keyB)
+		}
+		err = txn.Run(ctx, b)
+		require.NoError(t, err)
+
+		// Update the locked value and commit in a single batch. This should hit the
+		// one-phase commit fast-path and then release the "for update" lock(s).
+		b = txn.NewBatch()
+		b.Inc(keyA, 1)
+		err = txn.CommitInBatch(ctx, b)
+		require.NoError(t, err)
+
+		// If an external lock was acquired, we should see its resolution.
+		if external {
+			riReq := <-resIntentC
+			require.Equal(t, keyB, riReq.Key)
+		}
+
+		// After that, we should see no other intent resolution request for this
+		// transaction.
+		select {
+		case riReq := <-resIntentC:
+			t.Fatalf("unexpected intent resolution request: %v", riReq)
+		case <-time.After(10 * time.Millisecond):
+		}
+	})
+}
+
 // TestReplicaQueryLocks tests QueryLocks in a number of scenarios while locks are
 // held, such as filtering out uncontended locks and limiting results.
 func TestReplicaQueryLocks(t *testing.T) {
@@ -11453,12 +11579,12 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 	}
 
 	tests := []struct {
-		leaseStatus           kvserverpb.LeaseStatus
-		raftStatus            raft.BasicStatus
-		livenessMap           livenesspb.IsLiveMap
-		desc                  *roachpb.RangeDescriptor
-		requiresExpiringLease bool
-		exp                   bool
+		leaseStatus             kvserverpb.LeaseStatus
+		raftStatus              raft.BasicStatus
+		livenessMap             livenesspb.IsLiveMap
+		desc                    *roachpb.RangeDescriptor
+		requiresExpirationLease bool
+		exp                     bool
 	}{
 		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: myLease}, followerWithoutLeader, livenessMap, &desc, false, true},
 		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: otherLease}, followerWithoutLeader, livenessMap, &desc, false, false},
@@ -11488,7 +11614,7 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		v := shouldCampaignOnWake(test.leaseStatus, storeID, test.raftStatus, test.livenessMap, test.desc, test.requiresExpiringLease)
+		v := shouldCampaignOnWake(test.leaseStatus, storeID, test.raftStatus, test.livenessMap, test.desc, test.requiresExpirationLease)
 		if v != test.exp {
 			t.Errorf("%d: expected %v but got %v", i, test.exp, v)
 		}
@@ -11583,10 +11709,10 @@ func TestReplicaShouldCampaignOnLeaseRequestRedirect(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                  string
-		raftStatus            raft.BasicStatus
-		requiresExpiringLease bool
-		exp                   bool
+		name                    string
+		raftStatus              raft.BasicStatus
+		requiresExpirationLease bool
+		exp                     bool
 	}{
 		{"candidate", candidate, false, false},
 		{"leader", leader, false, false},
@@ -11600,7 +11726,7 @@ func TestReplicaShouldCampaignOnLeaseRequestRedirect(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			v := shouldCampaignOnLeaseRequestRedirect(tc.raftStatus, livenessMap, &desc, tc.requiresExpiringLease, now)
+			v := shouldCampaignOnLeaseRequestRedirect(tc.raftStatus, livenessMap, &desc, tc.requiresExpirationLease, now)
 			require.Equal(t, tc.exp, v)
 		})
 	}

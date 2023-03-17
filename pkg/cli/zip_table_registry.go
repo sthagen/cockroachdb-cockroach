@@ -304,6 +304,7 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"crdb_internal.hide_sql_constants(create_statement) as create_statement",
 			"crdb_internal.hide_sql_constants(alter_statements) as alter_statements",
 			"crdb_internal.hide_sql_constants(create_nofks) as create_nofks",
+			"crdb_internal.redact(create_redactable) as create_redactable",
 		},
 	},
 	// Ditto, for CREATE TYPE.
@@ -908,7 +909,7 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 	"crdb_internal.node_tenant_capabilities_cache": {
 		nonSensitiveCols: NonSensitiveColumns{
 			"tenant_id",
-			"capability_id",
+			"capability_name",
 			"capability_value",
 		},
 	},
@@ -1214,6 +1215,30 @@ var zipSystemTables = DebugZipTableRegistry{
 			`"distinctCount"`,
 			`"nullCount"`,
 			`"avgSize"`,
+		},
+	},
+	"system.task_payloads": {
+		// `value` column may contain customer info, such as URI params
+		// containing access keys, encryption salts, etc.
+		// `description` is user-defined and may contain PII.
+		nonSensitiveCols: NonSensitiveColumns{
+			"id",
+			"created",
+			"owner",
+			"owner_id",
+			"min_version",
+			"type",
+		},
+	},
+	"system.tenant_tasks": {
+		nonSensitiveCols: NonSensitiveColumns{
+			"tenant_id",
+			"issuer",
+			"task_id",
+			"created",
+			"payload_id",
+			"owner",
+			"owner_id",
 		},
 	},
 	"system.tenant_settings": {

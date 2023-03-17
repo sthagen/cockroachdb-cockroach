@@ -385,19 +385,19 @@ func assertEqualKVs(
 
 		// We only want to process MVCC KVs with a ts less than or equal to the max
 		// resolved ts for this partition.
-		if partitionTimestamp.Less(it.Key().Timestamp) {
+		if partitionTimestamp.Less(it.UnsafeKey().Timestamp) {
 			continue
 		}
 
-		newKey := (prevKey != nil && !it.Key().Key.Equal(prevKey)) || prevKey == nil
-		prevKey = it.Key().Key
+		newKey := (prevKey != nil && !it.UnsafeKey().Key.Equal(prevKey)) || prevKey == nil
+		prevKey = it.UnsafeKey().Clone().Key
 
 		if newKey {
 			// All value ts should have been drained at this point, otherwise there is
 			// a mismatch between the streamed and ingested data.
 			require.Equal(t, 0, len(valueTimestampTuples))
 			valueTimestampTuples, err = streamValidator.getValuesForKeyBelowTimestamp(
-				string(it.Key().Key), partitionTimestamp)
+				string(it.UnsafeKey().Key), partitionTimestamp)
 			require.NoError(t, err)
 		}
 
@@ -408,10 +408,10 @@ func assertEqualKVs(
 		v, err := it.Value()
 		require.NoError(t, err)
 		require.Equal(t, roachpb.KeyValue{
-			Key: it.Key().Key,
+			Key: it.UnsafeKey().Key,
 			Value: roachpb.Value{
 				RawBytes:  v,
-				Timestamp: it.Key().Timestamp,
+				Timestamp: it.UnsafeKey().Timestamp,
 			},
 		}, latestVersionInChain)
 		// Truncate the latest version which we just checked against in preparation
@@ -567,11 +567,12 @@ func runStreamIngestionProcessor(
 	cutoverProvider cutoverProvider,
 	streamingTestingKnobs *sql.StreamingTestingKnobs,
 ) (*distsqlutils.RowBuffer, error) {
-	sip, out, err := getStreamIngestionProcessor(ctx, t, registry, db,
+	sip, err := getStreamIngestionProcessor(ctx, t, registry, db,
 		partitions, initialScanTimestamp, checkpoint, tenantRekey, mockClient, cutoverProvider, streamingTestingKnobs)
 	require.NoError(t, err)
 
-	sip.Run(ctx)
+	out := &distsqlutils.RowBuffer{}
+	sip.Run(ctx, out)
 
 	// Ensure that all the outputs are properly closed.
 	if !out.ProducerClosed() {
@@ -595,11 +596,11 @@ func getStreamIngestionProcessor(
 	mockClient streamclient.Client,
 	cutoverProvider cutoverProvider,
 	streamingTestingKnobs *sql.StreamingTestingKnobs,
-) (*streamIngestionProcessor, *distsqlutils.RowBuffer, error) {
+) (*streamIngestionProcessor, error) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
 	if mockClient == nil {
-		return nil, nil, errors.AssertionFailedf("non-nil streamclient required")
+		return nil, errors.AssertionFailedf("non-nil streamclient required")
 	}
 
 	testDiskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
@@ -618,7 +619,6 @@ func getStreamIngestionProcessor(
 		DiskMonitor: testDiskMonitor,
 	}
 
-	out := &distsqlutils.RowBuffer{}
 	post := execinfrapb.PostProcessSpec{}
 
 	var spec execinfrapb.StreamIngestionDataSpec
@@ -636,7 +636,7 @@ func getStreamIngestionProcessor(
 	spec.InitialScanTimestamp = initialScanTimestamp
 	spec.Checkpoint.ResolvedSpans = checkpoint
 	processorID := int32(0)
-	proc, err := newStreamIngestionDataProcessor(ctx, &flowCtx, processorID, spec, &post, out)
+	proc, err := newStreamIngestionDataProcessor(ctx, &flowCtx, processorID, spec, &post)
 	require.NoError(t, err)
 	sip, ok := proc.(*streamIngestionProcessor)
 	if !ok {
@@ -648,7 +648,7 @@ func getStreamIngestionProcessor(
 		sip.cutoverProvider = cutoverProvider
 	}
 
-	return sip, out, err
+	return sip, err
 }
 
 func resolvedSpansMinTS(resolvedSpans []jobspb.ResolvedSpan) hlc.Timestamp {

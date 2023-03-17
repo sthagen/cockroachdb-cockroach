@@ -501,7 +501,6 @@ type Replica struct {
 		// Instead, the buffer internally holds a reference to mu and will use
 		// it appropriately.
 		proposalBuf propBuf
-
 		// proposals stores the Raft in-flight commands which originated at this
 		// Replica, i.e. all commands for which propose has been called, but which
 		// have not yet applied. A proposal is "pending" until it is "finalized",
@@ -2310,6 +2309,12 @@ func (r *Replica) measureNanosRunning(start time.Duration, f func(float64)) {
 // tracker state.
 func (r *Replica) GetLoadStatsForTesting() *load.ReplicaLoad {
 	return r.loadStats
+}
+
+// HasOutstandingLearnerSnapshotInFlightForTesting is for use only by tests to
+// gather whether there are in-flight snapshots to learner replcas.
+func (r *Replica) HasOutstandingLearnerSnapshotInFlightForTesting() bool {
+	return r.hasOutstandingLearnerSnapshotInFlight()
 }
 
 // ReadProtectedTimestampsForTesting is for use only by tests to read and update

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -567,7 +568,7 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
-			needsSystemConfig:    true,
+			needsSpanConfigs:     true,
 			acceptsUnsplitRanges: store.TestingKnobs().ReplicateQueueAcceptsUnsplit,
 			// The processing of the replicate queue often needs to send snapshots
 			// so we use the raftSnapshotQueueTimeoutFunc. This function sets a
@@ -613,9 +614,18 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 	return rq
 }
 
+func (rq *replicateQueue) enabled() bool {
+	st := rq.store.ClusterSettings()
+	return kvserverbase.ReplicateQueueEnabled.Get(&st.SV)
+}
+
 func (rq *replicateQueue) shouldQueue(
 	ctx context.Context, now hlc.ClockTimestamp, repl *Replica, _ spanconfig.StoreReader,
 ) (shouldQueue bool, priority float64) {
+	if !rq.enabled() {
+		return false, 0
+	}
+
 	desc, conf := repl.DescAndSpanConfig()
 	action, priority := rq.allocator.ComputeAction(ctx, rq.storePool, conf, desc)
 
@@ -677,15 +687,23 @@ func (rq *replicateQueue) shouldQueue(
 		log.KvDistribution.VEventf(ctx, 2, "lease transfer needed, enqueuing")
 		return true, 0
 	}
-	if !repl.LeaseStatusAt(ctx, now).IsValid() {
-		// The lease for this range is currently invalid, if this replica is
-		// the raft leader then it is necessary that it acquires the lease. We
-		// enqueue it regardless of being a leader or follower, where the
-		// leader at the time of processing will succeed. There is no
-		// requirement that the expired lease belongs to this replica, as
-		// regardless of the lease history, the current leader should hold the
-		// lease.
+
+	leaseStatus := repl.LeaseStatusAt(ctx, now)
+	if !leaseStatus.IsValid() && leaseStatus.Lease.Type() != roachpb.LeaseExpiration {
+		// The epoch lease for this range is currently invalid. If this replica is
+		// the raft leader then we'd like it to hold a valid lease. We enqueue it
+		// regardless of being a leader or follower, where the leader at the time of
+		// processing will succeed.
+		//
+		// We don't do this for expiration leases, because we'd like them to expire
+		// if the range is idle.
 		log.KvDistribution.VEventf(ctx, 2, "invalid lease, enqueuing")
+		return true, 0
+	}
+	if leaseStatus.OwnedBy(repl.StoreID()) && !repl.hasCorrectLeaseType(leaseStatus.Lease) {
+		// This replica holds (or held) an incorrect lease type, switch it to the
+		// correct type. Typically when changing kv.expiration_leases_only.enabled.
+		log.KvDistribution.VEventf(ctx, 2, "incorrect lease type, enqueueing")
 		return true, 0
 	}
 
@@ -695,6 +713,11 @@ func (rq *replicateQueue) shouldQueue(
 func (rq *replicateQueue) process(
 	ctx context.Context, repl *Replica, confReader spanconfig.StoreReader,
 ) (processed bool, err error) {
+	if !rq.enabled() {
+		log.VEventf(ctx, 2, "skipping replication: queue has been disabled")
+		return false, nil
+	}
+
 	retryOpts := retry.Options{
 		InitialBackoff: 50 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,
@@ -986,12 +1009,26 @@ func (rq *replicateQueue) PlanOneChange(
 	if _, err := repl.IsDestroyed(); err != nil {
 		return change, err
 	}
+
+	// Ensure ranges have a lease (returning NLHE if someone else has it), and
+	// switch the lease type if necessary (e.g. due to
+	// kv.expiration_leases_only.enabled).
+	//
 	// TODO(kvoli): This check should fail if not the leaseholder. In the case
 	// where we want to use the replicate queue to acquire leases, this should
-	// occur before planning or as a result. In order to return this in
-	// planning, it is necessary to simulate the prior change having succeeded
-	// to then plan this lease transfer.
-	if _, pErr := repl.redirectOnOrAcquireLease(ctx); pErr != nil {
+	// occur before planning or as a result. In order to return this in planning,
+	// it is necessary to simulate the prior change having succeeded to then plan
+	// this lease transfer.
+	//
+	// TODO(erikgrinaker): We shouldn't overload the replicate queue to also be
+	// responsible for lease maintenance, but it'll do for now. See:
+	// https://github.com/cockroachdb/cockroach/issues/98433
+	leaseStatus, pErr := repl.redirectOnOrAcquireLease(ctx)
+	if pErr != nil {
+		return change, pErr.GoError()
+	}
+	pErr = repl.maybeSwitchLeaseType(ctx, leaseStatus)
+	if pErr != nil {
 		return change, pErr.GoError()
 	}
 

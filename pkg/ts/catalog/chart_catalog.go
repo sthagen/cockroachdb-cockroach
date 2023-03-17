@@ -604,6 +604,12 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "Rangefeed Registrations",
+				Metrics: []string{
+					"kv.rangefeed.registrations",
+				},
+			},
+			{
 				Title: "Rangefeed Memory Allocations",
 				Metrics: []string{
 					"kv.rangefeed.budget_allocation_failed",
@@ -818,8 +824,17 @@ var charts = []sectionDescription{
 		},
 		Charts: []chartDescription{
 			{
-				Title:   "KVSubscriber",
-				Metrics: []string{"spanconfig.kvsubscriber.update_behind_nanos"},
+				Title: "KVSubscriber Lag Metrics",
+				Metrics: []string{
+					"spanconfig.kvsubscriber.oldest_protected_record_nanos",
+					"spanconfig.kvsubscriber.update_behind_nanos",
+				},
+			},
+			{
+				Title: "KVSubscriber Protected Record Count",
+				Metrics: []string{
+					"spanconfig.kvsubscriber.protected_record_count",
+				},
 			},
 		},
 	},
@@ -3374,6 +3389,18 @@ var charts = []sectionDescription{
 				},
 			},
 			{
+				Title: "PTS Counts",
+				Metrics: []string{
+					"schedules.BACKUP.protected_record_count",
+				},
+			},
+			{
+				Title: "PTS Age",
+				Metrics: []string{
+					"schedules.BACKUP.protected_age_sec",
+				},
+			},
+			{
 				Title: "Last Completed Backups",
 				Metrics: []string{
 					"schedules.BACKUP.last-completed-time",
@@ -3616,6 +3643,17 @@ var charts = []sectionDescription{
 					"jobs.poll_jobs_stats.resume_completed",
 					"jobs.poll_jobs_stats.resume_failed",
 					"jobs.poll_jobs_stats.resume_retry_error",
+				},
+			},
+			{
+				Title: "Auto Config Runner Job",
+				Metrics: []string{
+					"jobs.auto_config_runner.fail_or_cancel_completed",
+					"jobs.auto_config_runner.fail_or_cancel_failed",
+					"jobs.auto_config_runner.fail_or_cancel_retry_error",
+					"jobs.auto_config_runner.resume_completed",
+					"jobs.auto_config_runner.resume_failed",
+					"jobs.auto_config_runner.resume_retry_error",
 				},
 			},
 		},

@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
-const configIdx = 9
+const configIdx = 8
 
 var logicTestDir string
 var cclLogicTestDir string
@@ -435,6 +435,13 @@ func TestTenantLogic_column_families(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "column_families")
+}
+
+func TestTenantLogic_comment_on(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "comment_on")
 }
 
 func TestTenantLogic_composite_types(
@@ -1725,6 +1732,13 @@ func TestTenantLogic_show_create_all_types(
 	runLogicTest(t, "show_create_all_types")
 }
 
+func TestTenantLogic_show_create_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_redact")
+}
+
 func TestTenantLogic_show_default_privileges(
 	t *testing.T,
 ) {
@@ -1982,6 +1996,13 @@ func TestTenantLogic_truncate(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "truncate")
+}
+
+func TestTenantLogic_truncate_with_concurrent_mutation(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "truncate_with_concurrent_mutation")
 }
 
 func TestTenantLogic_tsvector(

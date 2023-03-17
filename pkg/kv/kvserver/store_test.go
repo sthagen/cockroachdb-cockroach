@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -180,12 +181,13 @@ func createTestStoreWithoutStart(
 
 	rpcContext := rpc.NewContext(ctx,
 		rpc.ContextOptions{
-			TenantID:        roachpb.SystemTenantID,
-			Config:          &base.Config{Insecure: true},
-			Clock:           cfg.Clock.WallClock(),
-			ToleratedOffset: cfg.Clock.ToleratedOffset(),
-			Stopper:         stopper,
-			Settings:        cfg.Settings,
+			TenantID:            roachpb.SystemTenantID,
+			Config:              &base.Config{Insecure: true},
+			Clock:               cfg.Clock.WallClock(),
+			ToleratedOffset:     cfg.Clock.ToleratedOffset(),
+			Stopper:             stopper,
+			Settings:            cfg.Settings,
+			TenantRPCAuthorizer: tenantcapabilitiesauthorizer.NewNoopAuthorizer(),
 		})
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
 	server, err := rpc.NewServer(rpcContext) // never started
@@ -200,6 +202,9 @@ func createTestStoreWithoutStart(
 	}
 	if cfg.StorePool == nil {
 		cfg.StorePool = NewTestStorePool(*cfg)
+	}
+	if cfg.RPCContext == nil {
+		cfg.RPCContext = rpcContext
 	}
 	// Many tests using this test harness (as opposed to higher-level
 	// ones like multiTestContext or TestServer) want to micro-manage
@@ -3462,7 +3467,7 @@ func TestAllocatorCheckRangeUnconfigured(t *testing.T) {
 		} else {
 			// Expect error looking up spanConfig if we can't use the system config span,
 			// as the spanconfig.KVSubscriber infrastructure is not initialized.
-			require.ErrorIs(t, err, errSysCfgUnavailable)
+			require.ErrorIs(t, err, errSpanConfigsUnavailable)
 			require.Equal(t, allocatorimpl.AllocatorNoop, action)
 		}
 	})

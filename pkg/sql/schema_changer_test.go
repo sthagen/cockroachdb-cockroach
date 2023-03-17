@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -103,6 +104,7 @@ func TestSchemaChangeProcess(t *testing.T) {
 		s.InternalDB().(isql.DB),
 		execCfg.Clock,
 		execCfg.Settings,
+		s.SettingsWatcher().(*settingswatcher.SettingsWatcher),
 		execCfg.Codec,
 		lease.ManagerTestingKnobs{},
 		stopper,
@@ -1723,6 +1725,7 @@ func TestSchemaChangeFailureAfterCheckpointing(t *testing.T) {
 	defer server.Stopper().Stop(context.Background())
 
 	if _, err := sqlDB.Exec(`
+SET use_declarative_schema_changer='off';
 CREATE DATABASE t;
 CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 `); err != nil {
@@ -6200,6 +6203,7 @@ func TestRetriableErrorDuringRollback(t *testing.T) {
 		defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
 		_, err := sqlDB.Exec(`
+SET use_declarative_schema_changer='off';
 CREATE DATABASE t;
 CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 INSERT INTO t.test VALUES (1, 2), (2, 2);

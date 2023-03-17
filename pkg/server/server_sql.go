@@ -120,6 +120,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -462,16 +463,28 @@ var _ slinstance.SessionEventListener = &stopperSessionEventListener{}
 func (r *refreshInstanceSessionListener) OnSessionDeleted(
 	ctx context.Context,
 ) (createAnotherSession bool) {
-	if err := r.cfg.stopper.RunAsyncTask(ctx, "refresh-instance-session", func(context.Context) {
-		nodeID, _ := r.cfg.nodeIDContainer.OptionalNodeID()
-		s, err := r.cfg.sqlLivenessProvider.Session(ctx)
-		if err != nil {
-			log.Errorf(ctx, "faild to get new liveness session ID: %v", err)
-		}
-		if _, err := r.cfg.sqlInstanceStorage.CreateNodeInstance(
-			ctx, s.ID(), s.Expiration(), r.cfg.AdvertiseAddr, r.cfg.SQLAdvertiseAddr, r.cfg.Locality, nodeID,
-		); err != nil {
-			log.Errorf(ctx, "failed to update instance with new session ID: %v", err)
+	if err := r.cfg.stopper.RunAsyncTask(ctx, "refresh-instance-session", func(ctx context.Context) {
+		for i := retry.StartWithCtx(ctx, retry.Options{MaxBackoff: time.Second * 5}); i.Next(); {
+			select {
+			case <-r.cfg.stopper.ShouldQuiesce():
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+			nodeID, _ := r.cfg.nodeIDContainer.OptionalNodeID()
+			s, err := r.cfg.sqlLivenessProvider.Session(ctx)
+			if err != nil {
+				log.Warningf(ctx, "failed to get new liveness session ID: %v", err)
+				continue
+			}
+			if _, err := r.cfg.sqlInstanceStorage.CreateNodeInstance(
+				ctx, s.ID(), s.Expiration(), r.cfg.AdvertiseAddr, r.cfg.SQLAdvertiseAddr, r.cfg.Locality, nodeID,
+			); err != nil {
+				log.Warningf(ctx, "failed to update instance with new session ID: %v", err)
+				continue
+			}
+			return
 		}
 	}); err != nil {
 		log.Errorf(ctx, "failed to run update of instance with new session ID: %v", err)
@@ -554,16 +567,17 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	}
 	cfg.sqlLivenessProvider = slprovider.New(
 		cfg.AmbientCtx,
-		cfg.stopper, cfg.clock, cfg.db, codec, cfg.Settings, sqllivenessKnobs, sessionEventsConsumer,
+		cfg.stopper, cfg.clock, cfg.db, codec, cfg.Settings, settingsWatcher, sqllivenessKnobs, sessionEventsConsumer,
 	)
 
 	cfg.sqlInstanceStorage = instancestorage.NewStorage(
-		cfg.db, codec, cfg.sqlLivenessProvider.CachedReader(), cfg.Settings)
+		cfg.db, codec, cfg.sqlLivenessProvider.CachedReader(), cfg.Settings,
+		cfg.clock, cfg.rangeFeedFactory, settingsWatcher)
+
 	cfg.sqlInstanceReader = instancestorage.NewReader(
-		cfg.sqlInstanceStorage,
-		cfg.sqlLivenessProvider,
-		cfg.rangeFeedFactory,
-		codec, cfg.clock, cfg.stopper)
+		cfg.sqlInstanceStorage, cfg.sqlLivenessProvider.CachedReader(),
+		cfg.stopper,
+	)
 
 	// We can't use the nodeDailer as the podNodeDailer unless we
 	// are serving the system tenant despite the fact that we've
@@ -631,6 +645,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg.internalDB,
 		cfg.clock,
 		cfg.Settings,
+		settingsWatcher,
 		codec,
 		lmKnobs,
 		cfg.stopper,
@@ -788,7 +803,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		RowMetrics:         &rowMetrics,
 		InternalRowMetrics: &internalRowMetrics,
 
-		SQLLivenessReader: cfg.sqlLivenessProvider,
+		SQLLivenessReader: cfg.sqlLivenessProvider.CachedReader(),
 		JobRegistry:       jobRegistry,
 		Gossip:            cfg.gossip,
 		PodNodeDialer:     cfg.podNodeDialer,
@@ -911,7 +926,6 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg.sqlStatusServer.TxnIDResolution,
 		&contentionMetrics,
 	)
-	contentionRegistry.Start(ctx, cfg.stopper)
 
 	storageEngineClient := kvserver.NewStorageEngineClient(cfg.nodeDialer)
 	*execCfg = sql.ExecutorConfig{
@@ -1389,6 +1403,8 @@ func (s *SQLServer) preStart(
 	}
 
 	s.leaseMgr.SetRegionPrefix(regionPhysicalRep)
+
+	s.execCfg.ContentionRegistry.Start(ctx, stopper)
 
 	// Start the sql liveness subsystem. We'll need it to get a session.
 	s.sqlLivenessProvider.Start(ctx, regionPhysicalRep)

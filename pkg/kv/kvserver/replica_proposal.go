@@ -127,20 +127,6 @@ type ProposalData struct {
 	tok TrackedRequestToken
 }
 
-// Supersedes takes the MaxLeaseIndex of a RaftCommand obtained from a log
-// entry. It returns true if the ProposalData tracks a different MaxIndex,
-// implying that the log entry has been reproposed under an updated
-// MaxLeaseIndex. This implies that the current log entry will have been
-// rejected and should not be reproposed.
-//
-// Note that some commands such as lease requests (but not transfers) don't use
-// MaxLeaseIndex. For these, false will be returned.
-//
-// See (*Replica).mu.proposals for a detailed explanation of reproposals.
-func (proposal *ProposalData) Supersedes(entryMaxLeaseIndex uint64) bool {
-	return proposal.command.MaxLeaseIndex != entryMaxLeaseIndex
-}
-
 // finishApplication is called when a command application has finished. The
 // method will be called downstream of Raft if the command required consensus,
 // but can be called upstream of Raft if the command did not and was never
@@ -363,8 +349,6 @@ func (r *Replica) leasePostApplyLocked(
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
 	r.mu.state.Lease = newLease
-	requiresExpirationBasedLease := r.requiresExpiringLeaseRLocked()
-	hasExpirationBasedLease := newLease.Type() == roachpb.LeaseExpiration
 
 	now := r.store.Clock().NowAsClockTimestamp()
 
@@ -382,21 +366,25 @@ func (r *Replica) leasePostApplyLocked(
 		r.gossipFirstRangeLocked(ctx)
 	}
 
-	if leaseChangingHands && iAmTheLeaseHolder && hasExpirationBasedLease && r.ownsValidLeaseRLocked(ctx, now) {
-		if requiresExpirationBasedLease {
+	hasExpirationLease := newLease.Type() == roachpb.LeaseExpiration
+	if leaseChangingHands && iAmTheLeaseHolder && hasExpirationLease && r.ownsValidLeaseRLocked(ctx, now) {
+		if r.requiresExpirationLeaseRLocked() {
 			// Whenever we first acquire an expiration-based lease for a range that
-			// requires it, notify the lease renewer worker that we want it to keep
-			// proactively renewing the lease before it expires.
+			// requires it (i.e. the liveness or meta ranges), notify the lease
+			// renewer worker that we want it to keep proactively renewing the lease
+			// before it expires. We don't eagerly renew other expiration leases,
+			// because a more sophisticated scheduler is needed to handle large
+			// numbers of expiration leases.
 			r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
 			select {
 			case r.store.renewableLeasesSignal <- struct{}{}:
 			default:
 			}
-		} else {
-			// We received an expiration lease for a range that doesn't require it,
-			// i.e. comes after the liveness keyspan. We've also applied it before
-			// it has expired. Upgrade this lease to the more efficient epoch-based
-			// one.
+		} else if !r.shouldUseExpirationLeaseRLocked() {
+			// We received an expiration lease for a range that shouldn't keep using
+			// it, most likely as part of a lease transfer (which is always
+			// expiration-based). We've also applied it before it has expired. Upgrade
+			// this lease to the more efficient epoch-based one.
 			if log.V(1) {
 				log.VEventf(ctx, 1, "upgrading expiration lease %s to an epoch-based one", newLease)
 			}

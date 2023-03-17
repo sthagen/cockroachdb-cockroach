@@ -34,7 +34,7 @@ func TestShowTraceReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 34213)
+	skip.WithIssue(t, 98598)
 
 	const numNodes = 4
 

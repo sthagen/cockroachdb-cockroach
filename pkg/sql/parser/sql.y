@@ -855,11 +855,17 @@ func (u *sqlSymUnion) showRangesOpts() *tree.ShowRangesOptions {
 func (u *sqlSymUnion) tenantSpec() *tree.TenantSpec {
     return u.val.(*tree.TenantSpec)
 }
+func (u *sqlSymUnion) likeTenantSpec() *tree.LikeTenantSpec {
+    return u.val.(*tree.LikeTenantSpec)
+}
 func (u *sqlSymUnion) cteMaterializeClause() tree.CTEMaterializeClause {
     return u.val.(tree.CTEMaterializeClause)
 }
 func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
     return u.val.(tree.ShowTenantOptions)
+}
+func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
+    return u.val.(tree.ShowCreateFormatOption)
 }
 %}
 
@@ -960,7 +966,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 
 %token <str> QUERIES QUERY QUOTE
 
-%token <str> RANGE RANGES READ REAL REASON REASSIGN RECURSIVE RECURRING REF REFERENCES REFRESH
+%token <str> RANGE RANGES READ REAL REASON REASSIGN RECURSIVE RECURRING REDACT REF REFERENCES REFRESH
 %token <str> REGCLASS REGION REGIONAL REGIONS REGNAMESPACE REGPROC REGPROCEDURE REGROLE REGTYPE REINDEX
 %token <str> RELATIVE RELOCATE REMOVE_PATH RENAME REPEATABLE REPLACE REPLICATION
 %token <str> RELEASE RESET RESTART RESTORE RESTRICT RESTRICTED RESUME RETENTION RETURNING RETURN RETURNS RETRY REVISION_HISTORY
@@ -981,7 +987,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %token <str> TRUNCATE TRUSTED TYPE TYPES
 %token <str> TRACING
 
-%token <str> UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UNSPLIT
+%token <str> UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UNSAFE_RESTORE_INCOMPATIBLE_VERSION UNSPLIT
 %token <str> UPDATE UPSERT UNSET UNTIL USE USER USERS USING UUID
 
 %token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VERIFY_BACKUP_TABLE_DATA VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
@@ -1169,6 +1175,8 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %type <tree.Statement> create_sequence_stmt
 %type <tree.Statement> create_func_stmt
 
+%type <*tree.LikeTenantSpec> opt_like_tenant
+
 %type <tree.Statement> create_stats_stmt
 %type <*tree.CreateStatsOptions> opt_create_stats_options
 %type <*tree.CreateStatsOptions> create_stats_option_list
@@ -1240,6 +1248,7 @@ func (u *sqlSymUnion) showTenantOpts() tree.ShowTenantOptions {
 %type <tree.Statement> show_commit_timestamp_stmt
 %type <tree.Statement> show_constraints_stmt
 %type <tree.Statement> show_create_stmt
+%type <tree.ShowCreateFormatOption> opt_show_create_format_options
 %type <tree.Statement> show_create_schedules_stmt
 %type <tree.Statement> show_create_external_connections_stmt
 %type <tree.Statement> show_csettings_stmt show_local_or_tenant_csettings_stmt
@@ -3760,6 +3769,11 @@ restore_options:
 	{
 		$$.val = &tree.RestoreOptions{VerifyData: true}
 	}
+| UNSAFE_RESTORE_INCOMPATIBLE_VERSION
+  {
+    $$.val = &tree.RestoreOptions{UnsafeRestoreIncompatibleVersion: true}
+  }
+
 import_format:
   name
   {
@@ -4348,25 +4362,42 @@ create_stmt:
 // %Help: CREATE TENANT - create new tenant
 // %Category: Experimental
 // %Text:
-// CREATE TENANT name
-// CREATE TENANT name FROM REPLICATION OF <tenant_spec> ON <location> [ WITH OPTIONS ... ]
+// CREATE TENANT name [ LIKE <tenant_spec> ]
+// CREATE TENANT name [ LIKE <tenant_spec> ] FROM REPLICATION OF <tenant_spec> ON <location> [ WITH OPTIONS ... ]
 create_tenant_stmt:
-  CREATE TENANT d_expr
+  CREATE TENANT d_expr opt_like_tenant
   {
     /* SKIP DOC */
-    $$.val = &tree.CreateTenant{TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()}}
+    $$.val = &tree.CreateTenant{
+      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()},
+      Like: $4.likeTenantSpec(),
+    }
   }
-| CREATE TENANT d_expr FROM REPLICATION OF d_expr ON d_expr opt_with_tenant_replication_options
+| CREATE TENANT d_expr opt_like_tenant FROM REPLICATION OF d_expr ON d_expr opt_with_tenant_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
       TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()},
-      ReplicationSourceTenantName: &tree.TenantSpec{IsName: true, Expr: $7.expr()},
-      ReplicationSourceAddress: $9.expr(),
-      Options: *$10.tenantReplicationOptions(),
+      ReplicationSourceTenantName: &tree.TenantSpec{IsName: true, Expr: $8.expr()},
+      ReplicationSourceAddress: $10.expr(),
+      Options: *$11.tenantReplicationOptions(),
+      Like: $4.likeTenantSpec(),
     }
   }
 | CREATE TENANT error // SHOW HELP: CREATE TENANT
+
+// opt_like_tenant defines a LIKE clause for CREATE TENANT.
+// Eventually this can grow to support INCLUDING/EXCLUDING options
+// like in CREATE TABLE.
+opt_like_tenant:
+  /* EMPTY */
+  {
+     $$.val = &tree.LikeTenantSpec{}
+  }
+| LIKE tenant_spec
+  {
+      $$.val = &tree.LikeTenantSpec{OtherTenant: $2.tenantSpec()}
+  }
 
 // Optional tenant replication options.
 opt_with_tenant_replication_options:
@@ -8098,30 +8129,40 @@ show_transfer_stmt:
 // SHOW CREATE ALL TYPES
 // %SeeAlso: WEBDOCS/show-create.html
 show_create_stmt:
-  SHOW CREATE table_name
+  SHOW CREATE table_name opt_show_create_format_options
   {
-    $$.val = &tree.ShowCreate{Name: $3.unresolvedObjectName()}
+    $$.val = &tree.ShowCreate{
+      Name: $3.unresolvedObjectName(), FmtOpt: $4.showCreateFormatOption(),
+    }
   }
-| SHOW CREATE TABLE table_name
-	{
+| SHOW CREATE TABLE table_name opt_show_create_format_options
+  {
     /* SKIP DOC */
-    $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeTable, Name: $4.unresolvedObjectName()}
-	}
-| SHOW CREATE VIEW table_name
-	{
+    $$.val = &tree.ShowCreate{
+      Mode: tree.ShowCreateModeTable,
+      Name: $4.unresolvedObjectName(),
+      FmtOpt: $5.showCreateFormatOption(),
+    }
+  }
+| SHOW CREATE VIEW table_name opt_show_create_format_options
+  {
     /* SKIP DOC */
-    $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeView, Name: $4.unresolvedObjectName()}
-	}
+    $$.val = &tree.ShowCreate{
+      Mode: tree.ShowCreateModeView,
+      Name: $4.unresolvedObjectName(),
+      FmtOpt: $5.showCreateFormatOption(),
+    }
+  }
 | SHOW CREATE SEQUENCE sequence_name
-	{
+  {
     /* SKIP DOC */
     $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeSequence, Name: $4.unresolvedObjectName()}
-	}
+  }
 | SHOW CREATE DATABASE db_name
-	{
+  {
     /* SKIP DOC */
     $$.val = &tree.ShowCreate{Mode: tree.ShowCreateModeDatabase, Name: $4.unresolvedObjectName()}
-	}
+  }
 | SHOW CREATE INDEXES FROM table_name
   {
     /* SKIP DOC */
@@ -8154,6 +8195,16 @@ show_create_stmt:
     $$.val = &tree.ShowCreateAllTypes{}
   }
 | SHOW CREATE error // SHOW HELP: SHOW CREATE
+
+opt_show_create_format_options:
+  /* EMPTY */
+  {
+    $$.val = tree.ShowCreateFormatOptionNone
+  }
+| WITH REDACT
+  {
+    $$.val = tree.ShowCreateFormatOptionRedactedValues
+  }
 
 // %Help: SHOW CREATE SCHEDULES - list CREATE statements for scheduled jobs
 // %Category: DDL
@@ -16429,6 +16480,7 @@ unreserved_keyword:
 | REASSIGN
 | RECURRING
 | RECURSIVE
+| REDACT
 | REF
 | REFRESH
 | REGION
@@ -16552,6 +16604,7 @@ unreserved_keyword:
 | UNKNOWN
 | UNLISTEN
 | UNLOGGED
+| UNSAFE_RESTORE_INCOMPATIBLE_VERSION
 | UNSET
 | UNSPLIT
 | UNTIL
@@ -16969,6 +17022,7 @@ bare_label_keywords:
 | REASSIGN
 | RECURRING
 | RECURSIVE
+| REDACT
 | REF
 | REFERENCES
 | REFRESH
@@ -17114,6 +17168,7 @@ bare_label_keywords:
 | UNKNOWN
 | UNLISTEN
 | UNLOGGED
+| UNSAFE_RESTORE_INCOMPATIBLE_VERSION
 | UNSET
 | UNSPLIT
 | UNTIL

@@ -47,6 +47,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -1688,8 +1690,8 @@ func TestAdminAPIJobs(t *testing.T) {
 			t.Fatal(err)
 		}
 		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run) VALUES ($1, $2, $3, $4, $5, $6)`,
-			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun,
+			`INSERT INTO system.jobs (id, status, payload, progress, num_runs, last_run, job_type) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			job.id, job.status, payloadBytes, progressBytes, job.numRuns, job.lastRun, payload.Type().String(),
 		)
 	}
 
@@ -3247,6 +3249,22 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestServerError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	pgError := pgerror.New(pgcode.OutOfMemory, "TestServerError.OutOfMemory")
+	err := serverError(ctx, pgError)
+	require.Equal(t, "rpc error: code = Internal desc = An internal server error has occurred. Please check your CockroachDB logs for more details. Error Code: 53200", err.Error())
+
+	err = serverError(ctx, err)
+	require.Equal(t, "rpc error: code = Internal desc = An internal server error has occurred. Please check your CockroachDB logs for more details. Error Code: 53200", err.Error())
+
+	err = fmt.Errorf("random error that is not pgerror or grpcstatus")
+	err = serverError(ctx, err)
+	require.Equal(t, "rpc error: code = Internal desc = An internal server error has occurred. Please check your CockroachDB logs for more details.", err.Error())
 }
 
 func TestDatabaseAndTableIndexRecommendations(t *testing.T) {

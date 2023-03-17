@@ -51,6 +51,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -108,10 +110,6 @@ func nonTableDescriptorRangeCount() int64 {
 		keys.TenantsRangesID,
 	}))
 }
-
-// apiServerMessage is the standard body for all HTTP 500 responses.
-var errAdminAPIError = grpcstatus.Errorf(codes.Internal, "An internal server error "+
-	"has occurred. Please check your CockroachDB logs for more details.")
 
 // A adminServer provides a RESTful HTTP API to administration of
 // the cockroach cluster.
@@ -309,14 +307,30 @@ func (s *adminServer) RegisterGateway(
 // the RPC endpoint method.
 func serverError(ctx context.Context, err error) error {
 	log.ErrorfDepth(ctx, 1, "%+v", err)
-	return errAdminAPIError
+
+	// Include the PGCode in the message for easier troubleshooting
+	errCode := pgerror.GetPGCode(err).String()
+	if errCode != pgcode.Uncategorized.String() {
+		errMessage := fmt.Sprintf("%s Error Code: %s", errAPIInternalErrorString, errCode)
+		return grpcstatus.Errorf(codes.Internal, errMessage)
+	}
+
+	// The error is already grpcstatus formatted error.
+	// Likely calling serverError multiple times on same error.
+	grpcCode := grpcstatus.Code(err)
+	if grpcCode != codes.Unknown {
+		return err
+	}
+
+	// Fallback to generic message
+	return errAPIInternalError
 }
 
 // serverErrorf logs the provided error and returns an error that should be returned by
 // the RPC endpoint method.
 func serverErrorf(ctx context.Context, format string, args ...interface{}) error {
 	log.ErrorfDepth(ctx, 1, format, args...)
-	return errAdminAPIError
+	return errAPIInternalError
 }
 
 // isNotFoundError returns true if err is a table/database not found error.
@@ -4197,8 +4211,18 @@ func (s *adminServer) GetTracingSnapshot(
 
 	for i, s := range spansList.Spans {
 		tags := make([]*serverpb.SpanTag, len(s.Tags))
-		for j, t := range s.Tags {
-			tags[j] = getSpanTag(t)
+		for j, tag := range s.Tags {
+			tags[j] = getSpanTag(tag)
+		}
+		childrenMetadata := make([]*serverpb.NamedOperationMetadata, len(s.ChildrenMetadata))
+
+		j := 0
+		for name, cm := range s.ChildrenMetadata {
+			childrenMetadata[j] = &serverpb.NamedOperationMetadata{
+				Name:     name,
+				Metadata: cm,
+			}
+			j++
 		}
 
 		spans[i] = &serverpb.TracingSpan{
@@ -4211,6 +4235,7 @@ func (s *adminServer) GetTracingSnapshot(
 			ProcessedTags:        tags,
 			Current:              s.Current,
 			CurrentRecordingMode: s.CurrentRecordingMode.ToProto(),
+			ChildrenMetadata:     childrenMetadata,
 		}
 	}
 
@@ -4307,38 +4332,6 @@ func (s *adminServer) SetTraceRecordingType(
 		return nil
 	})
 	return &serverpb.SetTraceRecordingTypeResponse{}, nil
-}
-
-func (s *adminServer) RecoveryCollectReplicaInfo(
-	request *serverpb.RecoveryCollectReplicaInfoRequest,
-	server serverpb.Admin_RecoveryCollectReplicaInfoServer,
-) error {
-	return errors.AssertionFailedf("To be implemented by #93040")
-}
-
-func (s *adminServer) RecoveryCollectLocalReplicaInfo(
-	request *serverpb.RecoveryCollectLocalReplicaInfoRequest,
-	server serverpb.Admin_RecoveryCollectLocalReplicaInfoServer,
-) error {
-	return errors.AssertionFailedf("To be implemented by #93040")
-}
-
-func (s *adminServer) RecoveryStagePlan(
-	ctx context.Context, request *serverpb.RecoveryStagePlanRequest,
-) (*serverpb.RecoveryStagePlanResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93044")
-}
-
-func (s *adminServer) RecoveryNodeStatus(
-	ctx context.Context, request *serverpb.RecoveryNodeStatusRequest,
-) (*serverpb.RecoveryNodeStatusResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
-}
-
-func (s *adminServer) RecoveryVerify(
-	ctx context.Context, request *serverpb.RecoveryVerifyRequest,
-) (*serverpb.RecoveryVerifyResponse, error) {
-	return nil, errors.AssertionFailedf("To be implemented by #93043")
 }
 
 // ListTenants returns a list of tenants that are served

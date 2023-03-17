@@ -1,10 +1,11 @@
 echo
 ----
 (base.RaftConfig) {
- RaftTickInterval: (time.Duration) 200ms,
- RaftElectionTimeoutTicks: (int) 10,
- RaftHeartbeatIntervalTicks: (int) 5,
- RangeLeaseRaftElectionTimeoutMultiplier: (float64) 3,
+ RaftTickInterval: (time.Duration) 500ms,
+ RaftElectionTimeoutTicks: (int) 4,
+ RaftReproposalTimeoutTicks: (int) 6,
+ RaftHeartbeatIntervalTicks: (int) 2,
+ RangeLeaseDuration: (time.Duration) 6s,
  RangeLeaseRenewalFraction: (float64) 0.5,
  RaftLogTruncationThreshold: (int64) 16777216,
  RaftProposalQuota: (int64) 8388608,
@@ -13,10 +14,11 @@ echo
  RaftMaxCommittedSizePerReady: (uint64) 67108864,
  RaftMaxInflightMsgs: (int) 128,
  RaftMaxInflightBytes: (uint64) 268435456,
- RaftDelaySplitToSuppressSnapshotTicks: (int) 230
+ RaftDelaySplitToSuppressSnapshot: (time.Duration) 45s
 }
 RaftHeartbeatInterval: 1s
 RaftElectionTimeout: 2s
+RaftReproposalTimeout: 3s
 RangeLeaseDurations: active=6s renewal=3s
 RangeLeaseAcquireTimeout: 4s
 NodeLivenessDurations: active=6s renewal=3s

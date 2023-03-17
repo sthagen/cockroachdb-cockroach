@@ -179,6 +179,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalSessionTraceTableID:                crdbInternalSessionTraceTable,
 		catconstants.CrdbInternalSessionVariablesTableID:            crdbInternalSessionVariablesTable,
 		catconstants.CrdbInternalStmtStatsTableID:                   crdbInternalStmtStatsView,
+		catconstants.CrdbInternalStmtStatsPersistedTableID:          crdbInternalStmtStatsPersistedView,
 		catconstants.CrdbInternalTableColumnsTableID:                crdbInternalTableColumnsTable,
 		catconstants.CrdbInternalTableIndexesTableID:                crdbInternalTableIndexesTable,
 		catconstants.CrdbInternalTableSpansTableID:                  crdbInternalTableSpansTable,
@@ -186,6 +187,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalTablesTableID:                      crdbInternalTablesTable,
 		catconstants.CrdbInternalClusterTxnStatsTableID:             crdbInternalClusterTxnStatsTable,
 		catconstants.CrdbInternalTxnStatsTableID:                    crdbInternalTxnStatsView,
+		catconstants.CrdbInternalTxnStatsPersistedTableID:           crdbInternalTxnStatsPersistedView,
 		catconstants.CrdbInternalTransactionStatsTableID:            crdbInternalTransactionStatisticsTable,
 		catconstants.CrdbInternalZonesTableID:                       crdbInternalZonesTable,
 		catconstants.CrdbInternalInvalidDescriptorsTableID:          crdbInternalInvalidDescriptorsTable,
@@ -1034,12 +1036,21 @@ const (
 	// Note that we are querying crdb_internal.system_jobs instead of system.jobs directly.
 	// The former has access control built in and will filter out jobs that the
 	// user is not allowed to see.
-	jobsQFrom        = ` FROM crdb_internal.system_jobs`
-	jobsBackoffArgs  = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
-	jobsStatusFilter = ` WHERE status = $3`
-	jobsQuery        = jobsQSelect + `, last_run, COALESCE(num_runs, 0), ` + jobs.NextRunClause +
+	jobsQFrom         = ` FROM crdb_internal.system_jobs`
+	jobsBackoffArgs   = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
+	jobsStatusFilter  = ` WHERE status = $3`
+	oldJobsTypeFilter = ` WHERE crdb_internal.job_payload_type(payload) = $3`
+	jobsTypeFilter    = ` WHERE job_type = $3`
+	jobsQuery         = jobsQSelect + `, last_run, COALESCE(num_runs, 0), ` + jobs.NextRunClause +
 		` as next_run` + jobsQFrom + ", " + jobsBackoffArgs
 )
+
+func getCRDBInternalJobsTableTypeFilter(ctx context.Context, version clusterversion.Handle) string {
+	if !version.IsActive(ctx, clusterversion.V23_1BackfillTypeColumnInJobsTable) {
+		return oldJobsTypeFilter
+	}
+	return jobsTypeFilter
+}
 
 // TODO(tbg): prefix with kv_.
 var crdbInternalJobsTable = virtualSchemaTable{
@@ -1067,12 +1078,19 @@ CREATE TABLE crdb_internal.jobs (
   num_runs              INT,
   execution_errors      STRING[],
   execution_events      JSONB,
-  INDEX(status)
+  INDEX(status),
+  INDEX(job_type)
 )`,
 	comment: `decoded job metadata from crdb_internal.system_jobs (KV scan)`,
 	indexes: []virtualIndex{{
 		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
 			q := jobsQuery + jobsStatusFilter
+			targetStatus := tree.MustBeDString(unwrappedConstraint)
+			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetStatus)
+		},
+	}, {
+		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
+			q := jobsQuery + getCRDBInternalJobsTableTypeFilter(ctx, p.execCfg.Settings.Version)
 			targetStatus := tree.MustBeDString(unwrappedConstraint)
 			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetStatus)
 		},
@@ -3199,6 +3217,7 @@ CREATE TABLE crdb_internal.create_statements (
   create_nofks                  STRING NOT NULL,
   alter_statements              STRING[] NOT NULL,
   validate_statements           STRING[] NOT NULL,
+  create_redactable             STRING NOT NULL,
   has_partitions                BOOL NOT NULL,
   is_multi_region               BOOL NOT NULL,
   is_virtual                    BOOL NOT NULL,
@@ -3218,7 +3237,7 @@ CREATE TABLE crdb_internal.create_statements (
 		scNameStr := tree.NewDString(sc.GetName())
 
 		var descType tree.Datum
-		var stmt, createNofk string
+		var stmt, createNofk, createRedactable string
 		alterStmts := tree.NewDArray(types.String)
 		validateStmts := tree.NewDArray(types.String)
 		namePrefix := tree.ObjectNamePrefix{SchemaName: tree.Name(sc.GetName()), ExplicitSchema: true}
@@ -3226,10 +3245,19 @@ CREATE TABLE crdb_internal.create_statements (
 		var err error
 		if table.IsView() {
 			descType = typeView
-			stmt, err = ShowCreateView(ctx, &p.semaCtx, p.SessionData(), &name, table)
+			stmt, err = ShowCreateView(
+				ctx, &p.semaCtx, p.SessionData(), &name, table, false, /* redactableValues */
+			)
+			if err != nil {
+				return err
+			}
+			createRedactable, err = ShowCreateView(
+				ctx, &p.semaCtx, p.SessionData(), &name, table, true, /* redactableValues */
+			)
 		} else if table.IsSequence() {
 			descType = typeSequence
 			stmt, err = ShowCreateSequence(ctx, &name, table)
+			createRedactable = stmt
 		} else {
 			descType = typeTable
 			displayOptions := ShowCreateDisplayOptions{
@@ -3244,6 +3272,13 @@ CREATE TABLE crdb_internal.create_statements (
 			}
 			displayOptions.FKDisplayMode = IncludeFkClausesInCreate
 			stmt, err = ShowCreateTable(ctx, p, &name, contextName, table, lookup, displayOptions)
+			if err != nil {
+				return err
+			}
+			displayOptions.RedactableValues = true
+			createRedactable, err = ShowCreateTable(
+				ctx, p, &name, contextName, table, lookup, displayOptions,
+			)
 		}
 		if err != nil {
 			return err
@@ -3269,6 +3304,7 @@ CREATE TABLE crdb_internal.create_statements (
 			tree.NewDString(createNofk),
 			alterStmts,
 			validateStmts,
+			tree.NewDString(createRedactable),
 			tree.MakeDBool(tree.DBool(hasPartitions)),
 			tree.MakeDBool(tree.DBool(db != nil && db.IsMultiRegion())),
 			tree.MakeDBool(tree.DBool(table.IsVirtualTable())),
@@ -3443,8 +3479,9 @@ CREATE TABLE crdb_internal.table_indexes (
 							idx,
 							idx.GetPartitioning(),
 							&partitionBuf,
-							0, /* indent */
-							0, /* colOffset */
+							0,     /* indent */
+							0,     /* colOffset */
+							false, /* redactableValues */
 						); err != nil {
 							return err
 						}
@@ -3966,6 +4003,11 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 			if hasAdmin {
 				return true, nil
 			}
+			viewActOrViewActRedact, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+			// Return if we have permission or encountered an error.
+			if viewActOrViewActRedact || err != nil {
+				return viewActOrViewActRedact, err
+			}
 			return p.HasPrivilege(ctx, desc, privilege.ZONECONFIG, p.User())
 		}
 
@@ -3978,9 +4020,9 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				break
 			}
 		}
-		// if the user has no ZONECONFIG privilege on any table/schema/database
+		// if the user has no VIEWACTIVITY or VIEWACTIVITYREDACTED or ZONECONFIG privilege on any table/schema/database
 		if !hasPermission {
-			return nil, nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only users with the ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases")
+			return nil, nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only users with the VIEWACTIVITY or VIEWACTIVITYREDACTED or ZONECONFIG privilege or the admin role can read crdb_internal.ranges_no_leases")
 		}
 
 		execCfg := p.ExecCfg()
@@ -6276,6 +6318,43 @@ GROUP BY
 	},
 }
 
+// crdb_internal.statement_statistics_persisted view selects persisted statement
+// statistics from the system table. This view is primarily used to query statement
+// stats info by date range.
+var crdbInternalStmtStatsPersistedView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.statement_statistics_persisted AS
+      SELECT
+          aggregated_ts,
+          fingerprint_id,
+          transaction_fingerprint_id,
+          plan_hash,
+          app_name,
+          node_id,
+          agg_interval,
+          metadata,
+          statistics,
+          plan,
+          index_recommendations,
+          indexes_usage
+      FROM
+          system.statement_statistics`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "aggregated_ts", Typ: types.TimestampTZ},
+		{Name: "fingerprint_id", Typ: types.Bytes},
+		{Name: "transaction_fingerprint_id", Typ: types.Bytes},
+		{Name: "plan_hash", Typ: types.Bytes},
+		{Name: "app_name", Typ: types.String},
+		{Name: "node_id", Typ: types.Int},
+		{Name: "agg_interval", Typ: types.Interval},
+		{Name: "metadata", Typ: types.Jsonb},
+		{Name: "statistics", Typ: types.Jsonb},
+		{Name: "plan", Typ: types.Jsonb},
+		{Name: "index_recommendations", Typ: types.StringArray},
+		{Name: "indexes_usage", Typ: types.Jsonb},
+	},
+}
+
 var crdbInternalActiveRangeFeedsTable = virtualSchemaTable{
 	comment: `node-level table listing all currently running range feeds`,
 	// NB: startTS is exclusive; consider renaming to startAfter.
@@ -6471,6 +6550,33 @@ GROUP BY
 		{Name: "metadata", Typ: types.Jsonb},
 		{Name: "statistics", Typ: types.Jsonb},
 		{Name: "aggregation_interval", Typ: types.Interval},
+	},
+}
+
+// crdb_internal.transaction_statistics_persisted view selects persisted transaction
+// statistics from the system table. This view is primarily used to query transaction
+// stats info by date range.
+var crdbInternalTxnStatsPersistedView = virtualSchemaView{
+	schema: `
+CREATE VIEW crdb_internal.transaction_statistics_persisted AS
+      SELECT
+        aggregated_ts,
+        fingerprint_id,
+        app_name,
+        node_id,
+        agg_interval,
+        metadata,
+        statistics
+      FROM
+        system.transaction_statistics`,
+	resultColumns: colinfo.ResultColumns{
+		{Name: "aggregated_ts", Typ: types.TimestampTZ},
+		{Name: "fingerprint_id", Typ: types.Bytes},
+		{Name: "app_name", Typ: types.String},
+		{Name: "node_id", Typ: types.Int},
+		{Name: "agg_interval", Typ: types.Interval},
+		{Name: "metadata", Typ: types.Jsonb},
+		{Name: "statistics", Typ: types.Jsonb},
 	},
 }
 
@@ -7169,7 +7275,8 @@ CREATE TABLE crdb_internal.%s (
   causes                     STRING[] NOT NULL,
   stmt_execution_ids         STRING[] NOT NULL,
   cpu_sql_nanos              INT8,
-  last_error_code            STRING
+  last_error_code            STRING,
+  status                     STRING NOT NULL
 )`
 
 var crdbInternalClusterTxnExecutionInsightsTable = virtualSchemaTable{
@@ -7298,6 +7405,7 @@ func populateTxnExecutionInsights(
 			stmtIDs,
 			tree.NewDInt(tree.DInt(insight.Transaction.CPUSQLNanos)),
 			tree.NewDString(errorCode),
+			tree.NewDString(insight.Transaction.Status.String()),
 		))
 
 		if err != nil {
@@ -7561,7 +7669,7 @@ var crdbInternalShowTenantCapabilitiesCache = virtualSchemaTable{
 	schema: `
 CREATE TABLE crdb_internal.node_tenant_capabilities_cache (
   tenant_id        INT,
-  capability_id    STRING,
+  capability_name  STRING,
   capability_value STRING
 );`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
@@ -7577,7 +7685,7 @@ CREATE TABLE crdb_internal.node_tenant_capabilities_cache (
 			tenantID           roachpb.TenantID
 			tenantCapabilities tenantcapabilities.TenantCapabilities
 		}
-		tenantCapabilitiesMap := tenantCapabilitiesReader.GetCapabilitiesMap()
+		tenantCapabilitiesMap := tenantCapabilitiesReader.GetGlobalCapabilityState()
 		tenantCapabilitiesEntries := make([]tenantCapabilitiesEntry, 0, len(tenantCapabilitiesMap))
 		for tenantID, tenantCapabilities := range tenantCapabilitiesMap {
 			tenantCapabilitiesEntries = append(

@@ -56,6 +56,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnrecovery"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -69,6 +71,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -262,6 +265,7 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 	// time in tests.
 	sc.RaftHeartbeatIntervalTicks = 1
 	sc.RaftElectionTimeoutTicks = 3
+	sc.RaftReproposalTimeoutTicks = 5
 	sc.RaftTickInterval = 100 * time.Millisecond
 	sc.SetDefaults()
 	return sc
@@ -1152,8 +1156,8 @@ type ConsistencyTestingKnobs struct {
 func (sc *StoreConfig) Valid() bool {
 	return sc.Clock != nil && sc.Transport != nil &&
 		sc.RaftTickInterval != 0 && sc.RaftHeartbeatIntervalTicks > 0 &&
-		sc.RaftElectionTimeoutTicks > 0 && sc.ScanInterval >= 0 &&
-		sc.AmbientCtx.Tracer != nil
+		sc.RaftElectionTimeoutTicks > 0 && sc.RaftReproposalTimeoutTicks > 0 &&
+		sc.ScanInterval >= 0 && sc.AmbientCtx.Tracer != nil
 }
 
 // SetDefaults initializes unset fields in StoreConfig to values
@@ -1182,7 +1186,7 @@ func (sc *StoreConfig) LeaseExpiration() int64 {
 	// the sum of the offset (=length of stasis period) and the active
 	// duration, but definitely not by 2x.
 	maxOffset := sc.Clock.MaxOffset()
-	return 2 * (sc.RangeLeaseActiveDuration() + maxOffset).Nanoseconds()
+	return 2 * (sc.RangeLeaseDuration + maxOffset).Nanoseconds()
 }
 
 // Tracer returns the tracer embedded within StoreConfig
@@ -1390,7 +1394,14 @@ func NewStore(
 			int(concurrentRangefeedItersLimit.Get(&cfg.Settings.SV)))
 	})
 
-	s.tenantRateLimiters = tenantrate.NewLimiterFactory(&cfg.Settings.SV, &cfg.TestingKnobs.TenantRateKnobs)
+	var authorizer tenantcapabilities.Authorizer
+	if cfg.RPCContext != nil && cfg.RPCContext.TenantRPCAuthorizer != nil {
+		authorizer = cfg.RPCContext.TenantRPCAuthorizer
+	} else {
+		authorizer = tenantcapabilitiesauthorizer.NewNoopAuthorizer()
+	}
+
+	s.tenantRateLimiters = tenantrate.NewLimiterFactory(&cfg.Settings.SV, &cfg.TestingKnobs.TenantRateKnobs, authorizer)
 	s.metrics.registry.AddMetricStruct(s.tenantRateLimiters.Metrics())
 
 	s.systemConfigUpdateQueueRateLimiter = quotapool.NewRateLimiter(
@@ -2066,7 +2077,7 @@ func (s *Store) WaitForInit() {
 // GetConfReader exposes access to a configuration reader.
 func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, error) {
 	if s.cfg.TestingKnobs.MakeSystemConfigSpanUnavailableToQueues {
-		return nil, errSysCfgUnavailable
+		return nil, errSpanConfigsUnavailable
 	}
 	if s.cfg.TestingKnobs.ConfReaderInterceptor != nil {
 		return s.cfg.TestingKnobs.ConfReaderInterceptor(), nil
@@ -2078,11 +2089,31 @@ func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, erro
 
 		sysCfg := s.cfg.SystemConfigProvider.GetSystemConfig()
 		if sysCfg == nil {
-			return nil, errSysCfgUnavailable
+			return nil, errSpanConfigsUnavailable
 		}
 		return sysCfg, nil
 	}
 
+	if s.cfg.SpanConfigSubscriber.LastUpdated().IsEmpty() {
+		// This code path is used in various internal queues. It's important to
+		// surface explicitly that we don't have any span configs instead of
+		// falling back to the statically configured one.
+		// - enabling range merges would be extremely dangerous -- we could
+		//   collapse everything into a single range.
+		// - enabling the split queue would mean applying the statically
+		//   configured range sizes in the fallback span config. For clusters
+		//   configured with larger range sizes, this could lead to a burst of
+		//   splitting post node-restart.
+		// - enabling the MVCC GC queue would mean applying the statically
+		//   configured default GC TTL and ignoring any set protected
+		//   timestamps. The latter is best-effort protection, but for clusters
+		//   configured with GC TTL greater than the default, post node-restart
+		//   it could lead to a burst of MVCC GC activity and AOST queries
+		//   failing to find expected data.
+		// - enabling the replicate queue would mean replicating towards the
+		//   statically defined 3x replication in the fallback span config.
+		return nil, errSpanConfigsUnavailable
+	}
 	return s.cfg.SpanConfigSubscriber, nil
 }
 
@@ -2093,6 +2124,13 @@ func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, erro
 // This reduces user-visible latency when range lookups are needed to serve a
 // request and reduces ping-ponging of r1's lease to different replicas as
 // maybeGossipFirstRange is called on each (e.g.  #24753).
+//
+// Currently, this is only used for ranges that _require_ expiration-based
+// leases, as determined by Replica.requiresExpirationLeaseRLocked(), i.e. the
+// meta and liveness ranges. For large numbers of expiration-based leases, e.g.
+// with kv.expiration_leases_only.enabled, a more sophisticated scheduler is
+// needed since the linear scan here can't keep up. See:
+// https://github.com/cockroachdb/cockroach/issues/98433
 func (s *Store) startLeaseRenewer(ctx context.Context) {
 	// Start a goroutine that watches and proactively renews certain
 	// expiration-based leases.
@@ -2107,7 +2145,7 @@ func (s *Store) startLeaseRenewer(ctx context.Context) {
 		// up more often that strictly necessary, but it's more maintainable than
 		// attempting to accurately determine exactly when each iteration of a
 		// lease expires and when we should attempt to renew it as a result.
-		renewalDuration := s.cfg.RangeLeaseActiveDuration() / 5
+		renewalDuration := s.cfg.RangeLeaseDuration / 5
 		if d := s.cfg.TestingKnobs.LeaseRenewalDurationOverride; d > 0 {
 			renewalDuration = d
 		}
@@ -2750,24 +2788,25 @@ func (s *Store) Descriptor(ctx context.Context, useCached bool) (*roachpb.StoreD
 }
 
 // RangeFeed registers a rangefeed over the specified span. It sends updates to
-// the provided stream and returns with an optional error when the rangefeed is
+// the provided stream and returns a future with an optional error when the rangefeed is
 // complete.
-func (s *Store) RangeFeed(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink) *kvpb.Error {
-
+func (s *Store) RangeFeed(
+	args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink,
+) *future.ErrorFuture {
 	if filter := s.TestingKnobs().TestingRangefeedFilter; filter != nil {
 		if pErr := filter(args, stream); pErr != nil {
-			return pErr
+			return future.MakeCompletedErrorFuture(pErr.GoError())
 		}
 	}
 
 	if err := verifyKeys(args.Span.Key, args.Span.EndKey, true); err != nil {
-		return kvpb.NewError(err)
+		return future.MakeCompletedErrorFuture(err)
 	}
 
 	// Get range and add command to the range for execution.
 	repl, err := s.GetReplica(args.RangeID)
 	if err != nil {
-		return kvpb.NewError(err)
+		return future.MakeCompletedErrorFuture(err)
 	}
 	if !repl.IsInitialized() {
 		// (*Store).Send has an optimization for uninitialized replicas to send back
@@ -2775,7 +2814,7 @@ func (s *Store) RangeFeed(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEven
 		// be found. RangeFeeds can always be served from followers and so don't
 		// otherwise return NotLeaseHolderError. For simplicity we also don't return
 		// one here.
-		return kvpb.NewError(kvpb.NewRangeNotFoundError(args.RangeID, s.StoreID()))
+		return future.MakeCompletedErrorFuture(kvpb.NewRangeNotFoundError(args.RangeID, s.StoreID()))
 	}
 
 	tenID, _ := repl.TenantID()
@@ -3281,9 +3320,6 @@ func (s *Store) AllocatorCheckRange(
 	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.AmbientCtx.Tracer, "allocator check range", spanOptions...)
 
 	confReader, err := s.GetConfReader(ctx)
-	if err == nil {
-		err = s.WaitForSpanConfigSubscription(ctx)
-	}
 	if err != nil {
 		log.Eventf(ctx, "span configs unavailable: %s", err)
 		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err

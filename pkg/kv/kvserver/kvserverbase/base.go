@@ -36,6 +36,33 @@ var MergeQueueEnabled = settings.RegisterBoolSetting(
 	true,
 )
 
+// ReplicateQueueEnabled is a setting that controls whether the replicate queue
+// is enabled.
+var ReplicateQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.replicate_queue.enabled",
+	"whether the replicate queue is enabled",
+	true,
+)
+
+// SplitQueueEnabled is a setting that controls whether the split queue is
+// enabled.
+var SplitQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.split_queue.enabled",
+	"whether the split queue is enabled",
+	true,
+)
+
+// MVCCGCQueueEnabled is a setting that controls whether the MVCC GC queue is
+// enabled.
+var MVCCGCQueueEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.mvcc_gc_queue.enabled",
+	"whether the MVCC GC queue is enabled",
+	true,
+)
+
 // CmdIDKey is a Raft command id. This will be logged unredacted - keep it random.
 type CmdIDKey string
 
@@ -151,7 +178,8 @@ func ContainsKeyRange(desc *roachpb.RangeDescriptor, start, end roachpb.Key) boo
 // into up to three pieces: A first piece which is contained in the Range,
 // and a slice of up to two further spans which are outside of the key
 // range. An span for which [Key, EndKey) is empty does not result in any
-// spans; thus IntersectSpan only applies to span ranges.
+// spans; thus IntersectSpan only applies to span ranges and point keys will
+// cause the function to panic.
 //
 // A range-local span range is never split: It's returned as either
 // belonging to or outside of the descriptor's key range, and passing an
@@ -164,8 +192,7 @@ func IntersectSpan(
 ) (middle *roachpb.Span, outside []roachpb.Span) {
 	start, end := desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey()
 	if len(span.EndKey) == 0 {
-		outside = append(outside, span)
-		return
+		panic("unsupported point key")
 	}
 	if bytes.Compare(span.Key, keys.LocalRangeMax) < 0 {
 		if bytes.Compare(span.EndKey, keys.LocalRangeMax) >= 0 {

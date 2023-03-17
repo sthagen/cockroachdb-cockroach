@@ -687,6 +687,11 @@ func (b *Builder) buildUDF(
 	// Build an expression for each statement in the function body.
 	rels := make(memo.RelListExpr, len(stmts))
 	isSetReturning := o.Class == tree.GeneratorClass
+	// TODO(mgartner): Once other UDFs can be referenced from within a UDF, a
+	// boolean will not be sufficient to track whether or not we are in a UDF.
+	// We'll need to track the depth of the UDFs we are building expressions
+	// within.
+	b.insideUDF = true
 	for i := range stmts {
 		stmtScope := b.buildStmt(stmts[i].AST, nil /* desiredTypes */, bodyScope)
 		expr := stmtScope.expr
@@ -768,16 +773,25 @@ func (b *Builder) buildUDF(
 			PhysProps: physProps,
 		}
 	}
+	b.insideUDF = false
 
+	// For set-returning functions, we handle STRICT behavior in the routine
+	// execution logic. For scalar UDFs this is handled by a CASE statement - see
+	// below.
+	calledOnNullInput := true
+	if isSetReturning {
+		calledOnNullInput = o.CalledOnNullInput
+	}
 	out = b.factory.ConstructUDF(
 		args,
 		&memo.UDFPrivate{
-			Name:         def.Name,
-			Params:       params,
-			Body:         rels,
-			Typ:          f.ResolvedType(),
-			SetReturning: isSetReturning,
-			Volatility:   o.Volatility,
+			Name:              def.Name,
+			Params:            params,
+			Body:              rels,
+			Typ:               f.ResolvedType(),
+			SetReturning:      isSetReturning,
+			Volatility:        o.Volatility,
+			CalledOnNullInput: calledOnNullInput,
 		},
 	)
 

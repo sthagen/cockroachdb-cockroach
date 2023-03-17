@@ -15,13 +15,16 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/cache"
@@ -76,17 +79,19 @@ var CacheSize = settings.RegisterIntSetting(
 	1024)
 
 // Storage deals with reading and writing session records. It implements the
-// sqlliveness.Reader interface, and the slinstace.Writer interface.
+// sqlliveness.Storage interface, and the slinstace.Writer interface.
 type Storage struct {
-	settings   *cluster.Settings
-	stopper    *stop.Stopper
-	clock      *hlc.Clock
-	db         *kv.DB
-	codec      keys.SQLCodec
-	metrics    Metrics
-	gcInterval func() time.Duration
-	newTimer   func() timeutil.TimerI
-	keyCodec   keyCodec
+	settings        *cluster.Settings
+	settingsWatcher *settingswatcher.SettingsWatcher
+	stopper         *stop.Stopper
+	clock           *hlc.Clock
+	db              *kv.DB
+	codec           keys.SQLCodec
+	metrics         Metrics
+	gcInterval      func() time.Duration
+	newTimer        func() timeutil.TimerI
+	newKeyCodec     keyCodec
+	oldKeyCodec     keyCodec
 
 	mu struct {
 		syncutil.Mutex
@@ -105,7 +110,7 @@ type Storage struct {
 	}
 }
 
-var _ sqlliveness.Reader = &Storage{}
+var _ sqlliveness.StorageReader = &Storage{}
 
 // NewTestingStorage constructs a new storage with control for the database
 // in which the `sqlliveness` table should exist.
@@ -116,18 +121,21 @@ func NewTestingStorage(
 	db *kv.DB,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
-	sqllivenessTableID catid.DescID,
-	rbrIndexID catid.IndexID,
+	settingsWatcher *settingswatcher.SettingsWatcher,
+	table catalog.TableDescriptor,
 	newTimer func() timeutil.TimerI,
 ) *Storage {
+	const rbtIndexID = 1
 	s := &Storage{
-		settings: settings,
-		stopper:  stopper,
-		clock:    clock,
-		db:       db,
-		codec:    codec,
-		keyCodec: makeKeyCodec(codec, sqllivenessTableID, rbrIndexID),
-		newTimer: newTimer,
+		settings:        settings,
+		settingsWatcher: settingsWatcher,
+		stopper:         stopper,
+		clock:           clock,
+		db:              db,
+		codec:           codec,
+		newKeyCodec:     &rbrEncoder{codec.IndexPrefix(uint32(table.GetID()), uint32(table.GetPrimaryIndexID()))},
+		oldKeyCodec:     &rbtEncoder{codec.IndexPrefix(uint32(table.GetID()), rbtIndexID)},
+		newTimer:        newTimer,
 		gcInterval: func() time.Duration {
 			baseInterval := GCInterval.Get(&settings.SV)
 			jitter := GCJitter.Get(&settings.SV)
@@ -156,9 +164,9 @@ func NewStorage(
 	db *kv.DB,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
+	settingsWatcher *settingswatcher.SettingsWatcher,
 ) *Storage {
-	const rbrIndexID = 2
-	return NewTestingStorage(ambientCtx, stopper, clock, db, codec, settings, keys.SqllivenessID, rbrIndexID,
+	return NewTestingStorage(ambientCtx, stopper, clock, db, codec, settings, settingsWatcher, systemschema.SqllivenessTable(),
 		timeutil.DefaultTimeSource{}.NewTimer)
 }
 
@@ -176,13 +184,6 @@ func (s *Storage) Start(ctx context.Context) {
 	}
 	_ = s.stopper.RunAsyncTask(ctx, "slstorage", s.deleteSessionsLoop)
 	s.mu.started = true
-}
-
-// IsAlive determines whether a given session is alive. If this method returns
-// true, the session may no longer be alive, but if it returns false, the
-// session definitely is not alive.
-func (s *Storage) IsAlive(ctx context.Context, sid sqlliveness.SessionID) (alive bool, err error) {
-	return s.isAlive(ctx, sid, sync)
 }
 
 type readType byte
@@ -235,6 +236,32 @@ func (s *Storage) isAlive(
 		return false, res.Err
 	}
 	return res.Val.(bool), nil
+}
+
+func (s *Storage) getReadCodec(version *settingswatcher.VersionGuard) keyCodec {
+	if version.IsActive(clusterversion.V23_1_SystemRbrReadNew) {
+		return s.newKeyCodec
+	}
+	return s.oldKeyCodec
+}
+
+func (s *Storage) getDualWriteCodec(version *settingswatcher.VersionGuard) keyCodec {
+	switch {
+	case version.IsActive(clusterversion.V23_1_SystemRbrSingleWrite):
+		return nil
+	case version.IsActive(clusterversion.V23_1_SystemRbrReadNew):
+		return s.oldKeyCodec
+	case version.IsActive(clusterversion.V23_1_SystemRbrDualWrite):
+		return s.newKeyCodec
+	default:
+		return nil
+	}
+}
+
+func (s *Storage) versionGuard(
+	ctx context.Context, txn *kv.Txn,
+) (settingswatcher.VersionGuard, error) {
+	return s.settingsWatcher.MakeVersionGuard(ctx, txn, clusterversion.V23_1_SystemRbrCleanup)
 }
 
 // This function will launch a singleflight goroutine for the session which
@@ -291,7 +318,13 @@ func (s *Storage) deleteOrFetchSession(
 		// Reset captured variable in case of retry.
 		deleted, expiration, prevExpiration = false, hlc.Timestamp{}, hlc.Timestamp{}
 
-		k, err := s.keyCodec.encode(sid)
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+
+		readCodec := s.getReadCodec(&version)
+		k, err := readCodec.encode(sid)
 		if err != nil {
 			return err
 		}
@@ -318,6 +351,14 @@ func (s *Storage) deleteOrFetchSession(
 		deleted, expiration = true, hlc.Timestamp{}
 		ba := txn.NewBatch()
 		ba.Del(k)
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(sid)
+			if err != nil {
+				return err
+			}
+			ba.Del(dualKey)
+		}
+
 		return txn.CommitInBatch(ctx, ba)
 	}); err != nil {
 		return false, hlc.Timestamp{}, errors.Wrapf(err,
@@ -385,20 +426,21 @@ func (s *Storage) deleteExpiredSessions(ctx context.Context) {
 }
 
 func (s *Storage) fetchExpiredSessionIDs(ctx context.Context) ([]sqlliveness.SessionID, error) {
-	var toCheck []sqlliveness.SessionID
-	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		toCheck = nil // reset for restarts
-		start := s.keyCodec.indexPrefix()
+	findRows := func(ctx context.Context, txn *kv.Txn, keyCodec keyCodec) ([]sqlliveness.SessionID, error) {
+		start := keyCodec.indexPrefix()
 		end := start.PrefixEnd()
 		now := s.clock.Now()
+
+		var toCheck []sqlliveness.SessionID
+
 		const maxRows = 1024 // arbitrary but plenty
 		for {
 			rows, err := txn.Scan(ctx, start, end, maxRows)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if len(rows) == 0 {
-				return nil
+				return nil, nil
 			}
 			for i := range rows {
 				exp, err := decodeValue(rows[i])
@@ -407,7 +449,7 @@ func (s *Storage) fetchExpiredSessionIDs(ctx context.Context) ([]sqlliveness.Ses
 					continue
 				}
 				if exp.Less(now) {
-					id, err := s.keyCodec.decode(rows[i].Key)
+					id, err := keyCodec.decode(rows[i].Key)
 					if err != nil {
 						log.Warningf(ctx, "failed to decode row %s session: %v", rows[i].Key.String(), err)
 					}
@@ -415,14 +457,25 @@ func (s *Storage) fetchExpiredSessionIDs(ctx context.Context) ([]sqlliveness.Ses
 				}
 			}
 			if len(rows) < maxRows {
-				return nil
+				return toCheck, nil
 			}
 			start = rows[len(rows)-1].Key.Next()
 		}
+	}
+
+	var result []sqlliveness.SessionID
+	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+		result, err = findRows(ctx, txn, s.getReadCodec(&version))
+		return err
 	}); err != nil {
 		return nil, err
 	}
-	return toCheck, nil
+
+	return result, nil
 }
 
 // Insert inserts the input Session in table `system.sqlliveness`.
@@ -432,13 +485,33 @@ func (s *Storage) fetchExpiredSessionIDs(ctx context.Context) ([]sqlliveness.Ses
 func (s *Storage) Insert(
 	ctx context.Context, sid sqlliveness.SessionID, expiration hlc.Timestamp,
 ) (err error) {
-	k, err := s.keyCodec.encode(sid)
-	if err != nil {
-		return err
-	}
-	v := encodeValue(expiration)
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
-	if err := s.db.InitPut(ctx, k, &v, true); err != nil {
+	if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		batch := txn.NewBatch()
+
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+		readCodec := s.getReadCodec(&version)
+		k, err := readCodec.encode(sid)
+		if err != nil {
+			return err
+		}
+		v := encodeValue(expiration)
+		batch.InitPut(k, &v, true)
+
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(sid)
+			if err != nil {
+				return err
+			}
+			dualValue := encodeValue(expiration)
+			batch.InitPut(dualKey, &dualValue, true)
+		}
+
+		return txn.CommitInBatch(ctx, batch)
+	}); err != nil {
 		s.metrics.WriteFailures.Inc(1)
 		return errors.Wrapf(err, "could not insert session %s", sid)
 	}
@@ -454,7 +527,14 @@ func (s *Storage) Update(
 ) (sessionExists bool, err error) {
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	err = s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		k, err := s.keyCodec.encode(sid)
+		version, err := s.versionGuard(ctx, txn)
+		if err != nil {
+			return err
+		}
+
+		readCodec := s.getReadCodec(&version)
+
+		k, err := readCodec.encode(sid)
 		if err != nil {
 			return err
 		}
@@ -468,6 +548,14 @@ func (s *Storage) Update(
 		v := encodeValue(expiration)
 		ba := txn.NewBatch()
 		ba.Put(k, &v)
+		if dualCodec := s.getDualWriteCodec(&version); dualCodec != nil {
+			dualKey, err := dualCodec.encode(sid)
+			if err != nil {
+				return err
+			}
+			dualValue := encodeValue(expiration)
+			ba.Put(dualKey, &dualValue)
+		}
 		return txn.CommitInBatch(ctx, ba)
 	})
 	if err != nil || !sessionExists {
@@ -485,15 +573,31 @@ func (s *Storage) Update(
 // currently known state of the session, but will trigger an asynchronous
 // refresh of the state of the session if it is not known.
 func (s *Storage) CachedReader() sqlliveness.Reader {
-	return (*cachedStorage)(s)
+	return (*cachedReader)(s)
 }
 
-// cachedStorage implements the sqlliveness.Reader interface, and the
+// BlockingReader reader returns an implementation of sqlliveness.Reader which
+// will cache results of previous reads but will synchronously block to
+// determine the status of a session which it does not know about or thinks
+// might be expired.
+func (s *Storage) BlockingReader() sqlliveness.Reader {
+	return (*blockingReader)(s)
+}
+
+type blockingReader Storage
+
+func (s *blockingReader) IsAlive(
+	ctx context.Context, sid sqlliveness.SessionID,
+) (alive bool, err error) {
+	return (*Storage)(s).isAlive(ctx, sid, sync)
+}
+
+// cachedReader implements the sqlliveness.Reader interface, and the
 // slinstace.Writer interface, but does not read from the underlying store
 // synchronously during IsAlive.
-type cachedStorage Storage
+type cachedReader Storage
 
-func (s *cachedStorage) IsAlive(
+func (s *cachedReader) IsAlive(
 	ctx context.Context, sid sqlliveness.SessionID,
 ) (alive bool, err error) {
 	return (*Storage)(s).isAlive(ctx, sid, async)

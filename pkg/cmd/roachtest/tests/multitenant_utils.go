@@ -300,7 +300,7 @@ func createTenantAdminRole(t test.Test, tenantName string, tenantSQL *sqlutils.S
 }
 
 // createInMemoryTenant runs through the necessary steps to create an in-memory tenant without
-// resource limits.
+// resource limits and full dbconsole viewing privileges.
 func createInMemoryTenant(
 	ctx context.Context,
 	t test.Test,
@@ -312,6 +312,7 @@ func createInMemoryTenant(
 	sysSQL := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), nodes.RandNode()[0]))
 	sysSQL.Exec(t, "CREATE TENANT $1", tenantName)
 	sysSQL.Exec(t, "ALTER TENANT $1 START SERVICE SHARED", tenantName)
+	sysSQL.Exec(t, `ALTER TENANT $1 GRANT CAPABILITY can_view_node_info=true, can_admin_split=true,can_view_tsdb_metrics=true`, tenantName)
 
 	removeTenantRateLimiters(t, sysSQL, tenantName)
 
@@ -342,7 +343,7 @@ func createInMemoryTenant(
 func removeTenantRateLimiters(t test.Test, systemSQL *sqlutils.SQLRunner, tenantName string) {
 	var tenantID int
 	systemSQL.QueryRow(t, `SELECT id FROM [SHOW TENANT $1]`, tenantName).Scan(&tenantID)
-	systemSQL.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1, 10000000000, 0,
+	systemSQL.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1::INT, 10000000000, 0,
 10000000000, now(), 0);`, tenantID)
 	systemSQL.ExecMultiple(t,
 		`SET CLUSTER SETTING kv.tenant_rate_limiter.burst_limit_seconds = 10000;`,

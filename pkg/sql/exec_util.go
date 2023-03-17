@@ -103,7 +103,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -1244,7 +1243,7 @@ type ExecutorConfig struct {
 	MetricsRecorder    nodeStatusGenerator
 	SessionRegistry    *SessionRegistry
 	ClosedSessionCache *ClosedSessionCache
-	SQLLiveness        sqlliveness.Liveness
+	SQLLiveness        sqlliveness.Provider
 	JobRegistry        *jobs.Registry
 	VirtualSchemas     *VirtualSchemaHolder
 	DistSQLPlanner     *DistSQLPlanner
@@ -1620,10 +1619,6 @@ type TenantTestingKnobs struct {
 	// OverrideTokenBucketProvider allows a test-only TokenBucketProvider (which
 	// can optionally forward requests to the real provider).
 	OverrideTokenBucketProvider func(origProvider kvtenant.TokenBucketProvider) kvtenant.TokenBucketProvider
-
-	// SkipSQLSystemTentantCheck is a temporary knob to test which admin functions fail for secondary tenants.
-	// TODO(ewall): Remove when usages in multitenant_admin_function_test.go are removed.
-	SkipSQLSystemTentantCheck bool
 
 	// BeforeCheckingForDescriptorIDSequence, if set, is called before
 	// the connExecutor checks for the presence of system.descriptor_id_seq after
@@ -3470,6 +3465,14 @@ func (m *sessionDataMutator) SetOptimizerAlwaysUseHistograms(val bool) {
 	m.data.OptimizerAlwaysUseHistograms = val
 }
 
+func (m *sessionDataMutator) SetEnableCreateStatsUsingExtremes(val bool) {
+	m.data.EnableCreateStatsUsingExtremes = val
+}
+
+func (m *sessionDataMutator) SetAllowRoleMembershipsToChangeDuringTransaction(val bool) {
+	m.data.AllowRoleMembershipsToChangeDuringTransaction = val
+}
+
 // Utility functions related to scrubbing sensitive information on SQL Stats.
 
 // quantizeCounts ensures that the Count field in the
@@ -3610,20 +3613,6 @@ func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *rowinfra.Metrics {
 		return cfg.InternalRowMetrics
 	}
 	return cfg.RowMetrics
-}
-
-// RequireSystemTenant returns an unsupported error if executed from inside a
-// secondary tenant. Tests may circumvent this check using a testing knob.
-// TODO(ewall): Replace usages of this with tenant capability checks in KV.
-func (cfg *ExecutorConfig) RequireSystemTenant() error {
-	if cfg.Codec.ForSystemTenant() {
-		return nil
-	}
-	knobs := cfg.TenantTestingKnobs
-	if knobs != nil && knobs.SkipSQLSystemTentantCheck {
-		return nil
-	}
-	return errorutil.UnsupportedWithMultiTenancy(errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
 }
 
 // RequireSystemTenantOrClusterSetting returns a setting disabled error if

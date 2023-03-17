@@ -82,7 +82,9 @@ const (
 	TenantUsageTableName                   SystemTableName = "tenant_usage"
 	SQLInstancesTableName                  SystemTableName = "sql_instances"
 	SpanConfigurationsTableName            SystemTableName = "span_configurations"
+	TaskPayloadsTableName                  SystemTableName = "task_payloads"
 	TenantSettingsTableName                SystemTableName = "tenant_settings"
+	TenantTasksTableName                   SystemTableName = "tenant_tasks"
 	SpanCountTableName                     SystemTableName = "span_count"
 	SystemPrivilegeTableName               SystemTableName = "privileges"
 	SystemExternalConnectionsTableName     SystemTableName = "external_connections"
@@ -159,6 +161,7 @@ const (
 	CrdbInternalSessionTraceTableID
 	CrdbInternalSessionVariablesTableID
 	CrdbInternalStmtStatsTableID
+	CrdbInternalStmtStatsPersistedTableID
 	CrdbInternalTableColumnsTableID
 	CrdbInternalTableIndexesTableID
 	CrdbInternalTableSpansTableID
@@ -166,6 +169,7 @@ const (
 	CrdbInternalTablesTableLastStatsID
 	CrdbInternalTransactionStatsTableID
 	CrdbInternalTxnStatsTableID
+	CrdbInternalTxnStatsPersistedTableID
 	CrdbInternalZonesTableID
 	CrdbInternalInvalidDescriptorsTableID
 	CrdbInternalClusterDatabasePrivilegesTableID

@@ -415,6 +415,13 @@ func TestLogic_column_families(
 	runLogicTest(t, "column_families")
 }
 
+func TestLogic_comment_on(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "comment_on")
+}
+
 func TestLogic_composite_types(
 	t *testing.T,
 ) {
@@ -1857,6 +1864,13 @@ func TestLogic_show_create_all_types(
 	runLogicTest(t, "show_create_all_types")
 }
 
+func TestLogic_show_create_redact(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_redact")
+}
+
 func TestLogic_show_default_privileges(
 	t *testing.T,
 ) {
@@ -2149,6 +2163,13 @@ func TestLogic_truncate(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "truncate")
+}
+
+func TestLogic_truncate_with_concurrent_mutation(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "truncate_with_concurrent_mutation")
 }
 
 func TestLogic_tsvector(

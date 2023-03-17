@@ -188,6 +188,8 @@ func (r *Replica) evalAndPropose(
 	// If the request requested that Raft consensus be performed asynchronously,
 	// return a proposal result immediately on the proposal's done channel.
 	// The channel's capacity will be large enough to accommodate this.
+	maybeFinishSpan := func() {}
+	defer func() { maybeFinishSpan() }() // NB: late binding is important
 	if ba.AsyncConsensus {
 		if ets := proposal.Local.DetachEndTxns(false /* alwaysOnly */); len(ets) != 0 {
 			// Disallow async consensus for commands with EndTxnIntents because
@@ -200,6 +202,12 @@ func (r *Replica) evalAndPropose(
 		// Fork the proposal's context span so that the proposal's context
 		// can outlive the original proposer's context.
 		proposal.ctx, proposal.sp = tracing.ForkSpan(ctx, "async consensus")
+		if proposal.sp != nil {
+			// We can't leak this span if we fail to hand the proposal to the
+			// replication layer, so finish it later in this method if we are to
+			// return with an error. (On success, we'll reset this to a noop).
+			maybeFinishSpan = proposal.sp.Finish
+		}
 
 		// Signal the proposal's response channel immediately.
 		reply := *proposal.Local.Reply
@@ -292,6 +300,9 @@ func (r *Replica) evalAndPropose(
 	if pErr != nil {
 		return nil, nil, "", nil, pErr
 	}
+	// We've successfully handed the proposal to the replication layer, so this
+	// method should not finish the trace span if we forked one off above.
+	maybeFinishSpan = func() {}
 	// Abandoning a proposal unbinds its context so that the proposal's client
 	// is free to terminate execution. However, it does nothing to try to
 	// prevent the command from succeeding. In particular, endCmds will still be
@@ -317,45 +328,44 @@ func (r *Replica) evalAndPropose(
 
 // propose encodes a command, starts tracking it, and proposes it to Raft.
 //
-// On success, the method hands ownership of the command over to the Raft
-// machinery. After the method returns with a nil error, all access to the
-// command must be performed while holding Replica.mu and Replica.raftMu.
-// If the method returns with an error, the error is permanent for the
-// proposal, that is, the caller must notify the client that the proposal
-// failed and the client can retry, making a new proposal in the process.
+// The method hands ownership of the command over to the Raft machinery. After
+// the method returns, all access to the command must be performed while holding
+// Replica.mu and Replica.raftMu.
 //
-// propose takes ownership of the supplied token, even on error; the caller
-// should tok.Move() it into this method. It will be used to untrack the request
-// once it comes out of the proposal buffer. If the method returns with an error,
-// the token is released, since, as explained above, an error is permanent.
+// propose takes ownership of the supplied token; the caller should tok.Move()
+// it into this method. It will be used to untrack the request once it comes out
+// of the proposal buffer.
 //
-// The ProposalData must not be reproposed or reused should an error be returned
-// from this method. Its MaxLeaseIndex and encodedCommand fields must be empty.
-// Reproposals are a rich source of complexity. See the comment on `r.mu.proposals`
-// for details.
+// Note that this method is called for "new" proposals but also by
+// `tryReproposeWithNewLeaseIndex`. This second call leaves questions on what
+// exactly the desired semantics are - some fields (MaxLeaseIndex,
+// ClosedTimestamp) will be set and this re-entrance into `propose`
+// is hard to fully understand. (The reset of `MaxLeaseIndex`	inside this
+// method is a faer-fueled but likely unneeded consequence of this).
+//
+// TODO(repl): adopt the below issue which will see each proposal passed to this
+// method exactly once:
+//
+// https://github.com/cockroachdb/cockroach/issues/98477
 func (r *Replica) propose(
 	ctx context.Context, p *ProposalData, tok TrackedRequestToken,
 ) (pErr *kvpb.Error) {
 	defer tok.DoneIfNotMoved(ctx)
 
-	defer func() {
-		// An error for this method
+	// If an error occurs reset the command's MaxLeaseIndex to its initial value.
+	// Failure to propose will propagate to the client. An invariant of this
+	// package is that proposals which are finished carry a raft command with a
+	// MaxLeaseIndex equal to the proposal command's max lease index.
+	defer func(prev uint64) {
 		if pErr != nil {
-			p.encodedCommand = nil
+			p.command.MaxLeaseIndex = prev
 		}
-	}()
+	}(p.command.MaxLeaseIndex)
 
-	if p.command.MaxLeaseIndex > 0 {
-		// MaxLeaseIndex should not be populated now. It is set only when the proposal buffer
-		// flushes this proposal into the local raft instance.
-		return kvpb.NewError(errors.AssertionFailedf("MaxLeaseIndex set: %+v", p))
-	}
-	if p.encodedCommand != nil {
-		// This indicates someone took an existing proposal and handed it to this method
-		// again. The caller needs to properly reset the proposal if they're going to do
-		// that.
-		return kvpb.NewError(errors.AssertionFailedf("encodedCommand set: %+v", p))
-	}
+	// Make sure the maximum lease index is unset. This field will be set in
+	// propBuf.Insert and its encoded bytes will be appended to the encoding
+	// buffer as a MaxLeaseFooter.
+	p.command.MaxLeaseIndex = 0
 
 	// Determine the encoding style for the Raft command.
 	prefix := true
@@ -743,24 +753,6 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	err := r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
 		r.deliverLocalRaftMsgsRaftMuLockedReplicaMuLocked(ctx, raftGroup)
 
-		// NB: we need to have flushed the proposals before each application cycle
-		// because due to reproposals it is possible to have a proposal that
-		//
-		// - is going to be applied in this raft cycle, and
-		// - is not in the proposals map, and
-		// - is in the proposals buffer.
-		//
-		// The current structure of the code makes sure that by the time we apply the
-		// entry, the in-mem proposal has moved from the proposal buffer to the proposals
-		// map. Without this property, we could have the following interleaving:
-		//
-		// - proposal is in map (initial state)
-		// - refreshProposalsLocked adds it to the proposal buffer again
-		// - proposal applies with an error: removes it from map, finishes proposal
-		// - proposal buffer flushes, inserts proposal into map
-		// - we now have a finished proposal in the proposal map, an invariant violation.
-		//
-		// See Replica.mu.proposals.
 		numFlushed, err := r.mu.proposalBuf.FlushLockedWithRaftGroup(ctx, raftGroup)
 		if err != nil {
 			return false, err
@@ -1247,17 +1239,14 @@ func (r *Replica) tick(
 		}
 	}
 
-	refreshAtDelta := r.store.cfg.RaftElectionTimeoutTicks
+	refreshAtDelta := r.store.cfg.RaftReproposalTimeoutTicks
 	if knob := r.store.TestingKnobs().RefreshReasonTicksPeriod; knob > 0 {
 		refreshAtDelta = knob
 	}
 	if !r.store.TestingKnobs().DisableRefreshReasonTicks && r.mu.ticks%refreshAtDelta == 0 {
-		// RaftElectionTimeoutTicks is a reasonable approximation of how long we
-		// should wait before deciding that our previous proposal didn't go
-		// through. Note that the combination of the above condition and passing
-		// RaftElectionTimeoutTicks to refreshProposalsLocked means that commands
-		// will be refreshed when they have been pending for 1 to 2 election
-		// cycles.
+		// The combination of the above condition and passing refreshAtDelta to
+		// refreshProposalsLocked means that commands will be refreshed when they
+		// have been pending for 1 to 2 reproposal timeouts.
 		r.refreshProposalsLocked(ctx, refreshAtDelta, reasonTicks)
 	}
 	return true, nil
@@ -1989,7 +1978,7 @@ func shouldCampaignOnWake(
 	raftStatus raft.BasicStatus,
 	livenessMap livenesspb.IsLiveMap,
 	desc *roachpb.RangeDescriptor,
-	requiresExpiringLease bool,
+	requiresExpirationLease bool,
 ) bool {
 	// When waking up a range, campaign unless we know that another
 	// node holds a valid lease (this is most important after a split,
@@ -2008,9 +1997,12 @@ func shouldCampaignOnWake(
 	if raftStatus.Lead == raft.None {
 		return true
 	}
-	// Avoid a circular dependency on liveness and skip the is leader alive
-	// check for ranges that always use expiration based leases.
-	if requiresExpiringLease {
+	// Avoid a circular dependency on liveness and skip the is leader alive check
+	// for ranges that require expiration based leases (the meta and liveness
+	// ranges). We do want to check the liveness entry for other expiration
+	// leases, since in the case of a dead leader it allows us to campaign
+	// immediately without waiting out the election timeout.
+	if requiresExpirationLease {
 		return false
 	}
 	// Determine if we think the leader is alive, if we don't have the leader
@@ -2047,7 +2039,7 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
 	livenessMap, _ := r.store.livenessMap.Load().(livenesspb.IsLiveMap)
-	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus, livenessMap, r.descRLocked(), r.requiresExpiringLeaseRLocked()) {
+	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus, livenessMap, r.descRLocked(), r.requiresExpirationLeaseRLocked()) {
 		r.campaignLocked(ctx)
 	}
 }
@@ -2072,7 +2064,7 @@ func shouldCampaignOnLeaseRequestRedirect(
 	raftStatus raft.BasicStatus,
 	livenessMap livenesspb.IsLiveMap,
 	desc *roachpb.RangeDescriptor,
-	requiresExpiringLease bool,
+	shouldUseExpirationLease bool,
 	now hlc.Timestamp,
 ) bool {
 	// If we're already campaigning don't start a new term.
@@ -2087,15 +2079,14 @@ func shouldCampaignOnLeaseRequestRedirect(
 	if raftStatus.Lead == raft.None {
 		return true
 	}
-	// Avoid a circular dependency on liveness and skip the is leader alive check
-	// for ranges that always use expiration based leases. These ranges don't need
-	// to campaign based on liveness state because there can never be a case where
-	// a node can retain Raft leadership but still be unable to acquire the lease.
-	// This is possible on ranges that use epoch-based leases because the Raft
-	// leader may be partitioned from the liveness range.
+	// If we should be using an expiration lease then we don't need to campaign
+	// based on liveness state because there can never be a case where a node can
+	// retain Raft leadership but still be unable to acquire the lease. This is
+	// possible on ranges that use epoch-based leases because the Raft leader may
+	// be partitioned from the liveness range.
 	// See TestRequestsOnFollowerWithNonLiveLeaseholder for an example of a test
 	// that demonstrates this case.
-	if requiresExpiringLease {
+	if shouldUseExpirationLease {
 		return false
 	}
 	// Determine if we think the leader is alive, if we don't have the leader in

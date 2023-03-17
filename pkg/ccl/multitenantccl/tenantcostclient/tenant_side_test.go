@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -947,7 +948,7 @@ func TestSQLLivenessExemption(t *testing.T) {
 	// Create a tenant with ridiculously low resource limits.
 	host := sqlutils.MakeSQLRunner(hostDB)
 	host.Exec(t, "SELECT crdb_internal.create_tenant($1::INT)", tenantID.ToUint64())
-	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
+	host.Exec(t, "SELECT crdb_internal.update_tenant_resource_limits($1::INT, 0, 0.001, 0, now(), 0)", tenantID.ToUint64())
 
 	st := cluster.MakeTestingClusterSettings()
 	// Make the tenant heartbeat like crazy.
@@ -963,7 +964,8 @@ func TestSQLLivenessExemption(t *testing.T) {
 	_ = r
 
 	codec := keys.MakeSQLCodec(tenantID)
-	key := codec.IndexPrefix(keys.SqllivenessID, 1)
+	indexID := uint32(systemschema.SqllivenessTable().GetPrimaryIndexID())
+	key := codec.IndexPrefix(keys.SqllivenessID, indexID)
 
 	// livenessValue returns the KV value for the one row in the
 	// system.sqlliveness table. The value contains the session expiration time

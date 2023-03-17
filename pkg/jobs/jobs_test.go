@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -238,6 +238,7 @@ func (rts *registryTestSuite) setUp(t *testing.T) {
 		args.Knobs.UpgradeManager = &upgradebase.TestingKnobs{
 			DontUseJobs:                       true,
 			SkipJobMetricsPollingJobBootstrap: true,
+			SkipAutoConfigRunnerJobBootstrap:  true,
 		}
 		args.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{SkipJobBootstrap: true}
 
@@ -2025,19 +2026,20 @@ func TestShowAutomaticJobs(t *testing.T) {
 	}
 
 	for _, in := range rows {
-		// system.jobs is part proper SQL columns, part protobuf, so we can't use the
-		// row struct directly.
-		inPayload, err := protoutil.Marshal(&jobspb.Payload{
+		rawPayload := &jobspb.Payload{
 			UsernameProto: username.RootUserName().EncodeProto(),
 			Details:       jobspb.WrapPayloadDetails(in.details),
-		})
+		}
+		// system.jobs is part proper SQL columns, part protobuf, so we can't use the
+		// row struct directly.
+		inPayload, err := protoutil.Marshal(rawPayload)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		sqlDB.Exec(t,
-			`INSERT INTO system.jobs (id, status, payload) VALUES ($1, $2, $3)`,
-			in.id, in.status, inPayload,
+			`INSERT INTO system.jobs (id, status, payload, job_type) VALUES ($1, $2, $3, $4)`,
+			in.id, in.status, inPayload, rawPayload.Type().String(),
 		)
 	}
 
@@ -2072,13 +2074,13 @@ func TestShowAutomaticJobs(t *testing.T) {
 			2, "AUTO CREATE STATS", out.id, out.typ)
 	}
 
-	sqlDB.QueryRow(t, `SELECT job_id, job_type FROM [SHOW JOBS]`).Scan(&out.id, &out.typ)
+	sqlDB.QueryRow(t, `SELECT job_id, job_type FROM [SHOW JOBS] ORDER BY job_id LIMIT 1`).Scan(&out.id, &out.typ)
 	if out.id != 1 || out.typ != "CREATE STATS" {
 		t.Fatalf("Expected id:%d and type:%s but found id:%d and type:%s",
 			1, "CREATE STATS", out.id, out.typ)
 	}
 
-	sqlDB.QueryRow(t, `SELECT job_id, job_type FROM [SHOW AUTOMATIC JOBS]`).Scan(&out.id, &out.typ)
+	sqlDB.QueryRow(t, `SELECT job_id, job_type FROM [SHOW AUTOMATIC JOBS] ORDER BY job_id LIMIT 1`).Scan(&out.id, &out.typ)
 	if out.id != 2 || out.typ != "AUTO CREATE STATS" {
 		t.Fatalf("Expected id:%d and type:%s but found id:%d and type:%s",
 			2, "AUTO CREATE STATS", out.id, out.typ)

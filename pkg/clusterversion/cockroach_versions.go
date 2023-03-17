@@ -203,11 +203,6 @@ const (
 	TODODelete_V22_2RemoveGrantPrivilege
 	// TODODelete_V22_2MVCCRangeTombstones enables the use of MVCC range tombstones.
 	TODODelete_V22_2MVCCRangeTombstones
-	// TODODelete_V22_2UpgradeSequenceToBeReferencedByID ensures that sequences are referenced
-	// by IDs rather than by their names. For example, a column's DEFAULT (or
-	// ON UPDATE) expression can be defined to be 'nextval('s')'; we want to be
-	// able to refer to sequence 's' by its ID, since 's' might be later renamed.
-	TODODelete_V22_2UpgradeSequenceToBeReferencedByID
 	// TODODelete_V22_2SampledStmtDiagReqs enables installing statement diagnostic requests that
 	// probabilistically collects stmt bundles, controlled by the user provided
 	// sampling rate.
@@ -257,26 +252,12 @@ const (
 	// options table id column cannot be null. This is the final step
 	// of the system.role_options table migration.
 	TODODelete_V22_2SetRoleOptionsUserIDColumnNotNull
-	// TODODelete_V22_2UseDelRangeInGCJob enables the use of the DelRange operation in the
-	// GC job. Before it is enabled, the GC job uses ClearRange operations
-	// after the job waits out the GC TTL. After it has been enabled, the
-	// job instead issues DelRange operations at the beginning of the job
-	// and then waits for the data to be removed automatically before removing
-	// the descriptor and zone configurations.
-	TODODelete_V22_2UseDelRangeInGCJob
-	// TODODelete_V22_2WaitedForDelRangeInGCJob corresponds to the migration which waits for
-	// the GC jobs to adopt the use of DelRange with tombstones.
-	TODODelete_V22_2WaitedForDelRangeInGCJob
 	// TODODelete_V22_2RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
 	TODODelete_V22_2RangefeedUseOneStreamPerNode
 	// TODODelete_V22_2NoNonMVCCAddSSTable adds a migration which waits for all
 	// schema changes to complete. After this point, no non-MVCC
 	// AddSSTable calls will be used outside of tenant streaming.
 	TODODelete_V22_2NoNonMVCCAddSSTable
-	// TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences looks for invalid column
-	// ids in sequences' back references and attempts a best-effort-based matching
-	// to update those column IDs.
-	TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences
 	// TODODelete_V22_2TTLDistSQL uses DistSQL to distribute TTL SELECT/DELETE statements to
 	// leaseholder nodes.
 	TODODelete_V22_2TTLDistSQL
@@ -482,6 +463,41 @@ const (
 	// has been backfilled.
 	V23_1ExternalConnectionsTableOwnerIDColumnBackfilled
 
+	// V23_1AllowNewSystemPrivileges is the version at which we allow the new
+	// MODIFYSQLCLUSTERSETTING abd VIEWJOB system privileges to be used.
+	// Note: After v23.1 is released, we won't need to version gate these anymore,
+	// since we've made mixed-version clusters tolerate new privileges.
+	V23_1AllowNewSystemPrivileges
+
+	// V23_1JobInfoTableIsBackfilled is a version gate after which the
+	// system.jobs_info table has been backfilled with rows for the payload and
+	// progress of each job in the system.jobs table.
+	V23_1JobInfoTableIsBackfilled
+
+	// V23_1EnableFlushableIngest upgrades the Pebble format major version to
+	// FormatFlushableIngest, which enables use of flushable ingestion.
+	V23_1EnableFlushableIngest
+
+	// V23_1_UseDelRangeInGCJob enables the use of the DelRange operation in the
+	// GC job. Before it is enabled, the GC job uses ClearRange operations
+	// after the job waits out the GC TTL. After it has been enabled, the
+	// job instead issues DelRange operations at the beginning of the job
+	// and then waits for the data to be removed automatically before removing
+	// the descriptor and zone configurations.
+	V23_1_UseDelRangeInGCJob
+
+	// V23_1WaitedForDelRangeInGCJob corresponds to the migration which waits for
+	// the GC jobs to adopt the use of DelRange with tombstones.
+	V23_1WaitedForDelRangeInGCJob
+
+	// V23_1_TaskSystemTables is the version where the system tables
+	// task_payloads and tenant_tasks have been created.
+	V23_1_TaskSystemTables
+
+	// V23_1_CreateAutoConfigRunnerJob is the version where the auto
+	// config runner persistent job has been created.
+	V23_1_CreateAutoConfigRunnerJob
+
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -580,10 +596,6 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 16},
 	},
 	{
-		Key:     TODODelete_V22_2UpgradeSequenceToBeReferencedByID,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 18},
-	},
-	{
 		Key:     TODODelete_V22_2SampledStmtDiagReqs,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 20},
 	},
@@ -640,24 +652,12 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 54},
 	},
 	{
-		Key:     TODODelete_V22_2UseDelRangeInGCJob,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 56},
-	},
-	{
-		Key:     TODODelete_V22_2WaitedForDelRangeInGCJob,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 58},
-	},
-	{
 		Key:     TODODelete_V22_2RangefeedUseOneStreamPerNode,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
 	},
 	{
 		Key:     TODODelete_V22_2NoNonMVCCAddSSTable,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 62},
-	},
-	{
-		Key:     TODODelete_V22_2UpdateInvalidColumnIDsInSequenceBackReferences,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 66},
 	},
 	{
 		Key:     TODODelete_V22_2TTLDistSQL,
@@ -834,6 +834,34 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     V23_1ExternalConnectionsTableOwnerIDColumnBackfilled,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 76},
+	},
+	{
+		Key:     V23_1AllowNewSystemPrivileges,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 78},
+	},
+	{
+		Key:     V23_1JobInfoTableIsBackfilled,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 80},
+	},
+	{
+		Key:     V23_1EnableFlushableIngest,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 82},
+	},
+	{
+		Key:     V23_1_UseDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 84},
+	},
+	{
+		Key:     V23_1WaitedForDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 86},
+	},
+	{
+		Key:     V23_1_TaskSystemTables,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 88},
+	},
+	{
+		Key:     V23_1_CreateAutoConfigRunnerJob,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 90},
 	},
 
 	// *************************************************

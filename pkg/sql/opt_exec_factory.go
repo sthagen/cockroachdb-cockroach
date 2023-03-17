@@ -1233,7 +1233,9 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 	// statements for tables referenced via FKs in these tables.
 	for i := range envOpts.Tables {
 		out.writef("")
-		if err := c.PrintCreateTable(&out.buf, &envOpts.Tables[i]); err != nil {
+		if err := c.PrintCreateTable(
+			&out.buf, &envOpts.Tables[i], false, /* redactValues */
+		); err != nil {
 			return nil, err
 		}
 		out.writef("")
@@ -1252,7 +1254,7 @@ func (ef *execFactory) showEnv(plan string, envOpts exec.ExplainEnvData) (exec.N
 
 	for i := range envOpts.Views {
 		out.writef("")
-		if err := c.PrintCreateView(&out.buf, &envOpts.Views[i]); err != nil {
+		if err := c.PrintCreateView(&out.buf, &envOpts.Views[i], false /* redactValues */); err != nil {
 			return nil, err
 		}
 	}
@@ -2018,11 +2020,6 @@ func (ef *execFactory) ConstructAlterTableUnsplitAll(index cat.Index) (exec.Node
 func (ef *execFactory) ConstructAlterTableRelocate(
 	index cat.Index, input exec.Node, relocateSubject tree.RelocateSubject,
 ) (exec.Node, error) {
-
-	if err := ef.planner.ExecCfg().RequireSystemTenant(); err != nil {
-		return nil, err
-	}
-
 	return &relocateNode{
 		subjectReplicas: relocateSubject,
 		tableDesc:       index.Table().(*optTable).desc,
@@ -2038,9 +2035,6 @@ func (ef *execFactory) ConstructAlterRangeRelocate(
 	toStoreID tree.TypedExpr,
 	fromStoreID tree.TypedExpr,
 ) (exec.Node, error) {
-	if err := ef.planner.ExecCfg().RequireSystemTenant(); err != nil {
-		return nil, err
-	}
 	return &relocateRange{
 		rows:            input.(planNode),
 		subjectReplicas: relocateSubject,

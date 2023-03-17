@@ -32,7 +32,7 @@ query TTTI colnames,rowsort
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE data WITH DETAILS]
 ----
 start_key           end_key       replicas  lease_holder
-<before:/Table/57>  …/1/1         {1}       1
+<before:/Table/59>  …/1/1         {1}       1
 …/1/1               …/1/2         {2}       2
 …/1/2               …/1/3         {3}       3
 …/1/3               …/1/4         {4}       4
@@ -1997,6 +1997,15 @@ INSERT INTO abcd VALUES
 # insert values at the extremes of column x.
 statement ok
 INSERT INTO xy VALUES (-1, 9), (-2, 8), (5, 15), (6, 16)
+
+statement error pgcode 0A000 creating partial statistics with a WHERE clause is not yet supported
+CREATE STATISTICS abcd_a_partial ON a FROM abcd WHERE a > 1;
+
+statement error pgcode 0A000 creating partial statistics at extremes is not yet supported
+CREATE STATISTICS abcd_a_partial ON a FROM abcd USING EXTREMES;
+
+statement ok
+SET enable_create_stats_using_extremes = on
 
 statement ok
 CREATE STATISTICS abcd_a_partial ON a FROM abcd USING EXTREMES;

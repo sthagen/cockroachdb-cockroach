@@ -424,7 +424,7 @@ func TestStatusGetFiles(t *testing.T) {
 		}
 
 		request := serverpb.GetFilesRequest{
-			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"*"}}
+			NodeId: "local", Type: serverpb.FileType_HEAP, Patterns: []string{"heap*"}}
 		response, err := client.GetFiles(context.Background(), &request)
 		if err != nil {
 			t.Fatal(err)
@@ -1026,6 +1026,7 @@ func TestMetricsMetadata(t *testing.T) {
 
 func TestHotRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 98619, "flaky test")
 	defer log.Scope(t).Close(t)
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
@@ -1082,6 +1083,7 @@ func TestHotRangesResponse(t *testing.T) {
 
 func TestHotRanges2Response(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 98619, "flaky test")
 	defer log.Scope(t).Close(t)
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())

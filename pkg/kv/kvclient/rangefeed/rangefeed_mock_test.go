@@ -20,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -37,7 +36,6 @@ type mockClient struct {
 		ctx context.Context,
 		spans []roachpb.Span,
 		startFrom hlc.Timestamp,
-		withDiff bool,
 		eventC chan<- kvcoord.RangeFeedMessage,
 	) error
 
@@ -54,11 +52,10 @@ func (m *mockClient) RangeFeed(
 	ctx context.Context,
 	spans []roachpb.Span,
 	startFrom hlc.Timestamp,
-	withDiff bool,
 	eventC chan<- kvcoord.RangeFeedMessage,
 	opts ...kvcoord.RangeFeedOption,
 ) error {
-	return m.rangefeed(ctx, spans, startFrom, withDiff, eventC)
+	return m.rangefeed(ctx, spans, startFrom, eventC)
 }
 
 func (m *mockClient) Scan(
@@ -166,9 +163,8 @@ func TestRangeFeedMock(t *testing.T) {
 				return nil
 			},
 			rangefeed: func(
-				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, withDiff bool, eventC chan<- kvcoord.RangeFeedMessage,
+				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, eventC chan<- kvcoord.RangeFeedMessage,
 			) error {
-				assert.False(t, withDiff) // it was not set
 				sendEvent := func(ts hlc.Timestamp) {
 					eventC <- kvcoord.RangeFeedMessage{
 						RangeFeedEvent: &kvpb.RangeFeedEvent{
@@ -270,9 +266,8 @@ func TestRangeFeedMock(t *testing.T) {
 				return nil
 			},
 			rangefeed: func(
-				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, withDiff bool, eventC chan<- kvcoord.RangeFeedMessage,
+				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, eventC chan<- kvcoord.RangeFeedMessage,
 			) error {
-				assert.True(t, withDiff)
 				eventC <- kvcoord.RangeFeedMessage{
 					RangeFeedEvent: &kvpb.RangeFeedEvent{
 						Val: &kvpb.RangeFeedValue{
@@ -350,8 +345,6 @@ func TestRangeFeedMock(t *testing.T) {
 func TestBackoffOnRangefeedFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	skip.WithIssue(t, 97725, "flaky test")
-
 	ctx, cancel := context.WithCancel(context.Background())
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -369,7 +362,7 @@ func TestBackoffOnRangefeedFailure(t *testing.T) {
 		Times(3).
 		Return(errors.New("rangefeed failed"))
 	db.EXPECT().RangeFeed(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-		Do(func(context.Context, []roachpb.Span, hlc.Timestamp, bool, chan<- kvcoord.RangeFeedMessage, ...kvcoord.RangeFeedOption) {
+		Do(func(context.Context, []roachpb.Span, hlc.Timestamp, chan<- kvcoord.RangeFeedMessage, ...kvcoord.RangeFeedOption) {
 			cancel()
 		}).
 		Return(nil)

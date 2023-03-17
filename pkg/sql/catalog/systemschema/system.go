@@ -127,18 +127,9 @@ var indexUsageComputeExprStr = indexUsageComputeExpr
 
 // These system tables are not part of the system config.
 const (
-	// Note: the column "nodeID" refers to the SQL instance ID.
-	// It is named "nodeID" for historical reasons.
-	LeaseTableSchema = `
-CREATE TABLE system.lease (
-  "descID"   INT8,
-  version    INT8,
-  "nodeID"   INT8,
-  expiration TIMESTAMP,
-  CONSTRAINT "primary" PRIMARY KEY ("descID", version, expiration, "nodeID")
-);`
-
-	MRLeaseTableSchema = `CREATE TABLE system.lease (
+	// Note: the column "nodeID" refers to the SQL instance ID. It is named
+	// "nodeID" for historical reasons.
+	LeaseTableSchema = `CREATE TABLE system.lease (
   "descID"     INT8,
   version      INT8,
   "nodeID"     INT8,
@@ -484,14 +475,6 @@ CREATE TABLE system.scheduled_jobs (
 
 	SqllivenessTableSchema = `
 CREATE TABLE system.sqlliveness (
-    session_id       BYTES NOT NULL,
-    expiration       DECIMAL NOT NULL,
-    CONSTRAINT "primary" PRIMARY KEY (session_id),
-    FAMILY fam0_session_id_expiration (session_id, expiration)
-)`
-
-	MrSqllivenessTableSchema = `
-CREATE TABLE system.sqlliveness (
     session_id           BYTES NOT NULL,
     expiration           DECIMAL NOT NULL,
     crdb_region          BYTES NOT NULL,
@@ -685,20 +668,9 @@ CREATE TABLE system.sql_instances (
     session_id   BYTES,
     locality     JSONB,
     sql_addr     STRING,
-    CONSTRAINT "primary" PRIMARY KEY (id),
-    FAMILY "primary" (id, addr, session_id, locality, sql_addr)
-)`
-
-	MrSQLInstancesTableSchema = `
-CREATE TABLE system.sql_instances (
-    id           INT NOT NULL,
-    addr         STRING,
-    session_id   BYTES,
-    locality     JSONB,
     crdb_region  BYTES NOT NULL,
-    sql_addr     STRING,
     CONSTRAINT "primary" PRIMARY KEY (crdb_region, id),
-    FAMILY "primary" (crdb_region, id, addr, session_id, locality, sql_addr)
+    FAMILY "primary" (id, addr, session_id, locality, sql_addr, crdb_region)
 )`
 
 	SpanConfigurationsTableSchema = `
@@ -762,6 +734,33 @@ CREATE TABLE system.external_connections (
 	owner_id OID,
 	CONSTRAINT "primary" PRIMARY KEY (connection_name),
 	FAMILY "primary" (connection_name, created, updated, connection_type, connection_details, owner, owner_id)
+);`
+
+	SystemTenantTasksSchema = `
+CREATE TABLE system.tenant_tasks (
+	tenant_id    INT8 NOT NULL,
+	issuer       STRING NOT NULL,
+	task_id      INT8 NOT NULL,
+	created      TIMESTAMPTZ NOT NULL DEFAULT now():::TIMESTAMPTZ,
+	payload_id   STRING NOT NULL,
+	owner        STRING NOT NULL,
+	owner_id     OID,
+	CONSTRAINT "primary" PRIMARY KEY (tenant_id, issuer, task_id),
+	FAMILY "primary" (tenant_id, issuer, task_id, created, payload_id, owner, owner_id)
+);`
+
+	SystemTaskPayloadsSchema = `
+CREATE TABLE system.task_payloads (
+	id           STRING NOT NULL,
+	created      TIMESTAMPTZ NOT NULL DEFAULT now():::TIMESTAMPTZ,
+	owner        STRING NOT NULL,
+	owner_id     OID,
+	min_version  STRING NOT NULL,
+	description  STRING,
+	type         STRING NOT NULL,
+	value        BYTES NOT NULL,
+	CONSTRAINT "primary" PRIMARY KEY (id),
+	FAMILY "primary" (id, created, owner, owner_id, min_version, description, type, value)
 );`
 
 	SystemJobInfoTableSchema = `
@@ -1051,6 +1050,8 @@ func MakeSystemTables() []SystemTable {
 		SpanStatsUniqueKeysTable,
 		SpanStatsBucketsTable,
 		SpanStatsSamplesTable,
+		SystemTaskPayloadsTable,
+		SystemTenantTasksTable,
 	}
 }
 
@@ -1334,40 +1335,40 @@ var (
 var (
 	// LeaseTable is the descriptor for the leases table.
 	LeaseTable = func() SystemTable {
-		if TestSupportMultiRegion() {
-			return makeSystemTable(
-				MRLeaseTableSchema,
-				systemTable(
-					catconstants.LeaseTableName,
-					keys.LeaseTableID,
-					[]descpb.ColumnDescriptor{
-						{Name: "descID", ID: 1, Type: types.Int},
-						{Name: "version", ID: 2, Type: types.Int},
-						{Name: "nodeID", ID: 3, Type: types.Int},
-						{Name: "expiration", ID: 4, Type: types.Timestamp},
-						{Name: "crdb_region", ID: 5, Type: types.Bytes},
+		return makeSystemTable(
+			LeaseTableSchema,
+			systemTable(
+				catconstants.LeaseTableName,
+				keys.LeaseTableID,
+				[]descpb.ColumnDescriptor{
+					{Name: "descID", ID: 1, Type: types.Int},
+					{Name: "version", ID: 2, Type: types.Int},
+					{Name: "nodeID", ID: 3, Type: types.Int},
+					{Name: "expiration", ID: 4, Type: types.Timestamp},
+					{Name: "crdb_region", ID: 5, Type: types.Bytes},
+				},
+				[]descpb.ColumnFamilyDescriptor{
+					{
+						Name:        "primary",
+						ID:          0,
+						ColumnNames: []string{"descID", "version", "nodeID", "expiration", "crdb_region"},
+						ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5},
 					},
-					[]descpb.ColumnFamilyDescriptor{
-						{
-							Name:        "primary",
-							ID:          0,
-							ColumnNames: []string{"descID", "version", "nodeID", "expiration", "crdb_region"},
-							ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5},
-						},
+				},
+				descpb.IndexDescriptor{
+					Name:           "primary",
+					ID:             2,
+					Unique:         true,
+					KeyColumnNames: []string{"crdb_region", "descID", "version", "expiration", "nodeID"},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+						catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
+						catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
 					},
-					descpb.IndexDescriptor{
-						Name:           "primary",
-						ID:             2,
-						Unique:         true,
-						KeyColumnNames: []string{"crdb_region", "descID", "version", "expiration", "nodeID"},
-						KeyColumnDirections: []catenumpb.IndexColumn_Direction{
-							catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
-							catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC,
-						},
-						KeyColumnIDs: []descpb.ColumnID{5, 1, 2, 4, 3},
-					},
-				))
-		}
+					KeyColumnIDs: []descpb.ColumnID{5, 1, 2, 4, 3},
+				},
+			))
+	}
+	V22_2_LeaseTable = func() SystemTable {
 		return makeSystemTable(
 			LeaseTableSchema,
 			systemTable(
@@ -2306,36 +2307,6 @@ var (
 	// TODO(jeffswenson): remove the function wrapper around the
 	// SqllivenessTable descriptor. See TestSupportMultiRegion for context.
 	SqllivenessTable = func() SystemTable {
-		if TestSupportMultiRegion() {
-			return makeSystemTable(
-				MrSqllivenessTableSchema,
-				systemTable(
-					catconstants.SqllivenessTableName,
-					keys.SqllivenessID,
-					[]descpb.ColumnDescriptor{
-						{Name: "session_id", ID: 1, Type: types.Bytes, Nullable: false},
-						{Name: "expiration", ID: 2, Type: types.Decimal, Nullable: false},
-						{Name: "crdb_region", ID: 3, Type: types.Bytes, Nullable: false},
-					},
-					[]descpb.ColumnFamilyDescriptor{
-						{
-							Name:            "primary",
-							ID:              0,
-							ColumnNames:     []string{"session_id", "expiration", "crdb_region"},
-							ColumnIDs:       []descpb.ColumnID{1, 2, 3},
-							DefaultColumnID: 2,
-						},
-					},
-					descpb.IndexDescriptor{
-						Name:                "primary",
-						ID:                  2,
-						Unique:              true,
-						KeyColumnNames:      []string{"crdb_region", "session_id"},
-						KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-						KeyColumnIDs:        []descpb.ColumnID{3, 1},
-					},
-				))
-		}
 		return makeSystemTable(
 			SqllivenessTableSchema,
 			systemTable(
@@ -2344,17 +2315,25 @@ var (
 				[]descpb.ColumnDescriptor{
 					{Name: "session_id", ID: 1, Type: types.Bytes, Nullable: false},
 					{Name: "expiration", ID: 2, Type: types.Decimal, Nullable: false},
+					{Name: "crdb_region", ID: 3, Type: types.Bytes, Nullable: false},
 				},
 				[]descpb.ColumnFamilyDescriptor{
 					{
-						Name:            "fam0_session_id_expiration",
+						Name:            "primary",
 						ID:              0,
-						ColumnNames:     []string{"session_id", "expiration"},
-						ColumnIDs:       []descpb.ColumnID{1, 2},
+						ColumnNames:     []string{"crdb_region", "session_id", "expiration"},
+						ColumnIDs:       []descpb.ColumnID{3, 1, 2},
 						DefaultColumnID: 2,
 					},
 				},
-				pk("session_id"),
+				descpb.IndexDescriptor{
+					Name:                "primary",
+					ID:                  2,
+					Unique:              true,
+					KeyColumnNames:      []string{"crdb_region", "session_id"},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+					KeyColumnIDs:        []descpb.ColumnID{3, 1},
+				},
 			))
 	}
 
@@ -2760,39 +2739,6 @@ var (
 	// TODO(jeffswenson): remove the function wrapper around the
 	// SQLInstanceTable descriptor. See TestSupportMultiRegion for context.
 	SQLInstancesTable = func() SystemTable {
-		if TestSupportMultiRegion() {
-			return makeSystemTable(
-				MrSQLInstancesTableSchema,
-				systemTable(
-					catconstants.SQLInstancesTableName,
-					keys.SQLInstancesTableID,
-					[]descpb.ColumnDescriptor{
-						{Name: "id", ID: 1, Type: types.Int, Nullable: false},
-						{Name: "addr", ID: 2, Type: types.String, Nullable: true},
-						{Name: "session_id", ID: 3, Type: types.Bytes, Nullable: true},
-						{Name: "locality", ID: 4, Type: types.Jsonb, Nullable: true},
-						{Name: "crdb_region", ID: 5, Type: types.Bytes, Nullable: false},
-						{Name: "sql_addr", ID: 6, Type: types.String, Nullable: true},
-					},
-					[]descpb.ColumnFamilyDescriptor{
-						{
-							Name:            "primary",
-							ID:              0,
-							ColumnNames:     []string{"id", "addr", "session_id", "locality", "crdb_region", "sql_addr"},
-							ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6},
-							DefaultColumnID: 0,
-						},
-					},
-					descpb.IndexDescriptor{
-						Name:                "primary",
-						ID:                  2,
-						Unique:              true,
-						KeyColumnNames:      []string{"crdb_region", "id"},
-						KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
-						KeyColumnIDs:        []descpb.ColumnID{5, 1},
-					},
-				))
-		}
 		return makeSystemTable(
 			SQLInstancesTableSchema,
 			systemTable(
@@ -2804,17 +2750,25 @@ var (
 					{Name: "session_id", ID: 3, Type: types.Bytes, Nullable: true},
 					{Name: "locality", ID: 4, Type: types.Jsonb, Nullable: true},
 					{Name: "sql_addr", ID: 5, Type: types.String, Nullable: true},
+					{Name: "crdb_region", ID: 6, Type: types.Bytes, Nullable: false},
 				},
 				[]descpb.ColumnFamilyDescriptor{
 					{
 						Name:            "primary",
 						ID:              0,
-						ColumnNames:     []string{"id", "addr", "session_id", "locality", "sql_addr"},
-						ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5},
+						ColumnNames:     []string{"id", "addr", "session_id", "locality", "sql_addr", "crdb_region"},
+						ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6},
 						DefaultColumnID: 0,
 					},
 				},
-				pk("id"),
+				descpb.IndexDescriptor{
+					Name:                "primary",
+					ID:                  2,
+					Unique:              true,
+					KeyColumnNames:      []string{"crdb_region", "id"},
+					KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+					KeyColumnIDs:        []descpb.ColumnID{6, 1},
+				},
 			))
 	}
 
@@ -3008,6 +2962,71 @@ var (
 				KeyColumnIDs:        singleID1,
 			},
 		),
+	)
+
+	SystemTenantTasksTable = makeSystemTable(
+		SystemTenantTasksSchema,
+		systemTable(
+			catconstants.TenantTasksTableName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "tenant_id", ID: 1, Type: types.Int},
+				{Name: "issuer", ID: 2, Type: types.String},
+				{Name: "task_id", ID: 3, Type: types.Int},
+				{Name: "created", ID: 4, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
+				{Name: "payload_id", ID: 5, Type: types.String},
+				{Name: "owner", ID: 6, Type: types.String},
+				{Name: "owner_id", ID: 7, Type: types.Oid, Nullable: true},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:        "primary",
+					ID:          0,
+					ColumnNames: []string{"tenant_id", "issuer", "task_id", "created", "payload_id", "owner", "owner_id"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7},
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:                "primary",
+				ID:                  1,
+				Unique:              true,
+				KeyColumnNames:      []string{"tenant_id", "issuer", "task_id"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
+				KeyColumnIDs:        []descpb.ColumnID{1, 2, 3},
+			}),
+	)
+
+	SystemTaskPayloadsTable = makeSystemTable(
+		SystemTaskPayloadsSchema,
+		systemTable(
+			catconstants.TaskPayloadsTableName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "id", ID: 1, Type: types.String},
+				{Name: "created", ID: 2, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
+				{Name: "owner", ID: 3, Type: types.String},
+				{Name: "owner_id", ID: 4, Type: types.Oid, Nullable: true},
+				{Name: "min_version", ID: 5, Type: types.String},
+				{Name: "description", ID: 6, Type: types.String, Nullable: true},
+				{Name: "type", ID: 7, Type: types.String},
+				{Name: "value", ID: 8, Type: types.Bytes},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name:        "primary",
+					ID:          0,
+					ColumnNames: []string{"id", "created", "owner", "owner_id", "min_version", "description", "type", "value"},
+					ColumnIDs:   []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8},
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:                "primary",
+				ID:                  1,
+				Unique:              true,
+				KeyColumnNames:      []string{"id"},
+				KeyColumnDirections: singleASC,
+				KeyColumnIDs:        singleID1,
+			}),
 	)
 
 	SystemJobInfoTable = makeSystemTable(

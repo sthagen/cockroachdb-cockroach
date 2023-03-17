@@ -16,6 +16,10 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
+func init() {
+	tenantcapabilities.RegisterDefaultCapabilities(&TenantCapabilities{})
+}
+
 // boolCapValue is a wrapper around bool that ensures that values can
 // be included in reportables.
 type boolCapValue bool
@@ -47,36 +51,71 @@ func (b boolCap) Set(val interface{}) {
 	*b.cap = bval
 }
 
-// For implements the tenantcapabilities.TenantCapabilities interface.
+// invertedBoolCap is an accessor struct for boolean capabilities that are
+// stored as "disabled" in the underlying proto. Layers above this package
+// interact are oblivious to this detail.
+type invertedBoolCap struct {
+	cap *bool
+}
+
+// Get implements the tenantcapabilities.Capability interface.
+func (i invertedBoolCap) Get() tenantcapabilities.Value {
+	val := *i.cap
+	return boolCapValue(!val) // inverted
+}
+
+// Set implements the tenantcapabilities.Capability interface.
+func (i invertedBoolCap) Set(val interface{}) {
+	bval, ok := val.(bool)
+	if !ok {
+		panic(errors.AssertionFailedf("invalid value type: %T", val))
+	}
+	*i.cap = !bval
+}
+
+// Cap implements the tenantcapabilities.TenantCapabilities interface.
 func (t *TenantCapabilities) Cap(
 	capabilityID tenantcapabilities.CapabilityID,
 ) tenantcapabilities.Capability {
 	switch capabilityID {
+	case tenantcapabilities.CanAdminRelocateRange:
+		return boolCap{&t.CanAdminRelocateRange}
+	case tenantcapabilities.CanAdminScatter:
+		return invertedBoolCap{&t.DisableAdminScatter}
 	case tenantcapabilities.CanAdminSplit:
-		return boolCap{&t.CanAdminSplit}
+		return invertedBoolCap{&t.DisableAdminSplit}
 	case tenantcapabilities.CanAdminUnsplit:
 		return boolCap{&t.CanAdminUnsplit}
 	case tenantcapabilities.CanViewNodeInfo:
 		return boolCap{&t.CanViewNodeInfo}
 	case tenantcapabilities.CanViewTSDBMetrics:
 		return boolCap{&t.CanViewTSDBMetrics}
+	case tenantcapabilities.ExemptFromRateLimiting:
+		return boolCap{&t.ExemptFromRateLimiting}
 
 	default:
 		panic(errors.AssertionFailedf("unknown capability: %q", capabilityID.String()))
 	}
 }
 
-// GetBool implements the tenantcapabilities.TenantCapabilities interface. It is an optimization.
+// GetBool implements the tenantcapabilities.TenantCapabilities interface.
+// It is an optimization.
 func (t *TenantCapabilities) GetBool(capabilityID tenantcapabilities.CapabilityID) bool {
 	switch capabilityID {
+	case tenantcapabilities.CanAdminRelocateRange:
+		return t.CanAdminRelocateRange
+	case tenantcapabilities.CanAdminScatter:
+		return !t.DisableAdminScatter
 	case tenantcapabilities.CanAdminSplit:
-		return t.CanAdminSplit
+		return !t.DisableAdminSplit
 	case tenantcapabilities.CanAdminUnsplit:
 		return t.CanAdminUnsplit
 	case tenantcapabilities.CanViewNodeInfo:
 		return t.CanViewNodeInfo
 	case tenantcapabilities.CanViewTSDBMetrics:
 		return t.CanViewTSDBMetrics
+	case tenantcapabilities.ExemptFromRateLimiting:
+		return t.ExemptFromRateLimiting
 
 	default:
 		panic(errors.AssertionFailedf("unknown or non-bool capability: %q", capabilityID.String()))

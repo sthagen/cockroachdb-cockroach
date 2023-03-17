@@ -24,6 +24,8 @@ import { ThunkAction, ThunkDispatch } from "redux-thunk";
 import { createHashHistory } from "history";
 import { getLoginPage } from "src/redux/login";
 import { APIRequestFn } from "src/util/api";
+import { util as clusterUiUtil } from "@cockroachlabs/cluster-ui";
+const { isForbiddenRequestError } = clusterUiUtil;
 
 import { PayloadAction, WithRequest } from "src/interfaces/action";
 import { maybeClearTenantCookie } from "./cookies";
@@ -45,6 +47,7 @@ export class CachedDataReducerState<TResponseMessage> {
   requestedAt?: moment.Moment; // Timestamp when data was last requested.
   setAt?: moment.Moment; // Timestamp when this data was last updated.
   lastError?: Error; // populated with the most recent error, if the last request failed
+  unauthorized = false; // If lastError was a 403 error, we avoid refreshing.
 }
 
 // KeyedCachedDataReducerState is used to track the state of the cached data
@@ -63,6 +66,7 @@ export class PaginatedCachedDataReducerState<TResponseMessage> {
   requestedAt?: moment.Moment; // Timestamp when data was last requested.
   setAt?: moment.Moment; // Timestamp when this data was last updated.
   lastError?: Error; // populated with the most recent error, if the last request failed
+  unauthorized = false; // If lastError was a 403 error, we avoid refreshing.
 
   constructor() {
     this.data = {};
@@ -91,6 +95,7 @@ export class CachedDataReducer<
   ERROR: string; // request encountered an error
   INVALIDATE: string; // invalidate data
   INVALIDATE_ALL: string; // invalidate all data on keyed cache
+  pendingRequestStarted: moment.Moment | null;
 
   /**
    * apiEndpoint - The API endpoint used to refresh data.
@@ -98,12 +103,15 @@ export class CachedDataReducer<
    * invalidationPeriod (optional) - The duration after
    *   data is received after which it will be invalidated.
    * requestTimeout (optional)
+   *  allowReplacementRequests (optional) - allows requests to be replaced
+   * while they are in flight.
    */
   constructor(
     protected apiEndpoint: APIRequestFn<TRequest, TResponseMessage>,
     public actionNamespace: TActionNamespace,
     protected invalidationPeriod?: moment.Duration,
     protected requestTimeout?: moment.Duration,
+    protected allowReplacementRequests = false,
   ) {
     // check actionNamespace
     assert(
@@ -115,6 +123,7 @@ export class CachedDataReducer<
     );
     CachedDataReducer.namespaces[actionNamespace] = true;
 
+    this.pendingRequestStarted = null;
     this.REQUEST = `cockroachui/CachedDataReducer/${actionNamespace}/REQUEST`;
     this.RECEIVE = `cockroachui/CachedDataReducer/${actionNamespace}/RECEIVE`;
     this.ERROR = `cockroachui/CachedDataReducer/${actionNamespace}/ERROR`;
@@ -170,6 +179,9 @@ export class CachedDataReducer<
         state.inFlight = false;
         state.lastError = error.data;
         state.valid = false;
+        if (isForbiddenRequestError(error.data)) {
+          state.unauthorized = true;
+        }
         return state;
       }
       case this.INVALIDATE:
@@ -234,6 +246,15 @@ export class CachedDataReducer<
     };
   };
 
+  cancelPendingRequest = (): void => {
+    this.pendingRequestStarted = null;
+  };
+
+  setPendingRequestTime = (): moment.Moment => {
+    this.pendingRequestStarted = moment.utc();
+    return this.pendingRequestStarted;
+  };
+
   /**
    * refresh is the primary action creator that should be used to refresh the
    * cached data. Dispatching it will attempt to asynchronously refresh the
@@ -260,10 +281,15 @@ export class CachedDataReducer<
 
       if (
         state &&
-        (state.inFlight || (this.invalidationPeriod && state.valid))
+        ((state.inFlight && !this.allowReplacementRequests) ||
+          state.unauthorized ||
+          (this.invalidationPeriod && state.valid))
       ) {
         return;
       }
+
+      this.cancelPendingRequest();
+      const pendingRequestStarted = this.setPendingRequestTime();
 
       // Note that after dispatching requestData, state.inFlight is true
       dispatch(this.requestData(req));
@@ -272,9 +298,16 @@ export class CachedDataReducer<
         .then(
           data => {
             // Dispatch the results to the store.
+            if (this.pendingRequestStarted !== pendingRequestStarted) {
+              return;
+            }
             dispatch(this.receiveData(data, req));
           },
           (error: Error) => {
+            if (this.pendingRequestStarted !== pendingRequestStarted) {
+              return;
+            }
+
             // TODO(couchand): This is a really myopic way to check for HTTP
             // codes.  However, at the moment that's all that the underlying
             // timeoutFetch offers.  Major changes to this plumbing are warranted.
@@ -295,6 +328,9 @@ export class CachedDataReducer<
           },
         )
         .then(() => {
+          if (this.pendingRequestStarted !== pendingRequestStarted) {
+            return;
+          }
           // Invalidate data after the invalidation period if one exists.
           if (this.invalidationPeriod) {
             setTimeout(
@@ -524,6 +560,9 @@ export class PaginatedCachedDataReducer<
         state.inFlight = false;
         state.lastError = error.data;
         state.valid = false;
+        if (isForbiddenRequestError(error.data)) {
+          state.unauthorized = true;
+        }
         return state;
       }
       case this.cachedDataReducer.INVALIDATE:
@@ -556,7 +595,9 @@ export class PaginatedCachedDataReducer<
         stateAccessor(getState(), req);
       if (
         state &&
-        (state.inFlight || (this.invalidationPeriod && state.valid))
+        (state.inFlight ||
+          (this.invalidationPeriod && state.valid) ||
+          state.unauthorized)
       ) {
         return;
       }

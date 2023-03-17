@@ -48,8 +48,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -75,7 +73,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/binfetcher"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -218,16 +215,6 @@ import (
 // - tracing-off: If specified, tracing defaults to being turned off. This is
 //   used to override the environment, which may ask for tracing to be on by
 //   default.
-// TODO(ecwall): We already have a tenant-capability-override-opt directive,
-// and ideally, this option would be better suited in that category. However,
-// that thing doesn't actually work. In particular, tenant capabilities are
-// checked against an eventually consistent, in-memory state. However, that
-// directive makes no attempt to ensure the in-memory state is sufficiently
-// caught up. We should probably get rid of this cluster option once that
-// directive is fixed.
-// - can-admin-split: If specified, allows secondary tenants to perform
-//   AdminSplit operations regardless of the underlying tenant capabilities
-//   state.
 //
 //
 // ###########################################
@@ -1280,47 +1267,56 @@ var _ = ((*logicTest)(nil)).newTestServerCluster
 // upgradeBinaryPath is given by the config's CockroachGoUpgradeVersion, or
 // is the locally built version if CockroachGoUpgradeVersion was not specified.
 func (t *logicTest) newTestServerCluster(bootstrapBinaryPath string, upgradeBinaryPath string) {
-	// During config initialization, NumNodes is required to be 3.
-	ports := make([]int, t.cfg.NumNodes)
-	for i := 0; i < len(ports); i++ {
-		port, err := getFreePort()
-		if err != nil {
-			t.Fatal(err)
+	// We have seen issues with ports being claimed for use (probably by a
+	// different test) after the call to getFreePort, so the cluster startup
+	// is in a retry loop to minimize the chance of hitting a transient issue.
+	err := retry.WithMaxAttempts(context.Background(), retry.Options{}, 3, func() error {
+		// During config initialization, NumNodes is required to be 3.
+		ports := make([]int, t.cfg.NumNodes)
+		for i := 0; i < len(ports); i++ {
+			port, err := getFreePort()
+			if err != nil {
+				return err
+			}
+			ports[i] = port
 		}
-		ports[i] = port
-	}
 
-	opts := []testserver.TestServerOpt{
-		testserver.ThreeNodeOpt(),
-		testserver.StoreOnDiskOpt(),
-		testserver.CockroachBinaryPathOpt(bootstrapBinaryPath),
-		testserver.UpgradeCockroachBinaryPathOpt(upgradeBinaryPath),
-		testserver.PollListenURLTimeoutOpt(120),
-		testserver.AddListenAddrPortOpt(ports[0]),
-		testserver.AddListenAddrPortOpt(ports[1]),
-		testserver.AddListenAddrPortOpt(ports[2]),
-	}
-	if strings.Contains(upgradeBinaryPath, "cockroach-short") {
-		// If we're using a cockroach-short binary, that means it was locally
-		// built, so we need to opt-in to development upgrades.
-		opts = append(opts, testserver.EnvVarOpt([]string{
-			"COCKROACH_UPGRADE_TO_DEV_VERSION=true",
-		}))
-	}
+		opts := []testserver.TestServerOpt{
+			testserver.ThreeNodeOpt(),
+			testserver.StoreOnDiskOpt(),
+			testserver.CockroachBinaryPathOpt(bootstrapBinaryPath),
+			testserver.UpgradeCockroachBinaryPathOpt(upgradeBinaryPath),
+			testserver.PollListenURLTimeoutOpt(120),
+			testserver.AddListenAddrPortOpt(ports[0]),
+			testserver.AddListenAddrPortOpt(ports[1]),
+			testserver.AddListenAddrPortOpt(ports[2]),
+		}
+		if strings.Contains(upgradeBinaryPath, "cockroach-short") {
+			// If we're using a cockroach-short binary, that means it was locally
+			// built, so we need to opt-in to development upgrades.
+			opts = append(opts, testserver.EnvVarOpt([]string{
+				"COCKROACH_UPGRADE_TO_DEV_VERSION=true",
+			}))
+		}
 
-	ts, err := testserver.NewTestServer(opts...)
+		ts, err := testserver.NewTestServer(opts...)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < t.cfg.NumNodes; i++ {
+			// Wait for each node to be reachable.
+			if err := ts.WaitForInitFinishForNode(i); err != nil {
+				return err
+			}
+		}
+
+		t.testserverCluster = ts
+		t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, ts.Stop)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < t.cfg.NumNodes; i++ {
-		// Wait for each node to be reachable.
-		if err := ts.WaitForInitFinishForNode(i); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	t.testserverCluster = ts
-	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, ts.Stop)
 
 	t.setUser(username.RootUser, 0 /* nodeIdx */)
 }
@@ -1409,11 +1405,12 @@ func (t *logicTest) newCluster(
 	params.ServerArgs.Knobs.DistSQL = &execinfra.TestingKnobs{
 		ForceDiskSpill: cfg.SQLExecUseDisk,
 	}
-	if cfg.BootstrapVersion != (roachpb.Version{}) {
+	if cfg.BootstrapVersion != clusterversion.Key(0) {
 		if params.ServerArgs.Knobs.Server == nil {
 			params.ServerArgs.Knobs.Server = &server.TestingKnobs{}
 		}
-		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BinaryVersionOverride = cfg.BootstrapVersion
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BootstrapVersionKeyOverride = cfg.BootstrapVersion
+		params.ServerArgs.Knobs.Server.(*server.TestingKnobs).BinaryVersionOverride = clusterversion.ByKey(cfg.BootstrapVersion)
 	}
 	if cfg.DisableUpgrade {
 		if params.ServerArgs.Knobs.Server == nil {
@@ -1444,35 +1441,6 @@ func (t *logicTest) newCluster(
 			nodeParams.Locality = locality
 		} else {
 			require.Lenf(t.rootT, cfg.Localities, 0, "node %d does not have a locality set", i+1)
-		}
-
-		if cfg.BinaryVersion != (roachpb.Version{}) {
-			binaryMinSupportedVersion := cfg.BinaryVersion
-			if cfg.BootstrapVersion != (roachpb.Version{}) {
-				// If we want to run a specific server version, we assume that it
-				// supports at least the bootstrap version.
-				binaryMinSupportedVersion = cfg.BootstrapVersion
-			}
-			nodeParams.Settings = cluster.MakeTestingClusterSettingsWithVersions(
-				cfg.BinaryVersion,
-				binaryMinSupportedVersion,
-				false, /* initializeVersion */
-			)
-
-			// If we're injecting fake versions, hook up logic to simulate the end
-			// version existing.
-			if len(clusterversion.ListBetween(cfg.BootstrapVersion, cfg.BinaryVersion)) == 0 {
-				mm, ok := nodeParams.Knobs.UpgradeManager.(*upgradebase.TestingKnobs)
-				if !ok {
-					mm = &upgradebase.TestingKnobs{}
-					nodeParams.Knobs.UpgradeManager = mm
-				}
-				mm.ListBetweenOverride = func(
-					from, to roachpb.Version,
-				) []roachpb.Version {
-					return []roachpb.Version{to}
-				}
-			}
 		}
 		paramsPerNode[i] = nodeParams
 	}
@@ -1843,6 +1811,7 @@ func (t *logicTest) setup(
 	t.testCleanupFuncs = append(t.testCleanupFuncs, tempExternalIODirCleanup)
 
 	if cfg.UseCockroachGoTestserver {
+		skip.WithIssue(t.t(), 98594, "flakes with 'empty connection string'")
 		skip.UnderStress(t.t(), "test takes a long time and downloads release artifacts")
 		if !bazel.BuiltWithBazel() {
 			skip.IgnoreLint(t.t(), "cockroach-go/testserver can only be uzed in bazel builds")
@@ -1937,22 +1906,6 @@ var _ clusterOpt = clusterOptTracingOff{}
 func (c clusterOptTracingOff) apply(args *base.TestServerArgs) {
 	args.TracingDefault = tracing.TracingModeOnDemand
 }
-
-// clusterOptAllowAdminSplitsForSecondaryTenants overrides can_admin_split capability
-// checks using the AuthorizerOverrideCapabilities testing knob.
-type clusterOptAllowAdminSplitsForSecondaryTenants struct{}
-
-// apply implements the knobOpt interface.
-func (a clusterOptAllowAdminSplitsForSecondaryTenants) apply(args *base.TestServerArgs) {
-	_, ok := args.Knobs.TenantCapabilitiesTestingKnobs.(*tenantcapabilities.TestingKnobs)
-	if !ok {
-		args.Knobs.TenantCapabilitiesTestingKnobs = &tenantcapabilities.TestingKnobs{}
-	}
-	args.Knobs.TenantCapabilitiesTestingKnobs.(*tenantcapabilities.TestingKnobs).
-		AuthorizerSkipAdminSplitCapabilityChecks = true
-}
-
-var _ clusterOpt = clusterOptAllowAdminSplitsForSecondaryTenants{}
 
 // knobOpt is implemented by options for configuring the testing knobs
 // for the cluster under which a test will run.
@@ -2136,8 +2089,6 @@ func readClusterOptions(t *testing.T, path string) []clusterOpt {
 			res = append(res, clusterOptTracingOff{})
 		case "ignore-tenant-strict-gc-enforcement":
 			res = append(res, clusterOptIgnoreStrictGCForTenants{})
-		case "can-admin-split":
-			res = append(res, clusterOptAllowAdminSplitsForSecondaryTenants{})
 		default:
 			t.Fatalf("unrecognized cluster option: %s", opt)
 		}

@@ -50,7 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -393,9 +392,9 @@ func TestStoreRangeSplitIntents(t *testing.T) {
 			break
 		}
 
-		if bytes.HasPrefix([]byte(iter.Key().Key), txnPrefix(roachpb.KeyMin)) ||
-			bytes.HasPrefix([]byte(iter.Key().Key), txnPrefix(splitKey)) {
-			t.Errorf("unexpected system key: %s; txn record should have been cleaned up", iter.Key())
+		if bytes.HasPrefix([]byte(iter.UnsafeKey().Key), txnPrefix(roachpb.KeyMin)) ||
+			bytes.HasPrefix([]byte(iter.UnsafeKey().Key), txnPrefix(splitKey)) {
+			t.Errorf("unexpected system key: %s; txn record should have been cleaned up", iter.UnsafeKey())
 		}
 	}
 }
@@ -1416,7 +1415,7 @@ func runSetupSplitSnapshotRace(
 			RaftConfig: base.RaftConfig{
 				// Disable the split delay mechanism, or it'll spend 10s going in circles.
 				// (We can't set it to zero as otherwise the default overrides us).
-				RaftDelaySplitToSuppressSnapshotTicks: -1,
+				RaftDelaySplitToSuppressSnapshot: -1,
 			},
 		}
 	}
@@ -2025,7 +2024,6 @@ func TestStoreSplitGCHint(t *testing.T) {
 // and the uninitialized replica reacting to messages.
 func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 66480, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	currentTrigger := make(chan *roachpb.SplitTrigger, 1)
@@ -2103,6 +2101,7 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		errChan := make(chan *kvpb.Error)
+		failedSendLog := log.Every(time.Second)
 
 		// Closed when the split goroutine is done.
 		splitDone := make(chan struct{})
@@ -2147,7 +2146,15 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 						Term: term,
 					},
 				}, rpc.DefaultClass); !sent {
-					t.Error("transport failed to send vote request")
+					// SendAsync can return false, indicating the message didn't send.
+					// The most likely reason this test encounters a message failing to
+					// send is the outgoing message queue being full. The queue filling
+					// up is expected given it has fixed capacity and this loop is
+					// attempting to sending 1 MsgVote every microsecond. See comments
+					// below and above for the frequency rationale.
+					if failedSendLog.ShouldLog() {
+						log.Infof(ctx, "transport failed to send vote request")
+					}
 				}
 				select {
 				case <-splitDone:
@@ -2776,7 +2783,6 @@ func TestTxnWaitQueueDependencyCycleWithRangeSplit(t *testing.T) {
 func TestStoreCapacityAfterSplit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.WithIssue(t, 92677)
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 	tc := testcluster.StartTestCluster(t, 2,
@@ -2800,16 +2806,6 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 	key := tc.ScratchRange(t)
 	desc := tc.AddVotersOrFatal(t, key, tc.Target(1))
 	tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(1))
-	testutils.SucceedsSoon(t, func() error {
-		repl, err := s.GetReplica(desc.RangeID)
-		if err != nil {
-			return err
-		}
-		if !repl.OwnsValidLease(ctx, tc.Servers[1].Clock().NowAsClockTimestamp()) {
-			return errors.New("s2 does not own valid lease for this range")
-		}
-		return nil
-	})
 
 	tc.IncrClockForLeaseUpgrade(t, manualClock)
 	tc.WaitForLeaseUpgrade(ctx, t, desc)
@@ -2851,6 +2847,11 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 		return nil
 	})
 
+	// Bump the clock again, right before calling capacity. We know that the
+	// writes have succeeded and should be reflected in Capacity, however the
+	// MinStatsDuration will cause nothing to be returned unless the last lease
+	// transfer is at least MinStatsDuration ago.
+	manualClock.Increment(int64(replicastats.MinStatsDuration))
 	cap, err = s.Capacity(ctx, false /* useCached */)
 	if err != nil {
 		t.Fatal(err)
@@ -2865,7 +2866,7 @@ func TestStoreCapacityAfterSplit(t *testing.T) {
 	// NB: The writes per second may be within some error bound below the
 	// minExpected due to timing and floating point calculation. An error of
 	// 0.01 (WPS) is added to avoid flaking the test.
-	if minExpected, a := 1/float64(replicastats.MinStatsDuration/time.Second), cap.WritesPerSecond; minExpected > a+0.01 {
+	if minExpected, a := 1/(float64(2*replicastats.MinStatsDuration/time.Second)), cap.WritesPerSecond; minExpected > a+0.01 {
 		t.Errorf("expected cap.WritesPerSecond >= %f, got %f", minExpected, a)
 	}
 

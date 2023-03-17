@@ -87,7 +87,7 @@ func Watch(ctx context.Context, env *Env, dbs []*kv.DB, dataSpan roachpb.Span) (
 			w.mu.Unlock()
 
 			ds := dss[i]
-			err := ds.RangeFeed(ctx, []roachpb.Span{dataSpan}, ts, true /* withDiff */, eventC)
+			err := ds.RangeFeed(ctx, []roachpb.Span{dataSpan}, ts, eventC, kvcoord.WithDiff())
 			if isRetryableRangeFeedErr(err) {
 				log.Infof(ctx, "got retryable RangeFeed error: %+v", err)
 				continue
@@ -307,9 +307,8 @@ func (w *Watcher) handleSSTable(ctx context.Context, data []byte) error {
 		return errors.AssertionFailedf("no SST data found")
 	}
 
-	// TODO(erikgrinaker): This should handle range keys too.
 	iter, err := storage.NewMemSSTIterator(data, false /* verify */, storage.IterOptions{
-		KeyTypes:   storage.IterKeyTypePointsOnly,
+		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		LowerBound: keys.MinKey,
 		UpperBound: keys.MaxKey,
 	})
@@ -318,12 +317,36 @@ func (w *Watcher) handleSSTable(ctx context.Context, data []byte) error {
 	}
 	defer iter.Close()
 	for iter.SeekGE(storage.MVCCKey{Key: keys.MinKey}); ; iter.Next() {
-		if ok, err := iter.Valid(); err != nil {
+		if ok, err := iter.Valid(); !ok {
 			return err
-		} else if !ok {
-			break
 		}
-		key := iter.Key()
+
+		// Add range keys.
+		if iter.RangeKeyChanged() {
+			hasPoint, hasRange := iter.HasPointAndRange()
+			if hasRange {
+				rangeKeys := iter.RangeKeys().Clone()
+				for _, v := range rangeKeys.Versions {
+					mvccValue, err := storage.DecodeMVCCValue(v.Value)
+					if err != nil {
+						return err
+					}
+					mvccValue.Value.Timestamp = v.Timestamp
+					if seq := mvccValue.KVNemesisSeq.Get(); seq > 0 {
+						w.env.Tracker.Add(rangeKeys.Bounds.Key, rangeKeys.Bounds.EndKey, v.Timestamp, seq)
+					}
+					if err := w.handleValueLocked(ctx, rangeKeys.Bounds, mvccValue.Value, nil); err != nil {
+						return err
+					}
+				}
+			}
+			if !hasPoint { // can only happen at range key start bounds
+				continue
+			}
+		}
+
+		// Add point keys.
+		key := iter.UnsafeKey().Clone()
 		rawValue, err := iter.Value()
 		if err != nil {
 			return err
@@ -342,5 +365,4 @@ func (w *Watcher) handleSSTable(ctx context.Context, data []byte) error {
 		log.Infof(ctx, `rangefeed AddSSTable %s %s -> %s`,
 			key.Key, key.Timestamp, mvccValue.Value.PrettyPrint())
 	}
-	return nil
 }

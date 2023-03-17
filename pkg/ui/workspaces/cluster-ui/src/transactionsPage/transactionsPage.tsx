@@ -36,7 +36,7 @@ import {
   filterTransactions,
 } from "./utils";
 import Long from "long";
-import { merge } from "lodash";
+import { flatMap, merge } from "lodash";
 import { unique, syncHistory } from "src/util";
 import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
 import { Loading } from "../loading";
@@ -73,12 +73,12 @@ import { InlineAlert } from "@cockroachlabs/ui-components";
 import { TransactionViewType } from "./transactionsPageTypes";
 import { isSelectedColumn } from "../columnsSelector/utils";
 import moment from "moment";
+import { STATS_LONG_LOADING_DURATION } from "../util/constants";
 
 type IStatementsResponse = protos.cockroach.server.serverpb.IStatementsResponse;
 
 const cx = classNames.bind(styles);
 
-const POLLING_INTERVAL_MILLIS = 300000;
 interface TState {
   filters?: Filters;
   pagination: ISortedTablePagination;
@@ -88,6 +88,7 @@ export interface TransactionsPageStateProps {
   columns: string[];
   data: IStatementsResponse;
   isDataValid: boolean;
+  isReqInFlight: boolean;
   lastUpdated: moment.Moment | null;
   timeScale: TimeScale;
   error?: Error | null;
@@ -104,7 +105,7 @@ export interface TransactionsPageDispatchProps {
   refreshData: (req: StatementsRequest) => void;
   refreshNodes: () => void;
   refreshUserSQLRoles: () => void;
-  resetSQLStats: (req: StatementsRequest) => void;
+  resetSQLStats: () => void;
   onTimeScaleChange?: (ts: TimeScale) => void;
   onColumnsChange?: (selectedColumns: string[]) => void;
   onFilterChange?: (value: Filters) => void;
@@ -120,12 +121,9 @@ export type TransactionsPageProps = TransactionsPageStateProps &
   TransactionsPageDispatchProps &
   RouteComponentProps;
 
-function stmtsRequestFromTimeScale(
-  ts: TimeScale,
-): protos.cockroach.server.serverpb.StatementsRequest {
+function stmtsRequestFromTimeScale(ts: TimeScale): StatementsRequest {
   const [start, end] = toRoundedDateRange(ts);
-  return new protos.cockroach.server.serverpb.StatementsRequest({
-    combined: true,
+  return new protos.cockroach.server.serverpb.CombinedStatementsStatsRequest({
     start: Long.fromNumber(start.unix()),
     end: Long.fromNumber(end.unix()),
   });
@@ -134,8 +132,6 @@ export class TransactionsPage extends React.Component<
   TransactionsPageProps,
   TState
 > {
-  refreshDataTimeout: NodeJS.Timeout;
-
   constructor(props: TransactionsPageProps) {
     super(props);
     this.state = {
@@ -146,14 +142,6 @@ export class TransactionsPage extends React.Component<
     };
     const stateFromHistory = this.getStateFromHistory();
     this.state = merge(this.state, stateFromHistory);
-
-    // In case the user selected a option not available on this page,
-    // force a selection of a valid option. This is necessary for the case
-    // where the value 10/30 min is selected on the Metrics page.
-    const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
-    if (ts !== this.props.timeScale) {
-      this.changeTimeScale(ts);
-    }
   }
 
   getStateFromHistory = (): Partial<TState> => {
@@ -194,69 +182,35 @@ export class TransactionsPage extends React.Component<
     };
   };
 
-  clearRefreshDataTimeout(): void {
-    if (this.refreshDataTimeout != null) {
-      clearTimeout(this.refreshDataTimeout);
-    }
-  }
-
-  // Schedule the next data request depending on the time
-  // range key.
-  resetPolling(ts: TimeScale): void {
-    this.clearRefreshDataTimeout();
-    if (ts.key !== "Custom") {
-      this.refreshDataTimeout = setTimeout(
-        this.refreshData,
-        POLLING_INTERVAL_MILLIS, // 5 minutes
-        ts,
-      );
-    }
-  }
-
-  refreshData = (ts?: TimeScale): void => {
-    const time = ts ?? this.props.timeScale;
-    const req = stmtsRequestFromTimeScale(time);
+  refreshData = (): void => {
+    const req = stmtsRequestFromTimeScale(this.props.timeScale);
     this.props.refreshData(req);
-
-    this.resetPolling(time);
   };
 
   resetSQLStats = (): void => {
-    const req = stmtsRequestFromTimeScale(this.props.timeScale);
-    this.props.resetSQLStats(req);
-    this.resetPolling(this.props.timeScale);
+    this.props.resetSQLStats();
   };
 
   componentDidMount(): void {
-    // For the first data fetch for this page, we refresh immediately if:
-    // - Last updated is null (no statements fetched previously)
-    // - The data is not valid (time scale may have changed on other pages)
-    // - The time range selected is a moving window and the last udpated time
-    // is >= 5 minutes.
-    // Otherwise, we schedule a refresh at 5 mins from the lastUpdated time if
-    // the time range selected is a moving window (i.e. not custom).
-    const now = moment();
-    let nextRefresh = null;
-    if (this.props.lastUpdated == null || !this.props.isDataValid) {
-      nextRefresh = now;
-    } else if (this.props.timeScale.key !== "Custom") {
-      nextRefresh = this.props.lastUpdated
-        .clone()
-        .add(POLLING_INTERVAL_MILLIS, "milliseconds");
-    }
-    if (nextRefresh) {
-      this.refreshDataTimeout = setTimeout(
-        this.refreshData,
-        Math.max(0, nextRefresh.diff(now, "milliseconds")),
-      );
+    // In case the user selected a option not available on this page,
+    // force a selection of a valid option. This is necessary for the case
+    // where the value 10/30 min is selected on the Metrics page.
+    const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
+    if (ts !== this.props.timeScale) {
+      this.changeTimeScale(ts);
+    } else if (
+      !this.props.isDataValid ||
+      !this.props.data ||
+      !this.props.lastUpdated
+    ) {
+      this.refreshData();
     }
 
-    this.props.refreshNodes();
+    if (!this.props.isTenant) {
+      this.props.refreshNodes();
+    }
+
     this.props.refreshUserSQLRoles();
-  }
-
-  componentWillUnmount(): void {
-    this.clearRefreshDataTimeout();
   }
 
   updateQueryParams(): void {
@@ -291,9 +245,18 @@ export class TransactionsPage extends React.Component<
     );
   }
 
-  componentDidUpdate(): void {
+  componentDidUpdate(prevProps: TransactionsPageProps): void {
     this.updateQueryParams();
-    this.props.refreshNodes();
+    if (!this.props.isTenant) {
+      this.props.refreshNodes();
+    }
+
+    if (
+      prevProps.timeScale !== this.props.timeScale ||
+      (prevProps.isDataValid && !this.props.isDataValid)
+    ) {
+      this.refreshData();
+    }
   }
 
   onChangeSortSetting = (ss: SortSetting): void => {
@@ -402,7 +365,6 @@ export class TransactionsPage extends React.Component<
     if (this.props.onTimeScaleChange) {
       this.props.onTimeScaleChange(ts);
     }
-    this.refreshData(ts);
   };
 
   render(): React.ReactElement {
@@ -425,7 +387,9 @@ export class TransactionsPage extends React.Component<
       .sort();
 
     const regions = unique(
-      nodes.map(node => nodeRegions[node.toString()]),
+      isTenant
+        ? flatMap(statements, statement => statement.stats.regions)
+        : nodes.map(node => nodeRegions[node.toString()]),
     ).sort();
 
     // We apply the search filters and app name filters prior to aggregating across Node IDs
@@ -447,8 +411,9 @@ export class TransactionsPage extends React.Component<
       data?.transactions || [],
       internal_app_name_prefix,
     );
-    const longLoadingMessage = !this.props?.data && (
-      <Delayed delay={moment.duration(2, "s")}>
+
+    const longLoadingMessage = (
+      <Delayed delay={STATS_LONG_LOADING_DURATION}>
         <InlineAlert
           intent="info"
           title="If the selected time interval contains a large amount of data, this page might take a few minutes to load."
@@ -498,7 +463,7 @@ export class TransactionsPage extends React.Component<
         </PageConfig>
         <div className={cx("table-area")}>
           <Loading
-            loading={!this.props?.data}
+            loading={this.props.isReqInFlight}
             page={"transactions"}
             error={this.props?.error}
             render={() => {
@@ -508,12 +473,12 @@ export class TransactionsPage extends React.Component<
                   t => ({
                     stats_data: t.stats_data,
                     node_id: t.node_id,
-                    regions: generateRegion(t, statements, nodeRegions),
+                    regions: generateRegion(t, statements),
                     regionNodes: generateRegionNode(t, statements, nodeRegions),
                   }),
                 );
               const { current, pageSize } = pagination;
-              const hasData = data.transactions?.length > 0;
+              const hasData = data?.transactions?.length > 0;
               const isUsedFilter = search?.length > 0;
 
               // Creates a list of all possible columns,
@@ -600,7 +565,7 @@ export class TransactionsPage extends React.Component<
               })
             }
           />
-          {longLoadingMessage}
+          {this.props.isReqInFlight && longLoadingMessage}
         </div>
       </>
     );

@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -2070,6 +2071,8 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
@@ -2082,6 +2085,7 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 			// statuses pre and post enabling the replicate queue.
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings:                 st,
 				DisableDefaultTestTenant: true,
 				ScanMinIdleTime:          time.Millisecond,
 				ScanMaxIdleTime:          time.Millisecond,
@@ -2361,9 +2365,18 @@ func TestReplicateQueueExpirationLeasesOnly(t *testing.T) {
 	skip.UnderRace(t) // too slow under stressrace
 	skip.UnderShort(t)
 
+	timeout := 5 * time.Second
+	if skip.Stress() {
+		timeout = 30 * time.Second
+	}
+
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			Settings: st,
 			// Speed up the replicate queue, which switches the lease type.
 			ScanMinIdleTime: time.Millisecond,
 			ScanMaxIdleTime: time.Millisecond,
@@ -2410,12 +2423,12 @@ func TestReplicateQueueExpirationLeasesOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		epochLeases, expLeases = countLeases()
+		t.Logf("enabling: epochLeases=%d expLeases=%d", epochLeases, expLeases)
 		return epochLeases == 0 && expLeases > 0
-	}, 10*time.Second, 200*time.Millisecond)
-	t.Logf("enabled: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+	}, timeout, 500*time.Millisecond)
 
 	// Run a scan across the ranges, just to make sure they work.
-	scanCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	scanCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	_, err = db.Scan(scanCtx, scratchKey, scratchKey.PrefixEnd(), 1)
 	require.NoError(t, err)
@@ -2429,7 +2442,7 @@ func TestReplicateQueueExpirationLeasesOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		epochLeases, expLeases = countLeases()
+		t.Logf("disabling: epochLeases=%d expLeases=%d", epochLeases, expLeases)
 		return epochLeases > 0 && expLeases > 0 && expLeases <= initialExpLeases
-	}, 10*time.Second, 200*time.Millisecond)
-	t.Logf("disabled: epochLeases=%d expLeases=%d", epochLeases, expLeases)
+	}, timeout, 500*time.Millisecond)
 }

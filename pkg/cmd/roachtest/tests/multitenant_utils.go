@@ -73,12 +73,13 @@ func createTenantCertNodes(nodes option.NodeListOption) createTenantOpt {
 	return func(c *createTenantOptions) { c.certNodes = nodes }
 }
 
-func createTenantNode(
+func createTenantNodeInternal(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
 	kvnodes option.NodeListOption,
 	tenantID, node, httpPort, sqlPort int,
+	certs bool,
 	opts ...createTenantOpt,
 ) *tenantNode {
 	var createOptions createTenantOptions
@@ -99,8 +100,32 @@ func createTenantNode(
 		node:       node,
 		sqlPort:    sqlPort,
 	}
-	tn.createTenantCert(ctx, t, c, createOptions.certNodes)
+	if certs {
+		tn.createTenantCert(ctx, t, c, createOptions.certNodes)
+	}
 	return tn
+}
+
+func createTenantNode(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	kvnodes option.NodeListOption,
+	tenantID, node, httpPort, sqlPort int,
+	opts ...createTenantOpt,
+) *tenantNode {
+	return createTenantNodeInternal(ctx, t, c, kvnodes, tenantID, node, httpPort, sqlPort, true /* certs */, opts...)
+}
+
+func createTenantNodeNoCerts(
+	ctx context.Context,
+	t test.Test,
+	c cluster.Cluster,
+	kvnodes option.NodeListOption,
+	tenantID, node, httpPort, sqlPort int,
+	opts ...createTenantOpt,
+) *tenantNode {
+	return createTenantNodeInternal(ctx, t, c, kvnodes, tenantID, node, httpPort, sqlPort, false /* certs */, opts...)
 }
 
 func (tn *tenantNode) createTenantCert(
@@ -341,15 +366,7 @@ func createInMemoryTenant(
 
 // removeTenantRateLimiters ensures the tenant is not throttled by limiters.
 func removeTenantRateLimiters(t test.Test, systemSQL *sqlutils.SQLRunner, tenantName string) {
-	var tenantID int
-	systemSQL.QueryRow(t, `SELECT id FROM [SHOW TENANT $1]`, tenantName).Scan(&tenantID)
-	systemSQL.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1::INT, 10000000000, 0,
-10000000000, now(), 0);`, tenantID)
-	systemSQL.ExecMultiple(t,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.burst_limit_seconds = 10000;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.rate_limit = -1000; `,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.read_batch_cost = 0;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.read_cost_per_mebibyte = 0;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.write_cost_per_megabyte = 0;`,
-		`SET CLUSTER SETTING kv.tenant_rate_limiter.write_request_cost = 0;`)
+	systemSQL.Exec(t, `SELECT crdb_internal.update_tenant_resource_limits($1::STRING, 10000000000, 0,
+10000000000, now(), 0);`, tenantName)
+	systemSQL.Exec(t, `ALTER TENANT $1 GRANT CAPABILITY exempt_from_rate_limiting=true`, tenantName)
 }

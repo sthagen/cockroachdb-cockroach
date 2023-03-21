@@ -136,28 +136,19 @@ export function generateTableID(db: string, table: string) {
 
 export const tableRequestToID = (
   req:
-    | api.TableDetailsRequestMessage
     | api.TableStatsRequestMessage
-    | api.IndexStatsRequestMessage,
+    | api.IndexStatsRequestMessage
+    | clusterUiApi.TableDetailsReqParams,
 ): string => generateTableID(req.database, req.table);
 
 const tableDetailsReducerObj = new KeyedCachedDataReducer(
-  api.getTableDetails,
+  clusterUiApi.getTableDetails,
   "tableDetails",
   tableRequestToID,
   null,
   moment.duration(10, "m"),
 );
 export const refreshTableDetails = tableDetailsReducerObj.refresh;
-
-const tableStatsReducerObj = new KeyedCachedDataReducer(
-  api.getTableStats,
-  "tableStats",
-  tableRequestToID,
-  null,
-  moment.duration(10, "m"),
-);
-export const refreshTableStats = tableStatsReducerObj.refresh;
 
 const indexStatsReducerObj = new KeyedCachedDataReducer(
   api.getIndexStats,
@@ -325,14 +316,24 @@ const storesReducerObj = new KeyedCachedDataReducer(
 export const refreshStores = storesReducerObj.refresh;
 
 const queriesReducerObj = new CachedDataReducer(
-  api.getCombinedStatements,
+  clusterUiApi.getCombinedStatements,
   "statements",
   null,
-  moment.duration(30, "m"),
-  true, // Allow new requests to replace in flight ones.
+  moment.duration(10, "m"),
+  true,
 );
 export const invalidateStatements = queriesReducerObj.invalidateData;
 export const refreshStatements = queriesReducerObj.refresh;
+
+const txnFingerprintStatsReducerObj = new CachedDataReducer(
+  clusterUiApi.getFlushedTxnStatsApi,
+  "transactions",
+  null,
+  moment.duration(30, "m"),
+  true,
+);
+export const invalidateTxns = txnFingerprintStatsReducerObj.invalidateData;
+export const refreshTxns = txnFingerprintStatsReducerObj.refresh;
 
 export const statementDetailsRequestToID = (
   req: api.StatementDetailsRequestMessage,
@@ -535,8 +536,9 @@ export interface APIReducersState {
   databaseDetails: KeyedCachedDataReducerState<
     clusterUiApi.SqlApiResponse<clusterUiApi.DatabaseDetailsResponse>
   >;
-  tableDetails: KeyedCachedDataReducerState<api.TableDetailsResponseMessage>;
-  tableStats: KeyedCachedDataReducerState<api.TableStatsResponseMessage>;
+  tableDetails: KeyedCachedDataReducerState<
+    clusterUiApi.SqlApiResponse<clusterUiApi.TableDetailsResponse>
+  >;
   indexStats: KeyedCachedDataReducerState<api.IndexStatsResponseMessage>;
   nonTableStats: CachedDataReducerState<api.NonTableStatsResponseMessage>;
   logs: CachedDataReducerState<api.LogEntriesResponseMessage>;
@@ -553,6 +555,7 @@ export interface APIReducersState {
   settings: CachedDataReducerState<api.SettingsResponseMessage>;
   stores: KeyedCachedDataReducerState<api.StoresResponseMessage>;
   statements: CachedDataReducerState<api.StatementsResponseMessage>;
+  transactions: CachedDataReducerState<api.StatementsResponseMessage>;
   statementDetails: KeyedCachedDataReducerState<api.StatementDetailsResponseMessage>;
   dataDistribution: CachedDataReducerState<api.DataDistributionResponseMessage>;
   metricMetadata: CachedDataReducerState<api.MetricMetadataResponseMessage>;
@@ -596,7 +599,6 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [databaseDetailsReducerObj.actionNamespace]:
     databaseDetailsReducerObj.reducer,
   [tableDetailsReducerObj.actionNamespace]: tableDetailsReducerObj.reducer,
-  [tableStatsReducerObj.actionNamespace]: tableStatsReducerObj.reducer,
   [indexStatsReducerObj.actionNamespace]: indexStatsReducerObj.reducer,
   [nonTableStatsReducerObj.actionNamespace]: nonTableStatsReducerObj.reducer,
   [logsReducerObj.actionNamespace]: logsReducerObj.reducer,
@@ -613,6 +615,8 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [sessionsReducerObj.actionNamespace]: sessionsReducerObj.reducer,
   [storesReducerObj.actionNamespace]: storesReducerObj.reducer,
   [queriesReducerObj.actionNamespace]: queriesReducerObj.reducer,
+  [txnFingerprintStatsReducerObj.actionNamespace]:
+    txnFingerprintStatsReducerObj.reducer,
   [statementDetailsReducerObj.actionNamespace]:
     statementDetailsReducerObj.reducer,
   [dataDistributionReducerObj.actionNamespace]:

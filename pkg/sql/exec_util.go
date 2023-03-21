@@ -733,6 +733,14 @@ var overrideAlterPrimaryRegionInSuperRegion = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
+var enableMultipleActivePortals = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.pgwire.multiple_active_portals.enabled",
+	"if true, portals with read-only SELECT query without sub/post queries "+
+		"can be executed in interleaving manner, but with local execution plan",
+	false,
+).WithPublic()
+
 var errNoTransactionInProgress = errors.New("there is no transaction in progress")
 var errTransactionInProgress = errors.New("there is already a transaction in progress")
 
@@ -1426,6 +1434,7 @@ type ExecutorConfig struct {
 type UpdateVersionSystemSettingHook func(
 	ctx context.Context,
 	version clusterversion.ClusterVersion,
+	validate func(ctx context.Context) error,
 ) error
 
 // VersionUpgradeHook is used to run upgrades starting in v21.1.
@@ -1718,6 +1727,14 @@ type StreamingTestingKnobs struct {
 
 	// AfterCutoverStarted allows blocking after the cutover has started.
 	AfterCutoverStarted func()
+
+	// OnCutoverProgressUpdate is called on every progress update
+	// call during the cutover process.
+	OnCutoverProgressUpdate func()
+
+	// CutoverProgressShouldUpdate overrides the standard logic
+	// for whether the job record is updated on a progress update.
+	CutoverProgressShouldUpdate func() bool
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}

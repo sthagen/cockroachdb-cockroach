@@ -548,7 +548,7 @@ func (b *Builder) buildFunction(
 	}
 
 	overload := f.ResolvedOverload()
-	if overload.IsUDF {
+	if overload.HasSQLBody() {
 		return b.buildUDF(f, def, inScope, outScope, outCol, colRefs)
 	}
 
@@ -619,6 +619,7 @@ func (b *Builder) buildUDF(
 	colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
 	o := f.ResolvedOverload()
+	b.factory.Metadata().AddUserDefinedFunction(o, f.Func.ReferenceByName)
 
 	// Validate that the return types match the original return types defined in
 	// the function. Return types like user defined return types may change since
@@ -775,13 +776,6 @@ func (b *Builder) buildUDF(
 	}
 	b.insideUDF = false
 
-	// For set-returning functions, we handle STRICT behavior in the routine
-	// execution logic. For scalar UDFs this is handled by a CASE statement - see
-	// below.
-	calledOnNullInput := true
-	if isSetReturning {
-		calledOnNullInput = o.CalledOnNullInput
-	}
 	out = b.factory.ConstructUDF(
 		args,
 		&memo.UDFPrivate{
@@ -791,7 +785,7 @@ func (b *Builder) buildUDF(
 			Typ:               f.ResolvedType(),
 			SetReturning:      isSetReturning,
 			Volatility:        o.Volatility,
-			CalledOnNullInput: calledOnNullInput,
+			CalledOnNullInput: o.CalledOnNullInput,
 		},
 	)
 

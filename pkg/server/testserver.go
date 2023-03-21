@@ -944,6 +944,11 @@ func (ts *TestServer) StartSharedProcessTenant(
 	return testTenant, sqlDB, err
 }
 
+// MigrationServer is part of the TestTenantInterface.
+func (t *TestTenant) MigrationServer() interface{} {
+	return t.migrationServer
+}
+
 // StartTenant is part of TestServerInterface.
 func (ts *TestServer) StartTenant(
 	ctx context.Context, params base.TestTenantArgs,
@@ -1638,6 +1643,19 @@ func (ts *TestServer) GetRangeLease(
 // ExecutorConfig is part of the TestServerInterface.
 func (ts *TestServer) ExecutorConfig() interface{} {
 	return *ts.sqlServer.execCfg
+}
+
+// StartedDefaultTestTenant is part of the TestServerInterface.
+func (ts *TestServer) StartedDefaultTestTenant() bool {
+	return !ts.cfg.DisableDefaultTestTenant
+}
+
+// TenantOrServer is part of the TestServerInterface.
+func (ts *TestServer) TenantOrServer() serverutils.TestTenantInterface {
+	if ts.StartedDefaultTestTenant() {
+		return ts.testTenants[0]
+	}
+	return ts
 }
 
 // TracerI is part of the TestServerInterface.

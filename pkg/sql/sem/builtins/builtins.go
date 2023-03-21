@@ -2751,7 +2751,7 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 			Types:      tree.ParamTypes{},
 			ReturnType: tree.FixedReturnType(types.Decimal),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				return evalCtx.GetClusterTimestamp(), nil
+				return evalCtx.GetClusterTimestamp()
 			},
 			Info: `Returns the logical time of the current transaction as
 a CockroachDB HLC in decimal form.
@@ -4874,6 +4874,9 @@ value if you rely on the HLC for accuracy.`,
 				if err != nil {
 					return nil, err
 				}
+				if !tid.IsSet() {
+					return tree.DNull, nil
+				}
 				return tree.NewDInt(tree.DInt(tid.ToUint64())), nil
 			},
 			Info: `Creates a new tenant with the provided parameters. ` +
@@ -4887,7 +4890,6 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			IsUDF:      true,
 			Body: `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'service_mode',
  'external'))`,
 			Info:       `create_tenant(id) is an alias for create_tenant('{"id": id, "service_mode": "external"}'::jsonb)`,
@@ -4900,7 +4902,6 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			IsUDF:      true,
 			Body:       `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'name', $2))`,
 			Info:       `create_tenant(id, name) is an alias for create_tenant('{"id": id, "name": name}'::jsonb)`,
 			Volatility: volatility.Volatile,
@@ -4911,7 +4912,6 @@ value if you rely on the HLC for accuracy.`,
 				{Name: "name", Typ: types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			IsUDF:      true,
 			Body:       `SELECT crdb_internal.create_tenant(json_build_object('name', $1))`,
 			Info: `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb).
 DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
@@ -4964,7 +4964,6 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 				{Name: "id", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			IsUDF:      true,
 			Body:       `SELECT crdb_internal.destroy_tenant($1, false)`,
 			Info:       "DO NOT USE -- USE 'DROP TENANT' INSTEAD.",
 			Volatility: volatility.Volatile,
@@ -6308,7 +6307,6 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 				{Name: "number", Typ: types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
-			IsUDF:      true,
 			Body: `SELECT crdb_internal.generate_test_objects(
 json_build_object('names', $1, 'counts', array[$2]))`,
 			Info: `Generates a number of objects whose name follow the provided pattern.
@@ -6324,7 +6322,6 @@ generate_test_objects('{"names":pat, "counts":[num]}'::jsonb)
 				{Name: "counts", Typ: types.IntArray},
 			},
 			ReturnType: tree.FixedReturnType(types.Jsonb),
-			IsUDF:      true,
 			Body: `SELECT crdb_internal.generate_test_objects(
 json_build_object('names', $1, 'counts', $2))`,
 			Info: `Generates a number of objects whose name follow the provided pattern.
@@ -7568,12 +7565,6 @@ expires until the statement bundle is collected`,
 					filter = kvpb.MVCCFilter_All
 				}
 
-				req := &kvpb.ExportRequest{
-					RequestHeader:     kvpb.RequestHeader{Key: startKey, EndKey: endKey},
-					StartTime:         startTimestamp,
-					MVCCFilter:        filter,
-					ExportFingerprint: true,
-				}
 				header := kvpb.Header{
 					Timestamp: evalCtx.Txn.ReadTimestamp(),
 					// We set WaitPolicy to Error, so that the export will return an error
@@ -7595,8 +7586,9 @@ expires until the statement bundle is collected`,
 					NoMemoryReservedAtSource: true,
 				}
 
-				todo := make(chan *kvpb.ExportRequest, 1)
-				todo <- req
+				todo := make(chan kvpb.RequestHeader, 1)
+				todo <- kvpb.RequestHeader{Key: startKey, EndKey: endKey}
+
 				ctxDone := ctx.Done()
 				var fingerprint uint64
 				// TODO(adityamaru): Memory monitor this slice of buffered SSTs that
@@ -7606,7 +7598,13 @@ expires until the statement bundle is collected`,
 					select {
 					case <-ctxDone:
 						return nil, ctx.Err()
-					case req := <-todo:
+					case reqHeader := <-todo:
+						req := &kvpb.ExportRequest{
+							RequestHeader:     reqHeader,
+							StartTime:         startTimestamp,
+							MVCCFilter:        filter,
+							ExportFingerprint: true,
+						}
 						var rawResp kvpb.Response
 						var pErr *kvpb.Error
 						exportRequestErr := contextutil.RunWithTimeout(ctx,
@@ -7637,10 +7635,7 @@ expires until the statement bundle is collected`,
 							if !resp.ResumeSpan.Valid() {
 								return nil, errors.Errorf("invalid resume span: %s", resp.ResumeSpan)
 							}
-
-							resumeReq := req
-							resumeReq.RequestHeader = kvpb.RequestHeaderFromSpan(*resp.ResumeSpan)
-							todo <- resumeReq
+							todo <- kvpb.RequestHeaderFromSpan(*resp.ResumeSpan)
 						}
 					default:
 						// No ExportRequests left to send. We've aggregated range keys

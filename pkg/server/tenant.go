@@ -312,6 +312,11 @@ func newTenantServer(
 		return nil, err
 	}
 
+	// Instantiate the migration API server.
+	tms := newTenantMigrationServer(sqlServer)
+	serverpb.RegisterMigrationServer(args.grpc.Server, tms)
+	sqlServer.migrationServer = tms // only for testing via TestTenant
+
 	// Tell the authz server how to connect to SQL.
 	adminAuthzCheck.makePlanner = func(opName string) (interface{}, func()) {
 		// This is a hack to get around a Go package dependency cycle. See comment
@@ -608,7 +613,9 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 	// We can now add the node registry.
 	s.recorder.AddNode(
 		s.registry,
-		roachpb.NodeDescriptor{},
+		roachpb.NodeDescriptor{
+			NodeID: s.rpcContext.NodeID.Get(),
+		},
 		timeutil.Now().UnixNano(),
 		s.sqlServer.cfg.AdvertiseAddr,
 		s.sqlServer.cfg.HTTPAdvertiseAddr,
@@ -1030,7 +1037,7 @@ func makeTenantSQLServerArgs(
 		return sqlServerArgs{}, err
 	}
 
-	sTS := ts.MakeTenantServer(baseCfg.AmbientCtx, tenantConnect)
+	sTS := ts.MakeTenantServer(baseCfg.AmbientCtx, tenantConnect, rpcContext.TenantID)
 
 	systemConfigWatcher := systemconfigwatcher.NewWithAdditionalProvider(
 		keys.MakeSQLCodec(sqlCfg.TenantID), clock, rangeFeedFactory, &baseCfg.DefaultZoneConfig,

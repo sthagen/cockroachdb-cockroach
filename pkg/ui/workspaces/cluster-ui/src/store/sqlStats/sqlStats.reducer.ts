@@ -37,11 +37,14 @@ export type UpdateTimeScalePayload = {
   ts: TimeScale;
 };
 
+// This is actually statements only, despite the SQLStatsState name.
+// We can rename this in the future. Leaving it now to reduce backport surface area.
 const sqlStatsSlice = createSlice({
   name: `${DOMAIN_NAME}/sqlstats`,
   initialState,
   reducers: {
     received: (state, action: PayloadAction<StatementsResponse>) => {
+      state.inFlight = false;
       state.data = action.payload;
       state.valid = true;
       state.lastError = null;
@@ -55,6 +58,7 @@ const sqlStatsSlice = createSlice({
       state.inFlight = false;
     },
     invalidated: state => {
+      state.inFlight = false;
       state.valid = false;
     },
     refresh: (state, action: PayloadAction<StatementsRequest>) => {

@@ -1460,6 +1460,8 @@ system         public              span_stats_samples                     BASE T
 system         public              span_stats_tenant_boundaries           BASE TABLE   YES                 1
 system         public              task_payloads                          BASE TABLE   YES                 1
 system         public              tenant_tasks                           BASE TABLE   YES                 1
+system         public              statement_activity                     BASE TABLE   YES                 1
+system         public              transaction_activity                   BASE TABLE   YES                 1
 
 statement ok
 ALTER TABLE other_db.xyz ADD COLUMN j INT
@@ -1526,6 +1528,7 @@ system              public             primary                                  
 system              public             29_44_1_not_null                                                                                                system         public        database_role_settings           CHECK            NO             NO
 system              public             29_44_2_not_null                                                                                                system         public        database_role_settings           CHECK            NO             NO
 system              public             29_44_3_not_null                                                                                                system         public        database_role_settings           CHECK            NO             NO
+system              public             29_44_4_not_null                                                                                                system         public        database_role_settings           CHECK            NO             NO
 system              public             primary                                                                                                         system         public        database_role_settings           PRIMARY KEY      NO             NO
 system              public             database_role_settings_database_id_role_id_key                                                                  system         public        database_role_settings           UNIQUE           NO             NO
 system              public             29_3_1_not_null                                                                                                 system         public        descriptor                       CHECK            NO             NO
@@ -1544,6 +1547,7 @@ system              public             29_52_3_not_null                         
 system              public             29_52_4_not_null                                                                                                system         public        external_connections             CHECK            NO             NO
 system              public             29_52_5_not_null                                                                                                system         public        external_connections             CHECK            NO             NO
 system              public             29_52_6_not_null                                                                                                system         public        external_connections             CHECK            NO             NO
+system              public             29_52_7_not_null                                                                                                system         public        external_connections             CHECK            NO             NO
 system              public             primary                                                                                                         system         public        external_connections             PRIMARY KEY      NO             NO
 system              public             29_53_1_not_null                                                                                                system         public        job_info                         CHECK            NO             NO
 system              public             29_53_2_not_null                                                                                                system         public        job_info                         CHECK            NO             NO
@@ -1583,6 +1587,7 @@ system              public             29_51_1_not_null                         
 system              public             29_51_2_not_null                                                                                                system         public        privileges                       CHECK            NO             NO
 system              public             29_51_3_not_null                                                                                                system         public        privileges                       CHECK            NO             NO
 system              public             29_51_4_not_null                                                                                                system         public        privileges                       CHECK            NO             NO
+system              public             29_51_5_not_null                                                                                                system         public        privileges                       CHECK            NO             NO
 system              public             primary                                                                                                         system         public        privileges                       PRIMARY KEY      NO             NO
 system              public             privileges_path_user_id_key                                                                                     system         public        privileges                       UNIQUE           NO             NO
 system              public             privileges_path_username_key                                                                                    system         public        privileges                       UNIQUE           NO             NO
@@ -1682,6 +1687,25 @@ system              public             29_39_1_not_null                         
 system              public             29_39_2_not_null                                                                                                system         public        sqlliveness                      CHECK            NO             NO
 system              public             29_39_3_not_null                                                                                                system         public        sqlliveness                      CHECK            NO             NO
 system              public             primary                                                                                                         system         public        sqlliveness                      PRIMARY KEY      NO             NO
+system              public             29_60_10_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_11_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_12_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_13_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_14_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_15_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_16_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_17_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_18_not_null                                                                                               system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_1_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_2_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_3_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_4_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_5_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_6_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_7_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_8_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             29_60_9_not_null                                                                                                system         public        statement_activity               CHECK            NO             NO
+system              public             primary                                                                                                         system         public        statement_activity               PRIMARY KEY      NO             NO
 system              public             29_34_1_not_null                                                                                                system         public        statement_bundle_chunks          CHECK            NO             NO
 system              public             29_34_3_not_null                                                                                                system         public        statement_bundle_chunks          CHECK            NO             NO
 system              public             primary                                                                                                         system         public        statement_bundle_chunks          PRIMARY KEY      NO             NO
@@ -1722,6 +1746,7 @@ system              public             primary                                  
 system              public             29_58_1_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
 system              public             29_58_2_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
 system              public             29_58_3_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
+system              public             29_58_4_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
 system              public             29_58_5_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
 system              public             29_58_7_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
 system              public             29_58_8_not_null                                                                                                system         public        task_payloads                    CHECK            NO             NO
@@ -1738,6 +1763,7 @@ system              public             29_59_3_not_null                         
 system              public             29_59_4_not_null                                                                                                system         public        tenant_tasks                     CHECK            NO             NO
 system              public             29_59_5_not_null                                                                                                system         public        tenant_tasks                     CHECK            NO             NO
 system              public             29_59_6_not_null                                                                                                system         public        tenant_tasks                     CHECK            NO             NO
+system              public             29_59_7_not_null                                                                                                system         public        tenant_tasks                     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        tenant_tasks                     PRIMARY KEY      NO             NO
 system              public             29_45_1_not_null                                                                                                system         public        tenant_usage                     CHECK            NO             NO
 system              public             29_45_2_not_null                                                                                                system         public        tenant_usage                     CHECK            NO             NO
@@ -1748,6 +1774,22 @@ system              public             29_8_1_not_null                          
 system              public             29_8_2_not_null                                                                                                 system         public        tenants                          CHECK            NO             NO
 system              public             primary                                                                                                         system         public        tenants                          PRIMARY KEY      NO             NO
 system              public             tenants_name_idx                                                                                                system         public        tenants                          UNIQUE           NO             NO
+system              public             29_61_10_not_null                                                                                               system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_11_not_null                                                                                               system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_12_not_null                                                                                               system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_13_not_null                                                                                               system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_14_not_null                                                                                               system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_15_not_null                                                                                               system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_1_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_2_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_3_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_4_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_5_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_6_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_7_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_8_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             29_61_9_not_null                                                                                                system         public        transaction_activity             CHECK            NO             NO
+system              public             primary                                                                                                         system         public        transaction_activity             PRIMARY KEY      NO             NO
 system              public             29_43_1_not_null                                                                                                system         public        transaction_statistics           CHECK            NO             NO
 system              public             29_43_2_not_null                                                                                                system         public        transaction_statistics           CHECK            NO             NO
 system              public             29_43_3_not_null                                                                                                system         public        transaction_statistics           CHECK            NO             NO
@@ -1772,6 +1814,7 @@ system              public             29_19_3_not_null                         
 system              public             29_19_4_not_null                                                                                                system         public        web_sessions                     CHECK            NO             NO
 system              public             29_19_5_not_null                                                                                                system         public        web_sessions                     CHECK            NO             NO
 system              public             29_19_7_not_null                                                                                                system         public        web_sessions                     CHECK            NO             NO
+system              public             29_19_9_not_null                                                                                                system         public        web_sessions                     CHECK            NO             NO
 system              public             primary                                                                                                         system         public        web_sessions                     PRIMARY KEY      NO             NO
 system              public             29_5_1_not_null                                                                                                 system         public        zones                            CHECK            NO             NO
 system              public             primary                                                                                                         system         public        zones                            PRIMARY KEY      NO             NO
@@ -1820,6 +1863,7 @@ system              public             29_19_3_not_null                         
 system              public             29_19_4_not_null                                                                                                createdAt IS NOT NULL
 system              public             29_19_5_not_null                                                                                                expiresAt IS NOT NULL
 system              public             29_19_7_not_null                                                                                                lastUsedAt IS NOT NULL
+system              public             29_19_9_not_null                                                                                                user_id IS NOT NULL
 system              public             29_20_10_not_null                                                                                               avgSize IS NOT NULL
 system              public             29_20_1_not_null                                                                                                tableID IS NOT NULL
 system              public             29_20_2_not_null                                                                                                statisticID IS NOT NULL
@@ -1927,6 +1971,7 @@ system              public             29_43_7_not_null                         
 system              public             29_44_1_not_null                                                                                                database_id IS NOT NULL
 system              public             29_44_2_not_null                                                                                                role_name IS NOT NULL
 system              public             29_44_3_not_null                                                                                                settings IS NOT NULL
+system              public             29_44_4_not_null                                                                                                role_id IS NOT NULL
 system              public             29_45_1_not_null                                                                                                tenant_id IS NOT NULL
 system              public             29_45_2_not_null                                                                                                instance_id IS NOT NULL
 system              public             29_45_3_not_null                                                                                                next_instance_id IS NOT NULL
@@ -1949,12 +1994,14 @@ system              public             29_51_1_not_null                         
 system              public             29_51_2_not_null                                                                                                path IS NOT NULL
 system              public             29_51_3_not_null                                                                                                privileges IS NOT NULL
 system              public             29_51_4_not_null                                                                                                grant_options IS NOT NULL
+system              public             29_51_5_not_null                                                                                                user_id IS NOT NULL
 system              public             29_52_1_not_null                                                                                                connection_name IS NOT NULL
 system              public             29_52_2_not_null                                                                                                created IS NOT NULL
 system              public             29_52_3_not_null                                                                                                updated IS NOT NULL
 system              public             29_52_4_not_null                                                                                                connection_type IS NOT NULL
 system              public             29_52_5_not_null                                                                                                connection_details IS NOT NULL
 system              public             29_52_6_not_null                                                                                                owner IS NOT NULL
+system              public             29_52_7_not_null                                                                                                owner_id IS NOT NULL
 system              public             29_53_1_not_null                                                                                                job_id IS NOT NULL
 system              public             29_53_2_not_null                                                                                                info_key IS NOT NULL
 system              public             29_53_3_not_null                                                                                                written IS NOT NULL
@@ -1971,6 +2018,7 @@ system              public             29_57_2_not_null                         
 system              public             29_58_1_not_null                                                                                                id IS NOT NULL
 system              public             29_58_2_not_null                                                                                                created IS NOT NULL
 system              public             29_58_3_not_null                                                                                                owner IS NOT NULL
+system              public             29_58_4_not_null                                                                                                owner_id IS NOT NULL
 system              public             29_58_5_not_null                                                                                                min_version IS NOT NULL
 system              public             29_58_7_not_null                                                                                                type IS NOT NULL
 system              public             29_58_8_not_null                                                                                                value IS NOT NULL
@@ -1980,7 +2028,41 @@ system              public             29_59_3_not_null                         
 system              public             29_59_4_not_null                                                                                                created IS NOT NULL
 system              public             29_59_5_not_null                                                                                                payload_id IS NOT NULL
 system              public             29_59_6_not_null                                                                                                owner IS NOT NULL
+system              public             29_59_7_not_null                                                                                                owner_id IS NOT NULL
 system              public             29_5_1_not_null                                                                                                 id IS NOT NULL
+system              public             29_60_10_not_null                                                                                               plan IS NOT NULL
+system              public             29_60_11_not_null                                                                                               index_recommendations IS NOT NULL
+system              public             29_60_12_not_null                                                                                               execution_count IS NOT NULL
+system              public             29_60_13_not_null                                                                                               execution_total_seconds IS NOT NULL
+system              public             29_60_14_not_null                                                                                               execution_total_cluster_seconds IS NOT NULL
+system              public             29_60_15_not_null                                                                                               contention_time_avg_seconds IS NOT NULL
+system              public             29_60_16_not_null                                                                                               cpu_sql_avg_nanos IS NOT NULL
+system              public             29_60_17_not_null                                                                                               service_latency_avg_seconds IS NOT NULL
+system              public             29_60_18_not_null                                                                                               service_latency_p99_seconds IS NOT NULL
+system              public             29_60_1_not_null                                                                                                aggregated_ts IS NOT NULL
+system              public             29_60_2_not_null                                                                                                fingerprint_id IS NOT NULL
+system              public             29_60_3_not_null                                                                                                transaction_fingerprint_id IS NOT NULL
+system              public             29_60_4_not_null                                                                                                plan_hash IS NOT NULL
+system              public             29_60_5_not_null                                                                                                app_name IS NOT NULL
+system              public             29_60_6_not_null                                                                                                node_id IS NOT NULL
+system              public             29_60_7_not_null                                                                                                agg_interval IS NOT NULL
+system              public             29_60_8_not_null                                                                                                metadata IS NOT NULL
+system              public             29_60_9_not_null                                                                                                statistics IS NOT NULL
+system              public             29_61_10_not_null                                                                                               execution_total_seconds IS NOT NULL
+system              public             29_61_11_not_null                                                                                               execution_total_cluster_seconds IS NOT NULL
+system              public             29_61_12_not_null                                                                                               contention_time_avg_seconds IS NOT NULL
+system              public             29_61_13_not_null                                                                                               cpu_sql_avg_nanos IS NOT NULL
+system              public             29_61_14_not_null                                                                                               service_latency_avg_seconds IS NOT NULL
+system              public             29_61_15_not_null                                                                                               service_latency_p99_seconds IS NOT NULL
+system              public             29_61_1_not_null                                                                                                aggregated_ts IS NOT NULL
+system              public             29_61_2_not_null                                                                                                fingerprint_id IS NOT NULL
+system              public             29_61_3_not_null                                                                                                app_name IS NOT NULL
+system              public             29_61_4_not_null                                                                                                node_id IS NOT NULL
+system              public             29_61_5_not_null                                                                                                agg_interval IS NOT NULL
+system              public             29_61_6_not_null                                                                                                metadata IS NOT NULL
+system              public             29_61_7_not_null                                                                                                statistics IS NOT NULL
+system              public             29_61_8_not_null                                                                                                query IS NOT NULL
+system              public             29_61_9_not_null                                                                                                execution_count IS NOT NULL
 system              public             29_6_1_not_null                                                                                                 name IS NOT NULL
 system              public             29_6_2_not_null                                                                                                 value IS NOT NULL
 system              public             29_6_3_not_null                                                                                                 lastUpdated IS NOT NULL
@@ -2072,6 +2154,12 @@ system         public        sql_instances                    crdb_region       
 system         public        sql_instances                    id                                                                                                        system              public             primary
 system         public        sqlliveness                      crdb_region                                                                                               system              public             primary
 system         public        sqlliveness                      session_id                                                                                                system              public             primary
+system         public        statement_activity               aggregated_ts                                                                                             system              public             primary
+system         public        statement_activity               app_name                                                                                                  system              public             primary
+system         public        statement_activity               fingerprint_id                                                                                            system              public             primary
+system         public        statement_activity               node_id                                                                                                   system              public             primary
+system         public        statement_activity               plan_hash                                                                                                 system              public             primary
+system         public        statement_activity               transaction_fingerprint_id                                                                                system              public             primary
 system         public        statement_bundle_chunks          id                                                                                                        system              public             primary
 system         public        statement_diagnostics            id                                                                                                        system              public             primary
 system         public        statement_diagnostics_requests   id                                                                                                        system              public             primary
@@ -2096,6 +2184,10 @@ system         public        tenant_usage                     instance_id       
 system         public        tenant_usage                     tenant_id                                                                                                 system              public             primary
 system         public        tenants                          id                                                                                                        system              public             primary
 system         public        tenants                          name                                                                                                      system              public             tenants_name_idx
+system         public        transaction_activity             aggregated_ts                                                                                             system              public             primary
+system         public        transaction_activity             app_name                                                                                                  system              public             primary
+system         public        transaction_activity             fingerprint_id                                                                                            system              public             primary
+system         public        transaction_activity             node_id                                                                                                   system              public             primary
 system         public        transaction_statistics           aggregated_ts                                                                                             system              public             primary
 system         public        transaction_statistics           app_name                                                                                                  system              public             primary
 system         public        transaction_statistics           crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8                                       system              public             check_crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8
@@ -2369,6 +2461,7 @@ system         pg_extension  spatial_ref_sys                  proj4text         
 system         pg_extension  spatial_ref_sys                  srid                                                                                                      1
 system         pg_extension  spatial_ref_sys                  srtext                                                                                                    4
 system         public        sql_instances                    addr                                                                                                      2
+system         public        sql_instances                    binary_version                                                                                            7
 system         public        sql_instances                    crdb_region                                                                                               6
 system         public        sql_instances                    id                                                                                                        1
 system         public        sql_instances                    locality                                                                                                  4
@@ -2377,6 +2470,24 @@ system         public        sql_instances                    sql_addr          
 system         public        sqlliveness                      crdb_region                                                                                               3
 system         public        sqlliveness                      expiration                                                                                                2
 system         public        sqlliveness                      session_id                                                                                                1
+system         public        statement_activity               agg_interval                                                                                              7
+system         public        statement_activity               aggregated_ts                                                                                             1
+system         public        statement_activity               app_name                                                                                                  5
+system         public        statement_activity               contention_time_avg_seconds                                                                               15
+system         public        statement_activity               cpu_sql_avg_nanos                                                                                         16
+system         public        statement_activity               execution_count                                                                                           12
+system         public        statement_activity               execution_total_cluster_seconds                                                                           14
+system         public        statement_activity               execution_total_seconds                                                                                   13
+system         public        statement_activity               fingerprint_id                                                                                            2
+system         public        statement_activity               index_recommendations                                                                                     11
+system         public        statement_activity               metadata                                                                                                  8
+system         public        statement_activity               node_id                                                                                                   6
+system         public        statement_activity               plan                                                                                                      10
+system         public        statement_activity               plan_hash                                                                                                 4
+system         public        statement_activity               service_latency_avg_seconds                                                                               17
+system         public        statement_activity               service_latency_p99_seconds                                                                               18
+system         public        statement_activity               statistics                                                                                                9
+system         public        statement_activity               transaction_fingerprint_id                                                                                3
 system         public        statement_bundle_chunks          data                                                                                                      3
 system         public        statement_bundle_chunks          description                                                                                               2
 system         public        statement_bundle_chunks          id                                                                                                        1
@@ -2398,15 +2509,21 @@ system         public        statement_diagnostics_requests   statement_fingerpr
 system         public        statement_statistics             agg_interval                                                                                              7
 system         public        statement_statistics             aggregated_ts                                                                                             1
 system         public        statement_statistics             app_name                                                                                                  5
+system         public        statement_statistics             contention_time                                                                                           17
+system         public        statement_statistics             cpu_sql_nanos                                                                                             16
 system         public        statement_statistics             crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8  11
+system         public        statement_statistics             execution_count                                                                                           14
 system         public        statement_statistics             fingerprint_id                                                                                            2
 system         public        statement_statistics             index_recommendations                                                                                     12
 system         public        statement_statistics             indexes_usage                                                                                             13
 system         public        statement_statistics             metadata                                                                                                  8
 system         public        statement_statistics             node_id                                                                                                   6
+system         public        statement_statistics             p99_latency                                                                                               19
 system         public        statement_statistics             plan                                                                                                      10
 system         public        statement_statistics             plan_hash                                                                                                 4
+system         public        statement_statistics             service_latency                                                                                           15
 system         public        statement_statistics             statistics                                                                                                9
+system         public        statement_statistics             total_estimated_execution_time                                                                            18
 system         public        statement_statistics             transaction_fingerprint_id                                                                                3
 system         public        table_statistics                 avgSize                                                                                                   10
 system         public        table_statistics                 columnIDs                                                                                                 4
@@ -2459,14 +2576,35 @@ system         public        tenants                          id                
 system         public        tenants                          info                                                                                                      3
 system         public        tenants                          name                                                                                                      4
 system         public        tenants                          service_mode                                                                                              6
+system         public        transaction_activity             agg_interval                                                                                              5
+system         public        transaction_activity             aggregated_ts                                                                                             1
+system         public        transaction_activity             app_name                                                                                                  3
+system         public        transaction_activity             contention_time_avg_seconds                                                                               12
+system         public        transaction_activity             cpu_sql_avg_nanos                                                                                         13
+system         public        transaction_activity             execution_count                                                                                           9
+system         public        transaction_activity             execution_total_cluster_seconds                                                                           11
+system         public        transaction_activity             execution_total_seconds                                                                                   10
+system         public        transaction_activity             fingerprint_id                                                                                            2
+system         public        transaction_activity             metadata                                                                                                  6
+system         public        transaction_activity             node_id                                                                                                   4
+system         public        transaction_activity             query                                                                                                     8
+system         public        transaction_activity             service_latency_avg_seconds                                                                               14
+system         public        transaction_activity             service_latency_p99_seconds                                                                               15
+system         public        transaction_activity             statistics                                                                                                7
 system         public        transaction_statistics           agg_interval                                                                                              5
 system         public        transaction_statistics           aggregated_ts                                                                                             1
 system         public        transaction_statistics           app_name                                                                                                  3
+system         public        transaction_statistics           contention_time                                                                                           12
+system         public        transaction_statistics           cpu_sql_nanos                                                                                             11
 system         public        transaction_statistics           crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8                                       8
+system         public        transaction_statistics           execution_count                                                                                           9
 system         public        transaction_statistics           fingerprint_id                                                                                            2
 system         public        transaction_statistics           metadata                                                                                                  6
 system         public        transaction_statistics           node_id                                                                                                   4
+system         public        transaction_statistics           p99_latency                                                                                               14
+system         public        transaction_statistics           service_latency                                                                                           10
 system         public        transaction_statistics           statistics                                                                                                7
+system         public        transaction_statistics           total_estimated_execution_time                                                                            13
 system         public        ui                               key                                                                                                       1
 system         public        ui                               lastUpdated                                                                                               3
 system         public        ui                               value                                                                                                     2
@@ -3489,6 +3627,8 @@ NULL     root     system         public              sqlliveness                
 NULL     root     system         public              sqlliveness                            INSERT          YES           NO
 NULL     root     system         public              sqlliveness                            SELECT          YES           YES
 NULL     root     system         public              sqlliveness                            UPDATE          YES           NO
+NULL     admin    system         public              statement_activity                     SELECT          YES           YES
+NULL     root     system         public              statement_activity                     SELECT          YES           YES
 NULL     admin    system         public              statement_bundle_chunks                DELETE          YES           NO
 NULL     admin    system         public              statement_bundle_chunks                INSERT          YES           NO
 NULL     admin    system         public              statement_bundle_chunks                SELECT          YES           YES
@@ -3557,6 +3697,8 @@ NULL     root     system         public              tenant_usage               
 NULL     root     system         public              tenant_usage                           UPDATE          YES           NO
 NULL     admin    system         public              tenants                                SELECT          YES           YES
 NULL     root     system         public              tenants                                SELECT          YES           YES
+NULL     admin    system         public              transaction_activity                   SELECT          YES           YES
+NULL     root     system         public              transaction_activity                   SELECT          YES           YES
 NULL     admin    system         public              transaction_statistics                 SELECT          YES           YES
 NULL     root     system         public              transaction_statistics                 SELECT          YES           YES
 NULL     admin    system         public              ui                                     DELETE          YES           NO
@@ -4234,6 +4376,10 @@ NULL     root     system         public              tenant_tasks               
 NULL     root     system         public              tenant_tasks                           INSERT          YES           NO
 NULL     root     system         public              tenant_tasks                           SELECT          YES           YES
 NULL     root     system         public              tenant_tasks                           UPDATE          YES           NO
+NULL     admin    system         public              statement_activity                     SELECT          YES           YES
+NULL     root     system         public              statement_activity                     SELECT          YES           YES
+NULL     admin    system         public              transaction_activity                   SELECT          YES           YES
+NULL     root     system         public              transaction_activity                   SELECT          YES           YES
 
 statement ok
 USE other_db;
@@ -5052,6 +5198,7 @@ declare_cursor_statement_timeout_enabled              on
 default_int_size                                      8
 default_table_access_method                           heap
 default_tablespace                                    ·
+default_text_search_config                            pg_catalog.english
 default_transaction_isolation                         serializable
 default_transaction_priority                          normal
 default_transaction_quality_of_service                regular
@@ -5134,6 +5281,7 @@ parallelize_multi_key_lookup_joins_enabled            off
 password_encryption                                   scram-sha-256
 pg_trgm.similarity_threshold                          0.3
 prefer_lookup_joins_for_fks                           off
+prepared_statements_cache_size                        0 B
 propagate_input_ordering                              off
 reorder_joins_limit                                   8
 require_explicit_primary_keys                         off
@@ -5154,6 +5302,7 @@ ssl                                                   on
 ssl_renegotiation_limit                               0
 standard_conforming_strings                           on
 statement_timeout                                     0
+streamer_enabled                                      on
 stub_catalog_tables                                   on
 synchronize_seqscans                                  on
 synchronous_commit                                    on

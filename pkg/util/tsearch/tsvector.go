@@ -18,6 +18,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/blevesearch/snowballstem"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
@@ -118,6 +119,14 @@ func (w tsWeight) TSVectorPGEncoding() (byte, error) {
 		return 0, nil
 	}
 	return 0, errors.Errorf("invalid tsvector weight %d", w)
+}
+
+func (w tsWeight) val() int {
+	b, err := w.TSVectorPGEncoding()
+	if err != nil {
+		panic(err)
+	}
+	return int(b)
 }
 
 // matches returns true if the receiver is matched by the input tsquery weight.
@@ -286,6 +295,10 @@ func (t tsTerm) matchesWeight(targetWeight tsWeight) bool {
 	return false
 }
 
+func (t tsTerm) isPrefixMatch() bool {
+	return len(t.positions) >= 1 && t.positions[0].weight&weightStar != 0
+}
+
 // TSVector is a sorted list of terms, each of which is a lexeme that might have
 // an associated position within an original document.
 type TSVector []tsTerm
@@ -391,34 +404,49 @@ func TSParse(input string) []string {
 // TSLexize implements the "dictionary" construct that's exposed via ts_lexize.
 // It gets invoked once per input token to produce an output lexeme during
 // routines like to_tsvector and to_tsquery.
-func TSLexize(config string, token string) (lexeme string, err error) {
-	if config != "simple" {
-		return "", pgerror.Newf(pgcode.UndefinedObject, "text search configuration %q does not exist", config)
+// It can return true in the second parameter to indicate a stopword was found.
+func TSLexize(config string, token string) (lexeme string, stopWord bool, err error) {
+	stopwords, ok := stopwordsMap[config]
+	if !ok {
+		return "", false, pgerror.Newf(pgcode.UndefinedObject, "text search configuration %q does not exist", config)
 	}
-	return strings.ToLower(token), nil
+
+	lower := strings.ToLower(token)
+	if _, ok := stopwords[lower]; ok {
+		return "", true, nil
+	}
+	stemmer, err := getStemmer(config)
+	if err != nil {
+		return "", false, err
+	}
+	env := snowballstem.NewEnv(lower)
+	stemmer(env)
+	return env.Current(), false, nil
 }
 
 // DocumentToTSVector parses an input document into lexemes, removes stop words,
 // stems and normalizes the lexemes, and returns a TSVector annotated with
 // lexeme positions according to a text search configuration passed by name.
 func DocumentToTSVector(config string, input string) (TSVector, error) {
-	if config != "simple" {
-		return nil, pgerror.Newf(pgcode.UndefinedObject, "text search configuration %q does not exist", config)
-	}
-
 	tokens := TSParse(input)
-	vector := make(TSVector, len(tokens))
+	vector := make(TSVector, 0, len(tokens))
 	for i := range tokens {
-		lexeme, err := TSLexize(config, tokens[i])
+		lexeme, stopWord, err := TSLexize(config, tokens[i])
 		if err != nil {
 			return nil, err
 		}
-		vector[i].lexeme = lexeme
+		if stopWord {
+			continue
+		}
+
+		term := tsTerm{lexeme: lexeme}
 		pos := i + 1
 		if i > maxTSVectorPosition {
+			// Postgres silently truncates positions larger than 16383 to 16383.
 			pos = maxTSVectorPosition
 		}
-		vector[i].positions = []tsPosition{{position: uint16(pos)}}
+		term.positions = []tsPosition{{position: uint16(pos)}}
+		vector = append(vector, term)
 	}
 	return normalizeTSVector(vector)
 }

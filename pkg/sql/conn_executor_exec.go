@@ -453,12 +453,10 @@ func (ex *connExecutor) execStmtInOpenState(
 		name := e.Name.String()
 		ps, ok := ex.extraTxnState.prepStmtsNamespace.prepStmts[name]
 		if !ok {
-			err := pgerror.Newf(
-				pgcode.InvalidSQLStatementName,
-				"prepared statement %q does not exist", name,
-			)
-			return makeErrEvent(err)
+			return makeErrEvent(newPreparedStmtDNEError(ex.sessionData(), name))
 		}
+		ex.extraTxnState.prepStmtsNamespace.touchLRUEntry(name)
+
 		var err error
 		pinfo, err = ex.planner.fillInPlaceholders(ctx, ps, name, e.Params)
 		if err != nil {
@@ -701,19 +699,6 @@ func (ex *connExecutor) execStmtInOpenState(
 	// placed. There are also sequencing point after every stage of
 	// constraint checks and cascading actions at the _end_ of a
 	// statement's execution.
-	//
-	// TODO(knz): At the time of this writing CockroachDB performs
-	// cascading actions and the corresponding FK existence checks
-	// interleaved with mutations. This is incorrect; the correct
-	// behavior, as described in issue
-	// https://github.com/cockroachdb/cockroach/issues/33475, is to
-	// execute cascading actions no earlier than after all the "main
-	// effects" of the current statement (including all its CTEs) have
-	// completed. There should be a sequence point between the end of
-	// the main execution and the start of the cascading actions, as
-	// well as in-between very stage of cascading actions.
-	// This TODO can be removed when the cascading code is reorganized
-	// accordingly and the missing call to Step() is introduced.
 	if err := ex.state.mu.txn.Step(ctx); err != nil {
 		return makeErrEvent(err)
 	}
@@ -1259,8 +1244,6 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	// Prepare the plan. Note, the error is processed below. Everything
 	// between here and there needs to happen even if there's an error.
 	err := ex.makeExecPlan(ctx, planner)
-	// We'll be closing the plan manually below after execution; this
-	// defer is a catch-all in case some other return path is taken.
 	defer planner.curPlan.close(ctx)
 
 	// include gist in error reports
@@ -1342,17 +1325,6 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		panic(err)
 	}
 
-	// We need to set the "exec done" flag early because
-	// curPlan.close(), which will need to observe it, may be closed
-	// during execution (PlanAndRun).
-	//
-	// TODO(knz): This is a mis-design. Andrei says "it's OK if
-	// execution closes the plan" but it transfers responsibility to
-	// run any "finalizers" on the plan (including plan sampling for
-	// stats) to the execution engine. That's a lot of responsibility
-	// to transfer! It would be better if this responsibility remained
-	// around here.
-	planner.curPlan.flags.Set(planFlagExecDone)
 	if !planner.ExecCfg().Codec.ForSystemTenant() {
 		planner.curPlan.flags.Set(planFlagTenant)
 	}
@@ -1399,17 +1371,6 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.extraTxnState.rowsWritten += stats.rowsWritten
 
 	populateQueryLevelStatsAndRegions(ctx, planner, ex.server.cfg, &stats, &ex.cpuStatsCollector)
-
-	// The transaction (from planner.txn) may already have been committed at this point,
-	// due to one-phase commit optimization or an error. Since we use that transaction
-	// on the optimizer, check if is still open before generating index recommendations.
-	if planner.txn.IsOpen() {
-		// Set index recommendations, so it can be saved on statement statistics.
-		// TODO(yuzefovich): figure out whether we want to set isInternalPlanner
-		// to true for the internal executors.
-		isInternal := ex.executorType == executorTypeInternal || planner.isInternalPlanner
-		planner.instrumentation.SetIndexRecommendations(ctx, ex.server.idxRecommendationsCache, planner, isInternal)
-	}
 
 	// Record the statement summary. This also closes the plan if the
 	// plan has not been closed earlier.
@@ -1709,6 +1670,12 @@ func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) erro
 		ex.extraTxnState.numDDL++
 	}
 
+	// Set index recommendations, so it can be saved on statement statistics.
+	// TODO(yuzefovich): figure out whether we want to set isInternalPlanner
+	// to true for the internal executors.
+	isInternal := ex.executorType == executorTypeInternal || planner.isInternalPlanner
+	planner.instrumentation.SetIndexRecommendations(ctx, ex.server.idxRecommendationsCache, planner, isInternal)
+
 	return nil
 }
 
@@ -1736,6 +1703,8 @@ func (s *topLevelQueryStats) add(other *topLevelQueryStats) {
 // runs it.
 // If an error is returned, the connection needs to stop processing queries.
 // Query execution errors are written to res; they are not returned.
+// NB: the plan (in planner.curPlan) is not closed, so it is the caller's
+// responsibility to do so.
 func (ex *connExecutor) execWithDistSQLEngine(
 	ctx context.Context,
 	planner *planner,
@@ -1744,6 +1713,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	distribute DistributionType,
 	progressAtomic *uint64,
 ) (topLevelQueryStats, error) {
+	defer planner.curPlan.savePlanInfo()
 	recv := MakeDistSQLReceiver(
 		ctx, res, stmtType,
 		ex.server.cfg.RangeDescriptorCache,
@@ -1757,42 +1727,48 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	}
 	defer recv.Release()
 
-	evalCtx := planner.ExtendedEvalContext()
-	planCtx := ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner,
-		planner.txn, distribute)
-	planCtx.stmtType = recv.stmtType
-	// Skip the diagram generation since on this "main" query path we can get it
-	// via the statement bundle.
-	planCtx.skipDistSQLDiagramGeneration = true
-	if ex.server.cfg.TestingKnobs.TestingSaveFlows != nil {
-		planCtx.saveFlows = ex.server.cfg.TestingKnobs.TestingSaveFlows(planner.stmt.SQL)
-	} else if planner.instrumentation.ShouldSaveFlows() {
-		planCtx.saveFlows = planCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypeMainQuery)
-	}
-	planCtx.associateNodeWithComponents = planner.instrumentation.getAssociateNodeWithComponentsFn()
-	planCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
+	var err error
 
-	var evalCtxFactory func(usedConcurrently bool) *extendedEvalContext
-	if len(planner.curPlan.subqueryPlans) != 0 ||
-		len(planner.curPlan.cascades) != 0 ||
-		len(planner.curPlan.checkPlans) != 0 {
-		var serialEvalCtx extendedEvalContext
-		ex.initEvalCtx(ctx, &serialEvalCtx, planner)
-		evalCtxFactory = func(usedConcurrently bool) *extendedEvalContext {
-			// Reuse the same object if this factory is not used concurrently.
-			factoryEvalCtx := &serialEvalCtx
-			if usedConcurrently {
-				factoryEvalCtx = &extendedEvalContext{}
-				ex.initEvalCtx(ctx, factoryEvalCtx, planner)
-			}
-			ex.resetEvalCtx(factoryEvalCtx, planner.txn, planner.ExtendedEvalContext().StmtTimestamp)
-			factoryEvalCtx.Placeholders = &planner.semaCtx.Placeholders
-			factoryEvalCtx.Annotations = &planner.semaCtx.Annotations
-			factoryEvalCtx.SessionID = planner.ExtendedEvalContext().SessionID
-			return factoryEvalCtx
+	if planner.hasFlowForPausablePortal() {
+		err = planner.resumeFlowForPausablePortal(recv)
+	} else {
+		evalCtx := planner.ExtendedEvalContext()
+		planCtx := ex.server.cfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, planner,
+			planner.txn, distribute)
+		planCtx.stmtType = recv.stmtType
+		// Skip the diagram generation since on this "main" query path we can get it
+		// via the statement bundle.
+		planCtx.skipDistSQLDiagramGeneration = true
+		if ex.server.cfg.TestingKnobs.TestingSaveFlows != nil {
+			planCtx.saveFlows = ex.server.cfg.TestingKnobs.TestingSaveFlows(planner.stmt.SQL)
+		} else if planner.instrumentation.ShouldSaveFlows() {
+			planCtx.saveFlows = planCtx.getDefaultSaveFlowsFunc(ctx, planner, planComponentTypeMainQuery)
 		}
+		planCtx.associateNodeWithComponents = planner.instrumentation.getAssociateNodeWithComponentsFn()
+		planCtx.collectExecStats = planner.instrumentation.ShouldCollectExecStats()
+
+		var evalCtxFactory func(usedConcurrently bool) *extendedEvalContext
+		if len(planner.curPlan.subqueryPlans) != 0 ||
+			len(planner.curPlan.cascades) != 0 ||
+			len(planner.curPlan.checkPlans) != 0 {
+			var serialEvalCtx extendedEvalContext
+			ex.initEvalCtx(ctx, &serialEvalCtx, planner)
+			evalCtxFactory = func(usedConcurrently bool) *extendedEvalContext {
+				// Reuse the same object if this factory is not used concurrently.
+				factoryEvalCtx := &serialEvalCtx
+				if usedConcurrently {
+					factoryEvalCtx = &extendedEvalContext{}
+					ex.initEvalCtx(ctx, factoryEvalCtx, planner)
+				}
+				ex.resetEvalCtx(factoryEvalCtx, planner.txn, planner.ExtendedEvalContext().StmtTimestamp)
+				factoryEvalCtx.Placeholders = &planner.semaCtx.Placeholders
+				factoryEvalCtx.Annotations = &planner.semaCtx.Annotations
+				factoryEvalCtx.SessionID = planner.ExtendedEvalContext().SessionID
+				return factoryEvalCtx
+			}
+		}
+		err = ex.server.cfg.DistSQLPlanner.PlanAndRunAll(ctx, evalCtx, planCtx, planner, recv, evalCtxFactory)
 	}
-	err := ex.server.cfg.DistSQLPlanner.PlanAndRunAll(ctx, evalCtx, planCtx, planner, recv, evalCtxFactory)
 	return recv.stats, err
 }
 
@@ -2103,7 +2079,7 @@ func (ex *connExecutor) sessionStateBase64() (tree.Datum, error) {
 	// we look at CurState() directly.
 	_, isNoTxn := ex.machine.CurState().(stateNoTxn)
 	state, err := serializeSessionState(
-		!isNoTxn, ex.extraTxnState.prepStmtsNamespace, ex.sessionData(),
+		!isNoTxn, &ex.extraTxnState.prepStmtsNamespace, ex.sessionData(),
 		ex.server.cfg,
 	)
 	if err != nil {

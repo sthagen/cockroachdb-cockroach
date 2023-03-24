@@ -733,7 +733,7 @@ var overrideAlterPrimaryRegionInSuperRegion = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
-var enableMultipleActivePortals = settings.RegisterBoolSetting(
+var EnableMultipleActivePortals = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"sql.pgwire.multiple_active_portals.enabled",
 	"if true, portals with read-only SELECT query without sub/post queries "+
@@ -3488,6 +3488,18 @@ func (m *sessionDataMutator) SetEnableCreateStatsUsingExtremes(val bool) {
 
 func (m *sessionDataMutator) SetAllowRoleMembershipsToChangeDuringTransaction(val bool) {
 	m.data.AllowRoleMembershipsToChangeDuringTransaction = val
+}
+
+func (m *sessionDataMutator) SetDefaultTextSearchConfig(val string) {
+	m.data.DefaultTextSearchConfig = val
+}
+
+func (m *sessionDataMutator) SetPreparedStatementsCacheSize(val int64) {
+	m.data.PreparedStatementsCacheSize = val
+}
+
+func (m *sessionDataMutator) SetStreamerEnabled(val bool) {
+	m.data.StreamerEnabled = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

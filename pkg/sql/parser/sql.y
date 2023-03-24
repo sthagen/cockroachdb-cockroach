@@ -899,7 +899,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 %token <str> COMMITTED COMPACT COMPLETE COMPLETIONS CONCAT CONCURRENTLY CONFIGURATION CONFIGURATIONS CONFIGURE
 %token <str> CONFLICT CONNECTION CONNECTIONS CONSTRAINT CONSTRAINTS CONTAINS CONTROLCHANGEFEED CONTROLJOB
-%token <str> CONVERSION CONVERT COORDINATOR_LOCALITY COPY COST COVERING CREATE CREATEDB CREATELOGIN CREATEROLE
+%token <str> CONVERSION CONVERT COPY COST COVERING CREATE CREATEDB CREATELOGIN CREATEROLE
 %token <str> CROSS CSV CUBE CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_SCHEMA
 %token <str> CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
 %token <str> CURRENT_USER CURSOR CYCLE
@@ -1207,6 +1207,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.Statement> preparable_stmt
 %type <tree.Statement> explainable_stmt
 %type <tree.Statement> row_source_extension_stmt
+%type <tree.Statement> copy_to_stmt
 %type <tree.Statement> export_stmt
 %type <tree.Statement> execute_stmt
 %type <tree.Statement> deallocate_stmt
@@ -3257,9 +3258,9 @@ backup_options:
   {
     $$.val = &tree.BackupOptions{IncrementalStorage: $3.stringOrPlaceholderOptList()}
   }
-| COORDINATOR_LOCALITY '=' string_or_placeholder
+| EXECUTION LOCALITY '=' string_or_placeholder
   {
-    $$.val = &tree.BackupOptions{CoordinatorLocality: $3.expr()}
+    $$.val = &tree.BackupOptions{ExecutionLocality: $4.expr()}
   }
 | INCLUDE_ALL_SECONDARY_TENANTS
   {
@@ -3977,7 +3978,7 @@ copy_stmt:
   {
     return unimplementedWithIssue(sqllex, 97181)
   }
-| COPY '(' preparable_stmt ')' TO STDOUT opt_with_copy_options
+| COPY '(' copy_to_stmt ')' TO STDOUT opt_with_copy_options
    {
      /* FORCE DOC */
      $$.val = &tree.CopyTo{
@@ -3985,7 +3986,7 @@ copy_stmt:
         Options: *$7.copyOptions(),
      }
    }
-| COPY '(' preparable_stmt ')' TO error
+| COPY '(' copy_to_stmt ')' TO error
    {
      return unimplementedWithIssue(sqllex, 96590)
    }
@@ -5677,6 +5678,16 @@ row_source_extension_stmt:
     $$.val = $1.slct()
   }
 | show_stmt         // help texts in sub-rule
+| update_stmt       // EXTEND WITH HELP: UPDATE
+| upsert_stmt       // EXTEND WITH HELP: UPSERT
+
+copy_to_stmt:
+  delete_stmt       // EXTEND WITH HELP: DELETE
+| insert_stmt       // EXTEND WITH HELP: INSERT
+| select_stmt       // help texts in sub-rule
+  {
+    $$.val = $1.slct()
+  }
 | update_stmt       // EXTEND WITH HELP: UPDATE
 | upsert_stmt       // EXTEND WITH HELP: UPSERT
 
@@ -11905,6 +11916,7 @@ returning_clause:
 // %Text:
 // UPDATE <tablename> [[AS] <name>]
 //        SET ...
+//        [FROM <source>]
 //        [WHERE <expr>]
 //        [ORDER BY <exprs...>]
 //        [LIMIT <expr>]
@@ -16261,7 +16273,6 @@ unreserved_keyword:
 | CONTROLJOB
 | CONVERSION
 | CONVERT
-| COORDINATOR_LOCALITY
 | COPY
 | COST
 | COVERING
@@ -16738,7 +16749,6 @@ bare_label_keywords:
 | CONTROLJOB
 | CONVERSION
 | CONVERT
-| COORDINATOR_LOCALITY
 | COPY
 | COST
 | COVERING

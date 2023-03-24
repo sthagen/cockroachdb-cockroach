@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
+	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
 	"github.com/cockroachdb/errors"
 )
 
@@ -1260,6 +1261,23 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return strconv.FormatInt(0, 10)
+		},
+	},
+
+	// See https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-DEFAULT-TEXT-SEARCH-CONFIG
+	`default_text_search_config`: {
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			if err := tsearch.ValidConfig(s); err != nil {
+				return err
+			}
+			m.SetDefaultTextSearchConfig(s)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return evalCtx.SessionData().DefaultTextSearchConfig, nil
+		},
+		GlobalDefault: func(c_ *settings.Values) string {
+			return "pg_catalog.english"
 		},
 	},
 
@@ -2565,6 +2583,43 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().AllowRoleMembershipsToChangeDuringTransaction), nil
 		},
 		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`prepared_statements_cache_size`: {
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			limit, err := humanizeutil.ParseBytes(s)
+			if err != nil {
+				return err
+			}
+			m.SetPreparedStatementsCacheSize(limit)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return string(humanizeutil.IBytes(evalCtx.SessionData().PreparedStatementsCacheSize)), nil
+		},
+		GlobalDefault: func(_ *settings.Values) string {
+			return string(humanizeutil.IBytes(0))
+		},
+	},
+
+	// CockroachDB extension.
+	`streamer_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`streamer_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("streamer_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetStreamerEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().StreamerEnabled), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(execinfra.UseStreamerEnabled.Get(sv))
+		},
 	},
 }
 

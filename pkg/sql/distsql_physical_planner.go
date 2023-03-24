@@ -791,7 +791,10 @@ const (
 // a single query.
 type PlanningCtx struct {
 	ExtendedEvalCtx *extendedEvalContext
-	spanIter        physicalplan.SpanResolverIterator
+
+	localityFilter roachpb.Locality
+
+	spanIter physicalplan.SpanResolverIterator
 	// nodeStatuses contains info for all SQLInstanceIDs that are referenced by
 	// any PhysicalPlan we generate with this context.
 	nodeStatuses map[base.SQLInstanceID]NodeStatus
@@ -881,6 +884,15 @@ func (p *PlanningCtx) EvalContext() *eval.Context {
 // has no remote flows.
 func (p *PlanningCtx) IsLocal() bool {
 	return p.isLocal
+}
+
+// getPortalPauseInfo returns the portal pause info if the current planner is
+// for a pausable portal. Otherwise, returns nil.
+func (p *PlanningCtx) getPortalPauseInfo() *portalPauseInfo {
+	if p.planner != nil && p.planner.pausablePortal != nil && p.planner.pausablePortal.pauseInfo != nil {
+		return p.planner.pausablePortal.pauseInfo
+	}
+	return nil
 }
 
 // getDefaultSaveFlowsFunc returns the default function used to save physical
@@ -1154,13 +1166,13 @@ func (dsp *DistSQLPlanner) PartitionSpans(
 		// If we're planning locally, map all spans to the gateway.
 		return []SpanPartition{{dsp.gatewaySQLInstanceID, spans}}, nil
 	}
-	if dsp.codec.ForSystemTenant() {
-		return dsp.partitionSpansSystem(ctx, planCtx, spans)
+	if dsp.useGossipPlanning(ctx, planCtx) {
+		return dsp.deprecatedPartitionSpansSystem(ctx, planCtx, spans)
 	}
-	return dsp.partitionSpansTenant(ctx, planCtx, spans)
+	return dsp.partitionSpans(ctx, planCtx, spans)
 }
 
-// partitionSpans takes a single span and splits it up according to the owning
+// partitionSpan takes a single span and splits it up according to the owning
 // nodes (if the span touches multiple ranges).
 //
 //   - partitions is the set of SpanPartitions so far. The updated set is
@@ -1266,14 +1278,14 @@ func (dsp *DistSQLPlanner) partitionSpan(
 	return partitions, lastPartitionIdx, nil
 }
 
-// partitionSpansSystem finds node owners for ranges touching the given spans
+// deprecatedPartitionSpansSystem finds node owners for ranges touching the given spans
 // for a system tenant.
-func (dsp *DistSQLPlanner) partitionSpansSystem(
+func (dsp *DistSQLPlanner) deprecatedPartitionSpansSystem(
 	ctx context.Context, planCtx *PlanningCtx, spans roachpb.Spans,
 ) (partitions []SpanPartition, _ error) {
 	nodeMap := make(map[base.SQLInstanceID]int)
 	resolver := func(nodeID roachpb.NodeID) base.SQLInstanceID {
-		return dsp.getSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, nodeID)
+		return dsp.deprecatedSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, nodeID)
 	}
 	for _, span := range spans {
 		var err error
@@ -1287,14 +1299,16 @@ func (dsp *DistSQLPlanner) partitionSpansSystem(
 	return partitions, nil
 }
 
-// partitionSpansTenant assigns SQL instances in a tenant to spans. It performs
-// region-aware physical planning among all available SQL instances if the
-// region information is available on at least some of the instances, and it
-// falls back to naive round-robin assignment if not.
-func (dsp *DistSQLPlanner) partitionSpansTenant(
+// partitionSpans assigns SQL instances to spans. In mixed sql and KV mode it
+// generally assigns each span to the instance hosted on the KV node chosen by
+// the configured replica oracle, while in clusters operating with standalone
+// SQL instances it performs locality-aware physical planning among all
+// available SQL instances if the locality info is available on at least some of
+// the instances, and it falls back to naive round-robin assignment if not.
+func (dsp *DistSQLPlanner) partitionSpans(
 	ctx context.Context, planCtx *PlanningCtx, spans roachpb.Spans,
 ) (partitions []SpanPartition, _ error) {
-	resolver, instances, hasLocalitySet, err := dsp.makeSQLInstanceIDForKVNodeIDTenantResolver(ctx)
+	resolver, instances, err := dsp.makeInstanceResolver(ctx, planCtx.localityFilter)
 	if err != nil {
 		return nil, err
 	}
@@ -1305,7 +1319,7 @@ func (dsp *DistSQLPlanner) partitionSpansTenant(
 		// Rows with column families may have been split into different spans.
 		// These spans should be assigned the same pod so that the pod can
 		// stitch together the rows correctly. Split rows are in adjacent spans.
-		if safeKey, err := keys.EnsureSafeSplitKey(span.Key); err == nil {
+		if safeKey, err := keys.EnsureSafeSplitKey(span.Key); err == nil && len(safeKey) > 0 {
 			if safeKey.Equal(lastKey) {
 				if log.V(1) {
 					log.Infof(ctx, "partitioning span %s", span)
@@ -1323,17 +1337,19 @@ func (dsp *DistSQLPlanner) partitionSpansTenant(
 			return nil, err
 		}
 	}
-	if err = dsp.maybeReassignToGatewaySQLInstance(partitions, instances, hasLocalitySet); err != nil {
-		return nil, err
+	if planCtx.localityFilter.Empty() {
+		if err = dsp.maybeReassignToGatewaySQLInstance(partitions, instances); err != nil {
+			return nil, err
+		}
 	}
 	return partitions, nil
 }
 
-// getSQLInstanceIDForKVNodeIDSystem returns the SQL instance ID that should
+// deprecatedSQLInstanceIDForKVNodeIDSystem returns the SQL instance that should
 // handle the range with the given node ID when planning is done on behalf of
 // the system tenant. It ensures that the chosen SQL instance is healthy and of
 // the compatible DistSQL version.
-func (dsp *DistSQLPlanner) getSQLInstanceIDForKVNodeIDSystem(
+func (dsp *DistSQLPlanner) deprecatedSQLInstanceIDForKVNodeIDSystem(
 	ctx context.Context, planCtx *PlanningCtx, nodeID roachpb.NodeID,
 ) base.SQLInstanceID {
 	sqlInstanceID := base.SQLInstanceID(nodeID)
@@ -1348,57 +1364,111 @@ func (dsp *DistSQLPlanner) getSQLInstanceIDForKVNodeIDSystem(
 	return sqlInstanceID
 }
 
-// makeSQLInstanceIDForKVNodeIDTenantResolver returns a function that can choose
-// the SQL instance ID for a provided node ID on behalf of a tenant. It also
-// returns a list of all healthy instances for the current tenant as well as a
-// boolean indicating whether the locality information is available for at least
-// some of those instances.
-func (dsp *DistSQLPlanner) makeSQLInstanceIDForKVNodeIDTenantResolver(
-	ctx context.Context,
-) (
-	resolver func(roachpb.NodeID) base.SQLInstanceID,
-	_ []sqlinstance.InstanceInfo,
-	hasLocalitySet bool,
-	_ error,
-) {
+// instanceIDForKVNodeHostedInstance returns the SQL instance ID for an
+// instance that is hosted in the process of a KV node. Currently SQL
+// instances run in KV node processes have IDs fixed to be equal to the KV
+// nodes' IDs, and all of the SQL instances for a given tenant are _either_
+// run in this mixed mode or standalone, meaning if this server is in mixed
+// mode, we can safely assume every other server is as well, and thus has
+// IDs matching node IDs.
+func instanceIDForKVNodeHostedInstance(nodeID roachpb.NodeID) base.SQLInstanceID {
+	return base.SQLInstanceID(nodeID)
+}
+
+// makeInstanceResolver returns a function that can choose the SQL instance ID
+// for a provided KV node ID. It also returns a list of all healthy instances if
+// that list was used in choosing an instance, specifically if the localities of
+// those instances were used to decide the assignment, for use by any steps that
+// wish to post-process that assignment (such as adjusting based on localities).
+// If the instance was assigned statically or the instance list had no locality
+// information leading to random assignments then no instance list is returned.
+func (dsp *DistSQLPlanner) makeInstanceResolver(
+	ctx context.Context, locFilter roachpb.Locality,
+) (func(roachpb.NodeID) base.SQLInstanceID, []sqlinstance.InstanceInfo, error) {
+	_, mixedProcessMode := dsp.distSQLSrv.NodeID.OptionalNodeID()
+
+	if mixedProcessMode && locFilter.Empty() {
+		return instanceIDForKVNodeHostedInstance, nil, nil
+	}
+
 	// GetAllInstances only returns healthy instances.
 	// TODO(yuzefovich): confirm that all instances are of compatible version.
 	instances, err := dsp.sqlAddressResolver.GetAllInstances(ctx)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, err
 	}
 	if len(instances) == 0 {
-		return nil, nil, false, errors.New("no healthy sql instances available for planning")
+		return nil, nil, errors.New("no healthy sql instances available for planning")
 	}
 
 	rng, _ := randutil.NewPseudoRand()
 
-	for i := range instances {
-		if instances[i].Locality.NonEmpty() {
-			hasLocalitySet = true
-			break
+	instancesHaveLocality := false
+
+	var gatewayIsEligible bool
+	if locFilter.NonEmpty() {
+		eligible := make([]sqlinstance.InstanceInfo, 0, len(instances))
+		for i := range instances {
+			if ok, _ := instances[i].Locality.Matches(locFilter); ok {
+				eligible = append(eligible, instances[i])
+				if instances[i].InstanceID == dsp.gatewaySQLInstanceID {
+					gatewayIsEligible = true
+				}
+			}
 		}
+		if len(eligible) == 0 {
+			return nil, nil, errors.New("no healthy sql instances available matching locality requirement")
+		}
+		instances = eligible
+		instancesHaveLocality = true
+	} else {
+		for i := range instances {
+			if instances[i].Locality.NonEmpty() {
+				instancesHaveLocality = true
+				break
+			}
+		}
+		gatewayIsEligible = true
 	}
 
 	// If we were able to determine the locality information for at least some
-	// instances, use the region-aware resolver.
-	if hasLocalitySet {
-		resolver = func(nodeID roachpb.NodeID) base.SQLInstanceID {
+	// instances, use the locality-aware resolver.
+	if instancesHaveLocality {
+		resolver := func(nodeID roachpb.NodeID) base.SQLInstanceID {
 			// Lookup the node localities to compare to the instance localities.
 			nodeDesc, err := dsp.nodeDescs.GetNodeDescriptor(nodeID)
 			if err != nil {
 				log.Eventf(ctx, "unable to get node descriptor for KV node %s", nodeID)
 				return dsp.gatewaySQLInstanceID
 			}
+
+			// If we're in mixed-mode, check if the picked node already matches the
+			// locality filter in which case we can just use it.
+			if mixedProcessMode {
+				if ok, _ := nodeDesc.Locality.Matches(locFilter); ok {
+					return instanceIDForKVNodeHostedInstance(nodeID)
+				} else {
+					log.VEventf(ctx, 2,
+						"node %d locality %s does not match locality filter %s, finding alternative placement...",
+						nodeID, nodeDesc.Locality, locFilter,
+					)
+				}
+			}
+
 			// TODO(dt): Pre-compute / cache this result, e.g. in the instance reader.
 			if closest := closestInstances(instances, nodeDesc.Locality); len(closest) > 0 {
 				return closest[rng.Intn(len(closest))]
 			}
+
 			// No instances had any locality tiers in common with the node locality so
-			// just return the gateway.
-			return dsp.gatewaySQLInstanceID
+			// just return the gateway if it is eligible. If it isn't, just pick a
+			// random instance from the eligible instances.
+			if gatewayIsEligible {
+				return dsp.gatewaySQLInstanceID
+			}
+			return instances[rng.Intn(len(instances))].InstanceID
 		}
-		return resolver, instances, hasLocalitySet, nil
+		return resolver, instances, nil
 	}
 
 	// If no sql instances have locality information, fallback to a naive
@@ -1409,12 +1479,12 @@ func (dsp *DistSQLPlanner) makeSQLInstanceIDForKVNodeIDTenantResolver(
 		instances[i], instances[j] = instances[j], instances[i]
 	})
 	var i int
-	resolver = func(roachpb.NodeID) base.SQLInstanceID {
+	resolver := func(roachpb.NodeID) base.SQLInstanceID {
 		id := instances[i%len(instances)].InstanceID
 		i++
 		return id
 	}
-	return resolver, instances, false, nil
+	return resolver, nil, nil
 }
 
 // closestInstances returns the subset of instances which are closest to the
@@ -1445,7 +1515,7 @@ func closestInstances(
 // the locality information isn't available for the instances, then we assume
 // the assigned instance to be in the same region as the gateway.
 func (dsp *DistSQLPlanner) maybeReassignToGatewaySQLInstance(
-	partitions []SpanPartition, instances []sqlinstance.InstanceInfo, hasLocalitySet bool,
+	partitions []SpanPartition, instances []sqlinstance.InstanceInfo,
 ) error {
 	if len(partitions) != 1 || partitions[0].SQLInstanceID == dsp.gatewaySQLInstanceID {
 		// Keep the existing partitioning if more than one instance is used or
@@ -1453,7 +1523,7 @@ func (dsp *DistSQLPlanner) maybeReassignToGatewaySQLInstance(
 		return nil
 	}
 	var gatewayRegion, assignedRegion string
-	if hasLocalitySet {
+	if len(instances) > 0 {
 		assignedInstance := partitions[0].SQLInstanceID
 		var ok bool
 		for _, instance := range instances {
@@ -1480,6 +1550,7 @@ func (dsp *DistSQLPlanner) maybeReassignToGatewaySQLInstance(
 			}
 		}
 	}
+
 	if gatewayRegion == assignedRegion {
 		partitions[0].SQLInstanceID = dsp.gatewaySQLInstanceID
 	}
@@ -1512,14 +1583,19 @@ func (dsp *DistSQLPlanner) getInstanceIDForScan(
 		return 0, err
 	}
 
-	if dsp.codec.ForSystemTenant() {
-		return dsp.getSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, replDesc.NodeID), nil
+	if dsp.useGossipPlanning(ctx, planCtx) && planCtx.localityFilter.Empty() {
+		return dsp.deprecatedSQLInstanceIDForKVNodeIDSystem(ctx, planCtx, replDesc.NodeID), nil
 	}
-	resolver, _, _, err := dsp.makeSQLInstanceIDForKVNodeIDTenantResolver(ctx)
+	resolver, _, err := dsp.makeInstanceResolver(ctx, planCtx.localityFilter)
 	if err != nil {
 		return 0, err
 	}
 	return resolver(replDesc.NodeID), nil
+}
+
+func (dsp *DistSQLPlanner) useGossipPlanning(ctx context.Context, planCtx *PlanningCtx) bool {
+	// TODO(dt): enable this by default, e.g. // && !dsp.distSQLSrv.Settings.Version.IsActive(ctx, clusterversion.V23_1)
+	return dsp.codec.ForSystemTenant() && planCtx.localityFilter.Empty()
 }
 
 // convertOrdering maps the columns in props.ordering to the output columns of a
@@ -4469,7 +4545,9 @@ func (dsp *DistSQLPlanner) NewPlanningCtx(
 	txn *kv.Txn,
 	distributionType DistributionType,
 ) *PlanningCtx {
-	return dsp.NewPlanningCtxWithOracle(ctx, evalCtx, planner, txn, distributionType, physicalplan.DefaultReplicaChooser)
+	return dsp.NewPlanningCtxWithOracle(
+		ctx, evalCtx, planner, txn, distributionType, physicalplan.DefaultReplicaChooser, roachpb.Locality{},
+	)
 }
 
 // NewPlanningCtxWithOracle is a variant of NewPlanningCtx that allows passing a
@@ -4481,11 +4559,13 @@ func (dsp *DistSQLPlanner) NewPlanningCtxWithOracle(
 	txn *kv.Txn,
 	distributionType DistributionType,
 	oracle replicaoracle.Oracle,
+	localityFiler roachpb.Locality,
 ) *PlanningCtx {
 	distribute := distributionType == DistributionTypeAlways || (distributionType == DistributionTypeSystemTenantOnly && evalCtx.Codec.ForSystemTenant())
 	infra := physicalplan.NewPhysicalInfrastructure(uuid.FastMakeV4(), dsp.gatewaySQLInstanceID)
 	planCtx := &PlanningCtx{
 		ExtendedEvalCtx: evalCtx,
+		localityFilter:  localityFiler,
 		infra:           infra,
 		isLocal:         !distribute,
 		planner:         planner,

@@ -1017,7 +1017,8 @@ func TestTxnMultipleCoord(t *testing.T) {
 	}
 
 	// New create a second, leaf coordinator.
-	leafInputState := txn.GetLeafTxnInputState(ctx)
+	leafInputState, err := txn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	txn2 := kv.NewLeafTxn(ctx, s.DB, 0 /* gatewayNodeID */, leafInputState)
 
 	// Start the second transaction.
@@ -2592,7 +2593,8 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 
 	ctx := context.Background()
 	rootTxn := kv.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 
 	// New create a second, leaf coordinator.
 	leafTxn := kv.NewLeafTxn(ctx, s.DB, 0 /* gatewayNodeID */, leafInputState)
@@ -2606,7 +2608,7 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 	// transformed into an UnhandledRetryableError. For our purposes, what this
 	// test is interested in demonstrating is that it's not a
 	// TransactionRetryWithProtoRefreshError.
-	_, err := leafTxn.Get(ctx, roachpb.Key("a"))
+	_, err = leafTxn.Get(ctx, roachpb.Key("a"))
 	if !errors.HasType(err, (*kvpb.UnhandledRetryableError)(nil)) {
 		t.Fatalf("expected UnhandledRetryableError(TransactionAbortedError), got: (%T) %v", err, err)
 	}
@@ -2615,7 +2617,7 @@ func TestLeafTxnClientRejectError(t *testing.T) {
 // Check that ingesting an Aborted txn record is a no-op. The TxnCoordSender is
 // supposed to reject such updates because they risk putting it into an
 // inconsistent state. See comments in TxnCoordSender.UpdateRootWithLeafFinalState().
-func TestUpdateRoootWithLeafFinalStateInAbortedTxn(t *testing.T) {
+func TestUpdateRootWithLeafFinalStateInAbortedTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	s := createTestDBWithKnobs(t, nil /* knobs */)
@@ -2623,7 +2625,8 @@ func TestUpdateRoootWithLeafFinalStateInAbortedTxn(t *testing.T) {
 	ctx := context.Background()
 
 	txn := kv.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
-	leafInputState := txn.GetLeafTxnInputState(ctx)
+	leafInputState, err := txn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, s.DB, 0, leafInputState)
 
 	finalState, err := leafTxn.GetLeafTxnFinalState(ctx)
@@ -2636,7 +2639,8 @@ func TestUpdateRoootWithLeafFinalStateInAbortedTxn(t *testing.T) {
 	}
 
 	// Check that the transaction was not updated.
-	leafInputState2 := txn.GetLeafTxnInputState(ctx)
+	leafInputState2, err := txn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	if leafInputState2.Txn.Status != roachpb.PENDING {
 		t.Fatalf("expected PENDING txn, got: %s", leafInputState2.Txn.Status)
 	}
@@ -3018,4 +3022,38 @@ func TestTxnCoordSenderSetFixedTimestamp(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTxnTypeCompatibleWithBatchRequest tests if a transaction type and a batch
+// request are compatible.
+func TestTxnTypeCompatibleWithBatchRequest(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	s := createTestDB(t)
+	defer s.Stop()
+
+	rootTxn := kv.NewTxn(ctx, s.DB, 0 /* gatewayNodeID */)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
+	leafTxn := kv.NewLeafTxn(ctx, s.DB, 0 /* gatewayNodeID */, leafInputState)
+
+	// a LeafTxn is not compatible with a locking request
+	_, err = leafTxn.GetForUpdate(ctx, roachpb.Key("a"))
+	require.Error(t, err)
+	require.Regexp(t, "LeafTxn .* incompatible with locking request .*", err)
+	err = leafTxn.Put(ctx, roachpb.Key("a"), []byte("b"))
+	require.Error(t, err)
+	require.Regexp(t, "LeafTxn .* incompatible with locking request .*", err)
+	// a LeafTxn is compatible with a non-locking request
+	_, err = leafTxn.Get(ctx, roachpb.Key("a"))
+	require.NoError(t, err)
+
+	// a RootTxn is compatible with all requests
+	_, err = rootTxn.GetForUpdate(ctx, roachpb.Key("a"))
+	require.NoError(t, err)
+	_, err = rootTxn.Get(ctx, roachpb.Key("a"))
+	require.NoError(t, err)
+	err = rootTxn.Put(ctx, roachpb.Key("a"), []byte("b"))
+	require.NoError(t, err)
 }

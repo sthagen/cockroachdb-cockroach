@@ -232,14 +232,16 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 	// boundaries. In fact, if we tried to split at table boundaries, those
 	// splits would quickly be merged away. The only enforced split points are
 	// between secondary tenants (e.g. between /tenant/<id> and /tenant/<id+1>).
-	// So we drop all descriptor split points and replace it with a single split
-	// point at the beginning of this tenant's keyspace.
+	// So we drop all descriptor split points and replace them with split points
+	// at the beginning and end of this tenant's keyspace.
 	if ms.codec.ForSystemTenant() {
 		for _, id := range ms.otherSplitIDs {
 			splits = append(splits, roachpb.RKey(ms.codec.TablePrefix(id)))
 		}
 	} else {
-		splits = []roachpb.RKey{roachpb.RKey(ms.codec.TenantPrefix())}
+		tenantStartKey := roachpb.RKey(ms.codec.TenantPrefix())
+		tenantEndKey := tenantStartKey.PrefixEnd()
+		splits = []roachpb.RKey{tenantStartKey, tenantEndKey}
 	}
 
 	// Other key/value generation that doesn't fit into databases and
@@ -273,11 +275,16 @@ func InitialValuesToString(ms MetadataSchema) string {
 	for _, kv := range kvs {
 		records = append(records, record{k: kv.Key, v: kv.Value.TagAndDataBytes()})
 	}
+	p := ms.codec.TenantPrefix()
+	pNext := p.PrefixEnd()
 	for _, s := range splits {
+		// Filter out the tenant end key because it does not have the same prefix.
+		if bytes.HasPrefix(s, pNext) {
+			continue
+		}
 		records = append(records, record{k: s})
 	}
 	// Strip the tenant prefix if there is one.
-	p := []byte(ms.codec.TenantPrefix())
 	for i, r := range records {
 		if !bytes.Equal(p, r.k[:len(p)]) {
 			panic("unexpected prefix")
@@ -339,6 +346,10 @@ func InitialValuesFromString(
 			kv.Value.SetTagAndData(v)
 			kvs = append(kvs, kv)
 		}
+	}
+	// Add back the filtered out tenant end key.
+	if !codec.ForSystemTenant() {
+		splits = append(splits, roachpb.RKey(p.PrefixEnd()))
 	}
 	return kvs, splits, nil
 }
@@ -457,6 +468,8 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 	target.AddDescriptor(systemschema.SpanStatsTenantBoundariesTable)
 	target.AddDescriptorForSystemTenant(systemschema.SystemTaskPayloadsTable)
 	target.AddDescriptorForSystemTenant(systemschema.SystemTenantTasksTable)
+	target.AddDescriptor(systemschema.StatementActivityTable)
+	target.AddDescriptor(systemschema.TransactionActivityTable)
 
 	// Adding a new system table? It should be added here to the metadata schema,
 	// and also created as a migration for older clusters.
@@ -468,7 +481,7 @@ func addSystemDescriptorsToSchema(target *MetadataSchema) {
 // NumSystemTablesForSystemTenant is the number of system tables defined on
 // the system tenant. This constant is only defined to avoid having to manually
 // update auto stats tests every time a new system table is added.
-const NumSystemTablesForSystemTenant = 48
+const NumSystemTablesForSystemTenant = 50
 
 // addSplitIDs adds a split point for each of the PseudoTableIDs to the supplied
 // MetadataSchema.

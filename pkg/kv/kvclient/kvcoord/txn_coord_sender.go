@@ -195,7 +195,7 @@ type txnInterceptor interface {
 
 	// importLeafFinalState updates any internal state held inside the
 	// interceptor from the given LeafTxn final state.
-	importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState)
+	importLeafFinalState(context.Context, *roachpb.LeafTxnFinalState) error
 
 	// epochBumpedLocked resets the interceptor in the case of a txn epoch
 	// increment.
@@ -475,12 +475,16 @@ func (tc *TxnCoordSender) Send(
 ) (*kvpb.BatchResponse, *kvpb.Error) {
 	// NOTE: The locking here is unusual. Although it might look like it, we are
 	// NOT holding the lock continuously for the duration of the Send. We lock
-	// here, and unlock at the botton of the interceptor stack, in the
-	// txnLockGatekeeper. The we lock again in that interceptor when the response
+	// here, and unlock at the bottom of the interceptor stack, in the
+	// txnLockGatekeeper. Then we lock again in that interceptor when the response
 	// comes, and unlock again in the defer below.
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	tc.mu.active = true
+
+	if pErr := tc.maybeRejectIncompatibleRequest(ctx, ba); pErr != nil {
+		return nil, pErr
+	}
 
 	if pErr := tc.maybeRejectClientLocked(ctx, ba); pErr != nil {
 		return nil, pErr
@@ -665,6 +669,26 @@ func (tc *TxnCoordSender) maybeCommitWait(ctx context.Context, deferred bool) er
 	log.VEventf(ctx, 2, "completed commit-wait sleep, took %s", after.Sub(before))
 	tc.metrics.CommitWaits.Inc(1)
 	return nil
+}
+
+// maybeRejectIncompatibleRequest checks if the TxnCoordSender is compatible with
+// a given BatchRequest.
+// Specifically, a Leaf TxnCoordSender is not compatible with locking requests.
+func (tc *TxnCoordSender) maybeRejectIncompatibleRequest(
+	ctx context.Context, ba *kvpb.BatchRequest,
+) *kvpb.Error {
+	switch tc.typ {
+	case kv.RootTxn:
+		return nil
+	case kv.LeafTxn:
+		if ba.IsLocking() {
+			return kvpb.NewError(errors.WithContextTags(errors.AssertionFailedf(
+				"LeafTxn %s incompatible with locking request %s", tc.mu.txn, ba.Summary()), ctx))
+		}
+		return nil
+	default:
+		panic("unexpected TxnType")
+	}
 }
 
 // maybeRejectClientLocked checks whether the transaction is in a state that
@@ -1146,14 +1170,15 @@ func (tc *TxnCoordSender) Active() bool {
 
 // GetLeafTxnInputState is part of the client.TxnSender interface.
 func (tc *TxnCoordSender) GetLeafTxnInputState(
-	ctx context.Context, opt kv.TxnStatusOpt,
+	ctx context.Context,
 ) (*roachpb.LeafTxnInputState, error) {
 	tis := new(roachpb.LeafTxnInputState)
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	if err := tc.checkTxnStatusLocked(ctx, opt); err != nil {
-		return nil, err
+	pErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
+	if pErr != nil {
+		return nil, pErr.GoError()
 	}
 
 	// Copy mutable state so access is safe for the caller.
@@ -1173,15 +1198,20 @@ func (tc *TxnCoordSender) GetLeafTxnInputState(
 
 // GetLeafTxnFinalState is part of the client.TxnSender interface.
 func (tc *TxnCoordSender) GetLeafTxnFinalState(
-	ctx context.Context, opt kv.TxnStatusOpt,
+	ctx context.Context,
 ) (*roachpb.LeafTxnFinalState, error) {
 	tfs := new(roachpb.LeafTxnFinalState)
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	if err := tc.checkTxnStatusLocked(ctx, opt); err != nil {
-		return nil, err
-	}
+	// TODO(nvanbenschoten): should we be calling maybeRejectClientLocked here?
+	// The caller in execinfra.GetLeafTxnFinalState is not set up to propagate
+	// errors, so for now, we don't.
+	//
+	//   pErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
+	//   if pErr != nil {
+	//   	return nil, pErr.GoError()
+	//   }
 
 	// For compatibility with pre-20.1 nodes: populate the command
 	// count.
@@ -1200,26 +1230,10 @@ func (tc *TxnCoordSender) GetLeafTxnFinalState(
 	return tfs, nil
 }
 
-func (tc *TxnCoordSender) checkTxnStatusLocked(ctx context.Context, opt kv.TxnStatusOpt) error {
-	switch opt {
-	case kv.AnyTxnStatus:
-		// Nothing to check.
-	case kv.OnlyPending:
-		// Check the coordinator's proto status.
-		rejectErr := tc.maybeRejectClientLocked(ctx, nil /* ba */)
-		if rejectErr != nil {
-			return rejectErr.GoError()
-		}
-	default:
-		panic("unreachable")
-	}
-	return nil
-}
-
 // UpdateRootWithLeafFinalState is part of the client.TxnSender interface.
 func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 	ctx context.Context, tfs *roachpb.LeafTxnFinalState,
-) {
+) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
@@ -1229,7 +1243,7 @@ func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 
 	// Sanity check: don't combine if the tfs is for a different txn ID.
 	if tc.mu.txn.ID != tfs.Txn.ID {
-		return
+		return errors.AssertionFailedf("mismatched root id %s and leaf id %s", tc.mu.txn.ID, tfs.Txn.ID)
 	}
 
 	// If the LeafTxnFinalState is telling us the transaction has been
@@ -1247,13 +1261,17 @@ func (tc *TxnCoordSender) UpdateRootWithLeafFinalState(
 	// as any error is received from DistSQL, which would eliminate
 	// qualms about what error comes first.
 	if tfs.Txn.Status != roachpb.PENDING {
-		return
+		return nil
 	}
 
 	tc.mu.txn.Update(&tfs.Txn)
 	for _, reqInt := range tc.interceptorStack {
-		reqInt.importLeafFinalState(ctx, tfs)
+		err := reqInt.importLeafFinalState(ctx, tfs)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // TestingCloneTxn is part of the client.TxnSender interface.
@@ -1286,6 +1304,13 @@ func (tc *TxnCoordSender) Step(ctx context.Context) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return tc.interceptorAlloc.txnSeqNumAllocator.stepLocked(ctx)
+}
+
+// GetReadSeqNum is part of the TxnSender interface.
+func (tc *TxnCoordSender) GetReadSeqNum() enginepb.TxnSeq {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.interceptorAlloc.txnSeqNumAllocator.readSeq
 }
 
 // SetReadSeqNum is part of the TxnSender interface.

@@ -750,8 +750,28 @@ func (dsp *DistSQLPlanner) Run(
 			// TODO(yuzefovich): fix the propagation of the lock spans with the
 			// leaf txns and remove this check. See #94290.
 			containsNonDefaultLocking := planCtx.planner != nil && planCtx.planner.curPlan.flags.IsSet(planFlagContainsNonDefaultLocking)
-			if !containsNonDefaultLocking {
-				if execinfra.CanUseStreamer(dsp.st) {
+
+			// We also currently disable the usage of the Streamer API whenever
+			// we have a wrapped planNode. This is done to prevent scenarios
+			// where some of planNodes will use the RootTxn (via the internal
+			// executor) which prohibits the usage of the LeafTxn for this flow.
+			//
+			// Note that we're disallowing the Streamer API in more cases than
+			// strictly necessary (i.e. there are planNodes that don't use the
+			// txn at all), but auditing each planNode implementation to see
+			// which are using the internal executor is error-prone, so we just
+			// disable the Streamer API for the "super-set" of problematic
+			// cases.
+			mustUseRootTxn := func() bool {
+				for _, p := range plan.Processors {
+					if p.Spec.Core.LocalPlanNode != nil {
+						return true
+					}
+				}
+				return false
+			}()
+			if !containsNonDefaultLocking && !mustUseRootTxn {
+				if evalCtx.SessionData().StreamerEnabled {
 					for _, proc := range plan.Processors {
 						if jr := proc.Spec.Core.JoinReader; jr != nil {
 							// Both index and lookup joins, with and without
@@ -766,7 +786,7 @@ func (dsp *DistSQLPlanner) Run(
 		}
 		if localState.MustUseLeafTxn() {
 			// Set up leaf txns using the txnCoordMeta if we need to.
-			tis, err := txn.GetLeafTxnInputStateOrRejectClient(ctx)
+			tis, err := txn.GetLeafTxnInputState(ctx)
 			if err != nil {
 				log.Infof(ctx, "%s: %s", clientRejectedMsg, err)
 				recv.SetError(err)
@@ -833,14 +853,31 @@ func (dsp *DistSQLPlanner) Run(
 	if planCtx.planner != nil {
 		statementSQL = planCtx.planner.stmt.StmtNoConstants
 	}
-	ctx, flow, err := dsp.setupFlows(
-		ctx, evalCtx, planCtx, leafInputState, flows, recv, localState, statementSQL,
-	)
-	// Make sure that the local flow is always cleaned up if it was created.
+
+	var flow flowinfra.Flow
+	var err error
+	if i := planCtx.getPortalPauseInfo(); i != nil && i.flow != nil {
+		flow = i.flow
+	} else {
+		ctx, flow, err = dsp.setupFlows(
+			ctx, evalCtx, planCtx, leafInputState, flows, recv, localState, statementSQL,
+		)
+		if i != nil {
+			i.flow = flow
+			i.outputTypes = plan.GetResultTypes()
+		}
+	}
+
 	if flow != nil {
-		defer func() {
-			flow.Cleanup(ctx)
-		}()
+		// Make sure that the local flow is always cleaned up if it was created.
+		// If the flow is not for retained portal, we clean the flow up here.
+		// Otherwise, we delay the clean up via portalPauseInfo.flowCleanup until
+		// the portal is closed.
+		if planCtx.getPortalPauseInfo() == nil {
+			defer func() {
+				flow.Cleanup(ctx)
+			}()
+		}
 	}
 	if err != nil {
 		recv.SetError(err)
@@ -863,7 +900,8 @@ func (dsp *DistSQLPlanner) Run(
 		return
 	}
 
-	flow.Run(ctx)
+	noWait := planCtx.getPortalPauseInfo() != nil
+	flow.Run(ctx, noWait)
 }
 
 // DistSQLReceiver is an execinfra.RowReceiver and execinfra.BatchReceiver that
@@ -1560,6 +1598,8 @@ func getFinishedSetupFn(planner *planner) (finishedSetupFn func(flowinfra.Flow),
 // PlanAndRunAll combines running the main query, subqueries and cascades/checks.
 // If an error is returned, the connection needs to stop processing queries.
 // Query execution errors stored in recv; they are not returned.
+// NB: the plan (in planner.curPlan) is not closed, so it is the caller's
+// responsibility to do so.
 func (dsp *DistSQLPlanner) PlanAndRunAll(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
@@ -1568,7 +1608,6 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 	recv *DistSQLReceiver,
 	evalCtxFactory func(usedConcurrently bool) *extendedEvalContext,
 ) error {
-	defer planner.curPlan.close(ctx)
 	if len(planner.curPlan.subqueryPlans) != 0 {
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we

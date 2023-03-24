@@ -3765,7 +3765,6 @@ value if you rely on the HLC for accuracy.`,
 	"jsonb_to_tsvector":              makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"ts_delete":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"ts_filter":                      makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
-	"ts_rank":                        makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"ts_rank_cd":                     makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"ts_rewrite":                     makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
 	"tsquery_phrase":                 makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 7821, Category: builtinconstants.CategoryFullTextSearch}),
@@ -7704,7 +7703,7 @@ expires until the statement bundle is collected`,
 			},
 			types.String,
 			"Removes constants from a SQL statement. String provided must contain at most "+
-				"1 statement.",
+				"1 statement. (Hint: one way to easily quote arbitrary SQL is to use dollar-quotes.)",
 			volatility.Immutable,
 		),
 		tree.Overload{
@@ -7741,7 +7740,8 @@ expires until the statement bundle is collected`,
 				return result, nil
 			},
 			Info: "Hide constants for each element in an array of SQL statements. " +
-				"Note that maximum 1 statement is permitted per string element.",
+				"Note that maximum 1 statement is permitted per string element. (Hint: one way to easily " +
+				"quote arbitrary SQL is to use dollar-quotes.)",
 			Volatility: volatility.Immutable,
 		},
 	),
@@ -7780,7 +7780,8 @@ expires until the statement bundle is collected`,
 			},
 			types.String,
 			"Surrounds constants in SQL statement with redaction markers. String provided must "+
-				"contain at most 1 statement.",
+				"contain at most 1 statement. (Hint: one way to easily quote arbitrary SQL is to use "+
+				"dollar-quotes.)",
 			volatility.Immutable,
 		),
 		tree.Overload{
@@ -7817,7 +7818,8 @@ expires until the statement bundle is collected`,
 				return result, nil
 			},
 			Info: "Surrounds constants with redaction markers for each element in an array of SQL " +
-				"statements. Note that maximum 1 statement is permitted per string element.",
+				"statements. Note that maximum 1 statement is permitted per string element. (Hint: one " +
+				"way to easily quote arbitrary SQL is to use dollar-quotes.)",
 			Volatility: volatility.Immutable,
 		},
 	),

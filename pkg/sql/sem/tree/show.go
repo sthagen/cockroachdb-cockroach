@@ -21,6 +21,7 @@ package tree
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/errors"
@@ -221,24 +222,25 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.FormatNode(&o.DecryptionKMSURI)
 	}
 	if o.DebugMetadataSST {
+		maybeAddSep()
 		ctx.WriteString("debug_dump_metadata_sst")
 	}
 
 	// The following are only used in connection-check SHOW.
-	if o.CheckConnectionTransferSize != nil {
+	if o.CheckConnectionConcurrency != nil {
 		maybeAddSep()
-		ctx.WriteString("TRANSFER = ")
-		ctx.FormatNode(o.CheckConnectionTransferSize)
+		ctx.WriteString("CONCURRENTLY = ")
+		ctx.FormatNode(o.CheckConnectionConcurrency)
 	}
 	if o.CheckConnectionDuration != nil {
 		maybeAddSep()
 		ctx.WriteString("TIME = ")
 		ctx.FormatNode(o.CheckConnectionDuration)
 	}
-	if o.CheckConnectionConcurrency != nil {
+	if o.CheckConnectionTransferSize != nil {
 		maybeAddSep()
-		ctx.WriteString("CONCURRENTLY = ")
-		ctx.FormatNode(o.CheckConnectionConcurrency)
+		ctx.WriteString("TRANSFER = ")
+		ctx.FormatNode(o.CheckConnectionTransferSize)
 	}
 }
 
@@ -344,7 +346,7 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 	}
 
 	o.CheckConnectionConcurrency, err = combineExpr(o.CheckConnectionConcurrency, other.CheckConnectionConcurrency,
-		"time")
+		"concurrently")
 	if err != nil {
 		return err
 	}
@@ -1107,12 +1109,16 @@ func (node *ShowTenant) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW TENANT ")
 	ctx.FormatNode(node.TenantSpec)
 
+	withs := []string{}
 	if node.WithReplication {
-		ctx.WriteString(" WITH REPLICATION STATUS")
+		withs = append(withs, "REPLICATION STATUS")
 	}
-
 	if node.WithCapabilities {
-		ctx.WriteString(" WITH CAPABILITIES")
+		withs = append(withs, "CAPABILITIES")
+	}
+	if len(withs) > 0 {
+		ctx.WriteString(" WITH ")
+		ctx.WriteString(strings.Join(withs, ", "))
 	}
 }
 

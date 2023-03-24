@@ -180,6 +180,7 @@ describe("rest api", function () {
               },
             ],
           },
+          // Database span stats query
           {
             rows: [
               {
@@ -195,24 +196,22 @@ describe("rest api", function () {
 
       return clusterUiApi.getDatabaseDetails(dbName).then(result => {
         expect(fetchMock.calls(clusterUiApi.SQL_API_PATH).length).toBe(1);
-        expect(result.results.id_resp.database_id).toEqual("1");
-        expect(result.results.tables_resp.tables.length).toBe(1);
-        expect(result.results.grants_resp.grants.length).toBe(2);
-        expect(result.results.stats.index_stats.num_index_recommendations).toBe(
+        expect(result.results.idResp.database_id).toEqual("1");
+        expect(result.results.tablesResp.tables.length).toBe(1);
+        expect(result.results.grantsResp.grants.length).toBe(2);
+        expect(result.results.stats.indexStats.num_index_recommendations).toBe(
           1,
         );
-        expect(result.results.zone_config_resp.zone_config).toEqual(
+        expect(result.results.zoneConfigResp.zone_config).toEqual(
           mockZoneConfig,
         );
-        expect(result.results.zone_config_resp.zone_config_level).toBe(
+        expect(result.results.zoneConfigResp.zone_config_level).toBe(
           ZoneConfigurationLevel.DATABASE,
         );
-        expect(result.results.stats.pebble_data.approximate_disk_bytes).toBe(
-          100,
-        );
-        expect(result.results.stats.ranges_data.live_bytes).toBe(200);
-        expect(result.results.stats.ranges_data.total_bytes).toBe(300);
-        expect(result.results.stats.ranges_data.range_count).toBe(400);
+        expect(result.results.stats.spanStats.approximate_disk_bytes).toBe(100);
+        expect(result.results.stats.spanStats.live_bytes).toBe(200);
+        expect(result.results.stats.spanStats.total_bytes).toBe(300);
+        expect(result.results.stats.spanStats.range_count).toBe(400);
       });
     });
 
@@ -306,7 +305,7 @@ describe("rest api", function () {
           // Table schema details query
           { rows: [{ columns: ["a", "b", "c"], indexes: ["d", "e"] }] },
           // Table create statement query
-          { rows: [{ statement: "mock create stmt" }] },
+          { rows: [{ create_statement: "mock create stmt" }] },
           // Table zone config statement query
           { rows: [{ raw_config_sql: "mock zone config stmt" }] },
           // Table heuristics query
@@ -360,7 +359,7 @@ describe("rest api", function () {
           expect(resp.results.grantsResp.grants.length).toBe(1);
           expect(resp.results.schemaDetails.columns.length).toBe(3);
           expect(resp.results.schemaDetails.indexes.length).toBe(2);
-          expect(resp.results.createStmtResp.statement).toBe(
+          expect(resp.results.createStmtResp.create_statement).toBe(
             "mock create stmt",
           );
           expect(resp.results.zoneConfigResp.configure_zone_statement).toBe(

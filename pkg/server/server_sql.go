@@ -52,12 +52,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	// Ensure the auto config runner job is registered to avoid log spam.
+	// Pending merge of https://github.com/cockroachdb/cockroach/pull/98466.
+	_ "github.com/cockroachdb/cockroach/pkg/server/autoconfig"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/server/tracedumper"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -100,6 +104,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slprovider"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilegecache"
@@ -482,7 +487,14 @@ func (r *refreshInstanceSessionListener) OnSessionDeleted(
 				continue
 			}
 			if _, err := r.cfg.sqlInstanceStorage.CreateNodeInstance(
-				ctx, s.ID(), s.Expiration(), r.cfg.AdvertiseAddr, r.cfg.SQLAdvertiseAddr, r.cfg.Locality, nodeID,
+				ctx,
+				s.ID(),
+				s.Expiration(),
+				r.cfg.AdvertiseAddr,
+				r.cfg.SQLAdvertiseAddr,
+				r.cfg.Locality,
+				r.cfg.Settings.Version.BinaryVersion(),
+				nodeID,
 			); err != nil {
 				log.Warningf(ctx, "failed to update instance with new session ID: %v", err)
 				continue
@@ -1332,6 +1344,12 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	vmoduleSetting.SetOnChange(&cfg.Settings.SV, fn)
 	fn(ctx)
 
+	sql.EnableMultipleActivePortals.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
+		if sql.EnableMultipleActivePortals.Get(&cfg.Settings.SV) {
+			telemetry.Inc(sqltelemetry.MultipleActivePortalCounter)
+		}
+	})
+
 	return &SQLServer{
 		ambientCtx:                     cfg.BaseConfig.AmbientCtx,
 		stopper:                        cfg.stopper,
@@ -1432,14 +1450,27 @@ func (s *SQLServer) preStart(
 	if hasNodeID {
 		// Write/acquire our instance row.
 		instance, err = s.sqlInstanceStorage.CreateNodeInstance(
-			ctx, session.ID(), session.Expiration(), s.cfg.AdvertiseAddr, s.cfg.SQLAdvertiseAddr, s.distSQLServer.Locality, nodeID,
+			ctx,
+			session.ID(),
+			session.Expiration(),
+			s.cfg.AdvertiseAddr,
+			s.cfg.SQLAdvertiseAddr,
+			s.distSQLServer.Locality,
+			s.execCfg.Settings.Version.BinaryVersion(),
+			nodeID,
 		)
 		if err != nil {
 			return err
 		}
 	} else {
 		instance, err = s.sqlInstanceStorage.CreateInstance(
-			ctx, session.ID(), session.Expiration(), s.cfg.AdvertiseAddr, s.cfg.SQLAdvertiseAddr, s.distSQLServer.Locality,
+			ctx,
+			session.ID(),
+			session.Expiration(),
+			s.cfg.AdvertiseAddr,
+			s.cfg.SQLAdvertiseAddr,
+			s.distSQLServer.Locality,
+			s.execCfg.Settings.Version.BinaryVersion(),
 		)
 		if err != nil {
 			return err

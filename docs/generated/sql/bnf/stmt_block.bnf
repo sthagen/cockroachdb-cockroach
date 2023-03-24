@@ -66,7 +66,7 @@ analyze_stmt ::=
 copy_stmt ::=
 	'COPY' table_name opt_column_list 'FROM' 'STDIN' opt_with_copy_options opt_where_clause
 	| 'COPY' table_name opt_column_list 'TO' 'STDOUT' opt_with_copy_options
-	| 'COPY' '(' preparable_stmt ')' 'TO' 'STDOUT' opt_with_copy_options
+	| 'COPY' '(' copy_to_stmt ')' 'TO' 'STDOUT' opt_with_copy_options
 
 comment_stmt ::=
 	'COMMENT' 'ON' 'DATABASE' database_name 'IS' comment_text
@@ -331,6 +331,13 @@ opt_with_copy_options ::=
 opt_where_clause ::=
 	where_clause
 	| 
+
+copy_to_stmt ::=
+	delete_stmt
+	| insert_stmt
+	| select_stmt
+	| update_stmt
+	| upsert_stmt
 
 database_name ::=
 	name
@@ -1063,7 +1070,6 @@ unreserved_keyword ::=
 	| 'CONTROLJOB'
 	| 'CONVERSION'
 	| 'CONVERT'
-	| 'COORDINATOR_LOCALITY'
 	| 'COPY'
 	| 'COST'
 	| 'COVERING'
@@ -2297,7 +2303,7 @@ backup_options ::=
 	| 'DETACHED' '=' 'FALSE'
 	| 'KMS' '=' string_or_placeholder_opt_list
 	| 'INCREMENTAL_LOCATION' '=' string_or_placeholder_opt_list
-	| 'COORDINATOR_LOCALITY' '=' string_or_placeholder
+	| 'EXECUTION' 'LOCALITY' '=' string_or_placeholder
 	| 'INCLUDE_ALL_SECONDARY_TENANTS'
 	| 'INCLUDE_ALL_SECONDARY_TENANTS' '=' a_expr
 
@@ -3541,7 +3547,6 @@ bare_label_keywords ::=
 	| 'CONTROLJOB'
 	| 'CONVERSION'
 	| 'CONVERT'
-	| 'COORDINATOR_LOCALITY'
 	| 'COPY'
 	| 'COST'
 	| 'COVERING'

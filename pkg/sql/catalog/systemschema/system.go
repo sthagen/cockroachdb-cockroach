@@ -120,10 +120,22 @@ CREATE TABLE system.tenants (
 	RoleIDSequenceSchema = `
 CREATE SEQUENCE system.role_id_seq START 100 MINVALUE 100 MAXVALUE 2147483647;`
 
-	indexUsageComputeExpr = `(statistics->'statistics':::STRING)->'indexes':::STRING`
+	indexUsageComputeExpr           = `(statistics->'statistics':::STRING)->'indexes':::STRING`
+	executionCountComputeExpr       = `((statistics->'statistics':::STRING)->'cnt':::STRING)::INT8`
+	serviceLatencyComputeExpr       = `(((statistics->'statistics':::STRING)->'svcLat':::STRING)->'mean':::STRING)::FLOAT8`
+	cpuSqlNanosComputeExpr          = `(((statistics->'execution_statistics':::STRING)->'cpuSQLNanos':::STRING)->'mean':::STRING)::FLOAT8`
+	contentionTimeComputeExpr       = `(((statistics->'execution_statistics':::STRING)->'contentionTime':::STRING)->'mean':::STRING)::FLOAT8`
+	totalEstimatedExecutionTimeExpr = `((statistics->'statistics':::STRING)->'cnt':::STRING)::FLOAT8 * (((statistics->'statistics':::STRING)->'svcLat':::STRING)->>'mean':::STRING)::FLOAT8`
+	p99LatencyComputeExpr           = `(((statistics->'statistics':::STRING)->'latencyInfo':::STRING)->'p99':::STRING)::FLOAT8`
 )
 
 var indexUsageComputeExprStr = indexUsageComputeExpr
+var executionCountComputeExprStr = executionCountComputeExpr
+var serviceLatencyComputeExprStr = serviceLatencyComputeExpr
+var cpuSqlNanosComputeExprStr = cpuSqlNanosComputeExpr
+var contentionTimeComputeExprStr = contentionTimeComputeExpr
+var totalEstimatedExecutionTimeExprStr = totalEstimatedExecutionTimeExpr
+var p99LatencyComputeExprStr = p99LatencyComputeExpr
 
 // These system tables are not part of the system config.
 const (
@@ -234,7 +246,7 @@ CREATE TABLE system.web_sessions (
 	"revokedAt"    TIMESTAMP,
 	"lastUsedAt"   TIMESTAMP  NOT NULL DEFAULT now(),
 	"auditInfo"    STRING,
-	user_id        OID,
+	user_id        OID        NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (id),
 	INDEX ("expiresAt"),
 	INDEX ("createdAt"),
@@ -528,11 +540,23 @@ CREATE TABLE system.statement_statistics (
 
     index_recommendations STRING[] NOT NULL DEFAULT (array[]::STRING[]),
     indexes_usage JSONB AS (` + indexUsageComputeExpr + `) VIRTUAL,
+    execution_count INT8 AS (` + executionCountComputeExpr + `) STORED,
+    service_latency FLOAT AS (` + serviceLatencyComputeExpr + `) STORED,
+    cpu_sql_nanos FLOAT AS (` + cpuSqlNanosComputeExpr + `) STORED,
+    contention_time FLOAT AS (` + contentionTimeComputeExpr + `) STORED,
+    total_estimated_execution_time FLOAT AS (` + totalEstimatedExecutionTimeExpr + `) STORED,
+    p99_latency FLOAT8 AS (` + p99LatencyComputeExpr + `) STORED,
 
     CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, transaction_fingerprint_id, plan_hash, app_name, node_id)
       USING HASH WITH (bucket_count=8),
     INDEX "fingerprint_stats_idx" (fingerprint_id, transaction_fingerprint_id),
     INVERTED INDEX "indexes_usage_idx" (indexes_usage),
+    INDEX "execution_count_idx" (aggregated_ts, app_name, execution_count DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "service_latency_idx" (aggregated_ts, app_name, service_latency DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "cpu_sql_nanos_idx" (aggregated_ts, app_name, cpu_sql_nanos DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "contention_time_idx" (aggregated_ts, app_name, contention_time DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "total_estimated_execution_time_idx" (aggregated_ts, app_name, total_estimated_execution_time DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "p99_latency_idx" (aggregated_ts, app_name, p99_latency DESC) WHERE app_name NOT LIKE '$ internal%',
 		FAMILY "primary" (
 			crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8,
 			aggregated_ts,
@@ -545,7 +569,13 @@ CREATE TABLE system.statement_statistics (
 			metadata,
 			statistics,
 			plan,
-			index_recommendations
+			index_recommendations,
+			execution_count,
+			service_latency,
+			cpu_sql_nanos,
+			contention_time,
+			total_estimated_execution_time,
+			p99_latency
 		)
 )
 `
@@ -564,10 +594,22 @@ CREATE TABLE system.transaction_statistics (
     crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8 INT4 NOT VISIBLE NOT NULL AS (
       mod(fnv32("crdb_internal.datums_to_bytes"(aggregated_ts, app_name, fingerprint_id, node_id)), 8:::INT8
     )) STORED,
+    execution_count INT8 AS (` + executionCountComputeExpr + `) STORED,
+    service_latency FLOAT AS (` + serviceLatencyComputeExpr + `) STORED,
+    cpu_sql_nanos FLOAT AS (` + cpuSqlNanosComputeExpr + `) STORED,
+    contention_time FLOAT AS (` + contentionTimeComputeExpr + `) STORED,
+    total_estimated_execution_time FLOAT AS (` + totalEstimatedExecutionTimeExpr + `) STORED,
+    p99_latency FLOAT8 AS (` + p99LatencyComputeExpr + `) STORED,
 
     CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, app_name, node_id)
       USING HASH WITH (bucket_count=8),
     INDEX "fingerprint_stats_idx" (fingerprint_id),
+    INDEX "execution_count_idx" (aggregated_ts, app_name, execution_count DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "service_latency_idx" (aggregated_ts, app_name, service_latency DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "cpu_sql_nanos_idx" (aggregated_ts, app_name, cpu_sql_nanos DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "contention_time_idx" (aggregated_ts, app_name, contention_time DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "total_estimated_execution_time_idx" (aggregated_ts, app_name, total_estimated_execution_time DESC) WHERE app_name NOT LIKE '$ internal%',
+    INDEX "p99_latency_idx" (aggregated_ts, app_name, p99_latency DESC) WHERE app_name NOT LIKE '$ internal%',
 		FAMILY "primary" (
 			crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8,
 			aggregated_ts,
@@ -576,16 +618,121 @@ CREATE TABLE system.transaction_statistics (
 			node_id,
 			agg_interval,
 			metadata,
-			statistics
+			statistics,
+			execution_count,
+			service_latency,
+			cpu_sql_nanos,
+			contention_time,
+			total_estimated_execution_time,
+			p99_latency
 		)
 );
 `
+
+	StatementActivityTableSchema = `
+CREATE TABLE system.statement_activity
+(
+    aggregated_ts                    TIMESTAMPTZ NOT NULL,
+    fingerprint_id                   BYTES       NOT NULL,
+    transaction_fingerprint_id       BYTES       NOT NULL,
+    plan_hash                        BYTES       NOT NULL,
+    app_name                         STRING      NOT NULL,
+    node_id                          INT8        NOT NULL,
+    agg_interval                     INTERVAL    NOT NULL,
+    metadata                         JSONB       NOT NULL,
+    statistics                       JSONB       NOT NULL,
+    plan                             JSONB       NOT NULL,
+    index_recommendations            STRING[]    NOT NULL DEFAULT (ARRAY[]:::STRING[]),
+    execution_count                  INT         NOT NULL,
+    execution_total_seconds          FLOAT       NOT NULL,
+    execution_total_cluster_seconds  FLOAT       NOT NULL,
+    contention_time_avg_seconds      FLOAT       NOT NULL,
+    cpu_sql_avg_nanos                FLOAT       NOT NULL,
+    service_latency_avg_seconds      FLOAT       NOT NULL,
+    service_latency_p99_seconds      FLOAT       NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, transaction_fingerprint_id, plan_hash, app_name, node_id),
+    INDEX "fingerprint_id_idx" (fingerprint_id, transaction_fingerprint_id),
+    INDEX "execution_count_idx" (aggregated_ts, execution_count DESC),
+    INDEX "execution_total_seconds_idx" (aggregated_ts, execution_total_seconds DESC),
+    INDEX "contention_time_avg_seconds_idx" (aggregated_ts, contention_time_avg_seconds DESC),
+    INDEX "cpu_sql_avg_nanos_idx" (aggregated_ts, cpu_sql_avg_nanos DESC),
+    INDEX "service_latency_avg_seconds_idx" (aggregated_ts, service_latency_avg_seconds DESC),
+    INDEX "service_latency_p99_seconds_idx" (aggregated_ts, service_latency_p99_seconds DESC),
+    FAMILY "primary" (
+                      aggregated_ts,
+                      fingerprint_id,
+                      transaction_fingerprint_id,
+                      plan_hash,
+                      app_name,
+                      node_id,
+                      agg_interval,
+                      metadata,
+                      statistics,
+                      plan,
+                      index_recommendations,
+                      execution_count,
+                      execution_total_seconds,
+                      execution_total_cluster_seconds,
+                      contention_time_avg_seconds,
+                      cpu_sql_avg_nanos,
+                      service_latency_avg_seconds,
+                      service_latency_p99_seconds
+        )
+)
+`
+
+	TransactionActivityTableSchema = `
+CREATE TABLE system.transaction_activity
+(
+    aggregated_ts                    TIMESTAMPTZ NOT NULL,
+    fingerprint_id                   BYTES       NOT NULL,
+    app_name                         STRING      NOT NULL,
+    node_id                          INT8        NOT NULL,
+    agg_interval                     INTERVAL    NOT NULL,
+    metadata                         JSONB       NOT NULL,
+    statistics                       JSONB       NOT NULL,
+    query                            STRING      NOT NULL,
+    execution_count                  INT         NOT NULL,
+    execution_total_seconds          FLOAT       NOT NULL,
+    execution_total_cluster_seconds  FLOAT       NOT NULL,
+    contention_time_avg_seconds      FLOAT       NOT NULL,
+    cpu_sql_avg_nanos                FLOAT       NOT NULL,
+    service_latency_avg_seconds      FLOAT       NOT NULL,
+    service_latency_p99_seconds      FLOAT       NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, app_name, node_id),
+    INDEX "fingerprint_id_idx" (fingerprint_id),
+    INDEX "execution_count_idx" (aggregated_ts, execution_count DESC),
+    INDEX "execution_total_seconds_idx" (aggregated_ts, execution_total_seconds DESC),
+    INDEX "contention_time_avg_seconds_idx" (aggregated_ts, contention_time_avg_seconds DESC),
+    INDEX "cpu_sql_avg_nanos_idx" (aggregated_ts, cpu_sql_avg_nanos DESC),
+    INDEX "service_latency_avg_seconds_idx" (aggregated_ts, service_latency_avg_seconds DESC),
+    INDEX "service_latency_p99_seconds_idx" (aggregated_ts, service_latency_p99_seconds DESC),
+    FAMILY "primary" (
+                      aggregated_ts,
+                      fingerprint_id,
+                      app_name,
+                      node_id,
+                      agg_interval,
+                      metadata,
+                      statistics,
+                      query,
+                      execution_count,
+                      execution_total_seconds,
+                      execution_total_cluster_seconds,
+                      contention_time_avg_seconds,
+                      cpu_sql_avg_nanos,
+                      service_latency_avg_seconds,
+                      service_latency_p99_seconds
+        )
+);
+`
+
 	DatabaseRoleSettingsTableSchema = `
 CREATE TABLE system.database_role_settings (
     database_id  OID NOT NULL,
     role_name    STRING NOT NULL,
     settings     STRING[] NOT NULL,
-    role_id      OID NULL,
+    role_id      OID NOT NULL,
     CONSTRAINT "primary" PRIMARY KEY (database_id, role_name),
     UNIQUE INDEX (database_id, role_id) STORING (settings),
 		FAMILY "primary" (
@@ -663,14 +810,15 @@ CREATE TABLE system.tenant_usage (
 
 	SQLInstancesTableSchema = `
 CREATE TABLE system.sql_instances (
-    id           INT NOT NULL,
-    addr         STRING,
-    session_id   BYTES,
-    locality     JSONB,
-    sql_addr     STRING,
-    crdb_region  BYTES NOT NULL,
+    id             INT NOT NULL,
+    addr           STRING,
+    session_id     BYTES,
+    locality       JSONB,
+    sql_addr       STRING,
+    crdb_region    BYTES NOT NULL,
+    binary_version STRING,
     CONSTRAINT "primary" PRIMARY KEY (crdb_region, id),
-    FAMILY "primary" (id, addr, session_id, locality, sql_addr, crdb_region)
+    FAMILY "primary" (id, addr, session_id, locality, sql_addr, crdb_region, binary_version)
 )`
 
 	SpanConfigurationsTableSchema = `
@@ -716,7 +864,7 @@ CREATE TABLE system.privileges (
 	path STRING NOT NULL,
 	privileges STRING[] NOT NULL,
 	grant_options STRING[] NOT NULL,
-	user_id OID,
+	user_id OID NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (username, path),
 	UNIQUE INDEX (path, user_id) STORING (privileges, grant_options),
 	UNIQUE INDEX (path, username) STORING (privileges, grant_options),
@@ -731,7 +879,7 @@ CREATE TABLE system.external_connections (
 	connection_type STRING NOT NULL,
 	connection_details BYTES NOT NULL,
 	owner STRING NOT NULL,
-	owner_id OID,
+	owner_id OID NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (connection_name),
 	FAMILY "primary" (connection_name, created, updated, connection_type, connection_details, owner, owner_id)
 );`
@@ -744,7 +892,7 @@ CREATE TABLE system.tenant_tasks (
 	created      TIMESTAMPTZ NOT NULL DEFAULT now():::TIMESTAMPTZ,
 	payload_id   STRING NOT NULL,
 	owner        STRING NOT NULL,
-	owner_id     OID,
+	owner_id     OID NOT NULL,
 	CONSTRAINT "primary" PRIMARY KEY (tenant_id, issuer, task_id),
 	FAMILY "primary" (tenant_id, issuer, task_id, created, payload_id, owner, owner_id)
 );`
@@ -754,7 +902,7 @@ CREATE TABLE system.task_payloads (
 	id           STRING NOT NULL,
 	created      TIMESTAMPTZ NOT NULL DEFAULT now():::TIMESTAMPTZ,
 	owner        STRING NOT NULL,
-	owner_id     OID,
+	owner_id     OID NOT NULL,
 	min_version  STRING NOT NULL,
 	description  STRING,
 	type         STRING NOT NULL,
@@ -1052,6 +1200,8 @@ func MakeSystemTables() []SystemTable {
 		SpanStatsSamplesTable,
 		SystemTaskPayloadsTable,
 		SystemTenantTasksTable,
+		StatementActivityTable,
+		TransactionActivityTable,
 	}
 }
 
@@ -1593,7 +1743,7 @@ var (
 				{Name: "revokedAt", ID: 6, Type: types.Timestamp, Nullable: true},
 				{Name: "lastUsedAt", ID: 7, Type: types.Timestamp, DefaultExpr: &nowString},
 				{Name: "auditInfo", ID: 8, Type: types.String, Nullable: true},
-				{Name: "user_id", ID: 9, Type: types.Oid, Nullable: true},
+				{Name: "user_id", ID: 9, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2438,6 +2588,12 @@ var (
 				},
 				{Name: "index_recommendations", ID: 12, Type: types.StringArray, Nullable: false, DefaultExpr: &defaultIndexRec},
 				{Name: "indexes_usage", ID: 13, Type: types.Jsonb, Nullable: true, Virtual: true, ComputeExpr: &indexUsageComputeExprStr},
+				{Name: "execution_count", ID: 14, Type: types.Int, Nullable: true, ComputeExpr: &executionCountComputeExprStr},
+				{Name: "service_latency", ID: 15, Type: types.Float, Nullable: true, ComputeExpr: &serviceLatencyComputeExprStr},
+				{Name: "cpu_sql_nanos", ID: 16, Type: types.Float, Nullable: true, ComputeExpr: &cpuSqlNanosComputeExprStr},
+				{Name: "contention_time", ID: 17, Type: types.Float, Nullable: true, ComputeExpr: &contentionTimeComputeExprStr},
+				{Name: "total_estimated_execution_time", ID: 18, Type: types.Float, Nullable: true, ComputeExpr: &totalEstimatedExecutionTimeExprStr},
+				{Name: "p99_latency", ID: 19, Type: types.Float, Nullable: true, ComputeExpr: &p99LatencyComputeExprStr},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2446,9 +2602,11 @@ var (
 					ColumnNames: []string{
 						"crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8",
 						"aggregated_ts", "fingerprint_id", "transaction_fingerprint_id", "plan_hash", "app_name", "node_id",
-						"agg_interval", "metadata", "statistics", "plan", "index_recommendations",
+						"agg_interval", "metadata", "statistics", "plan", "index_recommendations", "execution_count",
+						"service_latency", "cpu_sql_nanos", "contention_time", "total_estimated_execution_time",
+						"p99_latency",
 					},
-					ColumnIDs:       []descpb.ColumnID{11, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12},
+					ColumnIDs:       []descpb.ColumnID{11, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18, 19},
 					DefaultColumnID: 0,
 				},
 			},
@@ -2522,6 +2680,125 @@ var (
 				Type:                descpb.IndexDescriptor_INVERTED,
 				InvertedColumnKinds: []catpb.InvertedIndexColumnKind{catpb.InvertedIndexColumnKind_DEFAULT},
 			},
+			descpb.IndexDescriptor{
+				Name:   "execution_count_idx",
+				ID:     4,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"execution_count",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 5, 14},
+				KeySuffixColumnIDs: []descpb.ColumnID{11, 2, 3, 4, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "service_latency_idx",
+				ID:     5,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"service_latency",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 5, 15},
+				KeySuffixColumnIDs: []descpb.ColumnID{11, 2, 3, 4, 6},
+				CompositeColumnIDs: []descpb.ColumnID{15},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "cpu_sql_nanos_idx",
+				ID:     6,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"cpu_sql_nanos",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 5, 16},
+				KeySuffixColumnIDs: []descpb.ColumnID{11, 2, 3, 4, 6},
+				CompositeColumnIDs: []descpb.ColumnID{16},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "contention_time_idx",
+				ID:     7,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"contention_time",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 5, 17},
+				KeySuffixColumnIDs: []descpb.ColumnID{11, 2, 3, 4, 6},
+				CompositeColumnIDs: []descpb.ColumnID{17},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "total_estimated_execution_time_idx",
+				ID:     8,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"total_estimated_execution_time",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 5, 18},
+				KeySuffixColumnIDs: []descpb.ColumnID{11, 2, 3, 4, 6},
+				CompositeColumnIDs: []descpb.ColumnID{18},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "p99_latency_idx",
+				ID:     9,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"p99_latency",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 5, 19},
+				KeySuffixColumnIDs: []descpb.ColumnID{11, 2, 3, 4, 6},
+				CompositeColumnIDs: []descpb.ColumnID{19},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
 		),
 		func(tbl *descpb.TableDescriptor) {
 			tbl.Checks = []*descpb.TableDescriptor_CheckConstraint{{
@@ -2558,6 +2835,12 @@ var (
 					ComputeExpr: &sqlTxnHashComputeExpr,
 					Hidden:      true,
 				},
+				{Name: "execution_count", ID: 9, Type: types.Int, Nullable: true, ComputeExpr: &executionCountComputeExprStr},
+				{Name: "service_latency", ID: 10, Type: types.Float, Nullable: true, ComputeExpr: &serviceLatencyComputeExprStr},
+				{Name: "cpu_sql_nanos", ID: 11, Type: types.Float, Nullable: true, ComputeExpr: &cpuSqlNanosComputeExprStr},
+				{Name: "contention_time", ID: 12, Type: types.Float, Nullable: true, ComputeExpr: &contentionTimeComputeExprStr},
+				{Name: "total_estimated_execution_time", ID: 13, Type: types.Float, Nullable: true, ComputeExpr: &totalEstimatedExecutionTimeExprStr},
+				{Name: "p99_latency", ID: 14, Type: types.Float, Nullable: true, ComputeExpr: &p99LatencyComputeExprStr},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2566,9 +2849,10 @@ var (
 					ColumnNames: []string{
 						"crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8",
 						"aggregated_ts", "fingerprint_id", "app_name", "node_id",
-						"agg_interval", "metadata", "statistics",
+						"agg_interval", "metadata", "statistics", "execution_count", "service_latency", "cpu_sql_nanos",
+						"contention_time", "total_estimated_execution_time", "p99_latency",
 					},
-					ColumnIDs:       []descpb.ColumnID{8, 1, 2, 3, 4, 5, 6, 7},
+					ColumnIDs:       []descpb.ColumnID{8, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14},
 					DefaultColumnID: 0,
 				},
 			},
@@ -2618,6 +2902,125 @@ var (
 				KeySuffixColumnIDs: []descpb.ColumnID{8, 1, 3, 4},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
+			descpb.IndexDescriptor{
+				Name:   "execution_count_idx",
+				ID:     3,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"execution_count",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 3, 9},
+				KeySuffixColumnIDs: []descpb.ColumnID{8, 2, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "service_latency_idx",
+				ID:     4,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"service_latency",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 3, 10},
+				KeySuffixColumnIDs: []descpb.ColumnID{8, 2, 4},
+				CompositeColumnIDs: []descpb.ColumnID{10},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "cpu_sql_nanos_idx",
+				ID:     5,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"cpu_sql_nanos",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 3, 11},
+				KeySuffixColumnIDs: []descpb.ColumnID{8, 2, 4},
+				CompositeColumnIDs: []descpb.ColumnID{11},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "contention_time_idx",
+				ID:     6,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"contention_time",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 3, 12},
+				KeySuffixColumnIDs: []descpb.ColumnID{8, 2, 4},
+				CompositeColumnIDs: []descpb.ColumnID{12},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "total_estimated_execution_time_idx",
+				ID:     7,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"total_estimated_execution_time",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 3, 13},
+				KeySuffixColumnIDs: []descpb.ColumnID{8, 2, 4},
+				CompositeColumnIDs: []descpb.ColumnID{13},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
+			descpb.IndexDescriptor{
+				Name:   "p99_latency_idx",
+				ID:     8,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"app_name",
+					"p99_latency",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 3, 14},
+				KeySuffixColumnIDs: []descpb.ColumnID{8, 2, 4},
+				CompositeColumnIDs: []descpb.ColumnID{14},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+				Predicate:          "app_name NOT LIKE '$ internal%':::STRING",
+			},
 		),
 		func(tbl *descpb.TableDescriptor) {
 			tbl.Checks = []*descpb.TableDescriptor_CheckConstraint{{
@@ -2629,6 +3032,368 @@ var (
 				FromHashShardedColumn: true,
 			}}
 		},
+	)
+
+	// StatementActivityTable is the descriptor for the SQL statement stats table.
+	// It stores statistics for statement fingerprints.
+	StatementActivityTable = makeSystemTable(
+		StatementActivityTableSchema,
+		systemTable(
+			catconstants.StatementActivityTableName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "aggregated_ts", ID: 1, Type: types.TimestampTZ, Nullable: false},
+				{Name: "fingerprint_id", ID: 2, Type: types.Bytes, Nullable: false},
+				{Name: "transaction_fingerprint_id", ID: 3, Type: types.Bytes, Nullable: false},
+				{Name: "plan_hash", ID: 4, Type: types.Bytes, Nullable: false},
+				{Name: "app_name", ID: 5, Type: types.String, Nullable: false},
+				{Name: "node_id", ID: 6, Type: types.Int, Nullable: false},
+				{Name: "agg_interval", ID: 7, Type: types.Interval, Nullable: false},
+				{Name: "metadata", ID: 8, Type: types.Jsonb, Nullable: false},
+				{Name: "statistics", ID: 9, Type: types.Jsonb, Nullable: false},
+				{Name: "plan", ID: 10, Type: types.Jsonb, Nullable: false},
+				{Name: "index_recommendations", ID: 11, Type: types.StringArray, Nullable: false, DefaultExpr: &defaultIndexRec},
+				{Name: "execution_count", ID: 12, Type: types.Int, Nullable: false},
+				{Name: "execution_total_seconds", ID: 13, Type: types.Float, Nullable: false},
+				{Name: "execution_total_cluster_seconds", ID: 14, Type: types.Float, Nullable: false},
+				{Name: "contention_time_avg_seconds", ID: 15, Type: types.Float, Nullable: false},
+				{Name: "cpu_sql_avg_nanos", ID: 16, Type: types.Float, Nullable: false},
+				{Name: "service_latency_avg_seconds", ID: 17, Type: types.Float, Nullable: false},
+				{Name: "service_latency_p99_seconds", ID: 18, Type: types.Float, Nullable: false},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name: "primary",
+					ID:   0,
+					ColumnNames: []string{
+						"aggregated_ts", "fingerprint_id", "transaction_fingerprint_id",
+						"plan_hash", "app_name", "node_id", "agg_interval", "metadata",
+						"statistics", "plan", "index_recommendations", "execution_count",
+						"execution_total_seconds", "execution_total_cluster_seconds",
+						"contention_time_avg_seconds", "cpu_sql_avg_nanos",
+						"service_latency_avg_seconds", "service_latency_p99_seconds",
+					},
+					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18},
+					DefaultColumnID: 0,
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:   tabledesc.LegacyPrimaryKeyIndexName,
+				ID:     1,
+				Unique: true,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"fingerprint_id",
+					"transaction_fingerprint_id",
+					"plan_hash",
+					"app_name",
+					"node_id",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6},
+				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "fingerprint_id_idx",
+				ID:     2,
+				Unique: false,
+				KeyColumnNames: []string{
+					"fingerprint_id",
+					"transaction_fingerprint_id",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{2, 3},
+				KeySuffixColumnIDs: []descpb.ColumnID{1, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "execution_count_idx",
+				ID:     3,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"execution_count",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 12},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "execution_total_seconds_idx",
+				ID:     4,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"execution_total_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 13},
+				CompositeColumnIDs: []descpb.ColumnID{13},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "contention_time_avg_seconds_idx",
+				ID:     5,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"contention_time_avg_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 15},
+				CompositeColumnIDs: []descpb.ColumnID{15},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "cpu_sql_avg_nanos_idx",
+				ID:     6,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"cpu_sql_avg_nanos",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 16},
+				CompositeColumnIDs: []descpb.ColumnID{16},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "service_latency_avg_seconds_idx",
+				ID:     7,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"service_latency_avg_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 17},
+				CompositeColumnIDs: []descpb.ColumnID{17},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "service_latency_p99_seconds_idx",
+				ID:     8,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"service_latency_p99_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 18},
+				CompositeColumnIDs: []descpb.ColumnID{18},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+		),
+	)
+
+	// TransactionActivityTable is the descriptor for the SQL transaction stats
+	// table. It stores statistics for transaction fingerprints.
+	TransactionActivityTable = makeSystemTable(
+		TransactionActivityTableSchema,
+		systemTable(
+			catconstants.TransactionActivityTableName,
+			descpb.InvalidID, // dynamically assigned
+			[]descpb.ColumnDescriptor{
+				{Name: "aggregated_ts", ID: 1, Type: types.TimestampTZ, Nullable: false},
+				{Name: "fingerprint_id", ID: 2, Type: types.Bytes, Nullable: false},
+				{Name: "app_name", ID: 3, Type: types.String, Nullable: false},
+				{Name: "node_id", ID: 4, Type: types.Int, Nullable: false},
+				{Name: "agg_interval", ID: 5, Type: types.Interval, Nullable: false},
+				{Name: "metadata", ID: 6, Type: types.Jsonb, Nullable: false},
+				{Name: "statistics", ID: 7, Type: types.Jsonb, Nullable: false},
+				{Name: "query", ID: 8, Type: types.String, Nullable: false},
+				{Name: "execution_count", ID: 9, Type: types.Int, Nullable: false},
+				{Name: "execution_total_seconds", ID: 10, Type: types.Float, Nullable: false},
+				{Name: "execution_total_cluster_seconds", ID: 11, Type: types.Float, Nullable: false},
+				{Name: "contention_time_avg_seconds", ID: 12, Type: types.Float, Nullable: false},
+				{Name: "cpu_sql_avg_nanos", ID: 13, Type: types.Float, Nullable: false},
+				{Name: "service_latency_avg_seconds", ID: 14, Type: types.Float, Nullable: false},
+				{Name: "service_latency_p99_seconds", ID: 15, Type: types.Float, Nullable: false},
+			},
+			[]descpb.ColumnFamilyDescriptor{
+				{
+					Name: "primary",
+					ID:   0,
+					ColumnNames: []string{
+						"aggregated_ts", "fingerprint_id", "app_name", "node_id",
+						"agg_interval", "metadata", "statistics", "query", "execution_count",
+						"execution_total_seconds", "execution_total_cluster_seconds",
+						"contention_time_avg_seconds", "cpu_sql_avg_nanos",
+						"service_latency_avg_seconds", "service_latency_p99_seconds",
+					},
+					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+					DefaultColumnID: 0,
+				},
+			},
+			descpb.IndexDescriptor{
+				Name:   tabledesc.LegacyPrimaryKeyIndexName,
+				ID:     1,
+				Unique: true,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"fingerprint_id",
+					"app_name",
+					"node_id",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs: []descpb.ColumnID{1, 2, 3, 4},
+				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "fingerprint_id_idx",
+				ID:     2,
+				Unique: false,
+				KeyColumnNames: []string{
+					"fingerprint_id",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{2},
+				KeySuffixColumnIDs: []descpb.ColumnID{1, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "execution_count_idx",
+				ID:     3,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"execution_count",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 9},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "execution_total_seconds_idx",
+				ID:     4,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"execution_total_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 10},
+				CompositeColumnIDs: []descpb.ColumnID{10},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "contention_time_avg_seconds_idx",
+				ID:     5,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"contention_time_avg_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 12},
+				CompositeColumnIDs: []descpb.ColumnID{12},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "cpu_sql_avg_nanos_idx",
+				ID:     6,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"cpu_sql_avg_nanos",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 13},
+				CompositeColumnIDs: []descpb.ColumnID{13},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "service_latency_avg_seconds_idx",
+				ID:     7,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"service_latency_avg_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 14},
+				CompositeColumnIDs: []descpb.ColumnID{14},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+			descpb.IndexDescriptor{
+				Name:   "service_latency_p99_seconds_idx",
+				ID:     8,
+				Unique: false,
+				KeyColumnNames: []string{
+					"aggregated_ts",
+					"service_latency_p99_seconds",
+				},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
+					catenumpb.IndexColumn_ASC,
+					catenumpb.IndexColumn_DESC,
+				},
+				KeyColumnIDs:       []descpb.ColumnID{1, 15},
+				CompositeColumnIDs: []descpb.ColumnID{15},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
+			},
+		),
 	)
 
 	// DatabaseRoleSettingsTable holds default values for session variables
@@ -2646,7 +3411,7 @@ var (
 				{Name: "database_id", ID: 1, Type: types.Oid, Nullable: false},
 				{Name: "role_name", ID: 2, Type: types.String, Nullable: false},
 				{Name: "settings", ID: 3, Type: types.StringArray, Nullable: false},
-				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: true},
+				{Name: "role_id", ID: 4, Type: types.Oid, Nullable: false},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2751,13 +3516,14 @@ var (
 					{Name: "locality", ID: 4, Type: types.Jsonb, Nullable: true},
 					{Name: "sql_addr", ID: 5, Type: types.String, Nullable: true},
 					{Name: "crdb_region", ID: 6, Type: types.Bytes, Nullable: false},
+					{Name: "binary_version", ID: 7, Type: types.String, Nullable: true},
 				},
 				[]descpb.ColumnFamilyDescriptor{
 					{
 						Name:            "primary",
 						ID:              0,
-						ColumnNames:     []string{"id", "addr", "session_id", "locality", "sql_addr", "crdb_region"},
-						ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6},
+						ColumnNames:     []string{"id", "addr", "session_id", "locality", "sql_addr", "crdb_region", "binary_version"},
+						ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7},
 						DefaultColumnID: 0,
 					},
 				},
@@ -2887,7 +3653,7 @@ var (
 				{Name: "path", ID: 2, Type: types.String},
 				{Name: "privileges", ID: 3, Type: types.StringArray},
 				{Name: "grant_options", ID: 4, Type: types.StringArray},
-				{Name: "user_id", ID: 5, Type: types.Oid, Nullable: true},
+				{Name: "user_id", ID: 5, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2943,7 +3709,7 @@ var (
 				{Name: "connection_type", ID: 4, Type: types.String},
 				{Name: "connection_details", ID: 5, Type: types.Bytes},
 				{Name: "owner", ID: 6, Type: types.String},
-				{Name: "owner_id", ID: 7, Type: types.Oid, Nullable: true},
+				{Name: "owner_id", ID: 7, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -2976,7 +3742,7 @@ var (
 				{Name: "created", ID: 4, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
 				{Name: "payload_id", ID: 5, Type: types.String},
 				{Name: "owner", ID: 6, Type: types.String},
-				{Name: "owner_id", ID: 7, Type: types.Oid, Nullable: true},
+				{Name: "owner_id", ID: 7, Type: types.Oid},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -3005,7 +3771,7 @@ var (
 				{Name: "id", ID: 1, Type: types.String},
 				{Name: "created", ID: 2, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
 				{Name: "owner", ID: 3, Type: types.String},
-				{Name: "owner_id", ID: 4, Type: types.Oid, Nullable: true},
+				{Name: "owner_id", ID: 4, Type: types.Oid},
 				{Name: "min_version", ID: 5, Type: types.String},
 				{Name: "description", ID: 6, Type: types.String, Nullable: true},
 				{Name: "type", ID: 7, Type: types.String},

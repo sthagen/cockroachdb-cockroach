@@ -1268,7 +1268,7 @@ func runClearRange(
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		batch := eng.NewUnindexedBatch(false /* writeOnly */)
+		batch := eng.NewUnindexedBatch()
 		if err := clearRange(eng, batch, MVCCKey{Key: keys.LocalMax}, MVCCKeyMax); err != nil {
 			b.Fatal(err)
 		}
@@ -1487,7 +1487,7 @@ func runBatchApplyBatchRepr(
 			})
 		}
 
-		batch := eng.NewUnindexedBatch(true /* writeOnly */)
+		batch := eng.NewWriteBatch()
 		defer batch.Close() // NB: hold open so batch.Repr() doesn't get reused
 
 		for i := 0; i < batchSize; i++ {
@@ -1504,9 +1504,9 @@ func runBatchApplyBatchRepr(
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		var batch Batch
+		var batch WriteBatch
 		if !indexed {
-			batch = eng.NewUnindexedBatch(true /* writeOnly */)
+			batch = eng.NewWriteBatch()
 		} else {
 			batch = eng.NewBatch()
 		}
@@ -1927,7 +1927,7 @@ func BenchmarkMVCCScannerWithIntentsAndVersions(b *testing.B) {
 			return cmp < 0
 		})
 		sstFileName := fmt.Sprintf("tmp-ingest-%d", i)
-		sstFile, err := eng.fs.Create(sstFileName)
+		sstFile, err := eng.Create(sstFileName)
 		require.NoError(b, err)
 		// No improvement with v3 since the multiple versions are in different
 		// files.

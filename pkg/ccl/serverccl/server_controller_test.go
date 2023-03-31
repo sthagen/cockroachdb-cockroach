@@ -9,6 +9,7 @@
 package serverccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -19,12 +20,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -38,6 +41,8 @@ func TestServerControllerHTTP(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderDeadlock(t, "test triggers many goroutines, which results in conn timeouts and test failures under deadlock")
+
 	ctx := context.Background()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
@@ -45,11 +50,15 @@ func TestServerControllerHTTP(t *testing.T) {
 	})
 	defer s.Stopper().Stop(ctx)
 
+	t.Logf("waking up HTTP server")
+
 	// Retrieve a privileged HTTP client. NB: this also populates
 	// system.web_sessions.
 	aurl := s.AdminURL()
 	client, err := s.GetAdminHTTPClient()
 	require.NoError(t, err)
+
+	t.Logf("retrieving web session details")
 
 	// Now retrieve the entry in the system tenant's web sessions.
 	row := db.QueryRow(`SELECT id,"hashedSecret",username,"createdAt","expiresAt" FROM system.web_sessions`)
@@ -59,12 +68,16 @@ func TestServerControllerHTTP(t *testing.T) {
 	var created, expires time.Time
 	require.NoError(t, row.Scan(&id, &secret, &username, &created, &expires))
 
+	t.Logf("waking up a test tenant")
+
 	// Create our own test tenant with a known name.
 	_, _, err = s.(*server.TestServer).StartSharedProcessTenant(ctx,
 		base.TestSharedProcessTenantArgs{
 			TenantName: "hello",
 		})
 	require.NoError(t, err)
+
+	t.Logf("connecting to the test tenant")
 
 	// Get a SQL connection to the test tenant.
 	sqlAddr := s.ServingSQLAddr()
@@ -75,6 +88,8 @@ func TestServerControllerHTTP(t *testing.T) {
 
 	// This actually uses the connection.
 	require.NoError(t, db2.Ping())
+
+	t.Logf("creating a test user and session")
 
 	// Instantiate the HTTP test username and privileges into the test tenant.
 	_, err = db2.Exec(fmt.Sprintf(`CREATE USER %s`, lexbase.EscapeSQLIdent(username)))
@@ -87,6 +102,8 @@ func TestServerControllerHTTP(t *testing.T) {
 VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3))`,
 		id, secret, username, created, expires)
 	require.NoError(t, err)
+
+	t.Logf("configuring the test connections")
 
 	// From this point, we are expecting the ability to access both tenants using
 	// the same cookie jar.
@@ -128,6 +145,8 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 		return req
 	}
 
+	t.Logf("retrieving session list from system tenant")
+
 	// Retrieve the session list for the system tenant.
 	req := newreq()
 	req.Header.Set(server.TenantSelectHeader, catconstants.SystemTenantName)
@@ -137,6 +156,8 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 	require.Equal(t, len(body.Sessions), 1)
 	require.Equal(t, body.Sessions[0].ApplicationName, "hello system")
 
+	t.Logf("retrieving session list from test tenant")
+
 	// Ditto for the test tenant.
 	req = newreq()
 	req.Header.Set(server.TenantSelectHeader, "hello")
@@ -145,6 +166,8 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 	t.Logf("response 2:\n%#v", body)
 	require.Equal(t, len(body.Sessions), 1)
 	require.Equal(t, body.Sessions[0].ApplicationName, "hello hello")
+
+	t.Logf("retrieving session list from system tenant via cookie")
 
 	c := &http.Cookie{
 		Name:     server.TenantSelectCookieName,
@@ -164,6 +187,8 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 	require.Equal(t, len(body.Sessions), 1)
 	require.Equal(t, body.Sessions[0].ApplicationName, "hello system")
 
+	t.Logf("retrieving session list from test tenant via cookie")
+
 	c.Value = "hello"
 	client.Jar.SetCookies(purl, []*http.Cookie{c})
 	req = newreq()
@@ -172,6 +197,8 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 	t.Logf("response 4:\n%#v", body)
 	require.Equal(t, len(body.Sessions), 1)
 	require.Equal(t, body.Sessions[0].ApplicationName, "hello hello")
+
+	t.Logf("retrieving session list from test tenant via cookie and header")
 
 	// Finally, do it again with both cookie and header. Verify
 	// that the header wins.
@@ -182,6 +209,49 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 	t.Logf("response 5:\n%#v", body)
 	require.Equal(t, len(body.Sessions), 1)
 	require.Equal(t, body.Sessions[0].ApplicationName, "hello system")
+
+	t.Logf("end of test")
+}
+
+// TestServerControllerDefaultHTTPTenant ensures that the default
+// tenant selected in the cookie does not use the default tenant
+// from the cluster setting *unless* the user successfully logged
+// in to that tenant.
+func TestServerControllerDefaultHTTPTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{DisableDefaultTestTenant: true})
+	defer s.Stopper().Stop(ctx)
+
+	_, sql, err := s.StartSharedProcessTenant(ctx, base.TestSharedProcessTenantArgs{
+		TenantName: "hello",
+		TenantID:   roachpb.MustMakeTenantID(10),
+	})
+	require.NoError(t, err)
+
+	_, err = sql.Exec("CREATE user foo with password 'cockroach'")
+	require.NoError(t, err)
+
+	client, err := s.GetUnauthenticatedHTTPClient()
+	require.NoError(t, err)
+
+	resp, err := client.Post(s.AdminURL()+"/login",
+		"application/json",
+		bytes.NewBuffer([]byte("{\"username\":\"foo\",\"password\":\"cockroach\"})")),
+	)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	tenantCookie := ""
+	for _, c := range resp.Cookies() {
+		if c.Name == server.TenantSelectCookieName {
+			tenantCookie = c.Value
+		}
+	}
+	require.Equal(t, "hello", tenantCookie)
 }
 
 // TestServerControllerBadHTTPCookies tests the controller's proxy

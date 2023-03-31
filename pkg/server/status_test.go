@@ -278,9 +278,14 @@ func TestStatusEngineStatsJson(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	var engineStats serverpb.EngineStatsResponse
-	if err := getStatusJSONProto(s, "enginestats/local", &engineStats); err != nil {
-		t.Fatal(err)
-	}
+	// Using SucceedsSoon because we have seen in the wild that
+	// occasionally requests don't go through with error "transport:
+	// error while dialing: connection interrupted (did the remote node
+	// shut down or are there networking issues?)"
+	testutils.SucceedsSoon(t, func() error {
+		return getStatusJSONProto(s, "enginestats/local", &engineStats)
+	})
+
 	if len(engineStats.Stats) != 1 {
 		t.Fatal(errors.Errorf("expected one engine stats, got: %v", engineStats))
 	}
@@ -1339,20 +1344,20 @@ func TestStatusVarsTxnMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_begin_count{tenant=\"system\",node_id=\"1\"} 1")) {
-		t.Errorf("expected `sql_txn_begin_count{tenant=\"system\",node_id=\"1\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_begin_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_txn_begin_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{tenant=\"system\",node_id=\"1\"} 1")) {
-		t.Errorf("expected `sql_restart_savepoint_count{tenant=\"system\",node_id=\"1\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{tenant=\"system\",node_id=\"1\"} 1")) {
-		t.Errorf("expected `sql_restart_savepoint_release_count{tenant=\"system\",node_id=\"1\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_restart_savepoint_release_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_restart_savepoint_release_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_commit_count{tenant=\"system\",node_id=\"1\"} 1")) {
-		t.Errorf("expected `sql_txn_commit_count{tenant=\"system\",node_id=\"1\"} 1`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_commit_count{node_id=\"1\"} 1")) {
+		t.Errorf("expected `sql_txn_commit_count{node_id=\"1\"} 1`, got: %s", body)
 	}
-	if !bytes.Contains(body, []byte("sql_txn_rollback_count{tenant=\"system\",node_id=\"1\"} 0")) {
-		t.Errorf("expected `sql_txn_rollback_count{tenant=\"system\",node_id=\"1\"} 0`, got: %s", body)
+	if !bytes.Contains(body, []byte("sql_txn_rollback_count{node_id=\"1\"} 0")) {
+		t.Errorf("expected `sql_txn_rollback_count{node_id=\"1\"} 0`, got: %s", body)
 	}
 }
 

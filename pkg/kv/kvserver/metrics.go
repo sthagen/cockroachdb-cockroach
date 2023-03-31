@@ -825,7 +825,7 @@ evaluating the network savings of not sending cross region traffic.
 		Unit:        metric.Unit_BYTES,
 	}
 	metaDelegateSnapshotSuccesses = metric.Metadata{
-		Name: "range.snapshot.delegate.successes",
+		Name: "range.snapshots.delegate.successes",
 		Help: `Number of snapshots that were delegated to a different node and
 resulted in success on that delegate. This does not count self delegated snapshots.
 `,
@@ -833,12 +833,18 @@ resulted in success on that delegate. This does not count self delegated snapsho
 		Unit:        metric.Unit_COUNT,
 	}
 	metaDelegateSnapshotFailures = metric.Metadata{
-		Name: "range.snapshot.delegate.failures",
+		Name: "range.snapshots.delegate.failures",
 		Help: `Number of snapshots that were delegated to a different node and
 resulted in failure on that delegate. There are numerous reasons a failure can
 occur on a delegate such as timeout, the delegate Raft log being too far behind
 or the delegate being too busy to send.
 `,
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDelegateSnapshotInProgress = metric.Metadata{
+		Name:        "range.snapshots.delegate.in-progress",
+		Help:        `Number of delegated snapshots that are currently in-flight.`,
 		Measurement: "Snapshots",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -1679,12 +1685,6 @@ throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
 		Measurement: "Nanoseconds",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
-	metaClosedTimestampFailuresToClose = metric.Metadata{
-		Name:        "kv.closed_timestamp.failures_to_close",
-		Help:        "Number of times the min prop tracker failed to close timestamps due to epoch mismatch or pending evaluations",
-		Measurement: "Attempts",
-		Unit:        metric.Unit_COUNT,
-	}
 
 	// Replica circuit breaker.
 	metaReplicaCircuitBreakerCurTripped = metric.Metadata{
@@ -1922,9 +1922,10 @@ type StoreMetrics struct {
 	RangeSnapshotRecvTotalInProgress *metric.Gauge
 
 	// Delegate snapshot metrics. These don't count self-delegated snapshots.
-	DelegateSnapshotSendBytes *metric.Counter
-	DelegateSnapshotSuccesses *metric.Counter
-	DelegateSnapshotFailures  *metric.Counter
+	DelegateSnapshotSendBytes  *metric.Counter
+	DelegateSnapshotSuccesses  *metric.Counter
+	DelegateSnapshotFailures   *metric.Counter
+	DelegateSnapshotInProgress *metric.Gauge
 
 	// Raft processing metrics.
 	RaftTicks                 *metric.Counter
@@ -2461,6 +2462,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		DelegateSnapshotSendBytes:                    metric.NewCounter(metaDelegateSnapshotSendBytes),
 		DelegateSnapshotSuccesses:                    metric.NewCounter(metaDelegateSnapshotSuccesses),
 		DelegateSnapshotFailures:                     metric.NewCounter(metaDelegateSnapshotFailures),
+		DelegateSnapshotInProgress:                   metric.NewGauge(metaDelegateSnapshotInProgress),
 
 		// Raft processing metrics.
 		RaftTicks: metric.NewCounter(metaRaftTicks),

@@ -83,6 +83,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"LAI":    {},
 						"SeqNum": {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation": {
+						"Level": {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock": {
 						"Durability": {},
 						"Mode":       {},
@@ -91,6 +94,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 					},
 					"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb": {
 						"SnapshotRequest_Type": {},
+					},
+					"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities": {
+						"ID": {},
 					},
 					"github.com/cockroachdb/cockroach/pkg/repstream/streampb": {
 						"StreamID": {},

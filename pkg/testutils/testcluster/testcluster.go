@@ -406,6 +406,14 @@ func (tc *TestCluster) Start(t testing.TB) {
 		tc.WaitForNStores(t, tc.NumServers(), tc.Servers[0].Gossip())
 	}
 
+	// Now that we have started all the servers on the bootstrap version, let us
+	// run the migrations up to the overridden BinaryVersion.
+	if v := tc.Servers[0].BinaryVersionOverride(); v != (roachpb.Version{}) {
+		if _, err := tc.Conns[0].Exec(`SET CLUSTER SETTING version = $1`, v.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// No need to disable the merge queue for SQL servers, as they don't have
 	// access to that cluster setting (and ALTER TABLE ... SPLIT AT is not
 	// supported in SQL servers either).
@@ -842,6 +850,14 @@ func (tc *TestCluster) WaitForVoters(
 	startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
 ) error {
 	return tc.waitForNewReplicas(startKey, true /* waitForVoter */, targets...)
+}
+
+// WaitForVotersOrFatal is the same as WaitForVoters but it will Fatal the test
+// on error.
+func (tc *TestCluster) WaitForVotersOrFatal(
+	t testing.TB, startKey roachpb.Key, targets ...roachpb.ReplicationTarget,
+) {
+	require.NoError(t, tc.WaitForVoters(startKey, targets...))
 }
 
 // waitForNewReplicas waits for each of the targets to have a fully initialized
@@ -1787,7 +1803,7 @@ func (tc *TestCluster) SplitTable(
 
 // WaitForTenantCapabilities implements TestClusterInterface.
 func (tc *TestCluster) WaitForTenantCapabilities(
-	t *testing.T, tenID roachpb.TenantID, targetCaps map[tenantcapabilities.CapabilityID]string,
+	t *testing.T, tenID roachpb.TenantID, targetCaps map[tenantcapabilities.ID]string,
 ) {
 	for i, ts := range tc.Servers {
 		testutils.SucceedsSoon(t, func() error {
@@ -1796,7 +1812,7 @@ func (tc *TestCluster) WaitForTenantCapabilities(
 			}
 
 			if len(targetCaps) > 0 {
-				missingCapabilityError := func(capID tenantcapabilities.CapabilityID) error {
+				missingCapabilityError := func(capID tenantcapabilities.ID) error {
 					return errors.Newf("server=%d tenant %s cap %q not at expected value", i, tenID, capID)
 				}
 				capabilities, found := ts.Server.TenantCapabilitiesReader().GetCapabilities(tenID)
@@ -1805,7 +1821,7 @@ func (tc *TestCluster) WaitForTenantCapabilities(
 				}
 
 				for capID, expectedValue := range targetCaps {
-					curVal := capabilities.Cap(capID).Get().String()
+					curVal := tenantcapabilities.MustGetValueByID(capabilities, capID).String()
 					if curVal != expectedValue {
 						return missingCapabilityError(capID)
 					}

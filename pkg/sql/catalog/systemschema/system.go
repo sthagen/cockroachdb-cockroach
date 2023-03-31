@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -125,7 +124,7 @@ CREATE SEQUENCE system.role_id_seq START 100 MINVALUE 100 MAXVALUE 2147483647;`
 	serviceLatencyComputeExpr       = `(((statistics->'statistics':::STRING)->'svcLat':::STRING)->'mean':::STRING)::FLOAT8`
 	cpuSqlNanosComputeExpr          = `(((statistics->'execution_statistics':::STRING)->'cpuSQLNanos':::STRING)->'mean':::STRING)::FLOAT8`
 	contentionTimeComputeExpr       = `(((statistics->'execution_statistics':::STRING)->'contentionTime':::STRING)->'mean':::STRING)::FLOAT8`
-	totalEstimatedExecutionTimeExpr = `((statistics->'statistics':::STRING)->'cnt':::STRING)::FLOAT8 * (((statistics->'statistics':::STRING)->'svcLat':::STRING)->>'mean':::STRING)::FLOAT8`
+	totalEstimatedExecutionTimeExpr = `((statistics->'statistics':::STRING)->>'cnt':::STRING)::FLOAT8 * (((statistics->'statistics':::STRING)->'svcLat':::STRING)->>'mean':::STRING)::FLOAT8`
 	p99LatencyComputeExpr           = `(((statistics->'statistics':::STRING)->'latencyInfo':::STRING)->'p99':::STRING)::FLOAT8`
 )
 
@@ -208,7 +207,7 @@ CREATE TABLE system.jobs (
 	id                INT8      DEFAULT unique_rowid(),
 	status            STRING    NOT NULL,
 	created           TIMESTAMP NOT NULL DEFAULT now(),
-	payload           BYTES     NOT NULL,
+	payload           BYTES,
 	progress          BYTES,
 	created_by_type   STRING,
 	created_by_id     INT,
@@ -637,7 +636,6 @@ CREATE TABLE system.statement_activity
     transaction_fingerprint_id       BYTES       NOT NULL,
     plan_hash                        BYTES       NOT NULL,
     app_name                         STRING      NOT NULL,
-    node_id                          INT8        NOT NULL,
     agg_interval                     INTERVAL    NOT NULL,
     metadata                         JSONB       NOT NULL,
     statistics                       JSONB       NOT NULL,
@@ -650,7 +648,7 @@ CREATE TABLE system.statement_activity
     cpu_sql_avg_nanos                FLOAT       NOT NULL,
     service_latency_avg_seconds      FLOAT       NOT NULL,
     service_latency_p99_seconds      FLOAT       NOT NULL,
-    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, transaction_fingerprint_id, plan_hash, app_name, node_id),
+    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, transaction_fingerprint_id, plan_hash, app_name),
     INDEX "fingerprint_id_idx" (fingerprint_id, transaction_fingerprint_id),
     INDEX "execution_count_idx" (aggregated_ts, execution_count DESC),
     INDEX "execution_total_seconds_idx" (aggregated_ts, execution_total_seconds DESC),
@@ -664,7 +662,6 @@ CREATE TABLE system.statement_activity
                       transaction_fingerprint_id,
                       plan_hash,
                       app_name,
-                      node_id,
                       agg_interval,
                       metadata,
                       statistics,
@@ -687,7 +684,6 @@ CREATE TABLE system.transaction_activity
     aggregated_ts                    TIMESTAMPTZ NOT NULL,
     fingerprint_id                   BYTES       NOT NULL,
     app_name                         STRING      NOT NULL,
-    node_id                          INT8        NOT NULL,
     agg_interval                     INTERVAL    NOT NULL,
     metadata                         JSONB       NOT NULL,
     statistics                       JSONB       NOT NULL,
@@ -699,7 +695,7 @@ CREATE TABLE system.transaction_activity
     cpu_sql_avg_nanos                FLOAT       NOT NULL,
     service_latency_avg_seconds      FLOAT       NOT NULL,
     service_latency_p99_seconds      FLOAT       NOT NULL,
-    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, app_name, node_id),
+    CONSTRAINT "primary" PRIMARY KEY (aggregated_ts, fingerprint_id, app_name),
     INDEX "fingerprint_id_idx" (fingerprint_id),
     INDEX "execution_count_idx" (aggregated_ts, execution_count DESC),
     INDEX "execution_total_seconds_idx" (aggregated_ts, execution_total_seconds DESC),
@@ -711,7 +707,6 @@ CREATE TABLE system.transaction_activity
                       aggregated_ts,
                       fingerprint_id,
                       app_name,
-                      node_id,
                       agg_interval,
                       metadata,
                       statistics,
@@ -914,7 +909,7 @@ CREATE TABLE system.task_payloads (
 	SystemJobInfoTableSchema = `
 CREATE TABLE system.job_info (
 	job_id INT8 NOT NULL,
-	info_key BYTES NOT NULL,
+	info_key STRING NOT NULL,
 	-- written is in the PK for this table to give it mvcc-over-sql semantics, so
 	-- that revisions to the value for the logical job/key pair are separate SQL
 	-- rows. This is done because we do not allow KV ranges to split between the
@@ -1646,7 +1641,7 @@ var (
 				{Name: "id", ID: 1, Type: types.Int, DefaultExpr: &uniqueRowIDString},
 				{Name: "status", ID: 2, Type: types.String},
 				{Name: "created", ID: 3, Type: types.Timestamp, DefaultExpr: &nowString},
-				{Name: "payload", ID: 4, Type: types.Bytes},
+				{Name: "payload", ID: 4, Type: types.Bytes, Nullable: true},
 				{Name: "progress", ID: 5, Type: types.Bytes, Nullable: true},
 				{Name: "created_by_type", ID: 6, Type: types.String, Nullable: true},
 				{Name: "created_by_id", ID: 7, Type: types.Int, Nullable: true},
@@ -3047,19 +3042,18 @@ var (
 				{Name: "transaction_fingerprint_id", ID: 3, Type: types.Bytes, Nullable: false},
 				{Name: "plan_hash", ID: 4, Type: types.Bytes, Nullable: false},
 				{Name: "app_name", ID: 5, Type: types.String, Nullable: false},
-				{Name: "node_id", ID: 6, Type: types.Int, Nullable: false},
-				{Name: "agg_interval", ID: 7, Type: types.Interval, Nullable: false},
-				{Name: "metadata", ID: 8, Type: types.Jsonb, Nullable: false},
-				{Name: "statistics", ID: 9, Type: types.Jsonb, Nullable: false},
-				{Name: "plan", ID: 10, Type: types.Jsonb, Nullable: false},
-				{Name: "index_recommendations", ID: 11, Type: types.StringArray, Nullable: false, DefaultExpr: &defaultIndexRec},
-				{Name: "execution_count", ID: 12, Type: types.Int, Nullable: false},
-				{Name: "execution_total_seconds", ID: 13, Type: types.Float, Nullable: false},
-				{Name: "execution_total_cluster_seconds", ID: 14, Type: types.Float, Nullable: false},
-				{Name: "contention_time_avg_seconds", ID: 15, Type: types.Float, Nullable: false},
-				{Name: "cpu_sql_avg_nanos", ID: 16, Type: types.Float, Nullable: false},
-				{Name: "service_latency_avg_seconds", ID: 17, Type: types.Float, Nullable: false},
-				{Name: "service_latency_p99_seconds", ID: 18, Type: types.Float, Nullable: false},
+				{Name: "agg_interval", ID: 6, Type: types.Interval, Nullable: false},
+				{Name: "metadata", ID: 7, Type: types.Jsonb, Nullable: false},
+				{Name: "statistics", ID: 8, Type: types.Jsonb, Nullable: false},
+				{Name: "plan", ID: 9, Type: types.Jsonb, Nullable: false},
+				{Name: "index_recommendations", ID: 10, Type: types.StringArray, Nullable: false, DefaultExpr: &defaultIndexRec},
+				{Name: "execution_count", ID: 11, Type: types.Int, Nullable: false},
+				{Name: "execution_total_seconds", ID: 12, Type: types.Float, Nullable: false},
+				{Name: "execution_total_cluster_seconds", ID: 13, Type: types.Float, Nullable: false},
+				{Name: "contention_time_avg_seconds", ID: 14, Type: types.Float, Nullable: false},
+				{Name: "cpu_sql_avg_nanos", ID: 15, Type: types.Float, Nullable: false},
+				{Name: "service_latency_avg_seconds", ID: 16, Type: types.Float, Nullable: false},
+				{Name: "service_latency_p99_seconds", ID: 17, Type: types.Float, Nullable: false},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
@@ -3067,13 +3061,13 @@ var (
 					ID:   0,
 					ColumnNames: []string{
 						"aggregated_ts", "fingerprint_id", "transaction_fingerprint_id",
-						"plan_hash", "app_name", "node_id", "agg_interval", "metadata",
+						"plan_hash", "app_name", "agg_interval", "metadata",
 						"statistics", "plan", "index_recommendations", "execution_count",
 						"execution_total_seconds", "execution_total_cluster_seconds",
 						"contention_time_avg_seconds", "cpu_sql_avg_nanos",
 						"service_latency_avg_seconds", "service_latency_p99_seconds",
 					},
-					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18},
+					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17},
 					DefaultColumnID: 0,
 				},
 			},
@@ -3087,7 +3081,6 @@ var (
 					"transaction_fingerprint_id",
 					"plan_hash",
 					"app_name",
-					"node_id",
 				},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
 					catenumpb.IndexColumn_ASC,
@@ -3095,9 +3088,8 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_ASC,
-					catenumpb.IndexColumn_ASC,
 				},
-				KeyColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5, 6},
+				KeyColumnIDs: []descpb.ColumnID{1, 2, 3, 4, 5},
 				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3113,7 +3105,7 @@ var (
 					catenumpb.IndexColumn_ASC,
 				},
 				KeyColumnIDs:       []descpb.ColumnID{2, 3},
-				KeySuffixColumnIDs: []descpb.ColumnID{1, 4, 5, 6},
+				KeySuffixColumnIDs: []descpb.ColumnID{1, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3128,8 +3120,8 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 12},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				KeyColumnIDs:       []descpb.ColumnID{1, 11},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3144,9 +3136,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 13},
-				CompositeColumnIDs: []descpb.ColumnID{13},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				KeyColumnIDs:       []descpb.ColumnID{1, 12},
+				CompositeColumnIDs: []descpb.ColumnID{12},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3161,9 +3153,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 15},
-				CompositeColumnIDs: []descpb.ColumnID{15},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				KeyColumnIDs:       []descpb.ColumnID{1, 14},
+				CompositeColumnIDs: []descpb.ColumnID{14},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3178,9 +3170,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 16},
-				CompositeColumnIDs: []descpb.ColumnID{16},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				KeyColumnIDs:       []descpb.ColumnID{1, 15},
+				CompositeColumnIDs: []descpb.ColumnID{15},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3195,9 +3187,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 17},
-				CompositeColumnIDs: []descpb.ColumnID{17},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				KeyColumnIDs:       []descpb.ColumnID{1, 16},
+				CompositeColumnIDs: []descpb.ColumnID{16},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3212,9 +3204,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 18},
-				CompositeColumnIDs: []descpb.ColumnID{18},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5, 6},
+				KeyColumnIDs:       []descpb.ColumnID{1, 17},
+				CompositeColumnIDs: []descpb.ColumnID{17},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4, 5},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		),
@@ -3231,31 +3223,30 @@ var (
 				{Name: "aggregated_ts", ID: 1, Type: types.TimestampTZ, Nullable: false},
 				{Name: "fingerprint_id", ID: 2, Type: types.Bytes, Nullable: false},
 				{Name: "app_name", ID: 3, Type: types.String, Nullable: false},
-				{Name: "node_id", ID: 4, Type: types.Int, Nullable: false},
-				{Name: "agg_interval", ID: 5, Type: types.Interval, Nullable: false},
-				{Name: "metadata", ID: 6, Type: types.Jsonb, Nullable: false},
-				{Name: "statistics", ID: 7, Type: types.Jsonb, Nullable: false},
-				{Name: "query", ID: 8, Type: types.String, Nullable: false},
-				{Name: "execution_count", ID: 9, Type: types.Int, Nullable: false},
-				{Name: "execution_total_seconds", ID: 10, Type: types.Float, Nullable: false},
-				{Name: "execution_total_cluster_seconds", ID: 11, Type: types.Float, Nullable: false},
-				{Name: "contention_time_avg_seconds", ID: 12, Type: types.Float, Nullable: false},
-				{Name: "cpu_sql_avg_nanos", ID: 13, Type: types.Float, Nullable: false},
-				{Name: "service_latency_avg_seconds", ID: 14, Type: types.Float, Nullable: false},
-				{Name: "service_latency_p99_seconds", ID: 15, Type: types.Float, Nullable: false},
+				{Name: "agg_interval", ID: 4, Type: types.Interval, Nullable: false},
+				{Name: "metadata", ID: 5, Type: types.Jsonb, Nullable: false},
+				{Name: "statistics", ID: 6, Type: types.Jsonb, Nullable: false},
+				{Name: "query", ID: 7, Type: types.String, Nullable: false},
+				{Name: "execution_count", ID: 8, Type: types.Int, Nullable: false},
+				{Name: "execution_total_seconds", ID: 9, Type: types.Float, Nullable: false},
+				{Name: "execution_total_cluster_seconds", ID: 10, Type: types.Float, Nullable: false},
+				{Name: "contention_time_avg_seconds", ID: 11, Type: types.Float, Nullable: false},
+				{Name: "cpu_sql_avg_nanos", ID: 12, Type: types.Float, Nullable: false},
+				{Name: "service_latency_avg_seconds", ID: 13, Type: types.Float, Nullable: false},
+				{Name: "service_latency_p99_seconds", ID: 14, Type: types.Float, Nullable: false},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{
 					Name: "primary",
 					ID:   0,
 					ColumnNames: []string{
-						"aggregated_ts", "fingerprint_id", "app_name", "node_id",
+						"aggregated_ts", "fingerprint_id", "app_name",
 						"agg_interval", "metadata", "statistics", "query", "execution_count",
 						"execution_total_seconds", "execution_total_cluster_seconds",
 						"contention_time_avg_seconds", "cpu_sql_avg_nanos",
 						"service_latency_avg_seconds", "service_latency_p99_seconds",
 					},
-					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+					ColumnIDs:       []descpb.ColumnID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14},
 					DefaultColumnID: 0,
 				},
 			},
@@ -3267,15 +3258,13 @@ var (
 					"aggregated_ts",
 					"fingerprint_id",
 					"app_name",
-					"node_id",
 				},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_ASC,
-					catenumpb.IndexColumn_ASC,
 				},
-				KeyColumnIDs: []descpb.ColumnID{1, 2, 3, 4},
+				KeyColumnIDs: []descpb.ColumnID{1, 2, 3},
 				Version:      descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3289,7 +3278,7 @@ var (
 					catenumpb.IndexColumn_ASC,
 				},
 				KeyColumnIDs:       []descpb.ColumnID{2},
-				KeySuffixColumnIDs: []descpb.ColumnID{1, 3, 4},
+				KeySuffixColumnIDs: []descpb.ColumnID{1, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3304,8 +3293,8 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 9},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				KeyColumnIDs:       []descpb.ColumnID{1, 8},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3320,9 +3309,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 10},
-				CompositeColumnIDs: []descpb.ColumnID{10},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				KeyColumnIDs:       []descpb.ColumnID{1, 9},
+				CompositeColumnIDs: []descpb.ColumnID{9},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3337,9 +3326,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 12},
-				CompositeColumnIDs: []descpb.ColumnID{12},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				KeyColumnIDs:       []descpb.ColumnID{1, 11},
+				CompositeColumnIDs: []descpb.ColumnID{11},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3354,9 +3343,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 13},
-				CompositeColumnIDs: []descpb.ColumnID{13},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				KeyColumnIDs:       []descpb.ColumnID{1, 12},
+				CompositeColumnIDs: []descpb.ColumnID{12},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3371,9 +3360,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 14},
-				CompositeColumnIDs: []descpb.ColumnID{14},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				KeyColumnIDs:       []descpb.ColumnID{1, 13},
+				CompositeColumnIDs: []descpb.ColumnID{13},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 			descpb.IndexDescriptor{
@@ -3388,9 +3377,9 @@ var (
 					catenumpb.IndexColumn_ASC,
 					catenumpb.IndexColumn_DESC,
 				},
-				KeyColumnIDs:       []descpb.ColumnID{1, 15},
-				CompositeColumnIDs: []descpb.ColumnID{15},
-				KeySuffixColumnIDs: []descpb.ColumnID{2, 3, 4},
+				KeyColumnIDs:       []descpb.ColumnID{1, 14},
+				CompositeColumnIDs: []descpb.ColumnID{14},
+				KeySuffixColumnIDs: []descpb.ColumnID{2, 3},
 				Version:            descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		),
@@ -3802,7 +3791,7 @@ var (
 			descpb.InvalidID, // dynamically assigned
 			[]descpb.ColumnDescriptor{
 				{Name: "job_id", ID: 1, Type: types.Int},
-				{Name: "info_key", ID: 2, Type: types.Bytes},
+				{Name: "info_key", ID: 2, Type: types.String},
 				{Name: "written", ID: 3, Type: types.TimestampTZ, DefaultExpr: &nowTZString},
 				{Name: "value", ID: 4, Type: types.Bytes, Nullable: true},
 			},
@@ -3989,14 +3978,3 @@ var (
 
 // SpanConfigurationsTableName represents system.span_configurations.
 var SpanConfigurationsTableName = tree.NewTableNameWithSchema("system", tree.PublicSchemaName, tree.Name(catconstants.SpanConfigurationsTableName))
-
-// TestSupportMultiRegion returns true if the cluster should support multi-region
-// optimized system databases.
-//
-// TODO(jeffswenson): remove TestSupportMultiRegion after implementing
-// migrations and version gates to migrate to the new regional by row
-// compatible schemas. The helper exists to allow e2e testing of the in
-// development multi-region system database features.
-func TestSupportMultiRegion() bool {
-	return envutil.EnvOrDefaultBool("COCKROACH_MR_SYSTEM_DATABASE", false)
-}

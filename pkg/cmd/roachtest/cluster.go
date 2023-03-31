@@ -743,6 +743,7 @@ type clusterConfig struct {
 	localCluster bool
 	useIOBarrier bool
 	alloc        *quotapool.IntAlloc
+	enableFIPS   bool
 }
 
 // clusterFactory is a creator of clusters.
@@ -876,7 +877,7 @@ func (f *clusterFactory) newCluster(
 	providerOptsContainer := vm.CreateProviderOptionsContainer()
 	// The ClusterName is set below in the retry loop to ensure
 	// that each create attempt gets a unique cluster name.
-	createVMOpts, providerOpts, err := cfg.spec.RoachprodOpts("", cfg.useIOBarrier)
+	createVMOpts, providerOpts, err := cfg.spec.RoachprodOpts("", cfg.useIOBarrier, cfg.enableFIPS)
 	if err != nil {
 		// We must release the allocation because cluster creation is not possible at this point.
 		cfg.alloc.Release()
@@ -1835,6 +1836,14 @@ func (c *clusterImpl) StartE(
 	if !envExists(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH") {
 		// Panic on span use-after-Finish, so we catch such bugs.
 		settings.Env = append(settings.Env, "COCKROACH_CRASH_ON_SPAN_USE_AFTER_FINISH=true")
+	}
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	if !envExists(settings.Env, "COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR") {
+		// This makes all roachtest use the new SHOW RANGES behavior,
+		// regardless of cluster settings.
+		settings.Env = append(settings.Env, "COCKROACH_FORCE_DEPRECATED_SHOW_RANGE_BEHAVIOR=false")
 	}
 
 	clusterSettingsOpts := []install.ClusterSettingOption{

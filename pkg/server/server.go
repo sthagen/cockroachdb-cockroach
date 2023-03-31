@@ -76,6 +76,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigptsreader"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigreporter"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/catalog/schematelemetry" // register schedules declared outside of pkg/sql
@@ -176,7 +177,7 @@ type Server struct {
 	spanConfigSubscriber spanconfig.KVSubscriber
 	spanConfigReporter   spanconfig.Reporter
 
-	tenantCapabilitiesWatcher tenantcapabilities.Watcher
+	tenantCapabilitiesWatcher *tenantcapabilitieswatcher.Watcher
 
 	// pgL is the SQL listener for pgwire connections coming over the network.
 	pgL net.Listener
@@ -623,6 +624,15 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		keys.SystemSQLCodec, clock, rangeFeedFactory, &cfg.DefaultZoneConfig,
 	)
 
+	tenantCapabilitiesWatcher := tenantcapabilitieswatcher.New(
+		clock,
+		rangeFeedFactory,
+		keys.TenantsTableID,
+		stopper,
+		1<<20, /* 1 MB */
+		tenantCapabilitiesTestingKnobs,
+	)
+
 	var spanConfig struct {
 		// kvAccessor powers the span configuration RPCs and the host tenant's
 		// reconciliation job.
@@ -668,6 +678,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 				1<<20, /* 1 MB */
 				fallbackConf,
 				cfg.Settings,
+				spanconfigstore.NewBoundsReader(tenantCapabilitiesWatcher),
 				spanConfigKnobs,
 				registry,
 			)
@@ -789,15 +800,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	tenantSettingsWatcher := tenantsettingswatcher.New(
 		clock, rangeFeedFactory, stopper, st,
-	)
-
-	tenantCapabilitiesWatcher := tenantcapabilitieswatcher.New(
-		clock,
-		rangeFeedFactory,
-		keys.TenantsTableID,
-		stopper,
-		1<<20, /* 1 MB */
-		tenantCapabilitiesTestingKnobs,
 	)
 
 	node := NewNode(

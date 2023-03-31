@@ -16,7 +16,6 @@ import (
 	"io"
 	"math"
 	"math/rand"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -681,7 +680,7 @@ func (s *Server) getScrubbedStmtStats(
 	var scrubbedStats []appstatspb.CollectedStatementStatistics
 	stmtStatsVisitor := func(_ context.Context, stat *appstatspb.CollectedStatementStatistics) error {
 		// Scrub the statement itself.
-		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query)
+		scrubbedQueryStr, ok := scrubStmtStatKey(s.cfg.VirtualSchemas, stat.Key.Query, nil)
 
 		// We don't want to report this stats if scrubbing has failed. We also don't
 		// wish to abort here because we want to try our best to report all the
@@ -1110,7 +1109,7 @@ func (ex *connExecutor) closeWrapper(ctx context.Context, recovered interface{})
 			// Embed the statement in the error object for the telemetry
 			// report below. The statement gets anonymized.
 			vt := ex.planner.extendedEvalCtx.VirtualSchemas
-			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt)
+			panicErr = WithAnonymizedStatement(panicErr, ex.curStmtAST, vt, nil)
 		}
 
 		// Report the panic to telemetry in any case.
@@ -2266,9 +2265,10 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
 
-		res = ex.clientComm.CreateCopyInResult(pos)
+		copyRes := ex.clientComm.CreateCopyInResult(tcmd, pos)
+		res = copyRes
 		stmtCtx := withStatement(ctx, tcmd.Stmt)
-		ev, payload = ex.execCopyIn(stmtCtx, tcmd)
+		ev, payload = ex.execCopyIn(stmtCtx, tcmd, copyRes)
 
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
 		// because:
@@ -2281,9 +2281,10 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionQueryReceived, tcmd.TimeReceived)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartParse, tcmd.ParseStart)
 		ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionEndParse, tcmd.ParseEnd)
-		res = ex.clientComm.CreateCopyOutResult(pos)
+		copyRes := ex.clientComm.CreateCopyOutResult(tcmd, pos)
+		res = copyRes
 		stmtCtx := withStatement(ctx, tcmd.Stmt)
-		ev, payload = ex.execCopyOut(stmtCtx, tcmd)
+		ev, payload = ex.execCopyOut(stmtCtx, tcmd, copyRes)
 
 		// Note: we write to ex.statsCollector.phaseTimes, instead of ex.phaseTimes,
 		// because:
@@ -2586,7 +2587,7 @@ func isCopyToExternalStorage(cmd CopyIn) bool {
 }
 
 func (ex *connExecutor) execCopyOut(
-	ctx context.Context, cmd CopyOut,
+	ctx context.Context, cmd CopyOut, res CopyOutResult,
 ) (retEv fsm.Event, retPayload fsm.EventPayload) {
 	// First handle connExecutor state transitions.
 	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
@@ -2774,16 +2775,11 @@ func (ex *connExecutor) execCopyOut(
 		// above.
 		txn := ex.planner.Txn()
 		var err error
-		if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd); err != nil {
+		if numOutputRows, err = runCopyTo(ctx, &ex.planner, txn, cmd, res); err != nil {
 			return err
 		}
 
-		// Finalize execution by sending the statement tag and number of rows read.
-		dummy := tree.CopyTo{}
-		tag := []byte(dummy.StatementTag())
-		tag = append(tag, ' ')
-		tag = strconv.AppendInt(tag, int64(numOutputRows), 10 /* base */)
-		return cmd.Conn.SendCommandComplete(tag)
+		return nil
 	}); copyErr != nil {
 		ev := eventNonRetriableErr{IsCommit: fsm.False}
 		payload := eventNonRetriableErrPayload{err: copyErr}
@@ -2809,7 +2805,7 @@ func (ex *connExecutor) setCopyLoggingFields(stmt parser.Statement) {
 // connection any more until this returns. The copyMachine will do the reading
 // and writing up to the CommandComplete message.
 func (ex *connExecutor) execCopyIn(
-	ctx context.Context, cmd CopyIn,
+	ctx context.Context, cmd CopyIn, res CopyInResult,
 ) (retEv fsm.Event, retPayload fsm.EventPayload) {
 	// First handle connExecutor state transitions.
 	if _, isNoTxn := ex.machine.CurState().(stateNoTxn); isNoTxn {
@@ -2867,6 +2863,7 @@ func (ex *connExecutor) execCopyIn(
 		var numInsertedRows int
 		if cm != nil {
 			numInsertedRows = cm.numInsertedRows()
+			res.SetRowsAffected(ctx, numInsertedRows)
 		}
 		// These fields are not available in COPY, so use the empty value.
 		f := tree.NewFmtCtx(tree.FmtHideConstants)
@@ -3102,12 +3099,15 @@ var retriableMinTimestampBoundUnsatisfiableError = errors.Newf(
 	"retriable MinTimestampBoundUnsatisfiableError",
 )
 
+// errIsRetriable is true if the error is a client-visible retry error
+// or the error is a special error that is handled internally and retried.
 func errIsRetriable(err error) bool {
-	return errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) ||
-		scerrors.ConcurrentSchemaChangeDescID(err) != descpb.InvalidID ||
+	return errors.HasInterface(err, (*pgerror.ClientVisibleRetryError)(nil)) ||
 		errors.Is(err, retriableMinTimestampBoundUnsatisfiableError) ||
+		// Note that this error is not handled internally and can make it to the
+		// client in implicit transactions. This is not great; it should
+		// be marked as a client visible retry error.
 		errors.Is(err, descidgen.ErrDescIDSequenceMigrationInProgress) ||
-		execinfra.IsDynamicQueryHasNoHomeRegionError(err) ||
 		descs.IsTwoVersionInvariantViolationError(err)
 }
 
@@ -3517,18 +3517,8 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		// Session is considered active when executing a transaction.
 		ex.totalActiveTimeStopWatch.Start()
 
-		if !ex.server.cfg.Codec.ForSystemTenant() {
-			// Update the leased descriptor collection with the current sqlliveness.Session.
-			// This is required in the multi-tenant environment to update the transaction
-			// deadline to either the session expiry or the leased descriptor deadline,
-			// whichever is sooner. We need this to ensure that transactions initiated
-			// by ephemeral SQL pods in multi-tenant environments are committed before the
-			// session expires.
-			session, err := ex.server.cfg.SQLLiveness.Session(ex.Ctx())
-			if err != nil {
-				return advanceInfo{}, err
-			}
-			ex.extraTxnState.descCollection.SetSession(session)
+		if err := ex.maybeSetSQLLivenessSession(); err != nil {
+			return advanceInfo{}, err
 		}
 	case txnCommit:
 		if res.Err() != nil {
@@ -3605,13 +3595,38 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		}
 
 		fallthrough
-	case txnRestart, txnRollback:
+	case txnRollback:
 		ex.resetExtraTxnState(ex.Ctx(), advInfo.txnEvent)
+	case txnRestart:
+		// In addition to resetting the extraTxnState, the restart event may
+		// also need to reset the sqlliveness.Session.
+		ex.resetExtraTxnState(ex.Ctx(), advInfo.txnEvent)
+		if err := ex.maybeSetSQLLivenessSession(); err != nil {
+			return advanceInfo{}, err
+		}
 	default:
 		return advanceInfo{}, errors.AssertionFailedf(
 			"unexpected event: %v", errors.Safe(advInfo.txnEvent))
 	}
 	return advInfo, nil
+}
+
+func (ex *connExecutor) maybeSetSQLLivenessSession() error {
+	if !ex.server.cfg.Codec.ForSystemTenant() ||
+		ex.server.cfg.TestingKnobs.ForceSQLLivenessSession {
+		// Update the leased descriptor collection with the current sqlliveness.Session.
+		// This is required in the multi-tenant environment to update the transaction
+		// deadline to either the session expiry or the leased descriptor deadline,
+		// whichever is sooner. We need this to ensure that transactions initiated
+		// by ephemeral SQL pods in multi-tenant environments are committed before the
+		// session expires.
+		session, err := ex.server.cfg.SQLLiveness.Session(ex.Ctx())
+		if err != nil {
+			return err
+		}
+		ex.extraTxnState.descCollection.SetSession(session)
+	}
+	return nil
 }
 
 func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
@@ -4217,7 +4232,7 @@ func init() {
 			return ""
 		}
 		// Anonymize the statement for reporting.
-		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */)
+		return anonymizeStmtAndConstants(stmt, nil /* VirtualTabler */, nil /* ClientNoticeSender */)
 	})
 	logcrash.RegisterTagFn("gist", func(ctx context.Context) string {
 		return planGistFromCtx(ctx)

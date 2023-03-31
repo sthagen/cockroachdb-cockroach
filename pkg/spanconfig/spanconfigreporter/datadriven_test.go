@@ -233,7 +233,12 @@ func newMockCluster(
 		nodes:    make(map[roachpb.NodeID]roachpb.NodeDescriptor),
 		ranges:   make(map[roachpb.RangeID]roachpb.RangeDescriptor),
 		liveness: make(map[roachpb.NodeID]bool),
-		store:    spanconfigstore.New(roachpb.TestingDefaultSpanConfig(), st, scKnobs),
+		store: spanconfigstore.New(
+			roachpb.TestingDefaultSpanConfig(),
+			st,
+			spanconfigstore.NewEmptyBoundsReader(),
+			scKnobs,
+		),
 	}
 }
 
@@ -274,12 +279,14 @@ func (s *mockCluster) Scan(
 }
 
 // NeedsSplit implements spanconfig.StoreReader.
-func (s *mockCluster) NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool {
+func (s *mockCluster) NeedsSplit(ctx context.Context, start, end roachpb.RKey) (bool, error) {
 	return s.store.NeedsSplit(ctx, start, end)
 }
 
 // ComputeSplitKey implements spanconfig.StoreReader.
-func (s *mockCluster) ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) roachpb.RKey {
+func (s *mockCluster) ComputeSplitKey(
+	ctx context.Context, start, end roachpb.RKey,
+) (roachpb.RKey, error) {
 	return s.store.ComputeSplitKey(ctx, start, end)
 }
 

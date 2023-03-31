@@ -3113,9 +3113,6 @@ CREATE TABLE t.test (
 		// backfill. This should have the same number of Puts
 		// as there are CPuts above.
 		fmt.Sprintf("Put /Table/%d/3/2/0 -> /BYTES/0x0a030a1302", tableID),
-		// TODO (rohany): this k/v is spurious and should be removed
-		//  when #45343 is fixed.
-		fmt.Sprintf("Put /Table/%d/3/2/1/1 -> /BYTES/0x0a020104", tableID),
 		fmt.Sprintf("Put /Table/%d/3/2/2/1 -> /BYTES/0x0a030a3306", tableID),
 		fmt.Sprintf("Put /Table/%d/3/2/4/1 -> /BYTES/0x0a02010c", tableID),
 
@@ -3154,7 +3151,6 @@ CREATE TABLE t.test (
 		// The temporary indexes are delete-preserving -- they
 		// should see the delete and issue Puts.
 		fmt.Sprintf("Put (delete) /Table/%d/3/2/0", tableID),
-		fmt.Sprintf("Put (delete) /Table/%d/3/2/1/1", tableID),
 		fmt.Sprintf("Put (delete) /Table/%d/3/2/2/1", tableID),
 		fmt.Sprintf("Put (delete) /Table/%d/3/2/3/1", tableID),
 		fmt.Sprintf("Put (delete) /Table/%d/3/2/4/1", tableID),
@@ -3182,7 +3178,6 @@ CREATE TABLE t.test (
 		// The temporary index for the newly added index sees
 		// a Put in all families.
 		fmt.Sprintf("Put /Table/%d/3/3/0 -> /BYTES/0x0a030a1302", tableID),
-		fmt.Sprintf("Put /Table/%d/3/3/1/1 -> /BYTES/0x0a020106", tableID),
 		fmt.Sprintf("Put /Table/%d/3/3/2/1 -> /BYTES/0x0a030a3306", tableID),
 		fmt.Sprintf("Put /Table/%d/3/3/4/1 -> /BYTES/0x0a02010c", tableID),
 		// TODO(ssd): double-check that this trace makes
@@ -3212,7 +3207,6 @@ CREATE TABLE t.test (
 		// The temporary index sees a Put in all families even though
 		// only some are changing. This is expected.
 		fmt.Sprintf("Put /Table/%d/3/3/0 -> /BYTES/0x0a030a1302", tableID),
-		fmt.Sprintf("Put /Table/%d/3/3/1/1 -> /BYTES/0x0a020106", tableID),
 		fmt.Sprintf("Put /Table/%d/3/3/3/1 -> /BYTES/0x0a02010a", tableID),
 	}
 	require.Equal(t, expected, scanToArray(rows))
@@ -4584,7 +4578,7 @@ func TestIndexBackfillAfterGC(t *testing.T) {
 
 	got := sqlDB.QueryStr(t, `
 		SELECT p->'schemaChange'->'writeTimestamp'->>'wallTime' < $1, jsonb_pretty(p)
-		FROM (SELECT crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload) AS p FROM system.jobs)
+		FROM (SELECT crdb_internal.pb_to_json('cockroach.sql.jobs.jobspb.Payload', payload) AS p FROM crdb_internal.system_jobs)
 		WHERE p->>'description' LIKE 'CREATE UNIQUE INDEX index_created_in_test%'`,
 		gcAt.WallTime,
 	)[0]

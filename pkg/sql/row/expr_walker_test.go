@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -201,7 +202,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 			}
 
 			for id, val := range test.seqIDToExpectedVal {
-				seqDesc := createAndIncrementSeqDescriptor(ctx, t, id, keys.TODOSQLCodec,
+				seqDesc := createAndIncrementSeqDescriptor(ctx, t, id, keysutils.TestingSQLCodec,
 					test.incrementBy, test.seqIDToOpts[id], kvDB)
 				seqMetadata := &row.SequenceMetadata{
 					SeqDesc:         seqDesc,
@@ -210,7 +211,7 @@ func TestJobBackedSeqChunkProvider(t *testing.T) {
 					CurVal:          0,
 				}
 				require.NoError(t, j.RequestChunk(ctx, evalCtx, annot, seqMetadata))
-				getJobProgressQuery := `SELECT progress FROM system.jobs J WHERE J.id = $1`
+				getJobProgressQuery := `SELECT progress FROM crdb_internal.system_jobs J WHERE J.id = $1`
 
 				var progressBytes []byte
 				require.NoError(t, sqlDB.QueryRow(getJobProgressQuery, job.ID()).Scan(&progressBytes))

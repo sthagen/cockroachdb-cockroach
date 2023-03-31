@@ -50,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -91,7 +92,7 @@ func (expected *expectation) verify(id jobspb.JobID, expectedStatus jobs.Status)
 	var payloadBytes []byte
 	var progressBytes []byte
 	if err := expected.DB.QueryRow(
-		`SELECT status, created, payload, progress FROM system.jobs WHERE id = $1`, id,
+		`SELECT status, created, payload, progress FROM crdb_internal.system_jobs WHERE id = $1`, id,
 	).Scan(
 		&statusString, &created, &payloadBytes, &progressBytes,
 	); err != nil {
@@ -1970,8 +1971,8 @@ func TestShowJobs(t *testing.T) {
 				t.Fatal(err)
 			}
 			sqlDB.Exec(t,
-				`INSERT INTO system.jobs (id, status, created, payload, progress, claim_session_id, claim_instance_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				in.id, in.status, in.created, inPayload, inProgress, session.ID().UnsafeBytes(), instanceID,
+				`INSERT INTO system.jobs (id, status, created, claim_session_id, claim_instance_id) VALUES ($1, $2, $3, $4, $5)`,
+				in.id, in.status, in.created, session.ID().UnsafeBytes(), instanceID,
 			)
 			sqlDB.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, in.id, jobs.GetLegacyPayloadKey(), inPayload)
 			sqlDB.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, in.id, jobs.GetLegacyProgressKey(), inProgress)
@@ -2181,37 +2182,37 @@ SELECT id, payload, progress FROM "".crdb_internal.system_jobs ORDER BY id DESC 
 
 	// Create the second row with a corrupted progress field.
 	if _, err := sqlDB.Exec(`
-	INSERT INTO system.jobs(id, status, payload, progress) SELECT id+2, status, payload, '\xaaaa'::BYTES FROM system.jobs WHERE id = $1;
+	INSERT INTO system.jobs(id, status) SELECT id+2, status FROM system.jobs WHERE id = $1;
 	`, jobID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`
 	  -- Create a payload field from the most recent row.
-	  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+2, info_key, value FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_payload'::BYTES;
+	  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+2, info_key, value FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_payload';
 	`, jobID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`
 		  -- Create a corrupted progress field.
-		  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+2, info_key, '\xaaaa'::BYTES FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_progress'::BYTES;
+		  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+2, info_key, '\xaaaa'::BYTES FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_progress';
 		`, jobID); err != nil {
 		t.Fatal(err)
 	}
 
 	// Test what happens with a NULL progress field (which is a valid value).
 	if _, err := sqlDB.Exec(`
-	INSERT INTO system.jobs(id, status, payload, progress) SELECT id+4, status, payload, NULL::BYTES FROM system.jobs WHERE id = $1;
+	INSERT INTO system.jobs(id, status) SELECT id+4, status FROM system.jobs WHERE id = $1;
 	`, jobID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`
 	  -- Create a payload field from the most recent row.
-	  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+4, info_key, value FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_payload'::BYTES;
+	  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+4, info_key, value FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_payload';
 	`, jobID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.Exec(`
-		  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+4, info_key, NULL::BYTES FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_progress'::BYTES;
+		  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+4, info_key, NULL::BYTES FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_progress';
 		`, jobID); err != nil {
 		t.Fatal(err)
 	}
@@ -2426,6 +2427,7 @@ func TestJobInTxn(t *testing.T) {
 
 	defer sql.ClearPlanHooks()
 	// Piggy back on BACKUP to be able to create a succeeding test job.
+	sql.ClearPlanHooks()
 	sql.AddPlanHook(
 		"test",
 		func(_ context.Context, stmt tree.Statement, execCtx sql.PlanHookState,
@@ -3058,7 +3060,8 @@ func TestMetrics(t *testing.T) {
 			var payloadBytes []byte
 			var payload jobspb.Payload
 			var status string
-			tdb.QueryRow(t, fmt.Sprintf("SELECT status, payload FROM system.jobs where id = %d", jobID)).Scan(
+			tdb.QueryRow(t, fmt.Sprintf("SELECT status, payload FROM (%s)",
+				jobutils.InternalSystemJobsBaseQuery), jobID).Scan(
 				&status, &payloadBytes)
 			require.Equal(t, "paused", status)
 			require.NoError(t, protoutil.Unmarshal(payloadBytes, &payload))
@@ -3343,7 +3346,7 @@ func TestPauseReason(t *testing.T) {
 		var payloadBytes []byte
 		var payload jobspb.Payload
 		var status string
-		tdb.QueryRow(t, "SELECT status, payload FROM system.jobs where id = $1", jobID).Scan(
+		tdb.QueryRow(t, "SELECT status, payload FROM crdb_internal.system_jobs where id = $1", jobID).Scan(
 			&status, &payloadBytes)
 		require.NoError(t, protoutil.Unmarshal(payloadBytes, &payload))
 

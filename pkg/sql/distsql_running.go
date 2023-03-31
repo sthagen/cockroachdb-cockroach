@@ -576,11 +576,9 @@ func (dsp *DistSQLPlanner) setupFlows(
 	// and we do so in a separate goroutine.
 	//
 	// We need to synchronize the new goroutine with flow.Cleanup() being called
-	// for two reasons:
-	// - flow.Cleanup() is the last thing before DistSQLPlanner.Run returns at
-	// which point the rowResultWriter is no longer protected by the mutex of
-	// the DistSQLReceiver
-	// - flow.Cancel can only be called before flow.Cleanup.
+	// since flow.Cleanup() is the last thing before DistSQLPlanner.Run returns
+	// at which point the rowResultWriter is no longer protected by the mutex of
+	// the DistSQLReceiver.
 	cleanupCalledMu := struct {
 		syncutil.Mutex
 		called bool
@@ -608,8 +606,6 @@ func (dsp *DistSQLPlanner) setupFlows(
 				seenError = true
 				func() {
 					cleanupCalledMu.Lock()
-					// Flow.Cancel cannot be called after or concurrently with
-					// Flow.Cleanup.
 					defer cleanupCalledMu.Unlock()
 					if cleanupCalledMu.called {
 						// Cleanup of the local flow has already been performed,
@@ -1710,21 +1706,6 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	skipDistSQLDiagramGeneration bool,
 	mustUseLeafTxn bool,
 ) error {
-	subqueryMonitor := mon.NewMonitor(
-		"subquery",
-		mon.MemoryResource,
-		dsp.distSQLSrv.Metrics.CurBytesCount,
-		dsp.distSQLSrv.Metrics.MaxBytesHist,
-		-1, /* use default block size */
-		noteworthyMemoryUsageBytes,
-		dsp.distSQLSrv.Settings,
-	)
-	subqueryMonitor.StartNoReserved(ctx, evalCtx.Planner.Mon())
-	defer subqueryMonitor.Stop(ctx)
-
-	subqueryMemAccount := subqueryMonitor.MakeBoundAccount()
-	defer subqueryMemAccount.Close(ctx)
-
 	distributeSubquery := getPlanDistribution(
 		ctx, planner.Descriptors().HasUncommittedTypes(),
 		planner.SessionData().DistSQLMode, subqueryPlan.plan,
@@ -2113,21 +2094,6 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 	associateNodeWithComponents func(exec.Node, execComponents),
 	addTopLevelQueryStats func(stats *topLevelQueryStats),
 ) error {
-	postqueryMonitor := mon.NewMonitor(
-		"postquery",
-		mon.MemoryResource,
-		dsp.distSQLSrv.Metrics.CurBytesCount,
-		dsp.distSQLSrv.Metrics.MaxBytesHist,
-		-1, /* use default block size */
-		noteworthyMemoryUsageBytes,
-		dsp.distSQLSrv.Settings,
-	)
-	postqueryMonitor.StartNoReserved(ctx, planner.Mon())
-	defer postqueryMonitor.Stop(ctx)
-
-	postqueryMemAccount := postqueryMonitor.MakeBoundAccount()
-	defer postqueryMemAccount.Close(ctx)
-
 	distributePostquery := getPlanDistribution(
 		ctx, planner.Descriptors().HasUncommittedTypes(),
 		planner.SessionData().DistSQLMode, postqueryPlan,

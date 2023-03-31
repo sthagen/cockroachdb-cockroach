@@ -1246,7 +1246,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	err := ex.makeExecPlan(ctx, planner)
 	defer planner.curPlan.close(ctx)
 
-	// include gist in error reports
+	// Include gist in error reports.
 	ctx = withPlanGist(ctx, planner.instrumentation.planGist.String())
 	if planner.extendedEvalCtx.TxnImplicit {
 		planner.curPlan.flags.Set(planFlagImplicitTxn)
@@ -1254,7 +1254,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	// Certain statements want their results to go to the client
 	// directly. Configure this here.
-	if planner.curPlan.avoidBuffering || ex.sessionData().AvoidBuffering {
+	if ex.executorType != executorTypeInternal && (planner.curPlan.avoidBuffering || ex.sessionData().AvoidBuffering) {
 		res.DisableBuffering()
 	}
 
@@ -1278,6 +1278,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	// Finally, process the planning error from above.
 	if err != nil {
+		err = addPlanningErrorHints(ctx, err, &stmt, ex.server.cfg.Settings, planner)
 		res.SetError(err)
 		return nil
 	}

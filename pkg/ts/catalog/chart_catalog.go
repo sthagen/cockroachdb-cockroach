@@ -636,8 +636,8 @@ var charts = []sectionDescription{
 					"range.snapshots.applied-voter",
 					"range.snapshots.applied-initial",
 					"range.snapshots.applied-non-voter",
-					"range.snapshot.delegate.successes",
-					"range.snapshot.delegate.failures",
+					"range.snapshots.delegate.successes",
+					"range.snapshots.delegate.failures",
 				},
 			},
 			{
@@ -649,6 +649,7 @@ var charts = []sectionDescription{
 					"range.snapshots.recv-in-progress",
 					"range.snapshots.send-total-in-progress",
 					"range.snapshots.recv-total-in-progress",
+					"range.snapshots.delegate.in-progress",
 				},
 			},
 			{
@@ -1569,6 +1570,7 @@ var charts = []sectionDescription{
 					"changefeed.checkpoint_hist_nanos",
 					"changefeed.flush_hist_nanos",
 					"changefeed.sink_batch_hist_nanos",
+					"changefeed.parallel_io_queue_nanos",
 				},
 			},
 			{
@@ -1591,6 +1593,12 @@ var charts = []sectionDescription{
 					"changefeed.bytes.messages_pushback_nanos",
 					"changefeed.messages.messages_pushback_nanos",
 					"changefeed.flush.messages_pushback_nanos",
+				},
+			},
+			{
+				Title: "Sink IO",
+				Metrics: []string{
+					"changefeed.sink_io_inflight",
 				},
 			},
 			{

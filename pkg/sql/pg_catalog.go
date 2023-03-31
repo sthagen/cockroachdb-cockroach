@@ -1321,13 +1321,22 @@ https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 						user = userPrivs.UserProto.Decode().Normalized()
 					}
 
-					privileges := privilege.ListFromBitField(
+					privileges, err := privilege.ListFromBitField(
 						userPrivs.Privileges, privilegeObjectType,
 					)
-					grantOptions := privilege.ListFromBitField(
+					if err != nil {
+						return err
+					}
+					grantOptions, err := privilege.ListFromBitField(
 						userPrivs.WithGrantOption, privilegeObjectType,
 					)
-					defaclItem := createDefACLItem(user, privileges, grantOptions, privilegeObjectType)
+					if err != nil {
+						return err
+					}
+					defaclItem, err := createDefACLItem(user, privileges, grantOptions, privilegeObjectType)
+					if err != nil {
+						return err
+					}
 					if err := arr.Append(
 						tree.NewDString(defaclItem)); err != nil {
 						return err
@@ -1343,19 +1352,25 @@ https://www.postgresql.org/docs/13/catalog-pg-default-acl.html`,
 					if objectType == privilege.Types {
 						if !catprivilege.GetRoleHasAllPrivilegesOnTargetObject(&defaultPrivilegesForRole, privilege.Types) &&
 							catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) {
-							defaclItem := createDefACLItem(
+							defaclItem, err := createDefACLItem(
 								"" /* public role */, privilege.List{privilege.USAGE}, privilege.List{}, privilegeObjectType,
 							)
+							if err != nil {
+								return err
+							}
 							if err := arr.Append(tree.NewDString(defaclItem)); err != nil {
 								return err
 							}
 						}
 						if !catprivilege.GetPublicHasUsageOnTypes(&defaultPrivilegesForRole) &&
 							defaultPrivilegesForRole.GetExplicitRole().RoleHasAllPrivilegesOnTypes {
-							defaclItem := createDefACLItem(
+							defaclItem, err := createDefACLItem(
 								defaultPrivilegesForRole.GetExplicitRole().UserProto.Decode().Normalized(),
 								privilege.List{privilege.ALL}, privilege.List{}, privilegeObjectType,
 							)
+							if err != nil {
+								return err
+							}
 							if err := arr.Append(tree.NewDString(defaclItem)); err != nil {
 								return err
 							}
@@ -1401,17 +1416,21 @@ func createDefACLItem(
 	privileges privilege.List,
 	grantOptions privilege.List,
 	privilegeObjectType privilege.ObjectType,
-) string {
+) (string, error) {
+	acl, err := privileges.ListToACL(
+		grantOptions,
+		privilegeObjectType,
+	)
+	if err != nil {
+		return "", err
+	}
 	return fmt.Sprintf(`%s=%s/%s`,
 		user,
-		privileges.ListToACL(
-			grantOptions,
-			privilegeObjectType,
-		),
+		acl,
 		// TODO(richardjcai): CockroachDB currently does not track grantors
 		//    See: https://github.com/cockroachdb/cockroach/issues/67442.
 		"", /* grantor */
-	)
+	), nil
 }
 
 var (
@@ -1450,15 +1469,15 @@ https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 	schema: vtable.PGCatalogDepend,
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		vt := p.getVirtualTabler()
-		pgConstraintsDesc, err := vt.getVirtualTableDesc(&pgConstraintsTableName)
+		pgConstraintsDesc, err := vt.getVirtualTableDesc(&pgConstraintsTableName, p)
 		if err != nil {
 			return errors.New("could not find pg_catalog.pg_constraint")
 		}
-		pgClassDesc, err := vt.getVirtualTableDesc(&pgClassTableName)
+		pgClassDesc, err := vt.getVirtualTableDesc(&pgClassTableName, p)
 		if err != nil {
 			return errors.New("could not find pg_catalog.pg_class")
 		}
-		pgRewriteDesc, err := vt.getVirtualTableDesc(&pgRewriteTableName)
+		pgRewriteDesc, err := vt.getVirtualTableDesc(&pgRewriteTableName, p)
 		if err != nil {
 			return errors.New("could not find pg_catalog.pg_rewrite")
 		}
@@ -2892,19 +2911,19 @@ https://www.postgresql.org/docs/9.6/catalog-pg-shdepend.html`,
 		vt := p.getVirtualTabler()
 		h := makeOidHasher()
 
-		pgClassDesc, err := vt.getVirtualTableDesc(&pgClassTableName)
+		pgClassDesc, err := vt.getVirtualTableDesc(&pgClassTableName, p)
 		if err != nil {
 			return errors.New("could not find pg_catalog.pg_class")
 		}
 		pgClassOid := tableOid(pgClassDesc.GetID())
 
-		pgAuthIDDesc, err := vt.getVirtualTableDesc(&pgAuthIDTableName)
+		pgAuthIDDesc, err := vt.getVirtualTableDesc(&pgAuthIDTableName, p)
 		if err != nil {
 			return errors.New("could not find pg_catalog.pg_authid")
 		}
 		pgAuthIDOid := tableOid(pgAuthIDDesc.GetID())
 
-		pgDatabaseDesc, err := vt.getVirtualTableDesc(&pgDatabaseTableName)
+		pgDatabaseDesc, err := vt.getVirtualTableDesc(&pgDatabaseTableName, p)
 		if err != nil {
 			return errors.New("could not find pg_catalog.pg_database")
 		}
@@ -2953,7 +2972,11 @@ https://www.postgresql.org/docs/9.6/catalog-pg-shdepend.html`,
 					return err
 				}
 				owner := privDesc.Owner()
-				for _, u := range privDesc.Show(privilege.Table, true /* showImplicitOwnerPrivs */) {
+				showPrivs, err := privDesc.Show(privilege.Table, true /* showImplicitOwnerPrivs */)
+				if err != nil {
+					return err
+				}
+				for _, u := range showPrivs {
 					if err := addSharedDependency(
 						dbOid(db.GetID()),       // dbid
 						pgClassOid,              // classid
@@ -2975,7 +2998,11 @@ https://www.postgresql.org/docs/9.6/catalog-pg-shdepend.html`,
 		if err = forEachDatabaseDesc(ctx, p, nil /*all databases*/, false, /* requiresPrivileges */
 			func(db catalog.DatabaseDescriptor) error {
 				owner := db.GetPrivileges().Owner()
-				for _, u := range db.GetPrivileges().Show(privilege.Database, true /* showImplicitOwnerPrivs */) {
+				showPrivs, err := db.GetPrivileges().Show(privilege.Database, true /* showImplicitOwnerPrivs */)
+				if err != nil {
+					return err
+				}
+				for _, u := range showPrivs {
 					if err := addSharedDependency(
 						tree.NewDOid(0),   // dbid
 						pgDatabaseOid,     // classid

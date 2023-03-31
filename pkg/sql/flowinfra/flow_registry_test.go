@@ -212,7 +212,8 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	// Register a flow with a very low timeout. After it times out, we'll attempt
 	// to connect a stream, but it'll be too late.
 	id1 := execinfrapb.FlowID{UUID: uuid.MakeV4()}
-	f1 := &FlowBase{ctxCancel: func() {}}
+	f1 := &FlowBase{}
+	f1.mu.ctxCancel = func() {}
 	streamID1 := execinfrapb.StreamID(1)
 	consumer := &distsqlutils.RowBuffer{}
 	wg := &sync.WaitGroup{}
@@ -370,7 +371,8 @@ func TestFlowRegistryDrain(t *testing.T) {
 	ctx := context.Background()
 	reg := NewFlowRegistry()
 
-	flow := &FlowBase{ctxCancel: func() {}}
+	flow := &FlowBase{}
+	flow.mu.ctxCancel = func() {}
 	id := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	registerFlow := func(t *testing.T, id execinfrapb.FlowID) {
 		t.Helper()
@@ -706,9 +708,10 @@ func TestErrorOnSlowHandshake(t *testing.T) {
 	flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	streamID := execinfrapb.StreamID(1)
 	cancelCh := make(chan struct{})
-	f := &FlowBase{ctxCancel: func() {
+	f := &FlowBase{}
+	f.mu.ctxCancel = func() {
 		cancelCh <- struct{}{}
-	}}
+	}
 
 	serverStream, _ /* clientStream */, cleanup := createDummyStream(t)
 	defer cleanup()
@@ -721,9 +724,10 @@ func TestErrorOnSlowHandshake(t *testing.T) {
 		err:                      errors.New("dummy error"),
 	}
 
+	receiver := &distsqlutils.RowBuffer{}
 	var wg sync.WaitGroup
 	streamInfo := &InboundStreamInfo{
-		receiver: RowInboundStreamHandler{&distsqlutils.RowBuffer{}, nil /* types */},
+		receiver: RowInboundStreamHandler{receiver, nil /* types */},
 		onFinish: wg.Done,
 	}
 	wg.Add(1)
@@ -776,5 +780,12 @@ func TestErrorOnSlowHandshake(t *testing.T) {
 		// test is to ensure that no deadlocks happen, and we don't care that
 		// much about which particular error was returned.
 		t.Fatalf("unexpected error from ConnectInboundStream: %v", err)
+	}
+	// We expect that "no inbound stream connection" error is pushed into the
+	// receiver.
+	if len(receiver.Mu.Records) != 1 {
+		t.Fatalf("expected a single meta object with an error, got %v", receiver.Mu.Records)
+	} else if r := receiver.Mu.Records[0]; !IsNoInboundStreamConnectionError(r.Meta.Err) {
+		t.Fatalf("unexpected error: %v", r)
 	}
 }

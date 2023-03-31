@@ -89,6 +89,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -1755,8 +1756,8 @@ func createAndWaitForJob(
 
 	var jobID jobspb.JobID
 	db.QueryRow(
-		t, `INSERT INTO system.jobs (created, status, payload, progress) VALUES ($1, $2, $3, $4) RETURNING id`,
-		timeutil.FromUnixMicros(now), jobs.StatusRunning, payload, progressBytes,
+		t, `INSERT INTO system.jobs (created, status) VALUES ($1, $2) RETURNING id`,
+		timeutil.FromUnixMicros(now), jobs.StatusRunning,
 	).Scan(&jobID)
 	db.Exec(
 		t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, jobID, jobs.GetLegacyPayloadKey(), payload,
@@ -6132,7 +6133,7 @@ func getMockTableDesc(
 // methods.
 func TestPublicIndexTableSpans(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	codec := keys.TODOSQLCodec
+	codec := keysutils.TestingSQLCodec
 	execCfg := &sql.ExecutorConfig{
 		Codec: codec,
 	}

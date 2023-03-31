@@ -17,6 +17,7 @@ changefeed.event_consumer_workers	integer	0	the number of workers to use when pr
 changefeed.fast_gzip.enabled	boolean	true	use fast gzip implementation
 changefeed.node_throttle_config	string		specifies node level throttling configuration for all changefeeeds
 changefeed.schema_feed.read_with_priority_after	duration	1m0s	retry with high priority if we were not able to read descriptors for too long; 0 disables
+changefeed.sink_io_workers	integer	0	the number of workers used by changefeeds when sending requests to the sink (currently webhook only): <0 disables, 0 assigns a reasonable default, >0 assigns the setting value.
 cloudstorage.azure.concurrent_upload_buffers	integer	1	controls the number of concurrent buffers that will be used by the Azure client when uploading chunks.Each buffer can buffer up to cloudstorage.write_chunk.size of memory during an upload
 cloudstorage.http.custom_ca	string		custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage
 cloudstorage.timeout	duration	10m0s	the timeout for import/export storage operations
@@ -251,6 +252,7 @@ sql.notices.enabled	boolean	true	enable notices in the server/client protocol be
 sql.optimizer.uniqueness_checks_for_gen_random_uuid.enabled	boolean	false	if enabled, uniqueness checks may be planned for mutations of UUID columns updated with gen_random_uuid(); otherwise, uniqueness is assumed due to near-zero collision probability
 sql.pgwire.multiple_active_portals.enabled	boolean	false	if true, portals with read-only SELECT query without sub/post queries can be executed in interleaving manner, but with local execution plan
 sql.schema.telemetry.recurrence	string	@weekly	cron-tab recurrence for SQL schema telemetry job
+sql.show_ranges_deprecated_behavior.enabled	boolean	true	if set, SHOW RANGES and crdb_internal.ranges{_no_leases} behave with deprecated pre-v23.1 semantics. NB: the new SHOW RANGES interface has richer WITH options than pre-v23.1 SHOW RANGES.
 sql.spatial.experimental_box2d_comparison_operators.enabled	boolean	false	enables the use of certain experimental box2d comparison operators
 sql.stats.automatic_collection.enabled	boolean	true	automatic statistics collection mode
 sql.stats.automatic_collection.fraction_stale_rows	float	0.2	target fraction of stale rows per table that will trigger a statistics refresh
@@ -289,4 +291,4 @@ trace.opentelemetry.collector	string		address of an OpenTelemetry trace collecto
 trace.snapshot.rate	duration	0s	if non-zero, interval at which background trace snapshots are captured
 trace.span_registry.enabled	boolean	true	if set, ongoing traces can be seen at https://<ui>/#/debug/tracez
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.
-version	version	1000023.1-2	set the active cluster version in the format '<major>.<minor>'
+version	version	1000023.1-4	set the active cluster version in the format '<major>.<minor>'

@@ -895,15 +895,31 @@ const (
 	// found.
 	SystemJobsAndJobInfoBaseQuery = `
 WITH
-	latestpayload AS (SELECT job_id, value FROM system.job_info AS payload WHERE info_key = 'legacy_payload'),
-	latestprogress AS (SELECT job_id, value FROM system.job_info AS progress WHERE info_key = 'legacy_progress')
+	latestpayload AS (SELECT job_id, value FROM system.job_info AS payload WHERE info_key = 'legacy_payload' ORDER BY written DESC),
+	latestprogress AS (SELECT job_id, value FROM system.job_info AS progress WHERE info_key = 'legacy_progress' ORDER BY written DESC)
 	SELECT 
+		DISTINCT(id), status, created, payload.value AS payload, progress.value AS progress,
+		created_by_type, created_by_id, claim_session_id, claim_instance_id, num_runs, last_run, job_type
+	FROM system.jobs AS j
+	INNER JOIN latestpayload AS payload ON j.id = payload.job_id
+	LEFT JOIN latestprogress AS progress ON j.id = progress.job_id
+`
+
+	// systemJobsAndJobInfoBaseQueryWithIDPredicate is the same as
+	// systemJobsAndJobInfoBaseQuery but with a predicate on `job_id` in the CTE
+	// queries.
+	systemJobsAndJobInfoBaseQueryWithIDPredicate = `
+WITH
+	latestpayload AS (SELECT job_id, value FROM system.job_info AS payload WHERE info_key = 'legacy_payload' AND job_id = $1 ORDER BY written DESC LIMIT 1),
+	latestprogress AS (SELECT job_id, value FROM system.job_info AS progress WHERE info_key = 'legacy_progress' AND job_id = $1 ORDER BY written DESC LIMIT 1)
+	SELECT
 		id, status, created, payload.value AS payload, progress.value AS progress,
 		created_by_type, created_by_id, claim_session_id, claim_instance_id, num_runs, last_run, job_type
 	FROM system.jobs AS j
 	INNER JOIN latestpayload AS payload ON j.id = payload.job_id
 	LEFT JOIN latestprogress AS progress ON j.id = progress.job_id
 `
+
 	// Before clusterversion.V23_1JobInfoTableIsBackfilled, the system.job_info
 	// table has not been fully populated with the payload and progress of jobs in
 	// the cluster.
@@ -943,6 +959,9 @@ func getInternalSystemJobsQueryFromClusterVersion(
 	var baseQuery string
 	if version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
 		baseQuery = SystemJobsAndJobInfoBaseQuery
+		if predicate == jobID {
+			baseQuery = systemJobsAndJobInfoBaseQueryWithIDPredicate
+		}
 	} else if version.IsActive(ctx, clusterversion.V23_1BackfillTypeColumnInJobsTable) {
 		baseQuery = systemJobsBaseQuery
 	} else {
@@ -2134,7 +2153,7 @@ CREATE TABLE crdb_internal.%s (
   node_id INT,                     -- the ID of the node running the transaction
   session_id STRING,               -- the ID of the session
   start TIMESTAMP,                 -- the start time of the transaction
-  txn_string STRING,               -- the string representation of the transcation
+  txn_string STRING,               -- the string representation of the transaction
   application_name STRING,         -- the name of the application as per SET application_name
   num_stmts INT,                   -- the number of statements executed so far
   num_retries INT,                 -- the number of times the transaction was restarted
@@ -7405,6 +7424,10 @@ func populateTxnExecutionInsights(
 	// We should truncate the query if it surpasses some absurd limit.
 	queryMax := 5000
 	for _, insight := range response.Insights {
+		if insight.Transaction == nil {
+			continue
+		}
+
 		var errorCode string
 		var queryBuilder strings.Builder
 		for i := range insight.Statements {
@@ -7581,6 +7604,12 @@ func populateStmtInsights(
 		return err
 	}
 	for _, insight := range response.Insights {
+		// We don't expect the transaction to be null here, but we should provide
+		// this check to ensure we only show valid data.
+		if insight.Transaction == nil {
+			continue
+		}
+
 		for _, s := range insight.Statements {
 
 			causes := tree.NewDArray(types.String)

@@ -224,9 +224,11 @@ const (
 	TODODelete_V22_2SystemUsersIDColumnIsBackfilled
 	// TODODelete_V22_2SetSystemUsersUserIDColumnNotNull sets the user_id column in system.users to not null.
 	TODODelete_V22_2SetSystemUsersUserIDColumnNotNull
-	// TODODelete_V22_2SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
+	// Permanent_V22_2SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
 	// telemetry logging jobs.
-	TODODelete_V22_2SQLSchemaTelemetryScheduledJobs
+	//
+	// This is a permanent migration which should exist forever.
+	Permanent_V22_2SQLSchemaTelemetryScheduledJobs
 	// TODODelete_V22_2SchemaChangeSupportsCreateFunction adds support of CREATE FUNCTION
 	// statement.
 	TODODelete_V22_2SchemaChangeSupportsCreateFunction
@@ -254,10 +256,6 @@ const (
 	TODODelete_V22_2SetRoleOptionsUserIDColumnNotNull
 	// TODODelete_V22_2RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
 	TODODelete_V22_2RangefeedUseOneStreamPerNode
-	// TODODelete_V22_2NoNonMVCCAddSSTable adds a migration which waits for all
-	// schema changes to complete. After this point, no non-MVCC
-	// AddSSTable calls will be used outside of tenant streaming.
-	TODODelete_V22_2NoNonMVCCAddSSTable
 	// TODODelete_V22_2TTLDistSQL uses DistSQL to distribute TTL SELECT/DELETE statements to
 	// leaseholder nodes.
 	TODODelete_V22_2TTLDistSQL
@@ -510,23 +508,35 @@ const (
 	// that are optimized for the console.
 	V23_1AddSystemActivityTables
 
+	// V23_1StopWritingPayloadAndProgressToSystemJobs is the version where the
+	// payload and progress columns are no longer written to system.jobs.
+	V23_1StopWritingPayloadAndProgressToSystemJobs
+
 	// V23_1ChangeSQLStatsTTL is the version where the gc TTL was updated to all
 	// SQL Stats tables.
 	V23_1ChangeSQLStatsTTL
 
+	// **********************************************************
+	// ** If we haven't yet selected a final 23.1 RC candidate **
+	// Step 1a: Add new versions for release-23.1 branch above here.
+	// **********************************************************
+	// Where to add new versions?
+	// - If the version gate is being backported to release-23.1, add the new version above this comment.
+	//   This can be done during 23.1 Stability until we select a final RC.
+	// - If the version gate is for 23.2 development (not being backported to release-23.1), add the
+	//   new version above "Step 1b"
+	// - Do not add new versions to a patch release.
+	// *************************************************
+
 	// V23_1 is CockroachDB v23.1. It's used for all v23.1.x patch releases.
 	V23_1
 
-	// V23_2_Start demarcates the start of cluster versions stepped through during
+	// V23_2Start demarcates the start of cluster versions stepped through during
 	// the process of upgrading from previous supported releases to 23.2.
 	V23_2Start
 
-	// V23_2StopWritingPayloadAndProgressToSystemJobs is the version where the
-	// payload and progress columns are no longer written to system.jobs.
-	V23_2StopWritingPayloadAndProgressToSystemJobs
-
 	// *************************************************
-	// Step (1): Add new versions here.
+	// Step 1b: Add new version for 23.2 development here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 )
@@ -655,7 +665,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 40},
 	},
 	{
-		Key:     TODODelete_V22_2SQLSchemaTelemetryScheduledJobs,
+		Key:     Permanent_V22_2SQLSchemaTelemetryScheduledJobs,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 42},
 	},
 	{
@@ -681,10 +691,6 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     TODODelete_V22_2RangefeedUseOneStreamPerNode,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
-	},
-	{
-		Key:     TODODelete_V22_2NoNonMVCCAddSSTable,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 62},
 	},
 	{
 		Key:     TODODelete_V22_2TTLDistSQL,
@@ -899,9 +905,26 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 94},
 	},
 	{
-		Key:     V23_1ChangeSQLStatsTTL,
+		Key:     V23_1StopWritingPayloadAndProgressToSystemJobs,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 96},
 	},
+	{
+		Key:     V23_1ChangeSQLStatsTTL,
+		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 98},
+	},
+
+	// **********************************************************
+	// ** If we haven't yet selected a final 23.1 RC candidate **
+	// Step 2a: Add new versions for release-23.1 branch above here.
+	// **********************************************************
+	// Where to add new versions?
+	// - If the version gate is being backported to release-23.1, add the new version above this comment.
+	//   This can be done during 23.1 Stability until we select a final RC.
+	// - If the version gate is for 23.2 development (not being backported to release-23.1), add the
+	//   new version above "Step 2b"
+	// - Do not add new versions to a patch release.
+	// *************************************************
+
 	{
 		Key:     V23_1,
 		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 0},
@@ -910,13 +933,9 @@ var rawVersionsSingleton = keyedVersions{
 		Key:     V23_2Start,
 		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 2},
 	},
-	{
-		Key:     V23_2StopWritingPayloadAndProgressToSystemJobs,
-		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 4},
-	},
 
 	// *************************************************
-	// Step (2): Add new versions here.
+	// Step 2b: Add new version gates for 23.2 development here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 }

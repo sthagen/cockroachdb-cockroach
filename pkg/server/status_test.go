@@ -52,7 +52,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -276,6 +275,8 @@ func TestStatusEngineStatsJson(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Stopper().Stop(context.Background())
+
+	t.Logf("using admin URL %s", s.AdminURL())
 
 	var engineStats serverpb.EngineStatsResponse
 	// Using SucceedsSoon because we have seen in the wild that
@@ -1158,7 +1159,7 @@ func TestHotRanges2ResponseWithViewActivityOptions(t *testing.T) {
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer kvserver.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistoryForTesting(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
@@ -1511,7 +1512,7 @@ func TestDiagnosticsResponse(t *testing.T) {
 func TestRangeResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer kvserver.EnableLeaseHistory(100)()
+	defer kvserver.EnableLeaseHistoryForTesting(100)()
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
 
@@ -1645,9 +1646,6 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
-	// Flush stats, as combinedstmts reads only from system.
-	thirdServer.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
 
 	// Hit query endpoint.
 	var resp serverpb.StatementsResponse
@@ -2021,8 +2019,6 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
-
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
 	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
@@ -2060,8 +2056,6 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 	for _, stmt := range statements {
 		thirdServerSQL.Exec(t, stmt.stmt)
 	}
-
-	testCluster.Server(2).SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
 
 	var resp serverpb.StatementsResponse
 	// Test that non-admin without VIEWACTIVITY privileges cannot access.
@@ -2192,8 +2186,6 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	// The liveness session might expire before the stress race can finish.
 	skip.UnderStressRace(t, "expensive tests")
 
-	ctx := context.Background()
-
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
 	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
@@ -2252,9 +2244,6 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	}
 
 	testPath := func(path string, expected resultValues) {
-		// Need to flush since this EP reads only flushed data.
-		testCluster.Server(2).SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
-
 		err := getStatusJSONProtoWithAdminOption(firstServerProto, path, &resp, false)
 		require.NoError(t, err)
 		require.Equal(t, int64(expected.totalCount), resp.Statement.Stats.Count)

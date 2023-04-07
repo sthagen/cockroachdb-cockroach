@@ -824,6 +824,9 @@ func createFlagsOverride(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 		if flags.Changed("geo") {
 			opts.GeoDistributed = overrideOpts.GeoDistributed
 		}
+		if flags.Changed("label") {
+			opts.CustomLabels = overrideOpts.CustomLabels
+		}
 	}
 }
 
@@ -1085,7 +1088,7 @@ func (c *clusterImpl) validate(
 	// Perform validation on the existing cluster.
 	c.status("checking that existing cluster matches spec")
 	pattern := "^" + regexp.QuoteMeta(c.name) + "$"
-	cloudClusters, err := roachprod.List(l, false /* listMine */, pattern)
+	cloudClusters, err := roachprod.List(l, false /* listMine */, pattern, vm.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -1729,7 +1732,7 @@ func (c *clusterImpl) Get(
 	}
 	c.status(fmt.Sprintf("getting %v", src))
 	defer c.status("")
-	return errors.Wrap(roachprod.Get(l, c.MakeNodes(opts...), src, dest), "cluster.Get")
+	return errors.Wrap(roachprod.Get(ctx, l, c.MakeNodes(opts...), src, dest), "cluster.Get")
 }
 
 // Put a string into the specified file on the remote(s).

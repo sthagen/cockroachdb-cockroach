@@ -21,10 +21,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -120,6 +122,32 @@ ALTER TENANT application START SERVICE SHARED`)
 			require.NoError(t, err)
 		}
 	}
+}
+
+func TestSharedProcessServerInheritsTempStorageLimit(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const specialSize = 123123123
+
+	// Start a server with a custom temp storage limit.
+	ctx := context.Background()
+	st := cluster.MakeClusterSettings()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Settings:          st,
+		TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(st, specialSize),
+		DefaultTestTenant: base.TestTenantDisabled,
+	})
+	defer s.Stopper().Stop(ctx)
+
+	// Start a shared process tenant server.
+	ts, _, err := s.StartSharedProcessTenant(ctx, base.TestSharedProcessTenantArgs{
+		TenantName: "hello",
+	})
+	require.NoError(t, err)
+
+	tss := ts.(*server.TestTenant)
+	require.Equal(t, int64(specialSize), tss.SQLCfg.TempStorageConfig.Mon.Limit())
 }
 
 func TestServerControllerHTTP(t *testing.T) {
@@ -387,34 +415,54 @@ func TestServerControllerMultiNodeTenantStartup(t *testing.T) {
 
 	ctx := context.Background()
 
+	t.Logf("starting test cluster")
 	numNodes := 3
 	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			},
 			DefaultTestTenant: base.TestTenantDisabled,
 		}})
-	defer tc.Stopper().Stop(ctx)
+	defer func() {
+		t.Logf("stopping test cluster")
+		tc.Stopper().Stop(ctx)
+	}()
 
+	t.Logf("starting tenant servers")
 	db := tc.ServerConn(0)
 	_, err := db.Exec("CREATE TENANT hello; ALTER TENANT hello START SERVICE SHARED")
 	require.NoError(t, err)
 
 	// Pick a random node, try to run some SQL inside that tenant.
 	rng, _ := randutil.NewTestRand()
-	sqlAddr := tc.Server(int(rng.Int31n(int32(numNodes)))).ServingSQLAddr()
+	serverIdx := int(rng.Int31n(int32(numNodes)))
+	sqlAddr := tc.Server(serverIdx).ServingSQLAddr()
+	t.Logf("attempting to use tenant server on node %d (%s)", serverIdx, sqlAddr)
 	testutils.SucceedsSoon(t, func() error {
 		tenantDB, err := serverutils.OpenDBConnE(sqlAddr, "cluster:hello", false, tc.Stopper())
 		if err != nil {
+			t.Logf("error connecting to tenant server (will retry): %v", err)
 			return err
 		}
 		defer tenantDB.Close()
-		if _, err := tenantDB.Exec("CREATE ROLE foo"); err != nil {
+		if err := tenantDB.Ping(); err != nil {
+			t.Logf("connection not ready (will retry): %v", err)
 			return err
 		}
+		if _, err := tenantDB.Exec("CREATE ROLE foo"); err != nil {
+			// This is not retryable -- if the server accepts the
+			// connection, it better be ready.
+			t.Fatal(err)
+		}
 		if _, err := tenantDB.Exec("GRANT ADMIN TO foo"); err != nil {
-			return err
+			// This is not retryable -- if the server accepts the
+			// connection, it better be ready.
+			t.Fatal(err)
 		}
 		return nil
 	})
+	t.Logf("tenant server on node %d (%s) is ready", serverIdx, sqlAddr)
 }
 
 func TestServerStartStop(t *testing.T) {
@@ -544,4 +592,38 @@ func TestServerControllerLoginLogout(t *testing.T) {
 	}
 	require.ElementsMatch(t, []string{"session", "tenant"}, cookieNames)
 	require.ElementsMatch(t, []string{"", ""}, cookieValues)
+}
+
+func TestServiceShutdownUsesGracefulDrain(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	})
+	defer s.Stopper().Stop(ctx)
+
+	drainCh := make(chan struct{})
+
+	// Start a shared process server.
+	_, _, err := s.(*server.TestServer).StartSharedProcessTenant(ctx,
+		base.TestSharedProcessTenantArgs{
+			TenantName: "hello",
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					RequireGracefulDrain: true,
+					DrainReportCh:        drainCh,
+				},
+			},
+		})
+	require.NoError(t, err)
+
+	_, err = db.Exec("ALTER TENANT hello STOP SERVICE")
+	require.NoError(t, err)
+
+	// Wait for the server to shut down. This also asserts that the
+	// graceful drain has occurred.
+	<-drainCh
 }

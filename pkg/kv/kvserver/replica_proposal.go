@@ -232,6 +232,10 @@ func (r *Replica) leasePostApplyLocked(
 	// Everything we do before then doesn't need to worry about requests being
 	// evaluated under the new lease.
 
+	// maybeSplit is true if we may have been called during splitPostApply, where
+	// prevLease equals newLease and we're applying the RHS lease.
+	var maybeSplit bool
+
 	// Sanity check to make sure that the lease sequence is moving in the right
 	// direction.
 	if s1, s2 := prevLease.Sequence, newLease.Sequence; s1 != 0 {
@@ -249,6 +253,7 @@ func (r *Replica) leasePostApplyLocked(
 				log.Fatalf(ctx, "sequence identical for different leases, prevLease=%s, newLease=%s",
 					redact.Safe(prevLease), redact.Safe(newLease))
 			}
+			maybeSplit = prevLease.Equal(newLease)
 		case s2 == s1+1:
 			// Lease sequence incremented by 1. Expected case.
 		case s2 > s1+1 && jumpOpt == assertNoLeaseJump:
@@ -367,15 +372,17 @@ func (r *Replica) leasePostApplyLocked(
 		r.gossipFirstRangeLocked(ctx)
 	}
 
-	hasExpirationLease := newLease.Type() == roachpb.LeaseExpiration
-	if leaseChangingHands && iAmTheLeaseHolder && hasExpirationLease && r.ownsValidLeaseRLocked(ctx, now) {
+	if newLease.Type() == roachpb.LeaseExpiration && (leaseChangingHands || maybeSplit) &&
+		iAmTheLeaseHolder && r.ownsValidLeaseRLocked(ctx, now) {
 		if r.requiresExpirationLeaseRLocked() {
 			// Whenever we first acquire an expiration-based lease for a range that
 			// requires it (i.e. the liveness or meta ranges), notify the lease
 			// renewer worker that we want it to keep proactively renewing the lease
-			// before it expires. We don't eagerly renew other expiration leases,
-			// because a more sophisticated scheduler is needed to handle large
-			// numbers of expiration leases.
+			// before it expires.
+			//
+			// Other expiration leases are only proactively renewed if
+			// kv.expiration_leases_only.enabled is true, but in that case the renewal
+			// is handled by the Raft scheduler during Raft ticks.
 			r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
 			select {
 			case r.store.renewableLeasesSignal <- struct{}{}:

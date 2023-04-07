@@ -83,7 +83,7 @@ func (s *Server) newTenantServer(
 	// Apply the TestTenantArgs, if any.
 	baseCfg.TestingKnobs = testArgs.Knobs
 
-	tenantServer, err := s.startTenantServerInternal(ctx, baseCfg, sqlCfg, tenantStopper, tenantNameContainer)
+	tenantServer, err := newTenantServerInternal(ctx, baseCfg, sqlCfg, tenantStopper, tenantNameContainer)
 	if err != nil {
 		return nil, err
 	}
@@ -124,12 +124,12 @@ func (s *Server) getTenantID(
 	return tenantID, nil
 }
 
-// startTenantServerInternal starts a server for the given target
+// newTenantServerInternal instantiates a server for the given target
 // tenant ID.
 //
-// Note that even if an error is returned, tasks might have been started with
-// the stopper, so the caller needs to Stop() it.
-func (s *Server) startTenantServerInternal(
+// Note that even if an error is returned, closers may have been
+// registered with the stopper, so the caller needs to Stop() it.
+func newTenantServerInternal(
 	ctx context.Context,
 	baseCfg BaseConfig,
 	sqlCfg SQLConfig,
@@ -140,28 +140,13 @@ func (s *Server) startTenantServerInternal(
 	stopper.SetTracer(baseCfg.Tracer)
 
 	// New context, since we're using a separate tracer.
-	startCtx := ambientCtx.AnnotateCtx(context.Background())
+	newCtx := ambientCtx.AnnotateCtx(context.Background())
 
 	// Inform the logs we're starting a new server.
-	log.Infof(startCtx, "starting tenant server")
+	log.Infof(newCtx, "creating tenant server")
 
-	// Now start the tenant proper.
-	tenantServer, err := NewSharedProcessTenantServer(startCtx, stopper, baseCfg, sqlCfg, tenantNameContainer)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tenantServer.Start(startCtx); err != nil {
-		return tenantServer, err
-	}
-
-	// Show the tenant details in logs.
-	// TODO(knz): Remove this once we can use a single listener.
-	if err := reportTenantInfo(startCtx, baseCfg, sqlCfg); err != nil {
-		return tenantServer, err
-	}
-
-	return tenantServer, nil
+	// Now instantiate the tenant server proper.
+	return newSharedProcessTenantServer(newCtx, stopper, baseCfg, sqlCfg, tenantNameContainer)
 }
 
 func (s *Server) makeSharedProcessTenantConfig(
@@ -193,12 +178,15 @@ func makeSharedProcessTenantServerConfig(
 ) (baseCfg BaseConfig, sqlCfg SQLConfig, err error) {
 	st := cluster.MakeClusterSettings()
 
-	// This version initialization is copied from cli/mt_start_sql.go.
+	// We need a value in the version setting prior to the update
+	// coming from the system.settings table. This value must be valid
+	// and compatible with the state of the tenant's keyspace.
 	//
-	// TODO(knz): Why is this even useful? The comment refers to v21.1
-	// compatibility, yet if we don't do this, the server panics with
-	// "version not initialized". This might be related to:
-	// https://github.com/cockroachdb/cockroach/issues/84587
+	// Since we don't know at which binary version the tenant
+	// keyspace was initialized, we must be conservative and
+	// assume it was created a long time ago; and that we may
+	// have to run all known migrations since then. So initialize
+	// the version setting to the minimum supported version.
 	if err := clusterversion.Initialize(
 		ctx, st.Version.BinaryMinSupportedVersion(), &st.SV,
 	); err != nil {
@@ -319,11 +307,9 @@ func makeSharedProcessTenantServerConfig(
 		baseCfg.InflightTraceDirName = traceDir
 	}
 
-	// TODO(knz): Define a meaningful storage config for each tenant,
-	// see: https://github.com/cockroachdb/cockroach/issues/84588.
 	useStore := kvServerCfg.SQLConfig.TempStorageConfig.Spec
 	tempStorageCfg := base.TempStorageConfigFromEnv(
-		ctx, st, useStore, "" /* parentDir */, kvServerCfg.SQLConfig.TempStorageConfig.Mon.MaximumBytes())
+		ctx, st, useStore, "" /* parentDir */, kvServerCfg.SQLConfig.TempStorageConfig.Mon.Limit())
 	// TODO(knz): Make tempDir configurable.
 	tempDir := useStore.Path
 	if tempStorageCfg.Path, err = fs.CreateTempDir(tempDir, TempDirPrefix, stopper); err != nil {
@@ -408,11 +394,11 @@ func rederivePort(index int, addrToChange string, prevAddr string, portOffset in
 	return net.JoinHostPort(h, port), nil
 }
 
-func reportTenantInfo(ctx context.Context, baseCfg BaseConfig, sqlCfg SQLConfig) error {
+func (s *SQLServerWrapper) reportTenantInfo(ctx context.Context) error {
 	var buf redact.StringBuilder
 	buf.Printf("started tenant SQL server at %s\n", timeutil.Now())
-	buf.Printf("webui:\t%s\n", baseCfg.AdminURL())
-	clientConnOptions, serverParams := MakeServerOptionsForURL(baseCfg.Config)
+	buf.Printf("webui:\t%s\n", s.cfg.AdminURL())
+	clientConnOptions, serverParams := MakeServerOptionsForURL(s.cfg.Config)
 	pgURL, err := clientsecopts.MakeURLForServer(clientConnOptions, serverParams, url.User(username.RootUser))
 	if err != nil {
 		log.Errorf(ctx, "failed computing the URL: %v", err)
@@ -420,15 +406,15 @@ func reportTenantInfo(ctx context.Context, baseCfg BaseConfig, sqlCfg SQLConfig)
 		buf.Printf("sql:\t%s\n", pgURL.ToPQ())
 		buf.Printf("sql (JDBC):\t%s\n", pgURL.ToJDBC())
 	}
-	if baseCfg.SocketFile != "" {
-		buf.Printf("socket:\t%s\n", baseCfg.SocketFile)
+	if s.cfg.SocketFile != "" {
+		buf.Printf("socket:\t%s\n", s.cfg.SocketFile)
 	}
-	if tmpDir := sqlCfg.TempStorageConfig.Path; tmpDir != "" {
+	if tmpDir := s.sqlCfg.TempStorageConfig.Path; tmpDir != "" {
 		buf.Printf("temp dir:\t%s\n", tmpDir)
 	}
-	buf.Printf("clusterID:\t%s\n", baseCfg.ClusterIDContainer.Get())
-	buf.Printf("tenantID:\t%s\n", sqlCfg.TenantID)
-	buf.Printf("instanceID:\t%d\n", baseCfg.IDContainer.Get())
+	buf.Printf("clusterID:\t%s\n", s.cfg.ClusterIDContainer.Get())
+	buf.Printf("tenantID:\t%s\n", s.sqlCfg.TenantID)
+	buf.Printf("instanceID:\t%d\n", s.cfg.IDContainer.Get())
 	// Collect the formatted string and show it to the user.
 	msg, err := util.ExpandTabsInRedactableBytes(buf.RedactableBytes())
 	if err != nil {

@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -1257,6 +1258,9 @@ type extraTxnState struct {
 	descCollection     *descs.Collection
 	jobs               *txnJobsCollection
 	schemaChangerState *SchemaChangerState
+
+	// regionsProvider is populated lazily.
+	regionsProvider *regions.Provider
 }
 
 // InternalDB stored information needed to construct a new
@@ -1310,6 +1314,18 @@ var _ isql.DB = &InternalDB{}
 type internalTxn struct {
 	internalExecutor
 	txn *kv.Txn
+}
+
+func (txn *internalTxn) Regions() descs.RegionProvider {
+	if txn.extraTxnState.regionsProvider == nil {
+		txn.extraTxnState.regionsProvider = regions.NewProvider(
+			txn.s.cfg.Codec,
+			txn.s.cfg.TenantStatusServer,
+			txn.txn,
+			txn.extraTxnState.descCollection,
+		)
+	}
+	return txn.extraTxnState.regionsProvider
 }
 
 func (txn *internalTxn) Descriptors() *descs.Collection {
@@ -1522,4 +1538,71 @@ func (ief *InternalDB) txn(
 			return err
 		}
 	}
+}
+
+// SessionDataOverride is a function that can be used to override some
+// fields in the session data through all uses of a isql.DB.
+//
+// This override is applied first; then any additional overrides from
+// the sessiondata.InternalExecutorOverride passed to the "*Ex()"
+// methods of Executor are applied on top.
+//
+// This particular override mechanism is useful for packages that do
+// not use the "Ex*()" methods or to safeguard the same set of
+// overrides throughout all uses (prevents mistakes due to
+// inconsistent overrides in different places).
+type SessionDataOverride = func(sd *sessiondata.SessionData)
+
+type internalDBWithOverrides struct {
+	baseDB               isql.DB
+	sessionDataOverrides []SessionDataOverride
+}
+
+var _ isql.DB = (*internalDBWithOverrides)(nil)
+
+// NewInternalDBWithSessionDataOverrides creates a new DB that wraps
+// the given DB and customizes the session data. The customizations
+// passed here are applied *before* any other customizations via the
+// sessiondata.InternalExecutorOverride parameter to the "*Ex()"
+// methods of Executor.
+func NewInternalDBWithSessionDataOverrides(
+	baseDB isql.DB, sessionDataOverrides ...SessionDataOverride,
+) isql.DB {
+	return &internalDBWithOverrides{
+		baseDB:               baseDB,
+		sessionDataOverrides: sessionDataOverrides,
+	}
+}
+
+// KV is part of the isql.DB interface.
+func (db *internalDBWithOverrides) KV() *kv.DB {
+	return db.baseDB.KV()
+}
+
+// Txn is part of the isql.DB interface.
+func (db *internalDBWithOverrides) Txn(
+	ctx context.Context, fn func(context.Context, isql.Txn) error, opts ...isql.TxnOption,
+) error {
+	return db.baseDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		for _, o := range db.sessionDataOverrides {
+			o(txn.SessionData())
+		}
+		return fn(ctx, txn)
+	}, opts...)
+}
+
+// Executor is part of the isql.DB interface.
+func (db *internalDBWithOverrides) Executor(opts ...isql.ExecutorOption) isql.Executor {
+	var cfg isql.ExecutorConfig
+	cfg.Init(opts...)
+	sd := cfg.GetSessionData()
+	if sd == nil {
+		// newSessionData is the default value used by InternalExecutor
+		// when no session data is provided otherwise.
+		sd = newSessionData(SessionArgs{})
+	}
+	for _, o := range db.sessionDataOverrides {
+		o(sd)
+	}
+	return db.baseDB.Executor(isql.WithSessionData(sd))
 }

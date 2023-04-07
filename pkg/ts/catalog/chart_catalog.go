@@ -3080,7 +3080,6 @@ var charts = []sectionDescription{
 			{
 				Title: "Size",
 				Metrics: []string{
-					"rocksdb.block.cache.pinned-usage",
 					"rocksdb.block.cache.usage",
 				},
 			},
@@ -3112,6 +3111,14 @@ var charts = []sectionDescription{
 			{
 				Title:   "Tombstone Count",
 				Metrics: []string{"storage.keys.tombstone.count"},
+			},
+			{
+				Title:   "Pinned Keys Written",
+				Metrics: []string{"storage.compactions.keys.pinned.count"},
+			},
+			{
+				Title:   "Pinned Key Bytes Written",
+				Metrics: []string{"storage.compactions.keys.pinned.bytes"},
 			},
 		},
 	},

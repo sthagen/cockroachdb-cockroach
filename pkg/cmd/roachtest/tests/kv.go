@@ -58,12 +58,13 @@ func registerKV(r registry.Registry) {
 		encryption               bool
 		sequential               bool
 		globalMVCCRangeTombstone bool
+		expirationLeases         bool
 		concMultiplier           int
 		ssds                     int
 		raid0                    bool
 		duration                 time.Duration
 		tracing                  bool // `trace.debug.enable`
-		tags                     []string
+		tags                     map[string]struct{}
 		owner                    registry.Owner // defaults to KV
 	}
 	computeNumSplits := func(opts kvOptions) int {
@@ -118,6 +119,11 @@ func registerKV(r registry.Registry) {
 		if opts.disableLoadSplits {
 			if _, err := db.ExecContext(ctx, "SET CLUSTER SETTING kv.range_split.by_load_enabled = 'false'"); err != nil {
 				t.Fatalf("failed to disable load based splitting: %v", err)
+			}
+		}
+		if opts.expirationLeases {
+			if _, err := db.ExecContext(ctx, "SET CLUSTER SETTING kv.expiration_leases_only.enabled = true"); err != nil {
+				t.Fatalf("failed to enable expiration leases: %v", err)
 			}
 		}
 		if opts.tracing {
@@ -200,6 +206,10 @@ func registerKV(r registry.Registry) {
 		{nodes: 3, cpus: 32, readPercent: 0, globalMVCCRangeTombstone: true},
 		{nodes: 3, cpus: 32, readPercent: 95, globalMVCCRangeTombstone: true},
 
+		// Configs with expiration-based leases.
+		{nodes: 3, cpus: 8, readPercent: 0, expirationLeases: true},
+		{nodes: 3, cpus: 8, readPercent: 95, expirationLeases: true},
+
 		// Configs with large block sizes.
 		{nodes: 3, cpus: 8, readPercent: 0, blockSize: 1 << 12 /* 4 KB */},
 		{nodes: 3, cpus: 8, readPercent: 95, blockSize: 1 << 12 /* 4 KB */},
@@ -239,8 +249,8 @@ func registerKV(r registry.Registry) {
 		{nodes: 1, cpus: 32, readPercent: 95, spanReads: true, splits: -1 /* no splits */, disableLoadSplits: true, sequential: true},
 
 		// Weekly larger scale configurations.
-		{nodes: 32, cpus: 8, readPercent: 0, tags: []string{"weekly"}, duration: time.Hour},
-		{nodes: 32, cpus: 8, readPercent: 95, tags: []string{"weekly"}, duration: time.Hour},
+		{nodes: 32, cpus: 8, readPercent: 0, tags: registry.Tags("weekly"), duration: time.Hour},
+		{nodes: 32, cpus: 8, readPercent: 95, tags: registry.Tags("weekly"), duration: time.Hour},
 	} {
 		opts := opts
 
@@ -251,7 +261,11 @@ func registerKV(r registry.Registry) {
 		}
 		nameParts = append(nameParts, fmt.Sprintf("kv%d%s", opts.readPercent, limitedSpanStr))
 		if len(opts.tags) > 0 {
-			nameParts = append(nameParts, strings.Join(opts.tags, "/"))
+			var keys []string
+			for k := range opts.tags {
+				keys = append(keys, k)
+			}
+			nameParts = append(nameParts, strings.Join(keys, "/"))
 		}
 		nameParts = append(nameParts, fmt.Sprintf("enc=%t", opts.encryption))
 		nameParts = append(nameParts, fmt.Sprintf("nodes=%d", opts.nodes))
@@ -272,6 +286,9 @@ func registerKV(r registry.Registry) {
 		}
 		if opts.globalMVCCRangeTombstone {
 			nameParts = append(nameParts, "mvcc-range-keys=global")
+		}
+		if opts.expirationLeases {
+			nameParts = append(nameParts, "lease=expiration")
 		}
 		if opts.concMultiplier != 0 { // support legacy test name which didn't include this multiplier
 			nameParts = append(nameParts, fmt.Sprintf("conc=%d", opts.concMultiplier))
@@ -297,6 +314,12 @@ func registerKV(r registry.Registry) {
 			encryption = registry.EncryptionAlwaysEnabled
 		}
 		cSpec := r.MakeClusterSpec(opts.nodes+1, spec.CPU(opts.cpus), spec.SSD(opts.ssds), spec.RAID0(opts.raid0))
+
+		// All the kv0|95 tests should run on AWS by default
+		if opts.tags == nil && opts.ssds == 0 && (opts.readPercent == 95 || opts.readPercent == 0) {
+			opts.tags = registry.Tags("aws")
+		}
+
 		var skip string
 		if opts.ssds != 0 && cSpec.Cloud != spec.GCE {
 			skip = fmt.Sprintf("multi-store tests are not supported on cloud %s", cSpec.Cloud)
@@ -931,7 +954,7 @@ func registerKVRestartImpact(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name: "kv/restart/nodes=12",
 		// This test is expensive (104vcpu), we run it weekly.
-		Tags:    []string{`weekly`},
+		Tags:    registry.Tags(`weekly`),
 		Owner:   registry.OwnerKV,
 		Cluster: r.MakeClusterSpec(13, spec.CPU(8)),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

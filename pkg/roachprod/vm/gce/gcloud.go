@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
+	cloudbilling "google.golang.org/api/cloudbilling/v1beta"
 )
 
 const (
@@ -175,22 +176,37 @@ func (jsonVM *jsonVM) toVM(
 	}
 
 	var volumes []vm.Volume
+	var localDisks []vm.Volume
+
+	parseDiskSize := func(size string) int {
+		if val, err := strconv.Atoi(size); err == nil {
+			return val
+		} else {
+			vmErrors = append(vmErrors, errors.Newf("invalid disk size: %q", size))
+		}
+		return 0
+	}
 
 	for _, jsonVMDisk := range jsonVM.Disks {
-		if jsonVMDisk.Source != "" && !jsonVMDisk.Boot {
+		if jsonVMDisk.Source == "" && jsonVMDisk.Type == "SCRATCH" {
+			// This is a scratch disk.
+			localDisks = append(localDisks, vm.Volume{
+				Size:               parseDiskSize(jsonVMDisk.DiskSizeGB),
+				ProviderVolumeType: "local-ssd",
+			})
+			continue
+		}
+		if !jsonVMDisk.Boot {
+			// Find a persistent volume (detailedDisk) matching the attached non-boot disk.
 			for _, detailedDisk := range disks {
 				if detailedDisk.SelfLink == jsonVMDisk.Source {
 					vol := vm.Volume{
 						ProviderResourceID: detailedDisk.Name,
-						ProviderVolumeType: jsonVMDisk.Type,
-						Zone:               jsonVM.Zone,
+						ProviderVolumeType: detailedDisk.Type,
+						Zone:               detailedDisk.Zone,
 						Name:               detailedDisk.Name,
 						Labels:             detailedDisk.Labels,
-					}
-					if val, err := strconv.Atoi(jsonVMDisk.DiskSizeGB); err == nil {
-						vol.Size = val
-					} else {
-						vmErrors = append(vmErrors, errors.Newf("invalid disk size: %q", jsonVMDisk.DiskSizeGB))
+						Size:               parseDiskSize(detailedDisk.SizeGB),
 					}
 					volumes = append(volumes, vol)
 				}
@@ -217,6 +233,7 @@ func (jsonVM *jsonVM) toVM(
 		SQLPort:                config.DefaultSQLPort,
 		AdminUIPort:            config.DefaultAdminUIPort,
 		NonBootAttachedVolumes: volumes,
+		LocalDisks:             localDisks,
 	}
 }
 
@@ -441,6 +458,9 @@ func (p *Provider) CreateVolume(
 }
 
 type instanceDisksResponse struct {
+	// Disks that are attached to the instance.
+	// N.B. Unattached disks can be enumerated via,
+	//	gcloud compute --project $project disks list --filter="-users:*"
 	Disks []attachDiskCmdDisk `json:"disks"`
 }
 type attachDiskCmdDisk struct {
@@ -806,22 +826,24 @@ func (p *Provider) Create(
 	for key, value := range m {
 		fmt.Fprintf(&sb, "%s=%s,", key, value)
 	}
-	s := sb.String()
-	args = append(args, "--labels", s[:len(s)-1])
-
+	labels := sb.String()
+	args = append(args, "--labels", labels)
 	args = append(args, "--metadata-from-file", fmt.Sprintf("startup-script=%s", filename))
 	args = append(args, "--project", project)
 	args = append(args, fmt.Sprintf("--boot-disk-size=%dGB", opts.OsVolumeSize))
 	var g errgroup.Group
 
 	nodeZones := vm.ZonePlacement(len(zones), len(names))
-	zoneHostNames := make([][]string, min(len(zones), len(names)))
+	// N.B. when len(zones) > len(names), we don't need to map unused zones
+	zoneToHostNames := make(map[string][]string, min(len(zones), len(names)))
 	for i, name := range names {
-		zoneIdx := nodeZones[i]
-		zoneHostNames[zoneIdx] = append(zoneHostNames[zoneIdx], name)
+		zone := zones[nodeZones[i]]
+		zoneToHostNames[zone] = append(zoneToHostNames[zone], name)
 	}
-	for zoneIdx, zoneHosts := range zoneHostNames {
-		argsWithZone := append(args[:len(args):len(args)], "--zone", zones[zoneIdx])
+	l.Printf("Creating %d instances, distributed across [%s]", len(names), strings.Join(zones, ", "))
+
+	for zone, zoneHosts := range zoneToHostNames {
+		argsWithZone := append(args[:len(args):len(args)], "--zone", zone)
 		argsWithZone = append(argsWithZone, zoneHosts...)
 		g.Go(func() error {
 			cmd := exec.Command("gcloud", argsWithZone...)
@@ -833,6 +855,64 @@ func (p *Provider) Create(
 			return nil
 		})
 
+	}
+	err = g.Wait()
+	if err != nil {
+		return err
+	}
+
+	return propagateDiskLabels(l, project, labels, zoneToHostNames, &opts)
+}
+
+// N.B. neither boot disk nor additional persistent disks are assigned VM labels by default.
+// Hence, we must propagate them. See: https://cloud.google.com/compute/docs/labeling-resources#labeling_boot_disks
+func propagateDiskLabels(
+	l *logger.Logger,
+	project string,
+	labels string,
+	zoneToHostNames map[string][]string,
+	opts *vm.CreateOpts,
+) error {
+	var g errgroup.Group
+
+	l.Printf("Propagating labels across all disks")
+
+	for zone, zoneHosts := range zoneToHostNames {
+		zoneArg := []string{"--zone", zone}
+
+		for _, host := range zoneHosts {
+			args := []string{"compute", "disks", "update"}
+			args = append(args, "--update-labels", labels[:len(labels)-1])
+			args = append(args, "--project", project)
+			args = append(args, zoneArg...)
+			host := host
+
+			g.Go(func() error {
+				// N.B. boot disk has the same name as the host.
+				bootDiskArgs := append(args, host)
+				cmd := exec.Command("gcloud", bootDiskArgs...)
+
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", bootDiskArgs, output)
+				}
+				return nil
+			})
+
+			if !opts.SSDOpts.UseLocalSSD {
+				g.Go(func() error {
+					// N.B. additional persistent disks are suffixed with the offset, starting at 1.
+					persistentDiskArgs := append(args, fmt.Sprintf("%s-1", host))
+					cmd := exec.Command("gcloud", persistentDiskArgs...)
+
+					output, err := cmd.CombinedOutput()
+					if err != nil {
+						return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", persistentDiskArgs, output)
+					}
+					return nil
+				})
+			}
+		}
 	}
 	return g.Wait()
 }
@@ -978,6 +1058,10 @@ func (p *Provider) FindActiveAccount(l *logger.Logger) (string, error) {
 
 // List queries gcloud to produce a list of VM info objects.
 func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) {
+	if opts.IncludeVolumes {
+		l.Printf("WARN: --include-volumes is disabled; attached disks info will be partial")
+	}
+
 	var vms vm.List
 	for _, prj := range p.GetProjects() {
 		args := []string{"compute", "instances", "list", "--project", prj, "--format", "json"}
@@ -1019,11 +1103,156 @@ func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) 
 		for _, jsonVM := range jsonVMS {
 			defaultOpts := p.CreateProviderOpts().(*ProviderOpts)
 			disks := userVMToDetailedDisk[jsonVM.SelfLink]
+
+			if len(disks) == 0 {
+				// Since `--include-volumes` is disabled, we convert attachDiskCmdDisk to describeVolumeCommandResponse.
+				// The former is a subset of the latter. Some information like `Labels` will be missing.
+				disks = toDescribeVolumeCommandResponse(jsonVM.Disks, jsonVM.Zone)
+			}
 			vms = append(vms, *jsonVM.toVM(prj, disks, defaultOpts))
 		}
 	}
 
+	if opts.ComputeEstimatedCost {
+		if err := populateCostPerHour(l, vms); err != nil {
+			// N.B. We continue despite the error since it doesn't prevent 'List' and other commands which may depend on it.
+
+			l.Errorf("Error during cost estimation (will continue without): %v", err)
+			if strings.Contains(err.Error(), "could not find default credentials") {
+				l.Printf("To fix this, run `gcloud auth application-default login`")
+			}
+		}
+	}
+
 	return vms, nil
+}
+
+// Convert attachDiskCmdDisk to describeVolumeCommandResponse and link via SelfLink, Source.
+func toDescribeVolumeCommandResponse(
+	disks []attachDiskCmdDisk, zone string,
+) []describeVolumeCommandResponse {
+	res := make([]describeVolumeCommandResponse, 0, len(disks))
+
+	diskType := func(s string) string {
+		if s == "PERSISTENT" {
+			// Unfortunately, we don't know if it's a pd-ssd or pd-standard. We assume pd_ssd since those are common.
+			return "pd-ssd"
+		}
+		return "unknown"
+	}
+
+	for _, d := range disks {
+		if d.Source == "" && d.Type == "SCRATCH" {
+			// Skip scratch disks.
+			continue
+		}
+		res = append(res, describeVolumeCommandResponse{
+			Name:     d.DeviceName,
+			SelfLink: d.Source,
+			SizeGB:   d.DiskSizeGB,
+			Type:     diskType(d.Type),
+			Zone:     zone,
+		})
+	}
+	return res
+}
+
+// populateCostPerHour adds an approximate cost per hour to each VM in the list,
+// using a basic estimation method.
+//  1. Compute and attached disks are estimated at the list prices, ignoring
+//     all discounts, but including any automatically applied credits.
+//  2. Boot disk costs are completely ignored.
+//  3. Network egress costs are completely ignored.
+//  4. Blob storage costs are completely ignored.
+func populateCostPerHour(l *logger.Logger, vms vm.List) error {
+	// Construct cost estimation service
+	ctx := context.Background()
+	service, err := cloudbilling.NewService(ctx)
+	if err != nil {
+		return err
+	}
+	beta := cloudbilling.NewV1betaService(service)
+	scenario := cloudbilling.EstimateCostScenarioWithListPriceRequest{
+		CostScenario: &cloudbilling.CostScenario{
+			ScenarioConfig: &cloudbilling.ScenarioConfig{
+				EstimateDuration: "3600s",
+			},
+			Workloads: []*cloudbilling.Workload{},
+		},
+	}
+	// Workload estimation service can handle 100 workloads at a time, so page
+	// 100 VMs at a time.
+	for len(vms) > 0 {
+		scenario.CostScenario.Workloads = scenario.CostScenario.Workloads[:0]
+		var page vm.List
+		if len(vms) <= 100 {
+			page, vms = vms, nil
+		} else {
+			page, vms = vms[:100], vms[100:]
+		}
+		for _, vm := range page {
+			machineType := vm.MachineType
+			zone := vm.Zone
+
+			workload := cloudbilling.Workload{
+				Name: vm.Name,
+				ComputeVmWorkload: &cloudbilling.ComputeVmWorkload{
+					InstancesRunning: &cloudbilling.Usage{
+						UsageRateTimeline: &cloudbilling.UsageRateTimeline{
+							UsageRateTimelineEntries: []*cloudbilling.UsageRateTimelineEntry{
+								{
+									// We're estimating the cost of 1 vm at a time.
+									UsageRate: 1,
+								},
+							},
+						},
+					},
+					MachineType: &cloudbilling.MachineType{
+						PredefinedMachineType: &cloudbilling.PredefinedMachineType{
+							MachineType: machineType,
+						},
+					},
+					PersistentDisks: []*cloudbilling.PersistentDisk{},
+					Region:          zone[:len(zone)-2],
+				},
+			}
+			for _, v := range vm.NonBootAttachedVolumes {
+				workload.ComputeVmWorkload.PersistentDisks = append(workload.ComputeVmWorkload.PersistentDisks, &cloudbilling.PersistentDisk{
+					DiskSize: &cloudbilling.Usage{
+						UsageRateTimeline: &cloudbilling.UsageRateTimeline{
+							Unit: "GiBy",
+							UsageRateTimelineEntries: []*cloudbilling.UsageRateTimelineEntry{
+								{
+									UsageRate: float64(v.Size),
+								},
+							},
+						},
+					},
+					DiskType: v.ProviderVolumeType,
+					Scope:    "SCOPE_ZONAL",
+				})
+			}
+			scenario.CostScenario.Workloads = append(scenario.CostScenario.Workloads, &workload)
+		}
+		estimate, err := beta.EstimateCostScenario(&scenario).Do()
+		if err != nil {
+			l.Errorf("Error estimating VM costs (will continue without): %v", err)
+			continue
+		}
+		workloadEstimates := estimate.CostEstimationResult.SegmentCostEstimates[0].WorkloadCostEstimates
+		for i := range workloadEstimates {
+			workloadEstimate := workloadEstimates[i].WorkloadTotalCostEstimate.NetCostEstimate
+			page[i].CostPerHour = float64(workloadEstimate.Units) + float64(workloadEstimate.Nanos)/1e9
+			// Add the estimated cost of local disks since the billing API only supports persistent disks.
+			for _, v := range page[i].LocalDisks {
+				// "For example, in the Iowa, Oregon, Taiwan, and Belgium regions, local SSDs cost $0.080 per GB per month."
+				// Normalized to per hour billing, 0.08 / 730 = 0.0001095890410958904
+				// https://cloud.google.com/compute/disks-image-pricing#disk
+				page[i].CostPerHour += float64(v.Size) * 0.00011
+			}
+		}
+	}
+	return nil
 }
 
 func serializeLabel(s string) string {

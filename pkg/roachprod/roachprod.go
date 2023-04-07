@@ -320,7 +320,9 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 // List returns a cloud.Cloud struct of all roachprod clusters matching clusterNamePattern.
 // Alternatively, the 'listMine' option can be provided to get the clusters that are owned
 // by the current user.
-func List(l *logger.Logger, listMine bool, clusterNamePattern string) (cloud.Cloud, error) {
+func List(
+	l *logger.Logger, listMine bool, clusterNamePattern string, opts vm.ListOptions,
+) (cloud.Cloud, error) {
 	if err := LoadClusters(); err != nil {
 		return cloud.Cloud{}, err
 	}
@@ -344,7 +346,7 @@ func List(l *logger.Logger, listMine bool, clusterNamePattern string) (cloud.Clo
 		}
 	}
 
-	cld, err := Sync(l, vm.ListOptions{})
+	cld, err := Sync(l, opts)
 	if err != nil {
 		return cloud.Cloud{}, err
 	}
@@ -468,7 +470,7 @@ func IP(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		if err := c.Parallel(l, "", len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
+		if err := c.Parallel(ctx, l, "", len(nodes), 0, func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
@@ -858,7 +860,7 @@ func Put(
 // Get copies a remote file from the nodes in a cluster.
 // If the file is retrieved from multiple nodes the destination
 // file name will be prefixed with the node number.
-func Get(l *logger.Logger, clusterName, src, dest string) error {
+func Get(ctx context.Context, l *logger.Logger, clusterName, src, dest string) error {
 	if err := LoadClusters(); err != nil {
 		return err
 	}
@@ -866,7 +868,7 @@ func Get(l *logger.Logger, clusterName, src, dest string) error {
 	if err != nil {
 		return err
 	}
-	return c.Get(l, c.Nodes, src, dest)
+	return c.Get(ctx, l, c.Nodes, src, dest)
 }
 
 type PGURLOptions struct {
@@ -894,7 +896,7 @@ func PgURL(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		if err := c.Parallel(l, "", len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
+		if err := c.Parallel(ctx, l, "", len(nodes), 0, func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
@@ -996,7 +998,7 @@ type PprofOpts struct {
 }
 
 // Pprof TODO
-func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
+func Pprof(ctx context.Context, l *logger.Logger, clusterName string, opts PprofOpts) error {
 	if err := LoadClusters(); err != nil {
 		return err
 	}
@@ -1028,7 +1030,7 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 	httpClient := httputil.NewClientWithTimeout(timeout)
 	startTime := timeutil.Now().Unix()
 	nodes := c.TargetNodes()
-	failed, err := c.ParallelE(l, description, len(nodes), 0, func(i int) (*install.RunResultDetails, error) {
+	err = c.Parallel(ctx, l, description, len(nodes), 0, func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 		node := nodes[i]
 		res := &install.RunResultDetails{Node: node}
 		host := c.Host(node)
@@ -1097,10 +1099,6 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 	}
 
 	if err != nil {
-		sort.Slice(failed, func(i, j int) bool { return failed[i].Index < failed[j].Index })
-		for _, f := range failed {
-			l.Errorf("%d: %+v: %s\n", f.Index, f.Err, f.Out)
-		}
 		exit.WithCode(exit.UnspecifiedError())
 	}
 
@@ -1688,11 +1686,11 @@ func sendCaptureCommand(
 ) error {
 	nodes := c.TargetNodes()
 	httpClient := httputil.NewClientWithTimeout(0 /* timeout: None */)
-	_, err := c.ParallelE(l,
+	_, err := c.ParallelE(ctx, l,
 		fmt.Sprintf("Performing workload capture %s", action),
 		len(nodes),
 		0,
-		func(i int) (*install.RunResultDetails, error) {
+		func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			host := c.Host(node)

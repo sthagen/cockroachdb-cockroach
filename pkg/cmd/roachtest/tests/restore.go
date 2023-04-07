@@ -130,6 +130,7 @@ func registerRestore(r registry.Registry) {
 		Owner:   registry.OwnerDisasterRecovery,
 		Cluster: withPauseSpecs.hardware.makeClusterSpecs(r, withPauseSpecs.backup.cloud),
 		Timeout: withPauseSpecs.timeout,
+		Tags:    registry.Tags("aws"),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 			if c.Spec().Cloud != withPauseSpecs.backup.cloud {
@@ -281,6 +282,7 @@ func registerRestore(r registry.Registry) {
 			hardware: makeHardwareSpecs(hardwareSpecs{}),
 			backup:   makeBackupSpecs(backupSpecs{}),
 			timeout:  1 * time.Hour,
+			tags:     registry.Tags("aws"),
 		},
 		{
 			// Note that the default specs in makeHardwareSpecs() spin up restore tests in aws,
@@ -302,6 +304,17 @@ func registerRestore(r registry.Registry) {
 			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 8}),
 			backup:   makeBackupSpecs(backupSpecs{}),
 			timeout:  1 * time.Hour,
+			tags:     registry.Tags("aws"),
+		},
+		{
+			// Benchmarks if per node throughput remains constant if the cluster
+			// is multi-region.
+			hardware: makeHardwareSpecs(hardwareSpecs{
+				nodes: 9,
+				zones: []string{"us-east-2b", "us-west-2b", "eu-west-1b"}}), // These zones are AWS-specific.
+			backup:  makeBackupSpecs(backupSpecs{}),
+			timeout: 1 * time.Hour,
+			tags:    registry.Tags("aws"),
 		},
 		{
 			// Benchmarks if per node throughput doubles if the vcpu count doubles
@@ -309,6 +322,7 @@ func registerRestore(r registry.Registry) {
 			hardware: makeHardwareSpecs(hardwareSpecs{cpus: 16}),
 			backup:   makeBackupSpecs(backupSpecs{}),
 			timeout:  1 * time.Hour,
+			tags:     registry.Tags("aws"),
 		},
 		{
 			// Ensures we can restore a 48 length incremental chain.
@@ -316,6 +330,7 @@ func registerRestore(r registry.Registry) {
 			hardware: makeHardwareSpecs(hardwareSpecs{}),
 			backup:   makeBackupSpecs(backupSpecs{backupsIncluded: 48}),
 			timeout:  1 * time.Hour,
+			tags:     registry.Tags("aws"),
 		},
 		{
 			// The nightly 8TB Restore test.
@@ -324,6 +339,7 @@ func registerRestore(r registry.Registry) {
 				version:  "v22.2.1",
 				workload: tpceRestore{customers: 500000}}),
 			timeout: 5 * time.Hour,
+			tags:    registry.Tags("aws"),
 		},
 		{
 			// The weekly 32TB Restore test.
@@ -332,7 +348,7 @@ func registerRestore(r registry.Registry) {
 				version:  "v22.2.1",
 				workload: tpceRestore{customers: 2000000}}),
 			timeout: 24 * time.Hour,
-			tags:    []string{"weekly", "aws-weekly"},
+			tags:    registry.Tags("weekly", "aws-weekly"),
 		},
 		{
 			// A teeny weeny 15GB restore that could be used to bisect scale agnostic perf regressions.
@@ -417,6 +433,10 @@ type hardwareSpecs struct {
 
 	// mem is the memory per cpu.
 	mem spec.MemPerCPU
+
+	// Availability zones to use. (Values are cloud-provider-specific.)
+	// If unset, the first of the default availability zones for the provider will be used.
+	zones []string
 }
 
 func (hw hardwareSpecs) makeClusterSpecs(r registry.Registry, backupCloud string) spec.ClusterSpec {
@@ -427,6 +447,10 @@ func (hw hardwareSpecs) makeClusterSpecs(r registry.Registry, backupCloud string
 	}
 	if hw.mem != spec.Auto {
 		clusterOpts = append(clusterOpts, spec.Mem(hw.mem))
+	}
+	if len(hw.zones) > 0 {
+		clusterOpts = append(clusterOpts, spec.Zones(strings.Join(hw.zones, ",")))
+		clusterOpts = append(clusterOpts, spec.Geo())
 	}
 	s := r.MakeClusterSpec(hw.nodes, clusterOpts...)
 
@@ -448,6 +472,9 @@ func (hw hardwareSpecs) String(verbose bool) string {
 	builder.WriteString(fmt.Sprintf("/cpus=%d", hw.cpus))
 	if hw.mem != spec.Auto {
 		builder.WriteString(fmt.Sprintf("/%smem", hw.mem))
+	}
+	if len(hw.zones) > 0 {
+		builder.WriteString(fmt.Sprintf("/zones=%s", strings.Join(hw.zones, ",")))
 	}
 	if verbose {
 		builder.WriteString(fmt.Sprintf("/volSize=%dGB", hw.volumeSize))
@@ -471,6 +498,7 @@ func makeHardwareSpecs(override hardwareSpecs) hardwareSpecs {
 	if override.volumeSize != 0 {
 		specs.volumeSize = override.volumeSize
 	}
+	specs.zones = override.zones
 	return specs
 }
 
@@ -615,7 +643,7 @@ type restoreSpecs struct {
 	hardware hardwareSpecs
 	backup   backupSpecs
 	timeout  time.Duration
-	tags     []string
+	tags     map[string]struct{}
 
 	// namePrefix appears in the name of the roachtest, i.e. `restore/{prefix}/{config}`.
 	namePrefix string

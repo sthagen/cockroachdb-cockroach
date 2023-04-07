@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // TestServerStartupGuardrails ensures that a SQL server will fail to start if
@@ -30,8 +30,16 @@ import (
 func TestServerStartupGuardrails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// We need to conditionally apply the DevOffset for the version
+	// returned by this function to work both on master (where the dev
+	// offset applies) and on release branches (where it doesn't).
 	v := func(major, minor int32) roachpb.Version {
-		return roachpb.Version{Major: clusterversion.DevOffset + major, Minor: minor}
+		binaryVersion := clusterversion.ByKey(clusterversion.BinaryVersionKey)
+		var offset int32
+		if binaryVersion.Major > clusterversion.DevOffset {
+			offset = clusterversion.DevOffset
+		}
+		return roachpb.Version{Major: offset + major, Minor: minor}
 	}
 
 	tests := []struct {
@@ -66,69 +74,59 @@ func TestServerStartupGuardrails(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		storageSettings := cluster.MakeTestingClusterSettingsWithVersions(
-			test.storageBinaryVersion,
-			test.storageBinaryMinSupportedVersion,
-			false, /* initializeVersion */
-		)
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			defer log.Scope(t).Close(t)
 
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-			// Disable the default test tenant, since we create one explicitly
-			// below.
-			DefaultTestTenant: base.TestTenantDisabled,
-			Settings:          storageSettings,
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					BinaryVersionOverride:          test.storageBinaryVersion,
-					BootstrapVersionKeyOverride:    clusterversion.V22_2,
-					DisableAutomaticVersionUpgrade: make(chan struct{}),
-				},
-				SQLEvalContext: &eval.TestingKnobs{
-					TenantLogicalVersionKeyOverride: test.TenantLogicalVersionKey,
-				},
-			},
-		})
+			storageSettings := cluster.MakeTestingClusterSettingsWithVersions(
+				test.storageBinaryVersion,
+				test.storageBinaryMinSupportedVersion,
+				false, /* initializeVersion */
+			)
 
-		tenantSettings := cluster.MakeTestingClusterSettingsWithVersions(
-			test.tenantBinaryVersion,
-			test.tenantBinaryMinSupportedVersion,
-			true, /* initializeVersion */
-		)
-
-		// The tenant will be created with an active version equal to the version
-		// corresponding to TenantLogicalVersionKey. Tenant creation is expected
-		// to succeed for all test cases but server creation is expected to succeed
-		// only if tenantBinaryVersion is at least equal to the version corresponding
-		// to TenantLogicalVersionKey.
-		stopper := stop.NewStopper()
-		tenantServer, err := s.StartTenant(context.Background(),
-			base.TestTenantArgs{
-				Settings: tenantSettings,
-				TenantID: serverutils.TestTenantID(),
-				Stopper:  stopper,
-				TestingKnobs: base.TestingKnobs{
+			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+				// Disable the default test tenant, since we create one explicitly
+				// below.
+				DefaultTestTenant: base.TestTenantDisabled,
+				Settings:          storageSettings,
+				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						BinaryVersionOverride:          test.tenantBinaryVersion,
+						BinaryVersionOverride:          test.storageBinaryVersion,
+						BootstrapVersionKeyOverride:    clusterversion.V22_2,
 						DisableAutomaticVersionUpgrade: make(chan struct{}),
+					},
+					SQLEvalContext: &eval.TestingKnobs{
+						TenantLogicalVersionKeyOverride: test.TenantLogicalVersionKey,
 					},
 				},
 			})
+			defer s.Stopper().Stop(context.Background())
 
-		if !testutils.IsError(err, test.expErrMatch) {
-			t.Fatalf("test %d: got error %s, wanted error matching '%s'", i, err, test.expErrMatch)
-		}
+			tenantSettings := cluster.MakeTestingClusterSettingsWithVersions(
+				test.tenantBinaryVersion,
+				test.tenantBinaryMinSupportedVersion,
+				true, /* initializeVersion */
+			)
 
-		// Only attempt to stop the tenant if it was started successfully.
-		if err == nil {
-			tenantServer.Stopper().Stop(context.Background())
-		} else {
-			// Test - stop the failed SQL server using a custom stopper
-			// NOTE: This custom stopper should not be required, but is because
-			// currently, if a SQL server fails to start it will not be cleaned
-			// up immediately without invoking the custom stopper. This could
-			// be a problem, and is tracked with #98868.
-			stopper.Stop(context.Background())
-		}
-		s.Stopper().Stop(context.Background())
+			// The tenant will be created with an active version equal to the version
+			// corresponding to TenantLogicalVersionKey. Tenant creation is expected
+			// to succeed for all test cases but server creation is expected to succeed
+			// only if tenantBinaryVersion is at least equal to the version corresponding
+			// to TenantLogicalVersionKey.
+			_, err := s.StartTenant(context.Background(),
+				base.TestTenantArgs{
+					Settings: tenantSettings,
+					TenantID: serverutils.TestTenantID(),
+					TestingKnobs: base.TestingKnobs{
+						Server: &server.TestingKnobs{
+							BinaryVersionOverride:          test.tenantBinaryVersion,
+							DisableAutomaticVersionUpgrade: make(chan struct{}),
+						},
+					},
+				})
+
+			if !testutils.IsError(err, test.expErrMatch) {
+				t.Fatalf("test %d: got error %s, wanted error matching '%s'", i, err, test.expErrMatch)
+			}
+		})
 	}
 }

@@ -1,5 +1,3 @@
-# LogicTest: default-configs local-mixed-22.2-23.1
-
 statement ok
 CREATE TABLE other (b INT PRIMARY KEY)
 
@@ -2245,6 +2243,8 @@ SELECT * FROM multipleinstmt ORDER BY id ASC;
 2  b  b  false  NULL  true  NULL
 3  c  c  false  NULL  true  NULL
 
+skip_on_retry
+
 subtest column_backfiller_update_batching
 
 let $use_decl_sc
@@ -3241,4 +3241,25 @@ t_99281  CREATE TABLE public.t_99281 (
            j INT8 NOT NULL,
            k INT8 NOT NULL,
            CONSTRAINT t_99281_pkey PRIMARY KEY (i ASC)
+         )
+
+subtest 99764
+
+statement ok
+CREATE TABLE t_99764 (i INT PRIMARY KEY, j INT, UNIQUE (j, CAST(j AS STRING)), FAMILY "primary" (i, j));
+set sql_safe_updates = false;
+
+# Dropping `j` should also drop the unique index as well as the expression column.
+# Legacy schema change is incapable to do this.
+skipif config local-legacy-schema-changer
+statement ok
+ALTER TABLE t_99764 DROP COLUMN j CASCADE;
+
+skipif config local-legacy-schema-changer
+query TT
+show create table t_99764
+----
+t_99764  CREATE TABLE public.t_99764 (
+             i INT8 NOT NULL,
+             CONSTRAINT t_99764_pkey PRIMARY KEY (i ASC)
          )

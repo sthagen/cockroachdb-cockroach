@@ -87,6 +87,7 @@ func registerRubyPG(r registry.Registry) {
 			"install ruby 3.1.2",
 			`mkdir -p ruby-install && \
         curl -fsSL https://github.com/postmodern/ruby-install/archive/v0.8.3.tar.gz | tar --strip-components=1 -C ruby-install -xz && \
+        sudo rm -rf /usr/local/bin/* && \
         sudo make -C ruby-install install && \
         sudo ruby-install --system ruby 3.1.2 && \
         sudo gem update --system`,
@@ -232,7 +233,7 @@ func registerRubyPG(r registry.Registry) {
 		Owner:      registry.OwnerSQLSessions,
 		Cluster:    r.MakeClusterSpec(1),
 		NativeLibs: registry.LibGEOS,
-		Tags:       []string{`default`, `orm`},
+		Tags:       registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runRubyPGTest(ctx, t, c)
 		},

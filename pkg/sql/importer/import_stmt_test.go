@@ -3024,7 +3024,6 @@ func TestImportIntoCSV(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 100477, "programming error in dropTableAfterJobComplete below")
 	skip.UnderShort(t)
 	skip.UnderRace(t, "takes >1min under race")
 
@@ -3102,15 +3101,14 @@ func TestImportIntoCSV(t *testing.T) {
 	testNum := -1
 	insertedRows := numFiles * rowsPerFile
 
-	// Some of the tests result in a failing import. in this case,
-	// the table won't be able to drop until IMPORT's
-	// OnFailOrCancel brings the table back online.
+	// Some of the tests result in a failing import. In this case, the table
+	// won't be able to drop until IMPORT's OnFailOrCancel brings the table back
+	// online.
 	//
-	// Depening on which node that the import started on,
-	// we may have paused rather than failed. This is
-	// because _all_ errors that "rpc error" are
-	// retriable. If we end up with a cross-node nodelocal
-	// request, we get a pause.
+	// Depending on which node that the import started on, we may have paused
+	// rather than failed. This is because _all_ errors that "rpc error" are
+	// retriable. If we end up with a cross-node nodelocal request, we get a
+	// pause.
 	dropTableAfterJobComplete := func(t *testing.T, tableName string) {
 		var jobID int
 		row := conn.QueryRow("SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'IMPORT' AND status IN ('paused', 'pause-requested', 'reverting')")
@@ -3119,7 +3117,19 @@ func TestImportIntoCSV(t *testing.T) {
 			t.Fatal(err)
 		}
 		if jobID != 0 {
-			sqlDB.Exec(t, "RESUME JOB $1", jobID)
+			// If the job has the "pause-requested" status, we must block until
+			// it transitions to the "paused" status (because we cannot cancel
+			// the job otherwise).
+			testutils.SucceedsSoon(t, func() error {
+				r := sqlDB.QueryRow(t, "SELECT status FROM [SHOW JOBS] WHERE job_id = $1", jobID)
+				var status string
+				r.Scan(&status)
+				if status == string(jobs.StatusPauseRequested) {
+					return errors.New("still has pause-requested status")
+				}
+				return nil
+			})
+			sqlDB.Exec(t, "CANCEL JOB $1", jobID)
 			sqlDB.Exec(t, "SHOW JOB WHEN COMPLETE $1", jobID)
 		}
 		sqlDB.Exec(t, fmt.Sprintf("DROP TABLE %s", tableName))
@@ -6598,7 +6608,19 @@ func TestCreateStatsAfterImport(t *testing.T) {
 	const nodes = 1
 	ctx := context.Background()
 	baseDir := datapathutils.TestDataPath(t)
-	args := base.TestServerArgs{ExternalIODir: baseDir}
+
+	// Disable stats collection on system tables before the cluster is started,
+	// otherwise there is a race condition where stats may be collected before we
+	// can disable them with `SET CLUSTER SETTING`. We disable stats collection on
+	// system tables so that we can collect statistics on the imported tables
+	// within the retry time limit.
+	st := cluster.MakeClusterSettings()
+	stats.AutomaticStatisticsOnSystemTables.Override(context.Background(), &st.SV, false)
+	args := base.TestServerArgs{
+		Settings:          st,
+		DefaultTestTenant: base.TestTenantDisabled,
+		ExternalIODir:     baseDir,
+	}
 	tc := serverutils.StartNewTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
 	defer tc.Stopper().Stop(ctx)
 	conn := tc.ServerConn(0)
@@ -6609,20 +6631,18 @@ func TestCreateStatsAfterImport(t *testing.T) {
 	sqlDB.Exec(t, "IMPORT PGDUMP ($1) WITH ignore_unsupported_statements", "nodelocal://1/cockroachdump/dump.sql")
 
 	// Verify that statistics have been created.
-	// Depending on timing, the statistics name may either be __auto__ or
-	// __import__, so we don't check the name in the results.
 	sqlDB.CheckQueryResultsRetry(t,
-		`SELECT column_names, row_count, distinct_count, null_count
+		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
 	  FROM [SHOW STATISTICS FOR TABLE t]`,
 		[][]string{
-			{"{i}", "2", "2", "0"},
-			{"{t}", "2", "2", "0"},
+			{"__auto__", "{i}", "2", "2", "0"},
+			{"__auto__", "{t}", "2", "2", "0"},
 		})
 	sqlDB.CheckQueryResultsRetry(t,
-		`SELECT column_names, row_count, distinct_count, null_count
+		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
 	  FROM [SHOW STATISTICS FOR TABLE a]`,
 		[][]string{
-			{"{i}", "1", "1", "0"},
+			{"__auto__", "{i}", "1", "1", "0"},
 		})
 }
 

@@ -103,9 +103,9 @@ const fullLoadTruncate = `{
   }`
 
 func awsdmsVerString(v *version.Version) string {
-	if ciBranch := os.Getenv("TC_BUILD_BRANCH"); ciBranch != "" {
-		ciBranch = strings.ReplaceAll(ciBranch, ".", "-")
-		return fmt.Sprintf("ci-%s", ciBranch)
+	if ciBuildID := os.Getenv("TC_BUILD_ID"); ciBuildID != "" {
+		ciBuildID = strings.ReplaceAll(ciBuildID, ".", "-")
+		return fmt.Sprintf("ci-build-%s", ciBuildID)
 	}
 	ret := fmt.Sprintf("local-%d-%d-%d", v.Major(), v.Minor(), v.Patch())
 	if v.PreRelease() != "" {
@@ -191,7 +191,7 @@ func registerAWSDMS(r registry.Registry) {
 		Name:    "awsdms",
 		Owner:   registry.OwnerSQLSessions, // TODO(otan): add a migrations OWNERS team
 		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `awsdms`},
+		Tags:    registry.Tags(`default`, `awsdms`, `aws`),
 		Run:     runAWSDMS,
 	})
 }

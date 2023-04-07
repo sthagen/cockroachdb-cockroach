@@ -657,7 +657,8 @@ func (ts *TestServer) Start(ctx context.Context) error {
 // serverutils.StartTenant method.
 type TestTenant struct {
 	*SQLServer
-	Cfg *BaseConfig
+	Cfg    *BaseConfig
+	SQLCfg *SQLConfig
 	*httpTestServer
 	drain *drainServer
 
@@ -920,6 +921,7 @@ func (ts *TestServer) StartSharedProcessTenant(
 	testTenant := &TestTenant{
 		SQLServer:      sqlServer,
 		Cfg:            sqlServer.cfg,
+		SQLCfg:         sqlServerWrapper.sqlCfg,
 		pgPreServer:    sqlServerWrapper.pgPreServer,
 		httpTestServer: hts,
 		drain:          sqlServerWrapper.drainServer,
@@ -1026,6 +1028,18 @@ func (ts *TestServer) StartTenant(
 	if st == nil {
 		st = cluster.MakeTestingClusterSettings()
 	}
+	// Verify that the settings object that was passed in has
+	// initialized the version setting. This is pretty much necessary
+	// for secondary tenants. See the comments at the beginning of
+	// `runStartSQL()` in cli/mt_start_sql.go and
+	// `makeSharedProcessTenantServerConfig()` in
+	// server_controller_new_server.go.
+	//
+	// The version is initialized in MakeTestingClusterSettings(). This
+	// assertion is there to prevent inadvertent changes to
+	// MakeTestingClusterSettings() and as a guardrail for tests that
+	// pass a custom params.Settings.
+	clusterversion.AssertInitialized(ctx, &st.SV)
 
 	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
 	// Remove in v23.2.
@@ -1083,7 +1097,7 @@ func (ts *TestServer) StartTenant(
 	baseCfg.DisableTLSForHTTP = params.DisableTLSForHTTP
 	baseCfg.EnableDemoLoginEndpoint = params.EnableDemoLoginEndpoint
 
-	if st.Version.IsActive(ctx, clusterversion.V23_1TenantCapabilities) {
+	if ts.ClusterSettings().Version.IsActive(ctx, clusterversion.V23_1TenantCapabilities) {
 		_, err := ie.Exec(ctx, "testserver-alter-tenant-cap", nil,
 			"ALTER TENANT [$1] GRANT CAPABILITY can_use_nodelocal_storage", params.TenantID.ToUint64())
 		if err != nil {
@@ -1177,6 +1191,7 @@ func (ts *TestServer) StartTenant(
 	return &TestTenant{
 		SQLServer:      sw.sqlServer,
 		Cfg:            &baseCfg,
+		SQLCfg:         &sqlCfg,
 		pgPreServer:    sw.pgPreServer,
 		httpTestServer: hts,
 		drain:          sw.drainServer,

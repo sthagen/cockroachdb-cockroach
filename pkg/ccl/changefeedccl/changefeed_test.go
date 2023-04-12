@@ -90,6 +90,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randident"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -902,7 +903,7 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 			sqlsmith.DisableAggregateFuncs(),
 			sqlsmith.DisableWindowFuncs(),
 			sqlsmith.DisableJoins(),
-			sqlsmith.DisableLimits(),
+			sqlsmith.DisableUDFs(),
 			sqlsmith.DisableIndexHints(),
 			sqlsmith.SetScalarComplexity(0.5),
 			sqlsmith.SetComplexity(0.5),
@@ -5971,7 +5972,7 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 	sqlDB.Exec(t, "ALTER TABLE test.foo SCATTER")
 
 	// Create a factory which executes the CREATE CHANGEFEED statement on server 0.
-	// This statement should fail, but the job itself ought to be creaated.
+	// This statement should fail, but the job itself ought to be created.
 	// After some time, that job should be adopted by another node, and executed successfully.
 	f, closeSink := makeFeedFactory(t, randomSinkType(feedTestEnterpriseSinks), tc.Server(1), tc.ServerConn(0))
 	defer closeSink()
@@ -5980,22 +5981,21 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 	feed := feed(t, f, "CREATE CHANGEFEED FOR foo")
 	defer closeFeed(t, feed)
 
-	// At this point, the job created by feed will fail to start running on node 0 due to draining
-	// registry.  However, this job will be retried, and it should succeed.
-	// Note: This test is a bit unrealistic in that if the registry is draining, that
-	// means that the server is draining (i.e. being shut down).  We don't do a full shutdown
-	// here, but we are simulating a restart by failing to start a flow the first time around.
-	assertPayloads(t, feed, []string{
-		`foo: [1]->{"after": {"k": 1, "v": 1}}`,
-		`foo: [2]->{"after": {"k": 2, "v": 0}}`,
-		`foo: [3]->{"after": {"k": 3, "v": 1}}`,
-		`foo: [4]->{"after": {"k": 4, "v": 0}}`,
-		`foo: [5]->{"after": {"k": 5, "v": 1}}`,
-		`foo: [6]->{"after": {"k": 6, "v": 0}}`,
-		`foo: [7]->{"after": {"k": 7, "v": 1}}`,
-		`foo: [8]->{"after": {"k": 8, "v": 0}}`,
-		`foo: [9]->{"after": {"k": 9, "v": 1}}`,
-		`foo: [10]->{"after": {"k": 10, "v": 0}}`,
+	jobID := feed.(cdctest.EnterpriseTestFeed).JobID()
+	registry := tc.Server(1).JobRegistry().(*jobs.Registry)
+	loadProgress := func() jobspb.Progress {
+		job, err := registry.LoadJob(context.Background(), jobID)
+		require.NoError(t, err)
+		return job.Progress()
+	}
+
+	// Wait until highwater advances.
+	testutils.SucceedsSoon(t, func() error {
+		progress := loadProgress()
+		if hw := progress.GetHighWater(); hw == nil || hw.IsEmpty() {
+			return errors.New("waiting for highwater")
+		}
+		return nil
 	})
 }
 
@@ -6537,7 +6537,7 @@ func TestChangefeedBackfillCheckpoint(t *testing.T) {
 		progress := loadProgress()
 		require.NotNil(t, progress.GetChangefeed())
 		h := progress.GetHighWater()
-		noHighWater := (h == nil || h.IsEmpty())
+		noHighWater := h == nil || h.IsEmpty()
 		require.True(t, noHighWater)
 
 		jobCheckpoint := progress.GetChangefeed().Checkpoint
@@ -8365,4 +8365,44 @@ func TestChangefeedExecLocality(t *testing.T) {
 	test(t, "all", "", []bool{true, true, true, true})
 	test(t, "x", "x=0", []bool{true, true, false, false})
 	test(t, "y", "y=1", []bool{false, true, false, true})
+}
+
+func TestChangefeedTopicNames(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		rand, _ := randutil.NewTestRand()
+		cfg := randident.DefaultNameGeneratorConfig()
+		cfg.Noise = true
+		cfg.Finalize()
+		ng := randident.NewNameGenerator(&cfg, rand, "table")
+
+		names, _ := ng.GenerateMultiple(context.Background(), 100, make(map[string]struct{}))
+
+		var escapedNames []string
+		for _, name := range names {
+			escapedNames = append(escapedNames, strings.ReplaceAll(name, `"`, `""`))
+		}
+
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		for _, name := range escapedNames {
+			sqlDB.Exec(t, fmt.Sprintf(`CREATE TABLE "%s" (a INT PRIMARY KEY);`, name))
+			sqlDB.Exec(t, fmt.Sprintf(`INSERT INTO "%s" VALUES (1);`, name))
+		}
+
+		var quotedNames []string
+		for _, name := range escapedNames {
+			quotedNames = append(quotedNames, "\""+name+"\"")
+		}
+		createStmt := fmt.Sprintf(`CREATE CHANGEFEED FOR %s`, strings.Join(quotedNames, ", "))
+		foo := feed(t, f, createStmt)
+		defer closeFeed(t, foo)
+
+		var expected []string
+		for _, name := range names {
+			expected = append(expected, fmt.Sprintf(`%s: [1]->{"after": {"a": 1}}`, name))
+		}
+		assertPayloads(t, foo, expected)
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("pubsub"))
 }

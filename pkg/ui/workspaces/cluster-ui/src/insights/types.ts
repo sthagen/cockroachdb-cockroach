@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { Moment } from "moment";
+import { Moment } from "moment-timezone";
 import { Filters } from "../queryFilter";
 
 // This enum corresponds to the string enum for `problems` in `cluster_execution_insights`
@@ -330,6 +330,7 @@ export interface indexDetails {
 
 // These are the fields used for workload insight recommendations.
 export interface ExecutionDetails {
+  application?: string;
   databaseName?: string;
   elapsedTimeMillis?: number;
   contentionTimeMs?: number;

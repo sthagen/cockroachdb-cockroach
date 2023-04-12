@@ -74,7 +74,7 @@ import {
 import { commonStyles } from "../common";
 import { isSelectedColumn } from "src/columnsSelector/utils";
 import { StatementViewType } from "./statementPageTypes";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   InsertStmtDiagnosticRequest,
   StatementDiagnosticsReport,
@@ -140,7 +140,6 @@ export interface StatementsPageStateProps {
   statementsError: Error | null;
   apps: string[];
   databases: string[];
-  totalFingerprints: number;
   lastReset: string;
   columns: string[];
   nodeRegions: { [key: string]: string };
@@ -308,7 +307,7 @@ export class StatementsPage extends React.Component<
       this.props.onApplySearchCriteria(
         this.state.timeScale,
         this.state.limit,
-        getSortLabel(this.state.reqSortSetting),
+        getSortLabel(this.state.reqSortSetting, "Statement"),
       );
     }
     this.refreshStatements();
@@ -594,7 +593,10 @@ export class StatementsPage extends React.Component<
     );
 
     const period = timeScaleToString(this.props.timeScale);
-    const sortSettingLabel = getSortLabel(this.props.reqSortSetting);
+    const sortSettingLabel = getSortLabel(
+      this.props.reqSortSetting,
+      "Statement",
+    );
 
     return (
       <>

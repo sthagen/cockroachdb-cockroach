@@ -27,7 +27,6 @@ import {
 import { Pagination, ResultsPerPageLabel } from "../pagination";
 import { statisticsClasses } from "./transactionsPageClasses";
 import {
-  aggregateAcrossNodeIDs,
   generateRegion,
   generateRegionNode,
   getTrxAppFilterOptions,
@@ -75,7 +74,7 @@ import {
 import { InlineAlert } from "@cockroachlabs/ui-components";
 import { TransactionViewType } from "./transactionsPageTypes";
 import { isSelectedColumn } from "../columnsSelector/utils";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   STATS_LONG_LOADING_DURATION,
   txnRequestSortOptions,
@@ -417,7 +416,7 @@ export class TransactionsPage extends React.Component<
       this.props.onApplySearchCriteria(
         this.state.timeScale,
         this.state.limit,
-        getSortLabel(this.state.reqSortSetting),
+        getSortLabel(this.state.reqSortSetting, "Transaction"),
       );
     }
     this.refreshData();
@@ -473,15 +472,13 @@ export class TransactionsPage extends React.Component<
       internal_app_name_prefix,
     );
 
-    const transactionsToDisplay: TransactionInfo[] = aggregateAcrossNodeIDs(
-      filteredTransactions,
-      statements,
-    ).map(t => ({
-      stats_data: t.stats_data,
-      node_id: t.node_id,
-      regions: generateRegion(t, statements),
-      regionNodes: generateRegionNode(t, statements, nodeRegions),
-    }));
+    const transactionsToDisplay: TransactionInfo[] = filteredTransactions.map(
+      t => ({
+        stats_data: t.stats_data,
+        regions: generateRegion(t, statements),
+        regionNodes: generateRegionNode(t, statements, nodeRegions),
+      }),
+    );
     const { current, pageSize } = pagination;
     const hasData = data?.transactions?.length > 0;
     const isUsedFilter = search?.length > 0;
@@ -528,7 +525,10 @@ export class TransactionsPage extends React.Component<
     );
 
     const period = timeScaleToString(this.props.timeScale);
-    const sortSettingLabel = getSortLabel(this.props.reqSortSetting);
+    const sortSettingLabel = getSortLabel(
+      this.props.reqSortSetting,
+      "Transaction",
+    );
 
     return (
       <>

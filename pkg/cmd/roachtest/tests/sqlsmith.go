@@ -197,12 +197,8 @@ WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
 						return
 					}
 
-					// At the moment, CockroachDB doesn't support pgwire query
-					// cancellation which is needed for correct handling of context
-					// cancellation, so instead of using a context with timeout, we opt
-					// in for using CRDB's 'statement_timeout'.
-					// TODO(yuzefovich): once #41335 is implemented, go back to using a
-					// context with timeout.
+					// TODO(yuzefovich): investigate why using the context with
+					// a timeout results in poisoning the connection (#101208).
 					_, err := conn.Exec(stmt)
 					if err == nil {
 						logStmt(stmt)

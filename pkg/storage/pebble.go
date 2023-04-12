@@ -1906,7 +1906,9 @@ func (p *Pebble) PreIngestDelay(ctx context.Context) {
 
 // ApproximateDiskBytes implements the Engine interface.
 func (p *Pebble) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
-	count, err := p.db.EstimateDiskUsage(from, to)
+	fromEncoded := EngineKey{Key: from}.Encode()
+	toEncoded := EngineKey{Key: to}.Encode()
+	count, err := p.db.EstimateDiskUsage(fromEncoded, toEncoded)
 	if err != nil {
 		return 0, err
 	}
@@ -1950,7 +1952,10 @@ func (p *Pebble) CreateCheckpoint(dir string, spans []roachpb.Span) error {
 	if l := len(spans); l > 0 {
 		s := make([]pebble.CheckpointSpan, 0, l)
 		for _, span := range spans {
-			s = append(s, pebble.CheckpointSpan{Start: span.Key, End: span.EndKey})
+			s = append(s, pebble.CheckpointSpan{
+				Start: EngineKey{Key: span.Key}.Encode(),
+				End:   EngineKey{Key: span.EndKey}.Encode(),
+			})
 		}
 		opts = append(opts, pebble.WithRestrictToSpans(s))
 	}

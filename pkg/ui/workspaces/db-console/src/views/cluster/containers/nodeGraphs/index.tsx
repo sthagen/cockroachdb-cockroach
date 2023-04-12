@@ -81,7 +81,7 @@ import {
   TimeScale,
 } from "@cockroachlabs/cluster-ui";
 import { reduceStorageOfTimeSeriesDataOperationalFlags } from "src/util/docs";
-import moment from "moment";
+import moment from "moment-timezone";
 import {
   selectResolution10sStorageTTL,
   selectResolution30mStorageTTL,
@@ -115,7 +115,7 @@ const dashboards: { [key: string]: GraphDashboard } = {
   storage: {
     label: "Storage",
     component: storageDashboard,
-    isKvDashboard: true,
+    isKvDashboard: false,
   },
   replication: {
     label: "Replication",

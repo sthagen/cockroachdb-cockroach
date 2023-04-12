@@ -10,7 +10,7 @@
 
 /* eslint-disable prettier/prettier */
 import { StatementsPageProps } from "./statementsPage";
-import moment from "moment";
+import moment from "moment-timezone";
 import { createMemoryHistory } from "history";
 import Long from "long";
 import { noop } from "lodash";
@@ -598,7 +598,6 @@ const statementsPagePropsFixture: StatementsPageProps = {
     key: "Custom",
   },
   apps: ["$ internal", "movr", "$ cockroach demo"],
-  totalFingerprints: 95,
   lastReset: "2020-04-13 07:22:23",
   columns: null,
   isTenant: false,

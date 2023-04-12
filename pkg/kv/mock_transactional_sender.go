@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -70,6 +71,17 @@ func (m *MockTransactionalSender) UpdateRootWithLeafFinalState(
 // TxnStatus is part of the TxnSender interface.
 func (m *MockTransactionalSender) TxnStatus() roachpb.TransactionStatus {
 	return m.txn.Status
+}
+
+// SetIsoLevel is part of the TxnSender interface.
+func (m *MockTransactionalSender) SetIsoLevel(isoLevel isolation.Level) error {
+	m.txn.IsoLevel = isoLevel
+	return nil
+}
+
+// IsoLevel is part of the TxnSender interface.
+func (m *MockTransactionalSender) IsoLevel() isolation.Level {
+	return m.txn.IsoLevel
 }
 
 // SetUserPriority is part of the TxnSender interface.
@@ -138,17 +150,17 @@ func (m *MockTransactionalSender) IsSerializablePushAndRefreshNotPossible() bool
 	return false
 }
 
-// CreateSavepoint is part of the client.TxnSender interface.
+// CreateSavepoint is part of the kv.TxnSender interface.
 func (m *MockTransactionalSender) CreateSavepoint(context.Context) (SavepointToken, error) {
 	panic("unimplemented")
 }
 
-// RollbackToSavepoint is part of the client.TxnSender interface.
+// RollbackToSavepoint is part of the kv.TxnSender interface.
 func (m *MockTransactionalSender) RollbackToSavepoint(context.Context, SavepointToken) error {
 	panic("unimplemented")
 }
 
-// ReleaseSavepoint is part of the client.TxnSender interface.
+// ReleaseSavepoint is part of the kv.TxnSender interface.
 func (m *MockTransactionalSender) ReleaseSavepoint(context.Context, SavepointToken) error {
 	panic("unimplemented")
 }
@@ -176,10 +188,10 @@ func (m *MockTransactionalSender) UpdateStateOnRemoteRetryableErr(
 	panic("unimplemented")
 }
 
-// DisablePipelining is part of the client.TxnSender interface.
+// DisablePipelining is part of the kv.TxnSender interface.
 func (m *MockTransactionalSender) DisablePipelining() error { return nil }
 
-// PrepareRetryableError is part of the client.TxnSender interface.
+// PrepareRetryableError is part of the kv.TxnSender interface.
 func (m *MockTransactionalSender) PrepareRetryableError(
 	ctx context.Context, msg redact.RedactableString,
 ) error {

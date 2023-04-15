@@ -198,25 +198,6 @@ func (desc *wrapper) ValidateForwardReferences(
 		}
 	}
 
-	// Row-level TTL is not compatible with foreign keys.
-	// This check should be in ValidateSelf but interferes with AllocateIDs.
-	if desc.HasRowLevelTTL() {
-		if len(desc.OutboundForeignKeys()) > 0 {
-			vea.Report(unimplemented.NewWithIssuef(
-				76407,
-				`foreign keys from table with TTL %q are not permitted`,
-				desc.GetName(),
-			))
-		}
-		if len(desc.InboundForeignKeys()) > 0 {
-			vea.Report(unimplemented.NewWithIssuef(
-				76407,
-				`foreign keys to table with TTL %q are not permitted`,
-				desc.GetName(),
-			))
-		}
-	}
-
 	// Check enforced outbound foreign keys.
 	for _, fk := range desc.EnforcedOutboundForeignKeys() {
 		vea.Report(desc.validateOutboundFK(fk.ForeignKeyDesc(), vdg))
@@ -1316,6 +1297,10 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 			return errors.Newf("index is interleaved")
 		}
 
+		if (idx.GetInvisibility() == 0.0 && idx.IsNotVisible()) || (idx.GetInvisibility() != 0.0 && !idx.IsNotVisible()) {
+			return errors.Newf("invisibility is incompatible with value for not_visible")
+		}
+
 		if _, indexNameExists := indexNames[idx.GetName()]; indexNameExists {
 			for i := range desc.Indexes {
 				if desc.Indexes[i].Name == idx.GetName() {
@@ -1518,7 +1503,7 @@ func (desc *wrapper) validateTableIndexes(columnsByID map[descpb.ColumnID]catalo
 				return errors.AssertionFailedf("primary index %q has invalid encoding type %d in proto, expected %d",
 					idx.GetName(), idx.IndexDesc().EncodingType, catenumpb.PrimaryIndexEncoding)
 			}
-			if idx.IsNotVisible() {
+			if idx.GetInvisibility() != 0.0 {
 				return errors.Newf("primary index %q cannot be not visible", idx.GetName())
 			}
 		}

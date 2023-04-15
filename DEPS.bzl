@@ -1,6 +1,6 @@
 load("@bazel_gazelle//:deps.bzl", "go_repository")
 
-# PRO-TIP: You can inject temorary changes to any of these dependencies by
+# PRO-TIP: You can inject temporary changes to any of these dependencies by
 # by pointing to an alternate remote to clone from. Delete the `sha256`,
 # `strip_prefix`, and `urls` parameters, and add `vcs = "git"` as well as a
 # custom `remote` and `commit`. For example:
@@ -1565,10 +1565,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "4ba6205e0829b82c4c0ece96e38c7be860684ae0dab725d745b0d5fd62fd93c8",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20230405180252-16bf77ee4012",
+        sha256 = "d8be5ce8a593880b4284a00d33f8bd28204b03f0d0979db850893eb76e5aac56",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20230411154528-23c3eabc394b",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20230405180252-16bf77ee4012.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20230411154528-23c3eabc394b.zip",
         ],
     )
     go_repository(

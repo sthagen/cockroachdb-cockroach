@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
@@ -155,7 +156,7 @@ func (p *planner) DeserializeSessionState(
 			// The pgwire protocol only allows at most 1 statement here.
 			return nil, pgerror.WrongNumberOfPreparedStatements(len(stmts))
 		}
-		var parserStmt parser.Statement
+		var parserStmt statements.Statement[tree.Statement]
 		if len(stmts) == 1 {
 			parserStmt = stmts[0]
 		}
@@ -169,6 +170,12 @@ func (p *planner) DeserializeSessionState(
 			// with the type hints that were serialized.
 			placeholderTypes = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 			for i, t := range prepStmt.PlaceholderTypeHints {
+				// Postgres allows more parameter type hints than parameters. Ignore
+				// these if present. For example:
+				// PREPARE p (int) AS SELECT 1;
+				if i == stmt.NumPlaceholders {
+					break
+				}
 				// If the OID is user defined or unknown, then skip it and let the
 				// statementPreparer resolve the type.
 				if t == 0 || t == oid.T_unknown || types.IsOIDUserDefinedType(t) {

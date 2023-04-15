@@ -3420,3 +3420,26 @@ statement ok
 USE test;
 DROP DATABASE d CASCADE;
 DROP FUNCTION fn;
+
+# Regression test for #100923. Do not attempt to inline an empty UDF and error.
+statement ok
+CREATE FUNCTION f100923() RETURNS BOOL STABLE LANGUAGE SQL AS ''
+
+query B
+SELECT f100923() FROM (VALUES (10), (20)) v(i)
+----
+NULL
+NULL
+
+# Regression test for #101253. UDF bodies may contain dollar signs.
+subtest regression_101253
+
+statement error pq: at or near "sfv": syntax error
+CREATE FUNCTION f_101253() RETURNS RECORD VOLATILE NOT LEAKPROOF LANGUAGE SQL AS $$
+  SELECT * FROM (VALUES (e'\x1b'), ('y$$sFV'), (e'\x06'));
+$$;
+
+statement ok
+CREATE FUNCTION f_101253() RETURNS RECORD VOLATILE NOT LEAKPROOF LANGUAGE SQL AS $func$
+  SELECT * FROM (VALUES (e'\x1b'), ('y$$sFV'), (e'\x06'));
+$func$;

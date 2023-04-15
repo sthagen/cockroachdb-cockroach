@@ -11,11 +11,13 @@
 package sqlsmith
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 )
@@ -883,21 +885,59 @@ func makeCreateFunc(s *Smither) (tree.Statement, bool) {
 func (s *Smither) makeCreateFunc() (cf *tree.CreateFunction, ok bool) {
 	fname := s.name("func")
 	name := tree.MakeFunctionNameFromPrefix(tree.ObjectNamePrefix{}, fname)
-	// Return a record, which means the UDF can return any number or type in its
-	// final SQL statement.
-	// TODO(harding): Return scalars, UDTs, and tables in addition to records.
+	// Return a record 50% of the time, which means the UDF can return any number
+	// or type in its final SQL statement. Otherwise, pick a random type from
+	// this smither's available types.
+	rtyp := types.AnyTuple
+	if s.coin() {
+		// Do not allow collated string types. These are not supported in UDFs.
+		rtyp = s.randType()
+		for rtyp.Family() == types.CollatedStringFamily {
+			rtyp = s.randType()
+		}
+	}
 	// Return multiple rows with the SETOF option about 33% of the time.
 	setof := false
 	if s.d6() < 3 {
 		setof = true
 	}
 	rtype := tree.FuncReturnType{
-		Type:  types.AnyTuple,
+		Type:  rtyp,
 		IsSet: setof,
 	}
-	// TODO(harding): Test with multiple input params.
-	// TODO(harding): Allow params to be referenced in the statement body.
-	var params tree.FuncParams
+
+	paramCnt := s.rnd.Intn(10)
+	if s.types == nil || len(s.types.scalarTypes) == 0 {
+		paramCnt = 0
+	}
+	// TODO(100405): Add support for non-default param classes. Currently, only IN
+	// parameters are supported.
+	// TODO(100962): Set a param default value sometimes.
+	params := make(tree.FuncParams, paramCnt)
+	paramTypes := make(tree.ParamTypes, paramCnt)
+	refs := make(colRefs, paramCnt)
+	for i := 0; i < paramCnt; i++ {
+		// Do not allow collated string types. These are not supported in UDFs.
+		ptyp := s.randType()
+		for ptyp.Family() == types.CollatedStringFamily {
+			ptyp = s.randType()
+		}
+		pname := fmt.Sprintf("p%d", i)
+		params[i] = tree.FuncParam{
+			Name: tree.Name(pname),
+			Type: ptyp,
+		}
+		paramTypes[i] = tree.ParamType{
+			Name: pname,
+			Typ:  ptyp,
+		}
+		refs[i] = &colRef{
+			typ: ptyp,
+			item: &tree.ColumnItem{
+				ColumnName: tree.Name(pname),
+			},
+		}
+	}
 
 	// There are up to 5 function options that may be applied to UDFs.
 	var opts tree.FunctionOptions
@@ -922,15 +962,18 @@ func (s *Smither) makeCreateFunc() (cf *tree.CreateFunction, ok bool) {
 	// ~17%: FunctionVolatile
 	// ~17%: FunctionImmutable
 	// ~17%: FunctionStable
-	immutable := false
+	funcVol := tree.FunctionVolatile
+	vol := volatility.Volatile
 	switch s.d6() {
 	case 1:
-		opts = append(opts, tree.FunctionVolatile)
+		funcVol = tree.FunctionImmutable
+		vol = volatility.Immutable
 	case 2:
-		opts = append(opts, tree.FunctionImmutable)
-		immutable = true
-	case 3:
-		opts = append(opts, tree.FunctionStable)
+		funcVol = tree.FunctionStable
+		vol = volatility.Stable
+	}
+	if funcVol != tree.FunctionVolatile || s.coin() {
+		opts = append(opts, funcVol)
 	}
 
 	// FunctionLeakproof
@@ -938,10 +981,13 @@ func (s *Smither) makeCreateFunc() (cf *tree.CreateFunction, ok bool) {
 	// immutable, also specify leakproof 50% of the time. Otherwise, specify
 	// not leakproof 50% of the time (default is not leakproof).
 	leakproof := false
-	if immutable {
+	if funcVol == tree.FunctionImmutable {
 		leakproof = s.coin()
 	}
 	if leakproof || s.coin() {
+		if leakproof {
+			vol = volatility.Leakproof
+		}
 		opts = append(opts, tree.FunctionLeakproof(leakproof))
 	}
 
@@ -956,13 +1002,30 @@ func (s *Smither) makeCreateFunc() (cf *tree.CreateFunction, ok bool) {
 	// are formatted correctly.
 	stmtCnt := s.rnd.Intn(11)
 	stmts := make([]string, 0, stmtCnt)
-	// TODO(harding): Make the desired types of the final statement match the
-	// function return type.
+	// Disable CTEs temporarily, since they are not currently supported in UDFs.
+	// TODO(92961): Allow CTEs in generated statements in UDF bodies.
+	// TODO(93049): Allow UDFs to call other UDFs, as well as create other UDFs.
+	oldDisableWith := s.disableWith
+	defer func() {
+		s.disableWith = oldDisableWith
+		s.disableUDFs = false
+	}()
+	s.disableWith = true
+	s.disableUDFs = true
 	for i := 0; i < stmtCnt; i++ {
 		// UDFs currently only support SELECT statements.
-		stmt, _, ok := s.makeSelect(nil /* desiredTypes */, nil /* refs */)
-		if !ok {
-			continue
+		// TODO(87289): Add mutations to the generated statements.
+		var stmt tree.Statement
+		if i == stmtCnt-1 {
+			// The return type of the last statement should match the function return
+			// type.
+			if stmt, _, ok = s.makeSelect([]*types.T{rtyp}, refs); !ok {
+				return nil, false
+			}
+		} else {
+			if stmt, _, ok = s.makeSelect(nil /* desiredTypes */, refs); !ok {
+				continue
+			}
 		}
 		stmts = append(stmts, tree.AsStringWithFlags(stmt, tree.FmtParsable))
 	}
@@ -976,7 +1039,27 @@ func (s *Smither) makeCreateFunc() (cf *tree.CreateFunction, ok bool) {
 		Params:     params,
 		Options:    opts,
 	}
-	// TODO(harding): Register existing functions so we can refer to them in queries.
+
+	// Add this function to the functions list so that we can use it in future
+	// queries. Unfortunately, if the function fails to be created, then any
+	// queries that reference it will also fail.
+	class := tree.NormalClass
+	if setof {
+		class = tree.GeneratorClass
+	}
+
+	// We only add overload fields that are necessary to generate functions.
+	ov := &tree.Overload{
+		Volatility: vol,
+		Types:      paramTypes,
+		Class:      class,
+		IsUDF:      true,
+	}
+
+	functions[class][rtyp.Oid()] = append(functions[class][rtyp.Oid()], function{
+		def:      tree.NewFunctionDefinition(name.String(), &tree.FunctionProperties{}, nil /* def */),
+		overload: ov,
+	})
 	return stmt, true
 }
 

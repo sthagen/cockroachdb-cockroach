@@ -750,7 +750,7 @@ func (b *Builder) buildScan(scan *memo.ScanExpr) (execPlan, error) {
 		return execPlan{},
 			errors.AssertionFailedf("expected inverted index scan to have an inverted constraint")
 	}
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
 
 	// Save if we planned a full table/index scan on the builder so that the
 	// planner can be made aware later. We only do this for non-virtual tables.
@@ -2158,7 +2158,7 @@ func (b *Builder) buildIndexJoin(join *memo.IndexJoinExpr) (execPlan, error) {
 	// TODO(radu): the distsql implementation of index join assumes that the input
 	// starts with the PK columns in order (#40749).
 	pri := tab.Index(cat.PrimaryIndex)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), pri.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), pri.ID())})
 	keyCols := make([]exec.NodeColumnOrdinal, pri.KeyColumnCount())
 	for i := range keyCols {
 		keyCols[i], err = input.getNodeColumnOrdinal(join.Table.ColumnID(pri.Column(i).Ordinal()))
@@ -2275,7 +2275,20 @@ func (b *Builder) handleRemoteLookupJoinError(join *memo.LookupJoinExpr) (err er
 	inputTableName := ""
 	// ScanExprs from global tables will have filled in a provided distribution
 	// of the gateway region by now.
-	queryHomeRegion, queryHasHomeRegion := input.(memo.RelExpr).ProvidedPhysical().Distribution.GetSingleRegion()
+	var queryHomeRegion string
+	var queryHasHomeRegion bool
+	if rel, ok := input.(memo.RelExpr); ok {
+		queryHomeRegion, queryHasHomeRegion = rel.ProvidedPhysical().Distribution.GetSingleRegion()
+	} else if _, ok = input.(*memo.ScalarListExpr); ok {
+		// A list of scalar constants doesn't access remote regions.
+		// If these aren't constants, such as scalar subqueries, checks for a home
+		// region are done elsewhere.
+		queryHasHomeRegion = true
+		queryHomeRegion = gatewayRegion
+	} else {
+		return errors.AssertionFailedf("unexpected expression kind while checking home region of input to lookup join: %v", input)
+	}
+
 	var inputTableMeta *opt.TableMeta
 	var inputTable cat.Table
 	var inputIndexOrdinal cat.IndexOrdinal
@@ -2470,7 +2483,7 @@ func (b *Builder) buildLookupJoin(join *memo.LookupJoinExpr) (execPlan, error) {
 
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
 
 	locking := join.Locking
 	if b.forceForUpdateLocking {
@@ -2645,7 +2658,7 @@ func (b *Builder) buildInvertedJoin(join *memo.InvertedJoinExpr) (execPlan, erro
 	md := b.mem.Metadata()
 	tab := md.Table(join.Table)
 	idx := tab.Index(join.Index)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed, []string{fmt.Sprintf("%d@%d", tab.ID(), idx.ID())})
 
 	prefixEqCols := make([]exec.NodeColumnOrdinal, len(join.PrefixKeyCols))
 	for i, c := range join.PrefixKeyCols {
@@ -2758,9 +2771,9 @@ func (b *Builder) buildZigzagJoin(join *memo.ZigzagJoinExpr) (execPlan, error) {
 	rightTable := md.Table(join.RightTable)
 	leftIndex := leftTable.Index(join.LeftIndex)
 	rightIndex := rightTable.Index(join.RightIndex)
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed,
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed,
 		[]string{fmt.Sprintf("%d@%d", leftTable.ID(), leftIndex.ID())})
-	b.IndexesUsed = util.CombineUniqueString(b.IndexesUsed,
+	b.IndexesUsed = util.CombineUnique(b.IndexesUsed,
 		[]string{fmt.Sprintf("%d@%d", rightTable.ID(), rightIndex.ID())})
 
 	leftEqCols := make([]exec.TableColumnOrdinal, len(join.LeftEqCols))

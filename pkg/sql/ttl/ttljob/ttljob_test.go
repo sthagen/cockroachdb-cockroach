@@ -160,6 +160,12 @@ func (h *rowLevelTTLTestJobTestHelper) waitForScheduledJob(
 		h.env.ScheduledJobsTableName(),
 	)
 
+	var regex *regexp.Regexp
+	if expectedErrorRe != "" {
+		var err error
+		regex, err = regexp.Compile(expectedErrorRe)
+		require.NoError(t, err)
+	}
 	testutils.SucceedsSoon(t, func() error {
 		// Force newly created job to be adopted and verify it succeeds.
 		h.server.JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
@@ -174,12 +180,8 @@ func (h *rowLevelTTLTestJobTestHelper) waitForScheduledJob(
 		if status != string(expectedStatus) {
 			return errors.Newf("expected status %s, got %s (error: %s)", expectedStatus, status, errorStr)
 		}
-		if expectedErrorRe != "" {
-			r, err := regexp.Compile(expectedErrorRe)
-			require.NoError(t, err)
-			if !r.MatchString(errorStr) {
-				return errors.Newf("expected error matches %s, got %s", expectedErrorRe, errorStr)
-			}
+		if regex != nil && !regex.MatchString(errorStr) {
+			return errors.Newf("expected error matches %s, got %s", expectedErrorRe, errorStr)
 		}
 		return nil
 	})
@@ -219,7 +221,7 @@ func (h *rowLevelTTLTestJobTestHelper) verifyExpiredRowsJobOnly(
 		var progressBytes []byte
 		require.NoError(t, rows.Scan(&status, &progressBytes))
 
-		require.Equal(t, "succeeded", status)
+		require.Equal(t, string(jobs.StatusSucceeded), status)
 
 		var progress jobspb.Progress
 		require.NoError(t, protoutil.Unmarshal(progressBytes, &progress))
@@ -250,7 +252,7 @@ func (h *rowLevelTTLTestJobTestHelper) verifyExpiredRows(
 		var progressBytes []byte
 		require.NoError(t, rows.Scan(&status, &progressBytes))
 
-		require.Equal(t, "succeeded", status)
+		require.Equal(t, string(jobs.StatusSucceeded), status)
 
 		var progress jobspb.Progress
 		require.NoError(t, protoutil.Unmarshal(progressBytes, &progress))
@@ -890,4 +892,129 @@ func TestRowLevelTTLJobRandomEntries(t *testing.T) {
 			th.verifyExpiredRowsJobOnly(t, tc.numExpiredRows)
 		})
 	}
+}
+
+func TestOutboundForeignKey(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
+		t,
+		&sql.TTLTestingKnobs{
+			AOSTDuration:     &zeroDuration,
+			ReturnStatsError: true,
+		},
+		false, /* testMultiTenant */
+		1,     /* numNodes */
+	)
+	defer cleanupFunc()
+
+	sqlDB := th.sqlDB
+	sqlDB.Exec(t, "CREATE TABLE parent (id INT PRIMARY KEY)")
+	sqlDB.Exec(t, "CREATE TABLE tbl (id INT PRIMARY KEY, expire_at TIMESTAMPTZ, parent_id INT REFERENCES parent (id)) WITH (ttl_expiration_expression = 'expire_at')")
+
+	sqlDB.Exec(t, "INSERT INTO parent VALUES (1)")
+	sqlDB.Exec(t, "INSERT INTO tbl VALUES (1, '2020-01-01', 1)")
+
+	// Force the schedule to execute.
+	th.waitForScheduledJob(t, jobs.StatusSucceeded, "")
+
+	results := sqlDB.QueryStr(t, "SELECT * FROM tbl")
+	require.Empty(t, results)
+}
+
+func TestInboundForeignKeyOnDeleteCascade(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
+		t,
+		&sql.TTLTestingKnobs{
+			AOSTDuration:     &zeroDuration,
+			ReturnStatsError: true,
+		},
+		false, /* testMultiTenant */
+		1,     /* numNodes */
+	)
+	defer cleanupFunc()
+
+	sqlDB := th.sqlDB
+	sqlDB.Exec(t, "CREATE TABLE tbl (id INT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expiration_expression = 'expire_at')")
+	sqlDB.Exec(t, "CREATE TABLE child (id INT PRIMARY KEY, tbl_id INT REFERENCES tbl (id) ON DELETE CASCADE)")
+
+	sqlDB.Exec(t, "INSERT INTO tbl VALUES (1, '2020-01-01')")
+	sqlDB.Exec(t, "INSERT INTO child VALUES (1, 1)")
+
+	// Force the schedule to execute.
+	th.waitForScheduledJob(t, jobs.StatusSucceeded, "")
+
+	results := sqlDB.QueryStr(t, "SELECT * FROM tbl")
+	require.Empty(t, results)
+
+	results = sqlDB.QueryStr(t, "SELECT * FROM child")
+	require.Empty(t, results)
+}
+
+func TestInboundForeignKeyOnDeleteRestrict(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
+		t,
+		&sql.TTLTestingKnobs{
+			AOSTDuration:     &zeroDuration,
+			ReturnStatsError: true,
+		},
+		false, /* testMultiTenant */
+		1,     /* numNodes */
+	)
+	defer cleanupFunc()
+
+	sqlDB := th.sqlDB
+	sqlDB.Exec(t, "CREATE TABLE tbl (id INT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expiration_expression = 'expire_at')")
+	sqlDB.Exec(t, "CREATE TABLE child (id INT PRIMARY KEY, tbl_id INT REFERENCES tbl (id) ON DELETE RESTRICT)")
+
+	sqlDB.Exec(t, "INSERT INTO tbl VALUES (1, '2020-01-01')")
+	sqlDB.Exec(t, "INSERT INTO child VALUES (1, 1)")
+
+	// Force the schedule to execute.
+	th.waitForScheduledJob(t, jobs.StatusFailed, `delete on table "tbl_name" violates foreign key constraint "child_tbl_id_fkey" on table "child"`)
+
+	results := sqlDB.QueryStr(t, "SELECT * FROM tbl")
+	require.Len(t, results, 1)
+
+	results = sqlDB.QueryStr(t, "SELECT * FROM child")
+	require.Len(t, results, 1)
+}
+
+func TestInboundForeignKeyOnDeleteRestrictNull(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	th, cleanupFunc := newRowLevelTTLTestJobTestHelper(
+		t,
+		&sql.TTLTestingKnobs{
+			AOSTDuration:     &zeroDuration,
+			ReturnStatsError: true,
+		},
+		false, /* testMultiTenant */
+		1,     /* numNodes */
+	)
+	defer cleanupFunc()
+
+	sqlDB := th.sqlDB
+	sqlDB.Exec(t, "CREATE TABLE tbl (id INT PRIMARY KEY, expire_at TIMESTAMPTZ) WITH (ttl_expiration_expression = 'expire_at')")
+	sqlDB.Exec(t, "CREATE TABLE child (id INT PRIMARY KEY, tbl_id INT REFERENCES tbl (id) ON DELETE RESTRICT)")
+
+	sqlDB.Exec(t, "INSERT INTO tbl VALUES (1, '2020-01-01')")
+	sqlDB.Exec(t, "INSERT INTO child VALUES (1, NULL)")
+
+	// Force the schedule to execute.
+	th.waitForScheduledJob(t, jobs.StatusSucceeded, "")
+
+	results := sqlDB.QueryStr(t, "SELECT * FROM tbl")
+	require.Len(t, results, 0)
+
+	results = sqlDB.QueryStr(t, "SELECT * FROM child")
+	require.Len(t, results, 1)
 }

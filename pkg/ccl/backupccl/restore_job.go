@@ -1044,6 +1044,7 @@ func createImportingDescriptors(
 							regionConfig,
 							txn,
 							p.ExecCfg(),
+							!details.SkipLocalitiesCheck,
 							p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
 						); err != nil {
 							return err
@@ -1218,6 +1219,7 @@ func createImportingDescriptors(
 						&tenantInfoCopy,
 						initialTenantZoneConfig,
 						false, /* ifNotExists */
+						p.ExecCfg().TenantTestingKnobs,
 					); err != nil {
 						return err
 					}

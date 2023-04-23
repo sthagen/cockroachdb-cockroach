@@ -6130,7 +6130,8 @@ func TestQueryIntentRequest(t *testing.T) {
 			key []byte,
 			txnMeta enginepb.TxnMeta,
 			baTxn *roachpb.Transaction,
-			expectIntent bool,
+			expectMatchingTxn bool,
+			expectMatchingTxnAndTimestamp bool,
 		) {
 			t.Helper()
 			var h kvpb.Header
@@ -6140,8 +6141,8 @@ func TestQueryIntentRequest(t *testing.T) {
 				h.Timestamp = txnMeta.WriteTimestamp
 			}
 			qiArgs := queryIntentArgs(key, txnMeta, errIfMissing)
-			qiRes, pErr := tc.SendWrappedWith(h, &qiArgs)
-			if errIfMissing && !expectIntent {
+			res, pErr := tc.SendWrappedWith(h, &qiArgs)
+			if errIfMissing && !expectMatchingTxn {
 				ownIntent := baTxn != nil
 				if ownIntent && txnMeta.WriteTimestamp.Less(txn.WriteTimestamp) {
 					if _, ok := pErr.GetDetail().(*kvpb.TransactionRetryError); !ok {
@@ -6153,34 +6154,32 @@ func TestQueryIntentRequest(t *testing.T) {
 					}
 				}
 			} else {
-				if pErr != nil {
-					t.Fatal(pErr)
-				}
-				if e, a := expectIntent, qiRes.(*kvpb.QueryIntentResponse).FoundIntent; e != a {
-					t.Fatalf("expected FoundIntent=%t but FoundIntent=%t", e, a)
-				}
+				require.Nil(t, pErr)
+				qiRes := res.(*kvpb.QueryIntentResponse)
+				require.Equal(t, expectMatchingTxn, qiRes.FoundIntent)
+				require.Equal(t, expectMatchingTxnAndTimestamp, qiRes.FoundUnpushedIntent)
 			}
 		}
 
 		for i, baTxn := range []*roachpb.Transaction{nil, txn} {
 			// Query the intent with the correct txn meta. Should see intent regardless
 			// of whether we're inside the txn or not.
-			queryIntent(key1, txn.TxnMeta, baTxn, true)
+			queryIntent(key1, txn.TxnMeta, baTxn, true, true)
 
 			// Query an intent on a different key for the same transaction. Should not
 			// see an intent.
 			keyPrevent := roachpb.Key(fmt.Sprintf("%s-%t-%d", key2, errIfMissing, i))
-			queryIntent(keyPrevent, txn.TxnMeta, baTxn, false)
+			queryIntent(keyPrevent, txn.TxnMeta, baTxn, false, false)
 
 			// Query the intent with a larger epoch. Should not see an intent.
 			largerEpochMeta := txn.TxnMeta
 			largerEpochMeta.Epoch++
-			queryIntent(key1, largerEpochMeta, baTxn, false)
+			queryIntent(key1, largerEpochMeta, baTxn, false, false)
 
 			// Query the intent with a smaller epoch. Should not see an intent.
 			smallerEpochMeta := txn.TxnMeta
 			smallerEpochMeta.Epoch--
-			queryIntent(key1, smallerEpochMeta, baTxn, false)
+			queryIntent(key1, smallerEpochMeta, baTxn, false, false)
 
 			// Query the intent with a larger timestamp. Should see an intent.
 			// See the comment on QueryIntentRequest.Txn for an explanation of why
@@ -6192,27 +6191,27 @@ func TestQueryIntentRequest(t *testing.T) {
 				largerBATxn = largerBATxn.Clone()
 				largerBATxn.WriteTimestamp = largerTSMeta.WriteTimestamp
 			}
-			queryIntent(key1, largerTSMeta, largerBATxn, true)
+			queryIntent(key1, largerTSMeta, largerBATxn, true, true)
 
-			// Query the intent with a smaller timestamp. Should not see an
-			// intent unless we're querying our own intent, in which case
-			// the smaller timestamp will be forwarded to the batch header
-			// transaction's timestamp.
+			// Query the intent with a smaller timestamp. Should be considered a
+			// pushed intent unless we're querying our own intent, in which case the
+			// smaller timestamp will be forwarded to the batch header transaction's
+			// timestamp and the intent will be considered an unpushed intent.
 			smallerTSMeta := txn.TxnMeta
 			smallerTSMeta.WriteTimestamp = smallerTSMeta.WriteTimestamp.Prev()
-			queryIntent(key1, smallerTSMeta, baTxn, baTxn == txn)
+			queryIntent(key1, smallerTSMeta, baTxn, true, baTxn == txn)
 
 			// Query the intent with a larger sequence number. Should not see an intent.
 			largerSeqMeta := txn.TxnMeta
 			largerSeqMeta.Sequence++
-			queryIntent(key1, largerSeqMeta, baTxn, false)
+			queryIntent(key1, largerSeqMeta, baTxn, false, false)
 
 			// Query the intent with a smaller sequence number. Should see an intent.
 			// See the comment on QueryIntentRequest.Txn for an explanation of why
 			// the request behaves like this.
 			smallerSeqMeta := txn.TxnMeta
 			smallerSeqMeta.Sequence--
-			queryIntent(key1, smallerSeqMeta, baTxn, true)
+			queryIntent(key1, smallerSeqMeta, baTxn, true, true)
 
 			// Perform a write at keyPrevent. The associated intent at this key
 			// was queried and found to be missing, so this write should be
@@ -9909,8 +9908,7 @@ type testQuiescer struct {
 	status          *raftSparseStatus
 	lastIndex       uint64
 	raftReady       bool
-	leaseStatus     kvserverpb.LeaseStatus
-	storeID         roachpb.StoreID
+	lease           roachpb.Lease
 	mergeInProgress bool
 	isDestroyed     bool
 
@@ -9955,18 +9953,12 @@ func (q *testQuiescer) hasPendingProposalQuotaRLocked() bool {
 	return q.pendingQuota
 }
 
-func (q *testQuiescer) leaseStatusAtRLocked(
-	ctx context.Context, now hlc.ClockTimestamp,
-) kvserverpb.LeaseStatus {
-	return q.leaseStatus
-}
-
-func (q *testQuiescer) StoreID() roachpb.StoreID {
-	return q.storeID
+func (q *testQuiescer) ownsValidLeaseRLocked(ctx context.Context, now hlc.ClockTimestamp) bool {
+	return q.lease.Replica.ReplicaID == 1
 }
 
 func (q *testQuiescer) getLeaseRLocked() (roachpb.Lease, roachpb.Lease) {
-	return q.leaseStatus.Lease, q.leaseStatus.Lease
+	return q.lease, q.lease
 }
 
 func (q *testQuiescer) mergeInProgressRLocked() bool {
@@ -9992,8 +9984,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 			// true. The transform function is intended to perform one mutation to
 			// this quiescer so that shouldReplicaQuiesce will return false.
 			q := &testQuiescer{
-				st:      cluster.MakeTestingClusterSettings(),
-				storeID: 1,
+				st: cluster.MakeTestingClusterSettings(),
 				desc: roachpb.RangeDescriptor{
 					InternalReplicas: []roachpb.ReplicaDescriptor{
 						{NodeID: 1, ReplicaID: 1},
@@ -10021,16 +10012,13 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 				},
 				lastIndex: logIndex,
 				raftReady: false,
-				leaseStatus: kvserverpb.LeaseStatus{
-					State: kvserverpb.LeaseState_VALID,
-					Lease: roachpb.Lease{
-						Sequence: 1,
-						Epoch:    1,
-						Replica: roachpb.ReplicaDescriptor{
-							NodeID:    1,
-							StoreID:   1,
-							ReplicaID: 1,
-						},
+				lease: roachpb.Lease{
+					Sequence: 1,
+					Epoch:    1,
+					Replica: roachpb.ReplicaDescriptor{
+						NodeID:    1,
+						StoreID:   1,
+						ReplicaID: 1,
 					},
 				},
 				livenessMap: livenesspb.IsLiveMap{
@@ -10114,52 +10102,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 		return q
 	})
 	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_ERROR
-		return q
-	})
-	test(true, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_VALID
-		return q
-	})
-	test(true, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_UNUSABLE
-		return q
-	})
-	test(true, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_EXPIRED
-		return q
-	})
-	test(true, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = kvserverpb.LeaseState_PROSCRIBED
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.State = -99
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.Lease.Replica.StoreID = 9
-		q.leaseStatus.State = kvserverpb.LeaseState_ERROR
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.Lease.Replica.StoreID = 9
-		q.leaseStatus.State = kvserverpb.LeaseState_VALID
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.Lease.Replica.StoreID = 9
-		q.leaseStatus.State = kvserverpb.LeaseState_UNUSABLE
-		return q
-	})
-	test(true, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.Lease.Replica.StoreID = 9
-		q.leaseStatus.State = kvserverpb.LeaseState_EXPIRED
-		return q
-	})
-	test(false, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.Lease.Replica.StoreID = 9
-		q.leaseStatus.State = kvserverpb.LeaseState_PROSCRIBED
+		q.lease.Replica.ReplicaID = 9
 		return q
 	})
 	test(false, func(q *testQuiescer) *testQuiescer {
@@ -10221,15 +10164,16 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 	// kv.expiration_leases_only.enabled is true.
 	test(false, func(q *testQuiescer) *testQuiescer {
 		ExpirationLeasesOnly.Override(context.Background(), &q.st.SV, true)
-		q.leaseStatus.Lease.Epoch = 0
-		q.leaseStatus.Lease.Expiration = &hlc.Timestamp{
+		q.lease.Epoch = 0
+		q.lease.Expiration = &hlc.Timestamp{
 			WallTime: timeutil.Now().Add(time.Minute).Unix(),
 		}
 		return q
 	})
 	test(true, func(q *testQuiescer) *testQuiescer {
-		q.leaseStatus.Lease.Epoch = 0
-		q.leaseStatus.Lease.Expiration = &hlc.Timestamp{
+		ExpirationLeasesOnly.Override(context.Background(), &q.st.SV, false)
+		q.lease.Epoch = 0
+		q.lease.Expiration = &hlc.Timestamp{
 			WallTime: timeutil.Now().Add(time.Minute).Unix(),
 		}
 		return q

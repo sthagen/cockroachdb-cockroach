@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -1050,7 +1051,9 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 	visibility := 1.0
 	if notvisible := og.randIntn(20) == 0; notvisible {
 		visibility = 0.0
-		// TODO(rytaft): sometimes generate a float between (0.0,1.0).
+		if og.randIntn(2) == 0 {
+			visibility = og.params.rng.Float64()
+		}
 	}
 
 	def := &tree.CreateIndex{
@@ -1333,15 +1336,15 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 	}()
 	// Forward indexes for arrays were added in 23.1, so check the index
 	// definitions for them in mixed version states.
-	forwardIndexesOnArraysNotSupported, err := isClusterVersionLessThan(
+	forwardIndexesOnNewTypesSupported, err := isClusterVersionLessThan(
 		ctx,
 		tx,
 		clusterversion.ByKey(clusterversion.V23_1))
 	if err != nil {
 		return nil, err
 	}
-	hasUnsupportedForwardQueries, err := func() (bool, error) {
-		if !forwardIndexesOnArraysNotSupported {
+	hasUnsupportedForwardIdxQueries, err := func() (bool, error) {
+		if !forwardIndexesOnNewTypesSupported {
 			return false, nil
 		}
 		colInfoMap := make(map[tree.Name]*tree.ColumnTableDef)
@@ -1363,7 +1366,8 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 						if err != nil {
 							return false, err
 						}
-						if typ.Family() == types.ArrayFamily {
+						if typ.Family() == types.ArrayFamily ||
+							typ.Family() == types.JsonFamily {
 							return true, err
 						}
 					}
@@ -1394,7 +1398,7 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 	codesWithConditions{
 		{code: pgcode.Syntax, condition: hasUnsupportedTSQuery},
 		{code: pgcode.FeatureNotSupported, condition: hasUnsupportedTSQuery},
-		{code: pgcode.FeatureNotSupported, condition: hasUnsupportedForwardQueries},
+		{code: pgcode.FeatureNotSupported, condition: hasUnsupportedForwardIdxQueries},
 	}.add(opStmt.potentialExecErrors)
 	// Descriptor ID generator may be temporarily unavailable, so
 	// allow uncategorized errors temporarily.
@@ -2825,6 +2829,12 @@ func (s *opStmt) executeStmt(ctx context.Context, tx pgx.Tx, og *operationGenera
 		// If the error not an instance of pgconn.PgError, then it is unexpected.
 		pgErr := new(pgconn.PgError)
 		if !errors.As(err, &pgErr) {
+			// Connections dropping with at the server side can be treated
+			// as rollback errors here.
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return errors.Mark(err,
+					errRunInTxnRbkSentinel)
+			}
 			return errors.Mark(
 				og.WrapWithErrorState(errors.Wrap(err, "***UNEXPECTED ERROR; Received a non pg error."), s),
 				errRunInTxnFatalSentinel,

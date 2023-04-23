@@ -93,6 +93,7 @@ crdb_internal  regions                                 table  admin  NULL  NULL
 crdb_internal  schema_changes                          table  admin  NULL  NULL
 crdb_internal  session_trace                           table  admin  NULL  NULL
 crdb_internal  session_variables                       table  admin  NULL  NULL
+crdb_internal  statement_activity                      view   admin  NULL  NULL
 crdb_internal  statement_statistics                    view   admin  NULL  NULL
 crdb_internal  statement_statistics_persisted          view   admin  NULL  NULL
 crdb_internal  statement_statistics_persisted_v22_2    view   admin  NULL  NULL
@@ -104,6 +105,7 @@ crdb_internal  table_row_statistics                    table  admin  NULL  NULL
 crdb_internal  table_spans                             table  admin  NULL  NULL
 crdb_internal  tables                                  table  admin  NULL  NULL
 crdb_internal  tenant_usage_details                    view   admin  NULL  NULL
+crdb_internal  transaction_activity                    view   admin  NULL  NULL
 crdb_internal  transaction_contention_events           table  admin  NULL  NULL
 crdb_internal  transaction_statistics                  view   admin  NULL  NULL
 crdb_internal  transaction_statistics_persisted        view   admin  NULL  NULL
@@ -286,10 +288,10 @@ SELECT * FROM crdb_internal.table_columns WHERE descriptor_name = ''
 ----
 descriptor_id  descriptor_name  column_id  column_name  column_type  nullable  default_expr  hidden
 
-query ITITTBBBBITT colnames
+query ITITTBBBBFITT colnames
 SELECT * FROM crdb_internal.table_indexes WHERE descriptor_name = ''
 ----
-descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted  is_sharded  is_visible  shard_bucket_count  created_at  create_statement
+descriptor_id  descriptor_name  index_id  index_name  index_type  is_unique  is_inverted  is_sharded  is_visible  visibility  shard_bucket_count  created_at  create_statement
 
 query ITITTITTB colnames
 SELECT * FROM crdb_internal.index_columns WHERE descriptor_name = ''
@@ -340,12 +342,12 @@ txn_id  txn_fingerprint_id  query  implicit_txn  session_id  start_time  end_tim
 query ITTI
 SELECT range_id, start_pretty, end_pretty, lease_holder FROM crdb_internal.ranges
 ----
-63  /Tenant/10  /Tenant/11  1
+64  /Tenant/10  /Tenant/11  1
 
 query ITT
 SELECT range_id, start_pretty, end_pretty FROM crdb_internal.ranges_no_leases
 ----
-63  /Tenant/10  /Tenant/11
+64  /Tenant/10  /Tenant/11
 
 query IT
 SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1

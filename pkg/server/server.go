@@ -68,6 +68,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverrules"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/server/structlogging"
 	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/server/tenantsettingswatcher"
@@ -102,6 +103,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
@@ -288,7 +290,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		return nil, errors.Wrap(err, "failed to apply loss of quorum recovery plan")
 	}
 
-	nodeTombStorage, checkPingFor := getPingCheckDecommissionFn(engines)
+	nodeTombStorage, decommissionCheck := getPingCheckDecommissionFn(engines)
 
 	g := gossip.New(
 		cfg.AmbientCtx,
@@ -316,7 +318,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			// Outgoing ping will block requests with codes.FailedPrecondition to
 			// notify caller that this replica is decommissioned but others could
 			// still be tried as caller node is valid, but not the destination.
-			return checkPingFor(ctx, req.TargetNodeID, codes.FailedPrecondition)
+			return decommissionCheck(ctx, req.TargetNodeID, codes.FailedPrecondition)
 		},
 		TenantRPCAuthorizer: authorizer,
 		NeedsDialback:       true,
@@ -329,17 +331,18 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	rpcContext.OnIncomingPing = func(ctx context.Context, req *rpc.PingRequest, resp *rpc.PingResponse) error {
 		// Decommission state is only tracked for the system tenant.
-		if tenantID, isTenant := roachpb.ClientTenantFromContext(ctx); isTenant &&
-			!roachpb.IsSystemTenantID(tenantID.ToUint64()) {
-			return nil
+		if tenantID, isTenant := roachpb.ClientTenantFromContext(ctx); !isTenant ||
+			roachpb.IsSystemTenantID(tenantID.ToUint64()) {
+			// Incoming ping will reject requests with codes.PermissionDenied to
+			// signal remote node that it is not considered valid anymore and
+			// operations should fail immediately.
+			if err := decommissionCheck(ctx, req.OriginNodeID, codes.PermissionDenied); err != nil {
+				return err
+			}
 		}
-		if err := rpcContext.VerifyDialback(ctx, req, resp, cfg.Locality); err != nil {
-			return err
-		}
-		// Incoming ping will reject requests with codes.PermissionDenied to
-		// signal remote node that it is not considered valid anymore and
-		// operations should fail immediately.
-		return checkPingFor(ctx, req.OriginNodeID, codes.PermissionDenied)
+		// VerifyDialback verifies if a reverse connection to the sending node can
+		// be established.
+		return rpcContext.VerifyDialback(ctx, req, resp, cfg.Locality)
 	}
 
 	rpcContext.HeartbeatCB = func() {
@@ -2050,6 +2053,10 @@ func (s *Server) AcceptClients(ctx context.Context) error {
 		&s.cfg.SocketFile,
 	); err != nil {
 		return err
+	}
+
+	if logcrash.DiagnosticsReportingEnabled.Get(&s.ClusterSettings().SV) {
+		structlogging.StartHotRangesLoggingScheduler(ctx, s.stopper, s.status, *s.sqlServer.internalExecutor, s.ClusterSettings())
 	}
 
 	s.sqlServer.isReady.Set(true)

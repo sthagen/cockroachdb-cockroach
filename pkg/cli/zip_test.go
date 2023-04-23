@@ -96,10 +96,12 @@ table_name NOT IN (
   'table_spans',
 	'tables',
 	'cluster_statement_statistics',
+  'statement_activity',
 	'statement_statistics_persisted',
 	'statement_statistics_persisted_v22_2',
 	'cluster_transaction_statistics',
 	'statement_statistics',
+  'transaction_activity',
 	'transaction_statistics_persisted',
 	'transaction_statistics_persisted_v22_2',
 	'transaction_statistics',
@@ -258,7 +260,6 @@ create table defaultdb."../system"(x int);
 // need the SSL certs dir to run a CLI test securely.
 func TestUnavailableZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 53306, "flaky test")
 
 	skip.UnderShort(t)
 	// Race builds make the servers so slow that they report spurious
@@ -324,11 +325,7 @@ func TestUnavailableZip(t *testing.T) {
 
 	// Strip any non-deterministic messages.
 	out = eraseNonDeterministicZipOutput(out)
-
-	// In order to avoid non-determinism here, we erase the output of
-	// the range retrieval.
-	re := regexp.MustCompile(`(?m)^(requesting ranges.*found|writing: debug/nodes/\d+/ranges).*\n`)
-	out = re.ReplaceAllString(out, ``)
+	out = eraseNonDeterministicErrors(out)
 
 	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "unavailable"),
 		func(t *testing.T, td *datadriven.TestData) string {
@@ -368,6 +365,21 @@ func eraseNonDeterministicZipOutput(out string) string {
 	re = regexp.MustCompile(`(?m)^\[node \d+\] retrieving goroutine_dump.*$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 
+	return out
+}
+
+func eraseNonDeterministicErrors(out string) string {
+	// In order to avoid non-determinism here, we erase the output of
+	// the range retrieval.
+	re := regexp.MustCompile(`(?m)^(requesting ranges.*found|writing: debug/nodes/\d+/ranges).*\n`)
+	out = re.ReplaceAllString(out, ``)
+
+	re = regexp.MustCompile(`(?m)^\[cluster\] requesting data for debug\/settings.*\n`)
+	out = re.ReplaceAllString(out, ``)
+
+	// In order to avoid non-determinism here, we truncate error messages.
+	re = regexp.MustCompile(`(?m)last request failed: .*$`)
+	out = re.ReplaceAllString(out, `last request failed: ...`)
 	return out
 }
 

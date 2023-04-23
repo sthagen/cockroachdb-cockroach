@@ -492,8 +492,8 @@ func (w *changefeedResultWriter) AddRow(ctx context.Context, row tree.Datums) er
 		return nil
 	}
 }
-func (w *changefeedResultWriter) IncrementRowsAffected(ctx context.Context, n int) {
-	w.rowsAffected += n
+func (w *changefeedResultWriter) SetRowsAffected(ctx context.Context, n int) {
+	w.rowsAffected = n
 }
 func (w *changefeedResultWriter) SetError(err error) {
 	w.err = err
@@ -523,7 +523,8 @@ type distResolver struct {
 func (r *distResolver) getRangesForSpans(
 	ctx context.Context, spans []roachpb.Span,
 ) ([]roachpb.Span, error) {
-	return kvfeed.AllRangeSpans(ctx, r.DistSender, spans)
+	spans, _, err := kvfeed.AllRangeSpans(ctx, r.DistSender, spans)
+	return spans, err
 }
 
 func rebalanceSpanPartitions(

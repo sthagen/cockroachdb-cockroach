@@ -51,6 +51,7 @@ const (
 	ZonesTableName                         SystemTableName = "zones"
 	SettingsTableName                      SystemTableName = "settings"
 	DescIDSequenceTableName                SystemTableName = "descriptor_id_seq"
+	TenantIDSequenceTableName              SystemTableName = "tenant_id_seq"
 	TenantsTableName                       SystemTableName = "tenants"
 	LeaseTableName                         SystemTableName = "lease"
 	EventLogTableName                      SystemTableName = "eventlog"
@@ -162,6 +163,7 @@ const (
 	CrdbInternalSchemaChangesTableID
 	CrdbInternalSessionTraceTableID
 	CrdbInternalSessionVariablesTableID
+	CrdbInternalStmtActivityTableID
 	CrdbInternalStmtStatsTableID
 	CrdbInternalStmtStatsPersistedTableID
 	CrdbInternalStmtStatsPersistedV22_2TableID
@@ -171,6 +173,7 @@ const (
 	CrdbInternalTablesTableID
 	CrdbInternalTablesTableLastStatsID
 	CrdbInternalTransactionStatsTableID
+	CrdbInternalTxnActivityTableID
 	CrdbInternalTxnStatsTableID
 	CrdbInternalTxnStatsPersistedTableID
 	CrdbInternalTxnStatsPersistedV22_2TableID

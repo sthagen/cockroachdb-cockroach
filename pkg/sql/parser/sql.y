@@ -701,6 +701,9 @@ func (u *sqlSymUnion) backupOptions() *tree.BackupOptions {
 func (u *sqlSymUnion) copyOptions() *tree.CopyOptions {
   return u.val.(*tree.CopyOptions)
 }
+func (u *sqlSymUnion) showJobOptions() *tree.ShowJobOptions {
+  return u.val.(*tree.ShowJobOptions)
+}
 func (u *sqlSymUnion) showBackupDetails() tree.ShowBackupDetails {
   return u.val.(tree.ShowBackupDetails)
 }
@@ -991,7 +994,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %token <str> UPDATE UPSERT UNSET UNTIL USE USER USERS USING UUID
 
 %token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VERIFY_BACKUP_TABLE_DATA VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
-%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE INVISIBLE VOLATILE VOTERS
+%token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE INVISIBLE VISIBILITY VOLATILE VOTERS
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1323,6 +1326,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <*tree.RestoreOptions> opt_with_restore_options restore_options restore_options_list
 %type <*tree.TenantReplicationOptions> opt_with_tenant_replication_options tenant_replication_options tenant_replication_options_list
 %type <tree.ShowBackupDetails> show_backup_details
+%type <*tree.ShowJobOptions> show_job_options show_job_options_list
 %type <*tree.ShowBackupOptions> opt_with_show_backup_options show_backup_options show_backup_options_list show_backup_connection_options show_backup_connection_options_list
 %type <*tree.CopyOptions> opt_with_copy_options copy_options copy_options_list copy_generic_options copy_generic_options_list
 %type <str> import_format
@@ -1498,7 +1502,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <*tree.IndexFlags> opt_index_flags
 %type <*tree.IndexFlags> index_flags_param
 %type <*tree.IndexFlags> index_flags_param_list
-%type <tree.Expr> a_expr b_expr c_expr d_expr typed_literal alter_index_visible opt_index_visible
+%type <tree.Expr> a_expr b_expr c_expr d_expr typed_literal
 %type <tree.Expr> substr_from substr_for
 %type <tree.Expr> in_expr
 %type <tree.Expr> having_clause
@@ -1548,7 +1552,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <str> extract_arg
 %type <bool> opt_varying
 
-%type <*tree.NumVal> signed_iconst only_signed_iconst
+%type <*tree.NumVal> signed_iconst only_signed_iconst alter_index_visible opt_index_visible
 %type <*tree.NumVal> signed_fconst only_signed_fconst
 %type <int32> iconst32
 %type <int64> signed_iconst64
@@ -2213,7 +2217,7 @@ alter_range_stmt:
 //   ALTER INDEX ... UNSPLIT ALL
 //   ALTER INDEX ... SCATTER [ FROM ( <exprs...> ) TO ( <exprs...> ) ]
 //   ALTER INDEX ... RELOCATE [ LEASE | VOTERS | NONVOTERS ] <selectclause>
-//   ALTER INDEX ... [VISIBLE | NOT VISIBLE | INVISIBLE]
+//   ALTER INDEX ... [VISIBLE | NOT VISIBLE | INVISIBLE | VISIBILITY ...]
 //
 // Zone configurations:
 //   DISCARD
@@ -2387,6 +2391,18 @@ alter_index_visible:
 | VISIBLE
   {
    $$.val = tree.NewNumVal(constant.MakeFloat64(0.0), "0.0", false /*negative*/)
+  }
+| VISIBILITY FCONST
+  {
+    visibilityConst, _ := constant.Float64Val($2.numVal().AsConstantValue())
+      if visibilityConst < 0.0 || visibilityConst > 1.0 {
+        sqllex.Error("index visibility must be between 0 and 1")
+        return 1
+      }
+    invisibilityConst := 1.0 - visibilityConst
+    invisibilityStr := fmt.Sprintf("%.2f", invisibilityConst)
+    treeNumVal := tree.NewNumVal(constant.MakeFloat64(invisibilityConst), invisibilityStr, false /*negative*/)
+    $$.val = treeNumVal
   }
 
 // Note: even though the ALTER RANGE ... CONFIGURE ZONE syntax only
@@ -7798,9 +7814,9 @@ statements_or_queries:
 // %Help: SHOW JOBS - list background jobs
 // %Category: Misc
 // %Text:
-// SHOW [AUTOMATIC | CHANGEFEED] JOBS [select clause]
+// SHOW [AUTOMATIC | CHANGEFEED] JOBS [select clause] [WITH EXECUTION DETAILS]
 // SHOW JOBS FOR SCHEDULES [select clause]
-// SHOW [CHANGEFEED] JOB <jobid>
+// SHOW [CHANGEFEED] JOB <jobid> [WITH EXECUTION DETAILS]
 // %SeeAlso: CANCEL JOBS, PAUSE JOBS, RESUME JOBS
 show_jobs_stmt:
   SHOW AUTOMATIC JOBS
@@ -7809,7 +7825,16 @@ show_jobs_stmt:
   }
 | SHOW JOBS
   {
-    $$.val = &tree.ShowJobs{Automatic: false}
+    $$.val = &tree.ShowJobs{
+      Automatic: false,
+    }
+  }
+| SHOW JOBS WITH show_job_options_list
+  {
+    $$.val = &tree.ShowJobs{
+      Automatic: false,
+      Options: $4.showJobOptions(),
+    }
   }
 | SHOW CHANGEFEED JOBS
   {
@@ -7821,6 +7846,13 @@ show_jobs_stmt:
 | SHOW JOBS select_stmt
   {
     $$.val = &tree.ShowJobs{Jobs: $3.slct()}
+  }
+| SHOW JOBS select_stmt WITH show_job_options_list
+  {
+    $$.val = &tree.ShowJobs{
+      Jobs: $3.slct(),
+      Options: $5.showJobOptions(),
+    }
   }
 | SHOW JOBS WHEN COMPLETE select_stmt
   {
@@ -7843,6 +7875,15 @@ show_jobs_stmt:
       },
     }
   }
+| SHOW JOB a_expr WITH show_job_options_list
+  {
+    $$.val = &tree.ShowJobs{
+      Jobs: &tree.Select{
+        Select: &tree.ValuesClause{Rows: []tree.Exprs{tree.Exprs{$3.expr()}}},
+      },
+      Options: $5.showJobOptions(),
+    }
+  }
 | SHOW CHANGEFEED JOB a_expr
   {
     $$.val = &tree.ShowChangefeedJobs{
@@ -7862,6 +7903,29 @@ show_jobs_stmt:
   }
 | SHOW JOB error // SHOW HELP: SHOW JOBS
 | SHOW CHANGEFEED JOB error // SHOW HELP: SHOW JOBS
+
+
+show_job_options_list:
+  // Require at least one option
+  show_job_options
+  {
+    $$.val = $1.showJobOptions()
+  }
+| show_job_options_list ',' show_job_options
+  {
+    if err := $1.showJobOptions().CombineWith($3.showJobOptions()); err != nil {
+      return setErr(sqllex, err)
+    }
+  }
+
+// List of valid SHOW JOB options.
+show_job_options:
+  EXECUTION DETAILS
+  {
+    $$.val = &tree.ShowJobOptions{
+      ExecutionDetails: true,
+    }
+  }
 
 // %Help: SHOW SCHEDULES - list periodic schedules
 // %Category: Misc
@@ -10797,6 +10861,18 @@ opt_index_visible:
 | VISIBLE
   {
     $$.val = tree.NewNumVal(constant.MakeFloat64(0.0), "0.0", false /*negative*/)
+  }
+| VISIBILITY FCONST
+  {
+    visibilityConst, _ := constant.Float64Val($2.numVal().AsConstantValue())
+      if visibilityConst < 0.0 || visibilityConst > 1.0 {
+        sqllex.Error("index visibility must be between 0 and 1")
+        return 1
+      }
+    invisibilityConst := 1.0 - visibilityConst
+    invisibilityStr := fmt.Sprintf("%.2f", invisibilityConst)
+    treeNumVal := tree.NewNumVal(constant.MakeFloat64(invisibilityConst), invisibilityStr, false /*negative*/)
+    $$.val = treeNumVal
   }
 | /* EMPTY */
   {
@@ -16672,6 +16748,7 @@ unreserved_keyword:
 | VIEWCLUSTERSETTING
 | VIEWDEBUG
 | VISIBLE
+| VISIBILITY
 | VOLATILE
 | VOTERS
 | WITHIN
@@ -17241,6 +17318,7 @@ bare_label_keywords:
 | VIEWDEBUG
 | VIRTUAL
 | VISIBLE
+| VISIBILITY
 | VOLATILE
 | VOTERS
 | WHEN

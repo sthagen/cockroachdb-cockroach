@@ -57,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -79,10 +80,7 @@ var ExpirationLeasesOnly = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.expiration_leases_only.enabled",
 	"only use expiration-based leases, never epoch-based ones (experimental, affects performance)",
-	false,
-	// TODO(erikgrinaker): Make this metamorphic when they don't prevent closed
-	// timestamp updates: https://github.com/cockroachdb/cockroach/issues/99812
-	//util.ConstantWithMetamorphicTestBool("kv.expiration_leases_only.enabled", false),
+	util.ConstantWithMetamorphicTestBool("kv.expiration_leases_only.enabled", false),
 )
 
 var leaseStatusLogLimiter = func() *log.EveryN {
@@ -315,7 +313,7 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 		}
 	}
 
-	if err := p.requestLeaseAsync(ctx, nextLeaseHolder, reqLease, status, leaseReq); err != nil {
+	if err := p.requestLeaseAsync(ctx, nextLeaseHolder, status, leaseReq); err != nil {
 		// We failed to start the asynchronous task. Send a blank NotLeaseHolderError
 		// back to indicate that we have no idea who the range lease holder might
 		// be; we've withdrawn from active duty.
@@ -338,11 +336,10 @@ func (p *pendingLeaseRequest) InitOrJoinRequest(
 // specified replica. The request is sent in an async task.
 //
 // The status argument is used as the expected value for liveness operations.
-// reqLease and leaseReq must be consistent with the LeaseStatus.
+// leaseReq must be consistent with the LeaseStatus.
 func (p *pendingLeaseRequest) requestLeaseAsync(
 	parentCtx context.Context,
 	nextLeaseHolder roachpb.ReplicaDescriptor,
-	reqLease roachpb.Lease,
 	status kvserverpb.LeaseStatus,
 	leaseReq kvpb.Request,
 ) error {
@@ -384,7 +381,7 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 		func(ctx context.Context) {
 			defer sp.Finish()
 
-			err := p.requestLease(ctx, nextLeaseHolder, reqLease, status, leaseReq)
+			err := p.requestLease(ctx, nextLeaseHolder, status, leaseReq)
 			// Error will be handled below.
 
 			// We reset our state below regardless of whether we've gotten an error or
@@ -425,7 +422,6 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 func (p *pendingLeaseRequest) requestLease(
 	ctx context.Context,
 	nextLeaseHolder roachpb.ReplicaDescriptor,
-	reqLease roachpb.Lease,
 	status kvserverpb.LeaseStatus,
 	leaseReq kvpb.Request,
 ) error {
@@ -434,12 +430,10 @@ func (p *pendingLeaseRequest) requestLease(
 		p.repl.store.metrics.LeaseRequestLatency.RecordValue(timeutil.Since(started).Nanoseconds())
 	}()
 
-	// If requesting an epoch-based lease & current state is expired,
-	// potentially heartbeat our own liveness or increment epoch of
-	// prior owner. Note we only do this if the previous lease was
-	// epoch-based.
-	if reqLease.Type() == roachpb.LeaseEpoch && status.State == kvserverpb.LeaseState_EXPIRED &&
-		status.Lease.Type() == roachpb.LeaseEpoch {
+	// If we're replacing an expired epoch-based lease, we must increment the
+	// epoch of the prior owner to invalidate its leases. If we were the owner,
+	// then we instead heartbeat to become live.
+	if status.Lease.Type() == roachpb.LeaseEpoch && status.State == kvserverpb.LeaseState_EXPIRED {
 		var err error
 		// If this replica is previous & next lease holder, manually heartbeat to become live.
 		if status.OwnedBy(nextLeaseHolder.StoreID) &&
@@ -491,7 +485,14 @@ func (p *pendingLeaseRequest) requestLease(
 				// so we don't log it as an error.
 				//
 				// https://github.com/cockroachdb/cockroach/issues/35986
-				if !errors.Is(err, liveness.ErrEpochAlreadyIncremented) {
+				if errors.Is(err, liveness.ErrEpochAlreadyIncremented) {
+					// ignore
+				} else if errors.HasType(err, &liveness.ErrEpochCondFailed{}) {
+					// ErrEpochCondFailed indicates that someone else changed the liveness
+					// record while we were incrementing it. The node could still be
+					// alive, or someone else updated it. Don't log this as an error.
+					log.Infof(ctx, "failed to increment leaseholder's epoch: %s", err)
+				} else {
 					log.Errorf(ctx, "failed to increment leaseholder's epoch: %s", err)
 				}
 			}

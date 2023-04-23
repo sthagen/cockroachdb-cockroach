@@ -638,6 +638,8 @@ var charts = []sectionDescription{
 					"range.snapshots.applied-non-voter",
 					"range.snapshots.delegate.successes",
 					"range.snapshots.delegate.failures",
+					"range.snapshots.recv-failed",
+					"range.snapshots.recv-unusable",
 				},
 			},
 			{
@@ -3711,6 +3713,17 @@ var charts = []sectionDescription{
 					"jobs.key_visualizer.resume_completed",
 					"jobs.key_visualizer.resume_failed",
 					"jobs.key_visualizer.resume_retry_error",
+				},
+			},
+			{
+				Title: "SQL Activity Updater",
+				Metrics: []string{
+					"jobs.auto_update_sql_activity.fail_or_cancel_completed",
+					"jobs.auto_update_sql_activity.fail_or_cancel_failed",
+					"jobs.auto_update_sql_activity.fail_or_cancel_retry_error",
+					"jobs.auto_update_sql_activity.resume_completed",
+					"jobs.auto_update_sql_activity.resume_failed",
+					"jobs.auto_update_sql_activity.resume_retry_error",
 				},
 			},
 			{

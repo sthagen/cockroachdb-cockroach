@@ -1033,7 +1033,6 @@ func TestMetricsMetadata(t *testing.T) {
 
 func TestHotRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 98619, "flaky test")
 	defer log.Scope(t).Close(t)
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
@@ -1066,9 +1065,9 @@ func TestHotRangesResponse(t *testing.T) {
 					t.Errorf("unexpected empty/unpopulated range descriptor: %+v", r.Desc)
 				}
 				if r.QueriesPerSecond > 0 {
-					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
-						t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
-							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond)
+					if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 && r.ReadBytesPerSecond == 0 && r.WriteBytesPerSecond == 0 {
+						t.Errorf("qps %.2f > 0, expected either reads=%.2f, writes=%.2f, readBytes=%.2f or writeBytes=%.2f to be non-zero",
+							r.QueriesPerSecond, r.ReadsPerSecond, r.WritesPerSecond, r.ReadBytesPerSecond, r.WriteBytesPerSecond)
 					}
 					// If the architecture doesn't support sampling CPU, it
 					// will also be zero.
@@ -1090,7 +1089,6 @@ func TestHotRangesResponse(t *testing.T) {
 
 func TestHotRanges2Response(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 98619, "flaky test")
 	defer log.Scope(t).Close(t)
 	ts := startServer(t)
 	defer ts.Stopper().Stop(context.Background())
@@ -1108,9 +1106,9 @@ func TestHotRanges2Response(t *testing.T) {
 			t.Errorf("unexpected empty range id: %d", r.RangeID)
 		}
 		if r.QPS > 0 {
-			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 {
-				t.Errorf("qps %.2f > 0, expected either reads=%.2f or writes=%.2f to be non-zero",
-					r.QPS, r.ReadsPerSecond, r.WritesPerSecond)
+			if r.ReadsPerSecond == 0 && r.WritesPerSecond == 0 && r.ReadBytesPerSecond == 0 && r.WriteBytesPerSecond == 0 {
+				t.Errorf("qps %.2f > 0, expected either reads=%.2f, writes=%.2f, readBytes=%.2f or writeBytes=%.2f to be non-zero",
+					r.QPS, r.ReadsPerSecond, r.WritesPerSecond, r.ReadBytesPerSecond, r.WriteBytesPerSecond)
 			}
 			// If the architecture doesn't support sampling CPU, it
 			// will also be zero.
@@ -1374,10 +1372,13 @@ func TestSpanStatsResponse(t *testing.T) {
 	}
 
 	var response roachpb.SpanStatsResponse
+	span := roachpb.Span{
+		Key:    roachpb.RKeyMin.AsRawKey(),
+		EndKey: roachpb.RKeyMax.AsRawKey(),
+	}
 	request := roachpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
+		NodeID: "1",
+		Spans:  []roachpb.Span{span},
 	}
 
 	url := ts.AdminURL() + statusPrefix + "span"
@@ -1388,7 +1389,8 @@ func TestSpanStatsResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
+	responseSpanStats := response.SpanToStats[span.String()]
+	if a, e := int(responseSpanStats.RangeCount), initialRanges; a != e {
 		t.Errorf("expected %d ranges, found %d", e, a)
 	}
 }
@@ -1403,10 +1405,13 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	rpcStopper := stop.NewStopper()
 	defer rpcStopper.Stop(ctx)
 	rpcContext := newRPCTestContext(ctx, ts, ts.RPCContext().Config)
+	span := roachpb.Span{
+		Key:    roachpb.RKeyMin.AsRawKey(),
+		EndKey: roachpb.RKeyMax.AsRawKey(),
+	}
 	request := roachpb.SpanStatsRequest{
-		NodeID:   "1",
-		StartKey: []byte(roachpb.RKeyMin),
-		EndKey:   []byte(roachpb.RKeyMax),
+		NodeID: "1",
+		Spans:  []roachpb.Span{span},
 	}
 
 	url := ts.ServingRPCAddr()
@@ -1425,7 +1430,8 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), initialRanges; a != e {
+	responseSpanStats := response.SpanToStats[span.String()]
+	if a, e := int(responseSpanStats.RangeCount), initialRanges; a != e {
 		t.Fatalf("expected %d ranges, found %d", e, a)
 	}
 }

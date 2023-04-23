@@ -306,7 +306,7 @@ func (v *distSQLExprCheckVisitor) VisitPre(expr tree.Expr) (recurse bool, newExp
 			return false, expr
 		}
 	case *tree.RoutineExpr:
-		// TODO(86310): enable UDFs in DistSQL.
+		// TODO(#86310): enable UDFs in DistSQL.
 		v.err = newQueryNotSupportedErrorf("user-defined routine %s cannot be executed with distsql", t)
 		return false, expr
 	case *tree.DOid:
@@ -1833,9 +1833,10 @@ func (dsp *DistSQLPlanner) planTableReaders(
 	ctx context.Context, planCtx *PlanningCtx, p *PhysicalPlan, info *tableReaderPlanningInfo,
 ) error {
 	var (
-		spanPartitions   []SpanPartition
-		parallelizeLocal bool
-		err              error
+		spanPartitions         []SpanPartition
+		parallelizeLocal       bool
+		ignoreMisplannedRanges bool
+		err                    error
 	)
 	if planCtx.isLocal {
 		spanPartitions, parallelizeLocal = dsp.maybeParallelizeLocalScans(ctx, planCtx, info)
@@ -1857,6 +1858,10 @@ func (dsp *DistSQLPlanner) planTableReaders(
 			return err
 		}
 		spanPartitions = []SpanPartition{{sqlInstanceID, info.spans}}
+		// The spans to scan might actually live on different nodes, so we don't
+		// want to create "misplanned ranges" metadata since it can result in
+		// false positives.
+		ignoreMisplannedRanges = true
 	}
 
 	corePlacement := make([]physicalplan.ProcessorCorePlacement, len(spanPartitions))
@@ -1880,6 +1885,7 @@ func (dsp *DistSQLPlanner) planTableReaders(
 		if !tr.Parallelize {
 			tr.BatchBytesLimit = dsp.distSQLSrv.TestingKnobs.TableReaderBatchBytesLimit
 		}
+		tr.IgnoreMisplannedRanges = ignoreMisplannedRanges
 		p.TotalEstimatedScannedRows += info.estimatedRowCount
 
 		corePlacement[i].SQLInstanceID = sp.SQLInstanceID
@@ -4417,12 +4423,8 @@ func (dsp *DistSQLPlanner) createPlanForExport(
 		UserProto:   planCtx.planner.User().EncodeProto(),
 	}
 
-	resTypes := make([]*types.T, len(colinfo.ExportColumns))
-	for i := range colinfo.ExportColumns {
-		resTypes[i] = colinfo.ExportColumns[i].Typ
-	}
 	plan.AddNoGroupingStage(
-		core, execinfrapb.PostProcessSpec{}, resTypes, execinfrapb.Ordering{},
+		core, execinfrapb.PostProcessSpec{}, colinfo.ExportColumnTypes, execinfrapb.Ordering{},
 	)
 
 	// The CSVWriter produces the same columns as the EXPORT statement.

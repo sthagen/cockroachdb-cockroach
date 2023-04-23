@@ -368,6 +368,7 @@ func Run(
 	secure bool,
 	stdout, stderr io.Writer,
 	cmdArray []string,
+	opts ...install.ParallelOption,
 ) error {
 	if err := LoadClusters(); err != nil {
 		return err
@@ -388,7 +389,7 @@ func Run(
 	if len(title) > 30 {
 		title = title[:27] + "..."
 	}
-	return c.Run(ctx, l, stdout, stderr, c.Nodes, title, cmd)
+	return c.Run(ctx, l, stdout, stderr, c.Nodes, title, cmd, opts...)
 }
 
 // RunWithDetails runs a command on the nodes in a cluster.
@@ -470,13 +471,13 @@ func IP(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		if err := c.Parallel(ctx, l, "", len(nodes), 0, func(ctx context.Context, i int) (*install.RunResultDetails, error) {
+		if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
 			ips[i] = res.Stdout
 			return res, nil
-		}, install.DefaultSSHRetryOpts); err != nil {
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -740,6 +741,18 @@ func Stop(ctx context.Context, l *logger.Logger, clusterName string, opts StopOp
 	return c.Stop(ctx, l, opts.Sig, opts.Wait, opts.MaxWait)
 }
 
+// Signal sends a signal to nodes in the cluster.
+func Signal(ctx context.Context, l *logger.Logger, clusterName string, sig int) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+	return c.Signal(ctx, l, sig)
+}
+
 // Init initializes the cluster.
 func Init(ctx context.Context, l *logger.Logger, clusterName string, opts install.StartOpts) error {
 	if err := LoadClusters(); err != nil {
@@ -896,13 +909,13 @@ func PgURL(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		if err := c.Parallel(ctx, l, "", len(nodes), 0, func(ctx context.Context, i int) (*install.RunResultDetails, error) {
+		if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
 			res.Stdout, res.Err = c.GetInternalIP(l, ctx, node)
 			ips[i] = res.Stdout
 			return res, nil
-		}, install.DefaultSSHRetryOpts); err != nil {
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -1030,7 +1043,7 @@ func Pprof(ctx context.Context, l *logger.Logger, clusterName string, opts Pprof
 	httpClient := httputil.NewClientWithTimeout(timeout)
 	startTime := timeutil.Now().Unix()
 	nodes := c.TargetNodes()
-	err = c.Parallel(ctx, l, description, len(nodes), 0, func(ctx context.Context, i int) (*install.RunResultDetails, error) {
+	err = c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 		node := nodes[i]
 		res := &install.RunResultDetails{Node: node}
 		host := c.Host(node)
@@ -1092,7 +1105,7 @@ func Pprof(ctx context.Context, l *logger.Logger, clusterName string, opts Pprof
 		outputFiles = append(outputFiles, outputFile)
 		mu.Unlock()
 		return res, nil
-	}, install.DefaultSSHRetryOpts)
+	}, install.WithDisplay(description))
 
 	for _, s := range outputFiles {
 		l.Printf("Created %s", s)
@@ -1686,10 +1699,7 @@ func sendCaptureCommand(
 ) error {
 	nodes := c.TargetNodes()
 	httpClient := httputil.NewClientWithTimeout(0 /* timeout: None */)
-	_, err := c.ParallelE(ctx, l,
-		fmt.Sprintf("Performing workload capture %s", action),
-		len(nodes),
-		0,
+	_, err := c.ParallelE(ctx, l, len(nodes),
 		func(ctx context.Context, i int) (*install.RunResultDetails, error) {
 			node := nodes[i]
 			res := &install.RunResultDetails{Node: node}
@@ -1754,7 +1764,7 @@ func sendCaptureCommand(
 				}
 			}
 			return res, res.Err
-		}, install.DefaultSSHRetryOpts)
+		}, install.WithDisplay(fmt.Sprintf("Performing workload capture %s", action)))
 	return err
 }
 

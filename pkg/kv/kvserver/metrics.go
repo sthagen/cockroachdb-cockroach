@@ -357,13 +357,13 @@ var (
 	}
 	metaAverageWriteBytesPerSecond = metric.Metadata{
 		Name:        "rebalancing.writebytespersecond",
-		Help:        "Number of bytes read recently per second, considering the last 30 minutes.",
+		Help:        "Number of bytes written recently per second, considering the last 30 minutes.",
 		Measurement: "Bytes/Sec",
 		Unit:        metric.Unit_BYTES,
 	}
 	metaAverageReadBytesPerSecond = metric.Metadata{
 		Name:        "rebalancing.readbytespersecond",
-		Help:        "Number of bytes written per second, considering the last 30 minutes.",
+		Help:        "Number of bytes read recently per second, considering the last 30 minutes.",
 		Measurement: "Bytes/Sec",
 		Unit:        metric.Unit_BYTES,
 	}
@@ -862,6 +862,18 @@ var (
 		Help:        "Number of recovery snapshot bytes sent",
 		Measurement: "Bytes",
 		Unit:        metric.Unit_BYTES,
+	}
+	metaRangeSnapshotRecvFailed = metric.Metadata{
+		Name:        "range.snapshots.recv-failed",
+		Help:        "Number of range snapshot initialization messages that errored out on the recipient, typically before any data is transferred",
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaRangeSnapshotRecvUnusable = metric.Metadata{
+		Name:        "range.snapshots.recv-unusable",
+		Help:        "Number of range snapshot that were fully transmitted but determined to be unnecessary or unusable",
+		Measurement: "Snapshots",
+		Unit:        metric.Unit_COUNT,
 	}
 	metaRangeSnapshotSendQueueLength = metric.Metadata{
 		Name:        "range.snapshots.send-queue",
@@ -2078,6 +2090,8 @@ type StoreMetrics struct {
 	RangeSnapshotRecoverySentBytes               *metric.Counter
 	RangeSnapshotRebalancingRcvdBytes            *metric.Counter
 	RangeSnapshotRebalancingSentBytes            *metric.Counter
+	RangeSnapshotRecvFailed                      *metric.Counter
+	RangeSnapshotRecvUnusable                    *metric.Counter
 
 	// Range snapshot queue metrics.
 	RangeSnapshotSendQueueLength     *metric.Gauge
@@ -2682,6 +2696,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeSnapshotRecoverySentBytes:               metric.NewCounter(metaRangeSnapshotRecoverySentBytes),
 		RangeSnapshotRebalancingRcvdBytes:            metric.NewCounter(metaRangeSnapshotRebalancingRcvdBytes),
 		RangeSnapshotRebalancingSentBytes:            metric.NewCounter(metaRangeSnapshotRebalancingSentBytes),
+		RangeSnapshotRecvFailed:                      metric.NewCounter(metaRangeSnapshotRecvFailed),
+		RangeSnapshotRecvUnusable:                    metric.NewCounter(metaRangeSnapshotRecvUnusable),
 		RangeSnapshotSendQueueLength:                 metric.NewGauge(metaRangeSnapshotSendQueueLength),
 		RangeSnapshotRecvQueueLength:                 metric.NewGauge(metaRangeSnapshotRecvQueueLength),
 		RangeSnapshotSendInProgress:                  metric.NewGauge(metaRangeSnapshotSendInProgress),

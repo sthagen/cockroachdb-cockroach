@@ -853,12 +853,15 @@ show_partitions_stmt ::=
 show_jobs_stmt ::=
 	'SHOW' 'AUTOMATIC' 'JOBS'
 	| 'SHOW' 'JOBS'
+	| 'SHOW' 'JOBS' 'WITH' show_job_options_list
 	| 'SHOW' 'CHANGEFEED' 'JOBS'
 	| 'SHOW' 'JOBS' select_stmt
+	| 'SHOW' 'JOBS' select_stmt 'WITH' show_job_options_list
 	| 'SHOW' 'JOBS' 'WHEN' 'COMPLETE' select_stmt
 	| 'SHOW' 'JOBS' for_schedules_clause
 	| 'SHOW' 'CHANGEFEED' 'JOBS' select_stmt
 	| 'SHOW' 'JOB' a_expr
+	| 'SHOW' 'JOB' a_expr 'WITH' show_job_options_list
 	| 'SHOW' 'CHANGEFEED' 'JOB' a_expr
 	| 'SHOW' 'JOB' 'WHEN' 'COMPLETE' a_expr
 
@@ -1453,6 +1456,7 @@ unreserved_keyword ::=
 	| 'VIEWCLUSTERSETTING'
 	| 'VIEWDEBUG'
 	| 'VISIBLE'
+	| 'VISIBILITY'
 	| 'VOLATILE'
 	| 'VOTERS'
 	| 'WITHIN'
@@ -1961,6 +1965,9 @@ for_grantee_clause ::=
 	'FOR' role_spec_list
 	| 
 
+show_job_options_list ::=
+	( show_job_options ) ( ( ',' show_job_options ) )*
+
 opt_schedule_executor_type ::=
 	'FOR' 'BACKUP'
 	| 'FOR' 'SQL' 'STATISTICS'
@@ -2431,6 +2438,7 @@ opt_index_visible ::=
 	'NOT' 'VISIBLE'
 	| 'INVISIBLE'
 	| 'VISIBLE'
+	| 'VISIBILITY' 'FCONST'
 	| 
 
 opt_schema_name ::=
@@ -2722,6 +2730,9 @@ targets_roles ::=
 	| 'TYPE' type_name_list
 	| grant_targets
 
+show_job_options ::=
+	'EXECUTION' 'DETAILS'
+
 show_ranges_options ::=
 	( 'TABLES' | 'INDEXES' | 'DETAILS' | 'KEYS' | 'EXPLAIN' ) ( ( ',' 'TABLES' | ',' 'INDEXES' | ',' 'DETAILS' | ',' 'EXPLAIN' | ',' 'KEYS' ) )*
 
@@ -2887,6 +2898,7 @@ alter_index_visible ::=
 	'NOT' 'VISIBLE'
 	| 'INVISIBLE'
 	| 'VISIBLE'
+	| 'VISIBILITY' 'FCONST'
 
 sequence_option_list ::=
 	( sequence_option_elem ) ( ( sequence_option_elem ) )*
@@ -4023,6 +4035,7 @@ bare_label_keywords ::=
 	| 'VIEWDEBUG'
 	| 'VIRTUAL'
 	| 'VISIBLE'
+	| 'VISIBILITY'
 	| 'VOLATILE'
 	| 'VOTERS'
 	| 'WHEN'

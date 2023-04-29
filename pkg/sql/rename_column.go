@@ -56,6 +56,11 @@ func (p *planner) RenameColumn(ctx context.Context, n *tree.RenameColumn) (planN
 		return nil, err
 	}
 
+	// Disallow schema changes if this table's schema is locked.
+	if err := checkTableSchemaUnlocked(tableDesc); err != nil {
+		return nil, err
+	}
+
 	return &renameColumnNode{n: n, tableDesc: tableDesc}, nil
 }
 
@@ -100,7 +105,13 @@ func (p *planner) findColumnToRename(
 	if err != nil {
 		return nil, err
 	}
-
+	// Block renaming of system columns.
+	if col.IsSystemColumn() {
+		return nil, pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"cannot rename system column %q", col.ColName(),
+		)
+	}
 	for _, tableRef := range tableDesc.DependedOnBy {
 		found := false
 		for _, colID := range tableRef.ColumnIDs {

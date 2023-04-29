@@ -905,3 +905,26 @@ func shouldSkipValidatingConstraint(
 	})
 	return skip, err
 }
+
+// panicIfSchemaIsLocked panics if table's schema is locked.
+// It is used to prevent schema change stmts.
+func panicIfSchemaIsLocked(tableElements ElementResultSet) {
+	_, _, schemaLocked := scpb.FindTableSchemaLocked(tableElements)
+	if schemaLocked != nil {
+		_, _, ns := scpb.FindNamespace(tableElements)
+		if ns == nil {
+			panic(errors.AssertionFailedf("programming error: Namespace element not found"))
+		}
+		panic(sqlerrors.NewSchemaChangeOnLockedTableErr(ns.Name))
+	}
+}
+
+// panicIfSystemColumn blocks alter operations on system columns.
+func panicIfSystemColumn(column *scpb.Column, columnName string) {
+	if column.IsSystemColumn {
+		// Block alter operations on system columns.
+		panic(pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"cannot alter system column %q", columnName))
+	}
+}

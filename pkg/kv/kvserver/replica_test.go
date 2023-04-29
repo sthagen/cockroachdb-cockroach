@@ -1513,7 +1513,7 @@ func internalMergeArgs(key []byte, value roachpb.Value) kvpb.MergeRequest {
 	}
 }
 
-func truncateLogArgs(index uint64, rangeID roachpb.RangeID) kvpb.TruncateLogRequest {
+func truncateLogArgs(index kvpb.RaftIndex, rangeID roachpb.RangeID) kvpb.TruncateLogRequest {
 	return kvpb.TruncateLogRequest{
 		Index:   index,
 		RangeID: rangeID,
@@ -6552,7 +6552,7 @@ func TestAppliedIndex(t *testing.T) {
 	sc.TestingKnobs.DisableCanAckBeforeApplication = true
 	tc.StartWithStoreConfig(ctx, t, stopper, sc)
 
-	var appliedIndex uint64
+	var appliedIndex kvpb.RaftIndex
 	var sum int64
 	for i := int64(1); i <= 10; i++ {
 		args := incrementArgs([]byte("a"), i)
@@ -7207,10 +7207,10 @@ func TestEntries(t *testing.T) {
 
 		repl := tc.repl
 		rangeID := repl.RangeID
-		var indexes []uint64
+		var indexes []kvpb.RaftIndex
 
-		populateLogs := func(from, to int) []uint64 {
-			var newIndexes []uint64
+		populateLogs := func(from, to int) []kvpb.RaftIndex {
+			var newIndexes []kvpb.RaftIndex
 			for i := from; i < to; i++ {
 				args := incrementArgs([]byte("a"), int64(i))
 				if _, pErr := tc.SendWrapped(args); pErr != nil {
@@ -7239,8 +7239,8 @@ func TestEntries(t *testing.T) {
 		indexes = append(indexes, populateLogs(0, 10)...)
 
 		for i, tc := range []struct {
-			lo             uint64
-			hi             uint64
+			lo             kvpb.RaftIndex
+			hi             kvpb.RaftIndex
 			maxBytes       uint64
 			expResultCount int
 			expCacheCount  int
@@ -7330,7 +7330,7 @@ func TestEntries(t *testing.T) {
 			if len(ents) != tc.expResultCount {
 				t.Errorf("%d: expected %d entries, got %d", i, tc.expResultCount, len(ents))
 			} else if tc.expResultCount > 0 {
-				expHitLimit := ents[len(ents)-1].Index < tc.hi-1
+				expHitLimit := kvpb.RaftIndex(ents[len(ents)-1].Index) < tc.hi-1
 				if hitLimit != expHitLimit {
 					t.Errorf("%d: unexpected hit limit: %t", i, hitLimit)
 				}
@@ -7365,7 +7365,7 @@ func TestTerm(t *testing.T) {
 		rangeID := repl.RangeID
 
 		// Populate the log with 10 entries. Save the LastIndex after each write.
-		var indexes []uint64
+		var indexes []kvpb.RaftIndex
 		for i := 0; i < 10; i++ {
 			args := incrementArgs([]byte("a"), int64(i))
 
@@ -7687,11 +7687,11 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 
 	type magicKey struct{}
 
-	var c int32                // updated atomically
-	var wrongLeaseIndex uint64 // populated below
+	var c int32                                // updated atomically
+	var wrongLeaseIndex kvpb.LeaseAppliedIndex // populated below
 
 	tc.repl.mu.Lock()
-	tc.repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) (indexOverride uint64) {
+	tc.repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) (indexOverride kvpb.LeaseAppliedIndex) {
 		if v := p.ctx.Value(magicKey{}); v != nil {
 			if curAttempt := atomic.AddInt32(&c, 1); curAttempt == 1 {
 				return wrongLeaseIndex
@@ -8138,7 +8138,7 @@ func TestReplicaRefreshMultiple(t *testing.T) {
 		t.Fatalf("test requires LeaseAppliedIndex >= 2 at this point, have %d", ai)
 	}
 	assigned := false
-	repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) (indexOverride uint64) {
+	repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) kvpb.LeaseAppliedIndex {
 		if p == proposal && !assigned {
 			assigned = true
 			t.Logf("assigned wrong LAI %d", ai-1)
@@ -8223,7 +8223,7 @@ func TestReplicaReproposalWithNewLeaseIndexError(t *testing.T) {
 
 	var curFlushAttempt, curInsertAttempt int32 // updated atomically
 	tc.repl.mu.Lock()
-	tc.repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) (indexOverride uint64) {
+	tc.repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) kvpb.LeaseAppliedIndex {
 		if v := p.ctx.Value(magicKey{}); v != nil {
 			flushAttempts := atomic.AddInt32(&curFlushAttempt, 1)
 			switch flushAttempts {
@@ -8233,7 +8233,7 @@ func TestReplicaReproposalWithNewLeaseIndexError(t *testing.T) {
 				// write. Two requests can't have the same lease applied index,
 				// so this will cause it to be rejected beneath raft with an
 				// illegal lease index error.
-				wrongLeaseIndex := uint64(1)
+				wrongLeaseIndex := kvpb.LeaseAppliedIndex(1)
 				return wrongLeaseIndex
 			default:
 				// Unexpected. Asserted against below.
@@ -8327,7 +8327,7 @@ func TestFailureToProcessCommandClearsLocalResult(t *testing.T) {
 
 	r := tc.repl
 	r.mu.Lock()
-	r.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) (indexOverride uint64) {
+	r.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) kvpb.LeaseAppliedIndex {
 		// We're going to recognize the first time the commnand for the EndTxn is
 		// proposed and we're going to hackily force a low MaxLeaseIndex, so that
 		// the processing gets rejected further on.
@@ -9906,7 +9906,7 @@ type testQuiescer struct {
 	numProposals    int
 	pendingQuota    bool
 	status          *raftSparseStatus
-	lastIndex       uint64
+	lastIndex       kvpb.RaftIndex
 	raftReady       bool
 	lease           roachpb.Lease
 	mergeInProgress bool
@@ -9937,7 +9937,7 @@ func (q *testQuiescer) raftBasicStatusRLocked() raft.BasicStatus {
 	return q.status.BasicStatus
 }
 
-func (q *testQuiescer) raftLastIndexRLocked() uint64 {
+func (q *testQuiescer) raftLastIndexRLocked() kvpb.RaftIndex {
 	return q.lastIndex
 }
 
@@ -10160,8 +10160,8 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 		}
 		return q
 	})
-	// Verify no quiescence with expiration-based leases, but only if
-	// kv.expiration_leases_only.enabled is true.
+	// Verify no quiescence with expiration-based leases, regardless
+	// of kv.expiration_leases_only.enabled.
 	test(false, func(q *testQuiescer) *testQuiescer {
 		ExpirationLeasesOnly.Override(context.Background(), &q.st.SV, true)
 		q.lease.Epoch = 0
@@ -10170,7 +10170,7 @@ func TestShouldReplicaQuiesce(t *testing.T) {
 		}
 		return q
 	})
-	test(true, func(q *testQuiescer) *testQuiescer {
+	test(false, func(q *testQuiescer) *testQuiescer {
 		ExpirationLeasesOnly.Override(context.Background(), &q.st.SV, false)
 		q.lease.Epoch = 0
 		q.lease.Expiration = &hlc.Timestamp{
@@ -13529,7 +13529,7 @@ func TestProposalNotAcknowledgedOrReproposedAfterApplication(t *testing.T) {
 	if _, pErr := tc.repl.Send(ctx, ba); pErr != nil {
 		t.Fatal(pErr)
 	}
-	log.Flush()
+	log.FlushFileSinks()
 
 	stopper.Quiesce(ctx)
 	entries, err := log.FetchEntriesFromFiles(0, math.MaxInt64, 1,
@@ -13865,9 +13865,6 @@ func TestRangeInfoReturned(t *testing.T) {
 	var tc testContext
 	tc.Start(ctx, t, stopper)
 
-	key := roachpb.Key("a")
-	gArgs := getArgs(key)
-
 	ri := tc.repl.GetRangeInfo(ctx)
 	require.False(t, ri.Lease.Empty())
 	require.Equal(t, roachpb.LAG_BY_CLUSTER_SETTING, ri.ClosedTimestampPolicy)
@@ -13875,18 +13872,22 @@ func TestRangeInfoReturned(t *testing.T) {
 	staleLeaseSeq := ri.Lease.Sequence - 1
 	wrongCTPolicy := roachpb.LEAD_FOR_GLOBAL_READS
 
+	requestLease := ri.Lease
+	requestLease.Sequence = 0
+
 	for _, test := range []struct {
-		req roachpb.ClientRangeInfo
+		cri roachpb.ClientRangeInfo
+		req kvpb.Request
 		exp *roachpb.RangeInfo
 	}{
 		{
 			// Empty client info. This case shouldn't happen.
-			req: roachpb.ClientRangeInfo{},
+			cri: roachpb.ClientRangeInfo{},
 			exp: &ri,
 		},
 		{
 			// Correct descriptor, missing lease, correct closedts policy.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  ri.Desc.Generation,
 				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
@@ -13894,7 +13895,7 @@ func TestRangeInfoReturned(t *testing.T) {
 		},
 		{
 			// Correct descriptor, stale lease, correct closedts policy.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  ri.Desc.Generation,
 				LeaseSequence:         staleLeaseSeq,
 				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
@@ -13903,7 +13904,7 @@ func TestRangeInfoReturned(t *testing.T) {
 		},
 		{
 			// Correct descriptor, correct lease, incorrect closedts policy.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  ri.Desc.Generation,
 				LeaseSequence:         ri.Lease.Sequence,
 				ClosedTimestampPolicy: wrongCTPolicy,
@@ -13912,7 +13913,7 @@ func TestRangeInfoReturned(t *testing.T) {
 		},
 		{
 			// Correct descriptor, correct lease, correct closedts policy.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  ri.Desc.Generation,
 				LeaseSequence:         ri.Lease.Sequence,
 				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
@@ -13921,7 +13922,7 @@ func TestRangeInfoReturned(t *testing.T) {
 		},
 		{
 			// Stale descriptor, no lease, correct closedts policy.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  staleDescGen,
 				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
@@ -13929,7 +13930,7 @@ func TestRangeInfoReturned(t *testing.T) {
 		},
 		{
 			// Stale descriptor, stale lease, incorrect closedts policy.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  staleDescGen,
 				LeaseSequence:         staleLeaseSeq,
 				ClosedTimestampPolicy: wrongCTPolicy,
@@ -13939,20 +13940,35 @@ func TestRangeInfoReturned(t *testing.T) {
 		{
 			// Stale desc, good lease, correct closedts policy. This case
 			// shouldn't happen.
-			req: roachpb.ClientRangeInfo{
+			cri: roachpb.ClientRangeInfo{
 				DescriptorGeneration:  staleDescGen,
 				LeaseSequence:         staleLeaseSeq,
 				ClosedTimestampPolicy: ri.ClosedTimestampPolicy,
 			},
 			exp: &ri,
 		},
+		{
+			// RequestLeaseRequest without ClientRangeInfo. These bypass
+			// DistSender and don't need range info returned.
+			cri: roachpb.ClientRangeInfo{},
+			req: &kvpb.RequestLeaseRequest{
+				Lease:     requestLease,
+				PrevLease: ri.Lease,
+			},
+			exp: nil,
+		},
 	} {
 		t.Run("", func(t *testing.T) {
 			ba := &kvpb.BatchRequest{}
-			ba.Add(&gArgs)
-			ba.Header.ClientRangeInfo = test.req
+			ba.Header.ClientRangeInfo = test.cri
+			req := test.req
+			if req == nil {
+				args := getArgs(roachpb.Key("a"))
+				req = &args
+			}
+			ba.Add(req)
 			br, pErr := tc.Sender().Send(ctx, ba)
-			require.Nil(t, pErr)
+			require.NoError(t, pErr.GoError())
 			if test.exp == nil {
 				require.Empty(t, br.RangeInfos)
 			} else {

@@ -375,7 +375,6 @@ func (b *baseStatusServer) ListLocalDistSQLFlows(
 			Infos: []serverpb.DistSQLRemoteFlows_Info{{
 				NodeID:    nodeIDOrZero,
 				Timestamp: f.Timestamp,
-				Status:    serverpb.DistSQLRemoteFlows_RUNNING,
 				Stmt:      f.StatementSQL,
 			}},
 		})
@@ -1239,7 +1238,7 @@ func (s *statusServer) LogFilesList(
 		}
 		return status.LogFilesList(ctx, req)
 	}
-	log.Flush()
+	log.FlushFileSinks()
 	logFiles, err := log.ListLogFiles()
 	if err != nil {
 		return nil, serverError(ctx, err)
@@ -1279,7 +1278,7 @@ func (s *statusServer) LogFile(
 	inputEditMode := log.SelectEditMode(req.Redact, log.KeepRedactable)
 
 	// Ensure that the latest log entries are available in files.
-	log.Flush()
+	log.FlushFileSinks()
 
 	// Read the logs.
 	reader, err := log.GetLogReader(req.File)
@@ -1409,7 +1408,7 @@ func (s *statusServer) Logs(
 	}
 
 	// Ensure that the latest log entries are available in files.
-	log.Flush()
+	log.FlushFileSinks()
 
 	// Read the logs.
 	entries, err := log.FetchEntriesFromFiles(

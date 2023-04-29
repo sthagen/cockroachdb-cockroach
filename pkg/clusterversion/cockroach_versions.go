@@ -184,8 +184,6 @@ const (
 	// TODODelete_V22_2Start demarcates work towards CockroachDB v22.2.
 	TODODelete_V22_2Start
 
-	// TODODelete_V22_2LocalTimestamps enables the use of local timestamps in MVCC values.
-	TODODelete_V22_2LocalTimestamps
 	// TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted updates the Pebble format
 	// version that recombines all user keys that may be split across multiple
 	// files into a single table.
@@ -521,18 +519,6 @@ const (
 	// tables.
 	V23_1CreateSystemActivityUpdateJob
 
-	// **********************************************************
-	// ** If we haven't yet selected a final 23.1 RC candidate **
-	// Step 1a: Add new versions for release-23.1 branch above here.
-	// **********************************************************
-	// Where to add new versions?
-	// - If the version gate is being backported to release-23.1, add the new version above this comment.
-	//   This can be done during 23.1 Stability until we select a final RC.
-	// - If the version gate is for 23.2 development (not being backported to release-23.1), add the
-	//   new version above "Step 1b"
-	// - Do not add new versions to a patch release.
-	// *************************************************
-
 	// V23_1 is CockroachDB v23.1. It's used for all v23.1.x patch releases.
 	V23_1
 
@@ -540,8 +526,16 @@ const (
 	// the process of upgrading from previous supported releases to 23.2.
 	V23_2Start
 
+	// V23_2TTLAllowDescPK is the version where TTL tables can have descending
+	// primary keys.
+	V23_2TTLAllowDescPK
+
+	// V23_2_PartiallyVisibleIndexes is the version where partially visible
+	// indexes are enabled.
+	V23_2_PartiallyVisibleIndexes
+
 	// *************************************************
-	// Step 1b: Add new version for 23.2 development here.
+	// Step (1) Add new versions here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 )
@@ -612,10 +606,6 @@ var rawVersionsSingleton = keyedVersions{
 	{
 		Key:     TODODelete_V22_2Start,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 2},
-	},
-	{
-		Key:     TODODelete_V22_2LocalTimestamps,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 4},
 	},
 	{
 		Key:     TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted,
@@ -921,19 +911,6 @@ var rawVersionsSingleton = keyedVersions{
 		Key:     V23_1CreateSystemActivityUpdateJob,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 102},
 	},
-
-	// **********************************************************
-	// ** If we haven't yet selected a final 23.1 RC candidate **
-	// Step 2a: Add new versions for release-23.1 branch above here.
-	// **********************************************************
-	// Where to add new versions?
-	// - If the version gate is being backported to release-23.1, add the new version above this comment.
-	//   This can be done during 23.1 Stability until we select a final RC.
-	// - If the version gate is for 23.2 development (not being backported to release-23.1), add the
-	//   new version above "Step 2b"
-	// - Do not add new versions to a patch release.
-	// *************************************************
-
 	{
 		Key:     V23_1,
 		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 0},
@@ -942,9 +919,17 @@ var rawVersionsSingleton = keyedVersions{
 		Key:     V23_2Start,
 		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 2},
 	},
+	{
+		Key:     V23_2TTLAllowDescPK,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 4},
+	},
+	{
+		Key:     V23_2_PartiallyVisibleIndexes,
+		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 6},
+	},
 
 	// *************************************************
-	// Step 2b: Add new version gates for 23.2 development here.
+	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 }

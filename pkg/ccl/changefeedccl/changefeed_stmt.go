@@ -1072,6 +1072,10 @@ func (b *changefeedResumer) Resume(ctx context.Context, execCtx interface{}) err
 	details := b.job.Details().(jobspb.ChangefeedDetails)
 	progress := b.job.Progress()
 
+	if createdBy := b.job.Payload().CreationClusterID; !jobExec.ExtendedEvalContext().ClusterID.Equal(createdBy) {
+		return errors.Newf("this changefeed was orignally created by cluster %s; it must be recreated on this cluster if this cluster is now expected to emit to the same destination", createdBy)
+	}
+
 	err := b.resumeWithRetries(ctx, jobExec, jobID, details, progress, execCfg)
 	if err != nil {
 		return b.handleChangefeedError(ctx, err, details, jobExec)
@@ -1219,7 +1223,8 @@ func (b *changefeedResumer) resumeWithRetries(
 		}
 
 		// All other errors retry.
-		log.Warningf(ctx, `WARNING: CHANGEFEED job %d encountered retryable error: %v`, jobID, err)
+		log.Warningf(ctx, `WARNING: CHANGEFEED job %d encountered retryable error: %v (attempt %d)`,
+			jobID, err, 1+r.CurrentAttempt())
 		lastRunStatusUpdate = b.setJobRunningStatus(ctx, lastRunStatusUpdate, "retryable error: %s", err)
 		if metrics, ok := execCfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics); ok {
 			sli, err := metrics.getSLIMetrics(details.Opts[changefeedbase.OptMetricsScope])
@@ -1232,8 +1237,11 @@ func (b *changefeedResumer) resumeWithRetries(
 		// been updated by the changeFrontier processor since the flow started.
 		reloadedJob, reloadErr := execCfg.JobRegistry.LoadClaimedJob(ctx, jobID)
 		if reloadErr != nil {
-			if ctx.Err() != nil {
+			switch {
+			case ctx.Err() != nil:
 				return ctx.Err()
+			case jobs.HasJobNotFoundError(reloadErr):
+				return reloadErr
 			}
 			log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress; `+
 				`continuing from last known high-water of %s: %v`,

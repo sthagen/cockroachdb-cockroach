@@ -103,7 +103,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
@@ -322,6 +321,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		},
 		TenantRPCAuthorizer: authorizer,
 		NeedsDialback:       true,
+		PreferSRVLookup:     cfg.JoinPreferSRVRecords,
 	}
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
@@ -2055,8 +2055,14 @@ func (s *Server) AcceptClients(ctx context.Context) error {
 		return err
 	}
 
-	if logcrash.DiagnosticsReportingEnabled.Get(&s.ClusterSettings().SV) {
-		structlogging.StartHotRangesLoggingScheduler(ctx, s.stopper, s.status, *s.sqlServer.internalExecutor, s.ClusterSettings())
+	if err := structlogging.StartHotRangesLoggingScheduler(
+		ctx,
+		s.stopper,
+		s.status,
+		*s.sqlServer.internalExecutor,
+		s.ClusterSettings(),
+	); err != nil {
+		return err
 	}
 
 	s.sqlServer.isReady.Set(true)

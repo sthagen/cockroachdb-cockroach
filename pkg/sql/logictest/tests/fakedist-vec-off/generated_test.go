@@ -1542,6 +1542,13 @@ func TestLogic_schema_change_retry(
 	runLogicTest(t, "schema_change_retry")
 }
 
+func TestLogic_schema_locked(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "schema_locked")
+}
+
 func TestLogic_schema_repair(
 	t *testing.T,
 ) {
@@ -2135,6 +2142,13 @@ func TestLogic_upsert(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "upsert")
+}
+
+func TestLogic_upsert_non_metamorphic(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "upsert_non_metamorphic")
 }
 
 func TestLogic_uuid(

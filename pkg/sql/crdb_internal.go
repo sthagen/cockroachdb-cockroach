@@ -2169,8 +2169,12 @@ var crdbInternalLocalTxnsTable = virtualSchemaTable{
 	comment: "running user transactions visible by the current user (RAM; local node only)",
 	schema:  fmt.Sprintf(txnsSchemaPattern, "node_transactions"),
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireAdminRole(ctx, "read crdb_internal.node_transactions"); err != nil {
+		hasViewActivityOrhasViewActivityRedacted, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
 			return err
+		}
+		if !hasViewActivityOrhasViewActivityRedacted {
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 		req, err := p.makeSessionsRequest(ctx, true /* excludeClosed */)
 		if err != nil {
@@ -2188,8 +2192,12 @@ var crdbInternalClusterTxnsTable = virtualSchemaTable{
 	comment: "running user transactions visible by the current user (cluster RPC; expensive!)",
 	schema:  fmt.Sprintf(txnsSchemaPattern, "cluster_transactions"),
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		if err := p.RequireAdminRole(ctx, "read crdb_internal.cluster_transactions"); err != nil {
+		hasViewActivityOrhasViewActivityRedacted, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
 			return err
+		}
+		if !hasViewActivityOrhasViewActivityRedacted {
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 		req, err := p.makeSessionsRequest(ctx, true /* excludeClosed */)
 		if err != nil {
@@ -2850,14 +2858,12 @@ func populateContentionEventsTable(
 	return nil
 }
 
-// TODO(yuzefovich): remove 'status' column in 23.2.
 const distSQLFlowsSchemaPattern = `
 CREATE TABLE crdb_internal.%s (
   flow_id UUID NOT NULL,
   node_id INT NOT NULL,
   stmt    STRING NULL,
-  since   TIMESTAMPTZ NOT NULL,
-  status  STRING NOT NULL
+  since   TIMESTAMPTZ NOT NULL
 )
 `
 
@@ -2906,8 +2912,7 @@ func populateDistSQLFlowsTable(
 			if err != nil {
 				return err
 			}
-			status := tree.NewDString(strings.ToLower(info.Status.String()))
-			if err = addRow(flowID, nodeID, stmt, since, status); err != nil {
+			if err = addRow(flowID, nodeID, stmt, since); err != nil {
 				return err
 			}
 		}

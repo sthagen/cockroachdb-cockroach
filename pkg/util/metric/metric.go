@@ -400,7 +400,7 @@ func (h *Histogram) TotalCountWindowed() int64 {
 	return int64(h.ToPrometheusMetricWindowed().Histogram.GetSampleCount())
 }
 
-// TotalSum returns the (cumulative) number of samples.
+// TotalSum returns the (cumulative) sum of samples.
 func (h *Histogram) TotalSum() float64 {
 	return h.ToPrometheusMetric().Histogram.GetSampleSum()
 }
@@ -927,4 +927,24 @@ func ValueAtQuantileWindowed(histogram *prometheusgo.Histogram, q float64) float
 	}
 
 	return val
+}
+
+// Quantile is a quantile along with a string suffix to be attached to the metric
+// name upon recording into the internal TSDB.
+type Quantile struct {
+	Suffix   string
+	Quantile float64
+}
+
+// RecordHistogramQuantiles are the quantiles at which (windowed) histograms
+// are recorded into the internal TSDB.
+var RecordHistogramQuantiles = []Quantile{
+	{"-max", 100},
+	{"-p99.999", 99.999},
+	{"-p99.99", 99.99},
+	{"-p99.9", 99.9},
+	{"-p99", 99},
+	{"-p90", 90},
+	{"-p75", 75},
+	{"-p50", 50},
 }

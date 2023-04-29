@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
@@ -102,6 +101,12 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 		return nil, pgerror.Wrapf(err, pgcode.InsufficientPrivilege,
 			"must be owner of table %s or have CREATE privilege on table %s",
 			tree.Name(tableDesc.GetName()), tree.Name(tableDesc.GetName()))
+	}
+
+	// Disallow schema changes if this table's schema is locked, unless it is to
+	// set/reset the "schema_locked" storage parameter.
+	if err = checkTableSchemaUnlocked(tableDesc); err != nil && !isSetOrResetSchemaLocked(n) {
+		return nil, err
 	}
 
 	n.HoistAddColumnConstraints(func() {
@@ -289,6 +294,12 @@ func (n *alterTableNode) startExec(params runParams) error {
 					if err != nil {
 						return err
 					}
+				}
+
+				activeVersion := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
+				if !activeVersion.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
+					d.Invisibility > 0.0 && d.Invisibility < 1.0 {
+					return unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported")
 				}
 				idx := descpb.IndexDescriptor{
 					Name:             string(d.Name),
@@ -489,7 +500,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 			}
 
 			tableDesc := n.tableDesc
-			if t.Column == colinfo.TTLDefaultExpirationColumnName &&
+			if t.Column == catpb.TTLDefaultExpirationColumnName &&
 				tableDesc.HasRowLevelTTL() &&
 				tableDesc.GetRowLevelTTL().HasDurationExpr() {
 				return errors.WithHintf(
@@ -600,8 +611,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
 					"column %q in the middle of being dropped", t.GetColumn())
 			}
+			// Block modification on system columns.
+			if col.IsSystemColumn() {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"cannot alter system column %q", col.GetName())
+			}
 			columnName := col.GetName()
-			if columnName == colinfo.TTLDefaultExpirationColumnName &&
+			if columnName == catpb.TTLDefaultExpirationColumnName &&
 				tableDesc.HasRowLevelTTL() &&
 				tableDesc.GetRowLevelTTL().HasDurationExpr() {
 				return pgerror.Newf(
@@ -747,7 +764,7 @@ func (n *alterTableNode) startExec(params runParams) error {
 		case *tree.AlterTableRenameColumn:
 			tableDesc := n.tableDesc
 			columnName := t.Column
-			if columnName == colinfo.TTLDefaultExpirationColumnName &&
+			if columnName == catpb.TTLDefaultExpirationColumnName &&
 				tableDesc.HasRowLevelTTL() &&
 				tableDesc.GetRowLevelTTL().HasDurationExpr() {
 				return pgerror.Newf(
@@ -1590,6 +1607,13 @@ func dropColumnImpl(
 		return nil, nil
 	}
 
+	// Block modification on system columns.
+	if colToDrop.IsSystemColumn() {
+		return nil, pgerror.Newf(
+			pgcode.FeatureNotSupported,
+			"cannot alter system column %q", colToDrop.GetName())
+	}
+
 	if colToDrop.IsInaccessible() {
 		return nil, pgerror.Newf(
 			pgcode.InvalidColumnReference,
@@ -1835,7 +1859,7 @@ func handleTTLStorageParamChange(
 
 		// Update default expression on automated column if required.
 		if before.HasDurationExpr() && after.HasDurationExpr() && before.DurationExpr != after.DurationExpr {
-			col, err := catalog.MustFindColumnByName(tableDesc, colinfo.TTLDefaultExpirationColumnName)
+			col, err := catalog.MustFindColumnByName(tableDesc, catpb.TTLDefaultExpirationColumnName)
 			if err != nil {
 				return false, err
 			}
@@ -1877,11 +1901,11 @@ func handleTTLStorageParamChange(
 		// Adding a TTL requires adding the automatic column and deferring the TTL
 		// addition to after the column is successfully added.
 		addTTLMutation = true
-		if catalog.FindColumnByName(tableDesc, colinfo.TTLDefaultExpirationColumnName) != nil {
+		if catalog.FindColumnByName(tableDesc, catpb.TTLDefaultExpirationColumnName) != nil {
 			return false, pgerror.Newf(
 				pgcode.InvalidTableDefinition,
 				"cannot add TTL to table with the %s column already defined",
-				colinfo.TTLDefaultExpirationColumnName,
+				catpb.TTLDefaultExpirationColumnName,
 			)
 		}
 		col, err := rowLevelTTLAutomaticColumnDef(after)
@@ -1927,7 +1951,7 @@ func handleTTLStorageParamChange(
 		// Create the DROP COLUMN job and the associated mutation.
 		dropTTLMutation = true
 		droppedViews, err := dropColumnImpl(params, tn, tableDesc, after, &tree.AlterTableDropColumn{
-			Column: colinfo.TTLDefaultExpirationColumnName,
+			Column: catpb.TTLDefaultExpirationColumnName,
 		})
 		if err != nil {
 			return false, err
@@ -2021,4 +2045,29 @@ func (p *planner) tryRemoveFKBackReferences(
 	}
 	tableDesc.InboundFKs = tableDesc.InboundFKs[:sliceIdx]
 	return nil
+}
+
+func checkTableSchemaUnlocked(desc catalog.TableDescriptor) (ret error) {
+	if desc != nil && desc.IsSchemaLocked() {
+		return sqlerrors.NewSchemaChangeOnLockedTableErr(desc.GetName())
+	}
+	return nil
+}
+
+// isSetOrResetSchemaLocked returns true if `n` contains a command to
+// set/reset "schema_locked" storage parameter.
+func isSetOrResetSchemaLocked(n *tree.AlterTable) bool {
+	for _, cmd := range n.Cmds {
+		switch cmd := cmd.(type) {
+		case *tree.AlterTableSetStorageParams:
+			if cmd.StorageParams.GetVal("schema_locked") != nil {
+				return true
+			}
+		case *tree.AlterTableResetStorageParams:
+			if cmd.Params.Contains("schema_locked") {
+				return true
+			}
+		}
+	}
+	return false
 }

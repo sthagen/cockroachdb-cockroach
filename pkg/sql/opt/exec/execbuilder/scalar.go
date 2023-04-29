@@ -570,6 +570,12 @@ func (b *Builder) buildAny(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 		return nil, b.decorrelationError()
 	}
 
+	if b.planLazySubqueries {
+		// We cannot currently plan uncorrelated ANY subqueries as
+		// lazily-evaluated routines.
+		return nil, b.decorrelationError()
+	}
+
 	// Build the execution plan for the input subquery.
 	plan, err := b.buildRelational(any.Input)
 	if err != nil {
@@ -695,9 +701,19 @@ func (b *Builder) buildExistsSubquery(
 				types.Bool,
 				false, /* enableStepping */
 				true,  /* calledOnNullInput */
+				false, /* multiColOutput */
+				false, /* generator */
 			),
 			tree.DBoolFalse,
 		}, types.Bool), nil
+	}
+
+	if b.planLazySubqueries {
+		// We cannot currently plan uncorrelated Exists subqueries as
+		// lazily-evaluated routines. However, this path should never be
+		// executed because the ConvertUncorrelatedExistsToCoalesceSubquery rule
+		// converts all uncorrelated Exists into Coalesce+Subquery expressions.
+		return nil, b.decorrelationError()
 	}
 
 	// Build the execution plan for the subquery. Note that the subquery could
@@ -803,6 +819,8 @@ func (b *Builder) buildSubquery(
 			subquery.Typ,
 			false, /* enableStepping */
 			true,  /* calledOnNullInput */
+			false, /* multiColOutput */
+			false, /* generator */
 		), nil
 	}
 
@@ -855,6 +873,8 @@ func (b *Builder) buildSubquery(
 			subquery.Typ,
 			false, /* enableStepping */
 			true,  /* calledOnNullInput */
+			false, /* multiColOutput */
+			false, /* generator */
 		), nil
 	}
 
@@ -937,6 +957,8 @@ func (b *Builder) buildUDF(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree.Typ
 		udf.Typ,
 		enableStepping,
 		udf.CalledOnNullInput,
+		udf.MultiColDataSource,
+		udf.SetReturning,
 	), nil
 }
 

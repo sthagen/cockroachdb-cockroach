@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"golang.org/x/text/language"
 )
 
@@ -332,6 +333,10 @@ func (n *EnumValue) Format(ctx *FmtCtx) {
 	f := ctx.flags
 	if f.HasFlags(FmtAnonymize) {
 		ctx.WriteByte('_')
+	} else if f.HasFlags(FmtMarkRedactionNode) {
+		ctx.WriteString(string(redact.StartMarker()))
+		lexbase.EncodeSQLString(&ctx.Buffer, string(*n))
+		ctx.WriteString(string(redact.EndMarker()))
 	} else {
 		lexbase.EncodeSQLString(&ctx.Buffer, string(*n))
 	}
@@ -2132,7 +2137,7 @@ func (o *CreateStatsOptions) CombineWith(other *CreateStatsOptions) error {
 
 // CreateExtension represents a CREATE EXTENSION statement.
 type CreateExtension struct {
-	Name        string
+	Name        Name
 	IfNotExists bool
 }
 
@@ -2147,7 +2152,9 @@ func (node *CreateExtension) Format(ctx *FmtCtx) {
 	// do not contain sensitive information and
 	// 2) we want to get telemetry on which extensions
 	// users attempt to load.
-	ctx.WriteString(node.Name)
+	ctx.WithFlags(ctx.flags&^FmtAnonymize, func() {
+		ctx.FormatNode(&node.Name)
+	})
 }
 
 // CreateExternalConnection represents a CREATE EXTERNAL CONNECTION statement.

@@ -276,7 +276,9 @@ func uploadAndStartFromCheckpointFixture(nodes option.NodeListOption, v string) 
 		startOpts := option.DefaultStartOpts()
 		// NB: can't start sequentially since cluster already bootstrapped.
 		startOpts.RoachprodOpts.Sequential = false
-		clusterupgrade.StartWithBinary(ctx, t.L(), u.c, nodes, binary, startOpts)
+		if err := clusterupgrade.StartWithBinary(ctx, t.L(), u.c, nodes, binary, startOpts); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -286,7 +288,9 @@ func uploadAndStart(nodes option.NodeListOption, v string) versionStep {
 		startOpts := option.DefaultStartOpts()
 		// NB: can't start sequentially since cluster already bootstrapped.
 		startOpts.RoachprodOpts.Sequential = false
-		clusterupgrade.StartWithBinary(ctx, t.L(), u.c, nodes, binary, startOpts)
+		if err := clusterupgrade.StartWithBinary(ctx, t.L(), u.c, nodes, binary, startOpts); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -403,7 +407,7 @@ func makeVersionFixtureAndFatal(
 			// #54761.
 			c.Run(ctx, c.Node(1), "cp", "{store-dir}/cluster-bootstrapped", "{store-dir}/"+name)
 			// Similar to the above - newer versions require the min version file to open a store.
-			c.Run(ctx, c.Node(1), "cp", fmt.Sprintf("{store-dir}/%s", storage.MinVersionFilename), "{store-dir}/"+name)
+			c.Run(ctx, c.All(), "cp", fmt.Sprintf("{store-dir}/%s", storage.MinVersionFilename), "{store-dir}/"+name)
 			c.Run(ctx, c.All(), "tar", "-C", "{store-dir}/"+name, "-czf", "{log-dir}/"+name+".tgz", ".")
 			t.Fatalf(`successfully created checkpoints; failing test on purpose.
 

@@ -11,7 +11,7 @@
 package scbuildstmt
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
@@ -26,6 +26,14 @@ func alterTableSetNotNull(
 	if isColNotNull(b, tbl.TableID, columnID) {
 		return
 	}
+	// Block alters on system columns.
+	scpb.ForEachColumn(b, func(current scpb.Status, target scpb.TargetStatus, e *scpb.Column) {
+		if e.TableID == tbl.TableID &&
+			e.ColumnID == columnID {
+			// Block drops on system columns.
+			panicIfSystemColumn(e, t.Column.String())
+		}
+	})
 	b.Add(&scpb.ColumnNotNull{
 		TableID:  tbl.TableID,
 		ColumnID: columnID,
@@ -40,7 +48,7 @@ func alterColumnPreChecks(b BuildCtx, tn *tree.TableName, tbl *scpb.Table, colum
 	scpb.ForEachRowLevelTTL(b.QueryByID(tbl.TableID), func(
 		_ scpb.Status, _ scpb.TargetStatus, e *scpb.RowLevelTTL,
 	) {
-		if columnName == colinfo.TTLDefaultExpirationColumnName && e.HasDurationExpr() {
+		if columnName == catpb.TTLDefaultExpirationColumnName && e.HasDurationExpr() {
 			panic(pgerror.Newf(
 				pgcode.InvalidTableDefinition,
 				`cannot alter column %s while ttl_expire_after is set`,

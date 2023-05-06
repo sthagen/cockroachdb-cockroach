@@ -1613,6 +1613,9 @@ type ExecutorTestingKnobs struct {
 	// BeforeCopyFromInsert, if set, will be called during a COPY FROM insert statement.
 	BeforeCopyFromInsert func() error
 
+	// CopyFromInsertRetry, if set, will be called when a COPY FROM insert statement is retried.
+	CopyFromInsertRetry func() error
+
 	// ForceSQLLivenessSession will force the use of a sqlliveness session for
 	// transaction deadlines even in the system tenant.
 	ForceSQLLivenessSession bool
@@ -2940,6 +2943,19 @@ type sessionDataMutatorIterator struct {
 	sessionDataMutatorBase
 	sds *sessiondata.Stack
 	sessionDataMutatorCallbacks
+}
+
+func makeSessionDataMutatorIterator(
+	sds *sessiondata.Stack, defaults SessionDefaults, settings *cluster.Settings,
+) *sessionDataMutatorIterator {
+	return &sessionDataMutatorIterator{
+		sds: sds,
+		sessionDataMutatorBase: sessionDataMutatorBase{
+			defaults: defaults,
+			settings: settings,
+		},
+		sessionDataMutatorCallbacks: sessionDataMutatorCallbacks{},
+	}
 }
 
 // mutator returns a mutator for the given sessionData.

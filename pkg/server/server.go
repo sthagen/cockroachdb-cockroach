@@ -92,7 +92,6 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/ttl/ttljob"      // register jobs declared outside of pkg/sql
 	_ "github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlschedule" // register schedules declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -321,7 +320,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		},
 		TenantRPCAuthorizer: authorizer,
 		NeedsDialback:       true,
-		PreferSRVLookup:     cfg.JoinPreferSRVRecords,
 	}
 	if knobs := cfg.TestingKnobs.Server; knobs != nil {
 		serverKnobs := knobs.(*TestingKnobs)
@@ -1069,7 +1067,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			username.RootUserName(),
 			&sql.MemoryMetrics{},
 			sqlServer.execCfg,
-			sessiondatapb.SessionData{},
+			sql.NewInternalSessionData(ctx, sqlServer.execCfg.Settings, opName),
 		)
 	}
 

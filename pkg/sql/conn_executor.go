@@ -757,7 +757,7 @@ func (s *Server) SetupConn(
 	sds := sessiondata.NewStack(sd)
 	// Set the SessionData from args.SessionDefaults. This also validates the
 	// respective values.
-	sdMutIterator := s.makeSessionDataMutatorIterator(sds, args.SessionDefaults)
+	sdMutIterator := makeSessionDataMutatorIterator(sds, args.SessionDefaults, s.cfg.Settings)
 	sdMutIterator.onDefaultIntSizeChange = onDefaultIntSizeChange
 	if err := sdMutIterator.applyOnEachMutatorError(func(m sessionDataMutator) error {
 		for varName, v := range varGen {
@@ -921,19 +921,6 @@ func newSessionData(args SessionArgs) *sessiondata.SessionData {
 	}
 	populateMinimalSessionData(sd)
 	return sd
-}
-
-func (s *Server) makeSessionDataMutatorIterator(
-	sds *sessiondata.Stack, defaults SessionDefaults,
-) *sessionDataMutatorIterator {
-	return &sessionDataMutatorIterator{
-		sds: sds,
-		sessionDataMutatorBase: sessionDataMutatorBase{
-			defaults: defaults,
-			settings: s.cfg.Settings,
-		},
-		sessionDataMutatorCallbacks: sessionDataMutatorCallbacks{},
-	}
 }
 
 // populateMinimalSessionData populates sd with some minimal values needed for
@@ -2216,6 +2203,22 @@ func (ex *connExecutor) execCmd() (retErr error) {
 				log.VEventf(ctx, 2, "portal resolved to: %s", portal.Stmt.AST.String())
 			}
 			ex.curStmtAST = portal.Stmt.AST
+			if copyTo, ok := ex.curStmtAST.(*tree.CopyTo); ok {
+				// The execution uses the same logic as if it were a simple query. This
+				// is because we no-op preparing of a COPY statement, in order to match
+				// Postgres behavior. Since there is no plan, we use the connExecutor
+				// to execute a prepared COPY.
+				copyCmd := CopyOut{
+					ParsedStmt:   portal.Stmt.Statement,
+					Stmt:         copyTo,
+					TimeReceived: tcmd.TimeReceived,
+				}
+				copyRes := ex.clientComm.CreateCopyOutResult(copyCmd, pos)
+				res = copyRes
+				stmtCtx := withStatement(ctx, copyTo)
+				ev, payload = ex.execCopyOut(stmtCtx, copyCmd, copyRes)
+				return nil
+			}
 
 			pinfo := &tree.PlaceholderInfo{
 				PlaceholderTypesInfo: tree.PlaceholderTypesInfo{

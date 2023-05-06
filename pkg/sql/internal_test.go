@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -521,37 +522,71 @@ func TestInternalExecutorPushDetectionInTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	si, _, db := serverutils.StartServer(t, params)
-	defer si.Stopper().Stop(ctx)
-	s := si.(*server.TestServer)
+	for _, tt := range []struct {
+		serializable bool
+		pushed       bool
+		refreshable  bool
+		exp          bool
+	}{
+		{serializable: false, pushed: false, refreshable: false, exp: false},
+		{serializable: false, pushed: false, refreshable: true, exp: false},
+		{serializable: false, pushed: true, refreshable: false, exp: false},
+		{serializable: false, pushed: true, refreshable: true, exp: false},
+		{serializable: true, pushed: false, refreshable: false, exp: false},
+		{serializable: true, pushed: false, refreshable: true, exp: false},
+		{serializable: true, pushed: true, refreshable: false, exp: true},
+		{serializable: true, pushed: true, refreshable: true, exp: false},
+		{serializable: true, pushed: true, refreshable: true, exp: false},
+	} {
+		name := fmt.Sprintf("serializable=%t,pushed=%t,refreshable=%t",
+			tt.serializable, tt.pushed, tt.refreshable)
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			params, _ := tests.CreateTestServerParams()
+			si, _, db := serverutils.StartServer(t, params)
+			defer si.Stopper().Stop(ctx)
+			s := si.(*server.TestServer)
 
-	// Setup a pushed txn.
-	txn := db.NewTxn(ctx, "test")
-	keyA := roachpb.Key("a")
-	_, err := db.Get(ctx, keyA)
-	require.NoError(t, err)
-	require.NoError(t, txn.Put(ctx, keyA, "x"))
-	require.NotEqual(t, txn.ReadTimestamp(), txn.ProvisionalCommitTimestamp(), "expect txn wts to be pushed")
+			// Setup a txn.
+			txn := db.NewTxn(ctx, "test")
+			keyA := roachpb.Key("a")
+			if !tt.serializable {
+				require.NoError(t, txn.SetIsoLevel(isolation.Snapshot))
+			}
+			if tt.pushed {
+				// Read outside the txn.
+				_, err := db.Get(ctx, keyA)
+				require.NoError(t, err)
+				// Write to the same key inside the txn to push its write timestamp.
+				require.NoError(t, txn.Put(ctx, keyA, "x"))
+				require.NotEqual(t, txn.ReadTimestamp(), txn.ProvisionalCommitTimestamp(), "expect txn wts to be pushed")
+			}
+			if !tt.refreshable {
+				// Fix the txn's timestamp to prevent refreshes.
+				txn.CommitTimestamp()
+			}
 
-	// Fix the txn's timestamp, such that
-	// txn.IsSerializablePushAndRefreshNotPossible() and the connExecutor is
-	// tempted to generate a retriable error eagerly.
-	txn.CommitTimestamp()
-	require.True(t, txn.IsSerializablePushAndRefreshNotPossible())
+			// Are txn.IsSerializablePushAndRefreshNotPossible() and the connExecutor
+			// tempted to generate a retriable error eagerly?
+			require.Equal(t, tt.exp, txn.IsSerializablePushAndRefreshNotPossible())
+			if !tt.exp {
+				// Test case no longer interesting.
+				return
+			}
 
-	tr := s.Tracer()
-	execCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test-recording")
-	defer getRecAndFinish()
-	ie := s.InternalExecutor().(*sql.InternalExecutor)
-	_, err = ie.Exec(execCtx, "test", txn, "select 42")
-	require.NoError(t, err)
-	require.NoError(t, testutils.MatchInOrder(getRecAndFinish().String(),
-		"push detected for non-refreshable txn but auto-retry not possible"))
-	require.NotEqual(t, txn.ReadTimestamp(), txn.ProvisionalCommitTimestamp(), "expect txn wts to be pushed")
+			tr := s.Tracer()
+			execCtx, getRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test-recording")
+			defer getRecAndFinish()
+			ie := s.InternalExecutor().(*sql.InternalExecutor)
+			_, err := ie.Exec(execCtx, "test", txn, "select 42")
+			require.NoError(t, err)
+			require.NoError(t, testutils.MatchInOrder(getRecAndFinish().String(),
+				"push detected for non-refreshable txn but auto-retry not possible"))
+			require.NotEqual(t, txn.ReadTimestamp(), txn.ProvisionalCommitTimestamp(), "expect txn wts to be pushed")
 
-	require.NoError(t, txn.Rollback(ctx))
+			require.NoError(t, txn.Rollback(ctx))
+		})
+	}
 }
 
 func TestInternalExecutorInLeafTxnDoesNotPanic(t *testing.T) {
@@ -624,23 +659,23 @@ func TestInternalDBWithOverrides(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	idb1 := s.InternalDB().(isql.DB)
+	idb1 := s.InternalDB().(*sql.InternalDB)
 
 	_ = idb1.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		assert.Equal(t, 0, int(txn.SessionData().DefaultIntSize))
+		assert.Equal(t, 8, int(txn.SessionData().DefaultIntSize))
 		assert.Equal(t, sessiondatapb.DistSQLAuto, txn.SessionData().DistSQLMode)
 		assert.Equal(t, "root", string(txn.SessionData().UserProto))
 
 		row, err := txn.QueryRow(ctx, "test", txn.KV(), "show default_int_size")
 		require.NoError(t, err)
-		assert.Equal(t, "'0'", row[0].String())
+		assert.Equal(t, "'8'", row[0].String())
 
 		return nil
 	})
 
 	drow, err := idb1.Executor().QueryRow(ctx, "test", nil, "show default_int_size")
 	require.NoError(t, err)
-	assert.Equal(t, "'0'", drow[0].String())
+	assert.Equal(t, "'8'", drow[0].String())
 
 	idb2 := sql.NewInternalDBWithSessionDataOverrides(idb1,
 		func(sd *sessiondata.SessionData) {

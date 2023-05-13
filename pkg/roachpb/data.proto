@@ -543,11 +543,15 @@ message Intent {
 }
 
 // A LockAcquisition represents the action of a Transaction acquiring a lock
-// with a specified durability level over a Span of keys.
+// with a specified durability level and strength over a Span of keys.
 message LockAcquisition {
   Span span = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   storage.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
   kv.kvserver.concurrency.lock.Durability durability = 3;
+  kv.kvserver.concurrency.lock.Strength strength = 4;
+  // IgnoredSeqNums is a list of sequence numbers that have been rolled back
+  // by the transaction at the time of the lock acquisition.
+  repeated storage.enginepb.IgnoredSeqNumRange ignored_seqnums = 5 [(gogoproto.nullable) = false, (gogoproto.customname) = "IgnoredSeqNums"];
 }
 
 // A LockUpdate is a Span together with Transaction state. LockUpdate messages
@@ -772,7 +776,7 @@ message ClientRangeInfo {
   int64 lease_sequence = 2 [(gogoproto.casttype) = "LeaseSequence"];
   RangeClosedTimestampPolicy closed_timestamp_policy = 3;
   // ExplicitlyRequested causes range info to be returned even if other fields
-  // are up-to-date.
+  // are up-to-date or empty.
   bool explicitly_requested = 4;
 }
 

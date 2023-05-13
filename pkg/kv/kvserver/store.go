@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
@@ -112,22 +113,27 @@ const (
 	replicaQueueExtraSize = 10
 )
 
-var storeSchedulerConcurrency = envutil.EnvOrDefaultInt(
-	// For small machines, we scale the scheduler concurrency by the number of
-	// CPUs. 8*NumCPU was determined in 9a68241 (April 2017) as the optimal
-	// concurrency level on 8 CPU machines. For larger machines, we've seen
-	// (#56851) that this scaling curve can be too aggressive and lead to too much
-	// contention in the Raft scheduler, so we cap the concurrency level at 96.
-	//
-	// As of November 2020, this default value could be re-tuned.
+// defaultRaftSchedulerConcurrency specifies the default number of Raft
+// scheduler worker goroutines. These are evenly distributed across stores,
+// rounded up such that all stores have the same number of workers (10 workers
+// across 3 stores yields 4 workers per store or 12 in total).
+//
+// For small machines, we scale the scheduler concurrency by the number of
+// CPUs. 8*NumCPU was determined in 9a68241 (April 2017) as the optimal
+// concurrency level on 8 CPU machines. For larger machines, we've seen
+// (#56851) that this scaling curve can be too aggressive and lead to too much
+// contention in the Raft scheduler, so we cap the concurrency level at 96.
+//
+// As of November 2020, this default value could be re-tuned.
+var defaultRaftSchedulerConcurrency = envutil.EnvOrDefaultInt(
 	"COCKROACH_SCHEDULER_CONCURRENCY", min(8*runtime.GOMAXPROCS(0), 96))
 
-// storeSchedulerShardSize specifies the maximum number of scheduler worker
-// goroutines per mutex shard. By default, we spin up 8 workers per CPU core,
-// capped at 96, so 16 is equivalent to 2 CPUs per shard, or a maximum of 6
-// shards. This significantly relieves contention at high core counts, while
-// also avoiding starvation by excessive sharding.
-var storeSchedulerShardSize = envutil.EnvOrDefaultInt("COCKROACH_SCHEDULER_SHARD_SIZE", 16)
+// defaultRaftSchedulerShardSize specifies the default maximum number of
+// scheduler worker goroutines per mutex shard. By default, we spin up 8 workers
+// per CPU core, capped at 96, so 16 is equivalent to 2 CPUs per shard, or a
+// maximum of 6 shards. This significantly relieves contention at high core
+// counts, while also avoiding starvation by excessive sharding.
+var defaultRaftSchedulerShardSize = envutil.EnvOrDefaultInt("COCKROACH_SCHEDULER_SHARD_SIZE", 16)
 
 var logSSTInfoTicks = envutil.EnvOrDefaultInt(
 	"COCKROACH_LOG_SST_INFO_TICKS_INTERVAL", 60)
@@ -274,7 +280,7 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 	sc.RaftElectionTimeoutTicks = 3
 	sc.RaftReproposalTimeoutTicks = 5
 	sc.RaftTickInterval = 100 * time.Millisecond
-	sc.SetDefaults()
+	sc.SetDefaults(1 /* numStores */)
 	return sc
 }
 
@@ -991,6 +997,10 @@ type Store struct {
 	// tenantRateLimiters manages tenantrate.Limiters
 	tenantRateLimiters *tenantrate.LimiterFactory
 
+	// eagerLeaseAcquisitionLimiter limits the number of concurrent eager lease
+	// acquisitions made during Raft ticks.
+	eagerLeaseAcquisitionLimiter *quotapool.IntPool
+
 	computeInitialMetrics              sync.Once
 	systemConfigUpdateQueueRateLimiter *quotapool.RateLimiter
 	spanConfigUpdateQueueRateLimiter   *quotapool.RateLimiter
@@ -1066,6 +1076,14 @@ type StoreConfig struct {
 	// Note that node Decommissioning events are always logged.
 	LogRangeAndNodeEvents bool
 
+	// RaftSchedulerConcurrency specifies the number of Raft scheduler workers
+	// for this store. Values < 1 imply 1.
+	RaftSchedulerConcurrency int
+
+	// RaftSchedulerShardSize specifies the maximum number of Raft scheduler
+	// workers per mutex shard. Values < 1 imply 1.
+	RaftSchedulerShardSize int
+
 	// RaftEntryCacheSize is the size in bytes of the Raft log entry cache
 	// shared by all Raft groups managed by the store.
 	RaftEntryCacheSize uint64
@@ -1077,6 +1095,11 @@ type StoreConfig struct {
 	IntentResolverTaskLimit int
 
 	TestingKnobs StoreTestingKnobs
+
+	// EagerLeaseAcquisitionLimiter is used to limit the number of concurrent
+	// eager lease extensions. Normally shared between all stores on a node.
+	// Can be nil, which disables the limit.
+	EagerLeaseAcquisitionLimiter *quotapool.IntPool
 
 	// SnapshotApplyLimit specifies the maximum number of empty
 	// snapshots and the maximum number of non-empty snapshots that are permitted
@@ -1162,17 +1185,30 @@ func (sc *StoreConfig) Valid() bool {
 	return sc.Clock != nil && sc.Transport != nil &&
 		sc.RaftTickInterval != 0 && sc.RaftHeartbeatIntervalTicks > 0 &&
 		sc.RaftElectionTimeoutTicks > 0 && sc.RaftReproposalTimeoutTicks > 0 &&
+		sc.RaftSchedulerConcurrency > 0 && sc.RaftSchedulerShardSize > 0 &&
 		sc.ScanInterval >= 0 && sc.AmbientCtx.Tracer != nil
 }
 
 // SetDefaults initializes unset fields in StoreConfig to values
 // suitable for use on a local network.
 // TODO(tschottdorf): see if this ought to be configurable via flags.
-func (sc *StoreConfig) SetDefaults() {
+func (sc *StoreConfig) SetDefaults(numStores int) {
 	sc.RaftConfig.SetDefaults()
 
 	if sc.CoalescedHeartbeatsInterval == 0 {
 		sc.CoalescedHeartbeatsInterval = sc.RaftTickInterval / 2
+	}
+	if sc.RaftSchedulerConcurrency == 0 {
+		sc.RaftSchedulerConcurrency = defaultRaftSchedulerConcurrency
+		// If we have more than one store, evenly divide the default workers across
+		// stores, since the default value is a function of CPU count and should not
+		// scale with the number of stores.
+		if numStores > 1 && sc.RaftSchedulerConcurrency > 1 {
+			sc.RaftSchedulerConcurrency = (sc.RaftSchedulerConcurrency-1)/numStores + 1 // ceil division
+		}
+	}
+	if sc.RaftSchedulerShardSize == 0 {
+		sc.RaftSchedulerShardSize = defaultRaftSchedulerShardSize
 	}
 	if sc.RaftEntryCacheSize == 0 {
 		sc.RaftEntryCacheSize = defaultRaftEntryCacheSize
@@ -1203,9 +1239,6 @@ func (sc *StoreConfig) Tracer() *tracing.Tracer {
 func NewStore(
 	ctx context.Context, cfg StoreConfig, eng storage.Engine, nodeDesc *roachpb.NodeDescriptor,
 ) *Store {
-	// TODO(tschottdorf): find better place to set these defaults.
-	cfg.SetDefaults()
-
 	if !cfg.Valid() {
 		log.Fatalf(ctx, "invalid store configuration: %+v", &cfg)
 	}
@@ -1299,8 +1332,8 @@ func NewStore(
 	s.draining.Store(false)
 	// NB: buffer up to RaftElectionTimeoutTicks in Raft scheduler to avoid
 	// unnecessary elections when ticks are temporarily delayed and piled up.
-	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s, storeSchedulerConcurrency,
-		storeSchedulerShardSize, cfg.RaftElectionTimeoutTicks)
+	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s,
+		cfg.RaftSchedulerConcurrency, cfg.RaftSchedulerShardSize, cfg.RaftElectionTimeoutTicks)
 
 	s.syncWaiter = logstore.NewSyncWaiterLoop()
 
@@ -1353,6 +1386,7 @@ func NewStore(
 	s.limiters.ConcurrentExportRequests = limit.MakeConcurrentRequestLimiter(
 		"exportRequestLimiter", int(ExportRequestsLimit.Get(&cfg.Settings.SV)),
 	)
+	s.eagerLeaseAcquisitionLimiter = cfg.EagerLeaseAcquisitionLimiter
 
 	// The snapshot storage is usually empty at this point since it is cleared
 	// after each snapshot application, except when the node crashed right before
@@ -1969,6 +2003,19 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			s.metrics.addMVCCStats(ctx, rep.tenantMetricsRef, rep.GetMVCCStats())
 		} else {
 			return errors.AssertionFailedf("no tenantID for initialized replica %s", rep)
+		}
+
+		// For replicas that use expiration-based leases, eagerly initialize the
+		// Raft group and unquiesce it. We don't quiesce ranges with expiration
+		// leases, and we want to eagerly acquire leases for them, which happens
+		// during Raft ticks. We rely on Raft pre-vote to avoid disturbing
+		// established Raft leaders.
+		//
+		// NB: cluster settings haven't propagated yet, so we have to check the last
+		// known lease instead of relying on shouldUseExpirationLeaseRLocked(). We
+		// also check Sequence > 0 to omit ranges that haven't seen a lease yet.
+		if l, _ := rep.GetLease(); l.Type() == roachpb.LeaseExpiration && l.Sequence > 0 {
+			rep.maybeInitializeRaftGroup(ctx)
 		}
 	}
 
@@ -2672,7 +2719,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		if r.OwnsValidLease(ctx, now) {
 			leaseCount++
 		}
-		usage := RangeUsageInfoForRepl(r)
+		usage := r.RangeUsageInfo()
 		logicalBytes += usage.LogicalBytes
 		bytesPerReplica = append(bytesPerReplica, float64(usage.LogicalBytes))
 		// TODO(a-robinson): How dangerous is it that these numbers will be
@@ -3267,7 +3314,9 @@ func (s *Store) ReplicateQueueDryRun(
 		s.cfg.AmbientCtx.Tracer, "replicate queue dry run",
 	)
 	defer collectAndFinish()
-	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
+	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica) bool {
+		return true
+	}
 	_, err := s.replicateQueue.processOneChange(
 		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
 	)

@@ -1,6 +1,6 @@
 load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "diagnostics",
@@ -58,7 +58,7 @@ go_test(
         "update_checker_test.go",
     ],
     args = ["-test.timeout=295s"],
-    tags = ["no-remote"],
+    tags = ["no-remote-exec"],
     deps = [
         ":diagnostics",
         "//pkg/base",

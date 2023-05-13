@@ -8,10 +8,17 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { createSelector } from "reselect";
-import { adminUISelector } from "../utils/selectors";
+package rttanalysis
 
-export const txnStatsSelector = createSelector(
-  adminUISelector,
-  adminUiState => adminUiState?.transactions,
-);
+import "testing"
+
+func BenchmarkUDFResolution(b *testing.B) { reg.Run(b) }
+func init() {
+	reg.Register("UDFResolution", []RoundTripBenchTestCase{
+		{
+			Name:  "select from udf",
+			Setup: `CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$;`,
+			Stmt:  `SELECT f()`,
+		},
+	})
+}

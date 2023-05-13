@@ -1,6 +1,6 @@
 load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "coldata",
@@ -43,7 +43,7 @@ go_test(
     ],
     args = ["-test.timeout=55s"],
     embed = [":coldata"],
-    tags = ["no-remote"],  # keep
+    tags = ["no-remote-exec"],  # keep
     deps = [
         "//pkg/col/coldatatestutils",
         "//pkg/sql/colconv",

@@ -1,7 +1,7 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
 load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
-load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
+load("//pkg/testutils:buildutil/buildutil.bzl", "disallowed_imports_test")
 load("//pkg/util/fsm/gen:REPORTS.bzl", "gen_reports")
 
 go_library(
@@ -705,7 +705,10 @@ go_test(
         "zone_config_test.go",
         "zone_test.go",
     ],
-    args = ["-test.timeout=3595s"],
+    args = select({
+        "//build/toolchains:use_ci_timeouts": ["-test.timeout=895s"],
+        "//conditions:default": ["-test.timeout=3595s"],
+    }),
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql:information_schema.go",

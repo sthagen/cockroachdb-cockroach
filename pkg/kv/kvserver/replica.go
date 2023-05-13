@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
@@ -2178,7 +2179,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 // both the lease holder and the raft leader before being applied by other
 // replicas).
 func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
-	ctx context.Context, now hlc.ClockTimestamp,
+	ctx context.Context, status kvserverpb.LeaseStatus,
 ) {
 	if r.store.TestingKnobs().DisableLeaderFollowsLeaseholder {
 		return
@@ -2186,7 +2187,6 @@ func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
 	if !r.isRaftLeaderRLocked() { // fast path
 		return
 	}
-	status := r.leaseStatusAtRLocked(ctx, now)
 	if !status.IsValid() || status.OwnedBy(r.StoreID()) {
 		return
 	}
@@ -2301,6 +2301,31 @@ func (r *Replica) MeasureRaftCPUNanos(start time.Duration) {
 	r.measureNanosRunning(start, func(dur float64) {
 		r.loadStats.RecordRaftCPUNanos(dur)
 	})
+}
+
+// RangeUsageInfo returns the usage information for the replica, assigning it
+// to the range usage information.
+// NB: This is currently just the replicas usage, it assumes that the range's
+// usage information matches. Which is dubious in some cases but often
+// reasonable when we only consider the leaseholder.
+func (r *Replica) RangeUsageInfo() allocator.RangeUsageInfo {
+	loadStats := r.LoadStats()
+	localityInfo := r.loadStats.RequestLocalityInfo()
+	return allocator.RangeUsageInfo{
+		LogicalBytes:             r.GetMVCCStats().Total(),
+		QueriesPerSecond:         loadStats.QueriesPerSecond,
+		WritesPerSecond:          loadStats.WriteKeysPerSecond,
+		ReadsPerSecond:           loadStats.ReadKeysPerSecond,
+		WriteBytesPerSecond:      loadStats.WriteBytesPerSecond,
+		ReadBytesPerSecond:       loadStats.ReadBytesPerSecond,
+		RaftCPUNanosPerSecond:    loadStats.RaftCPUNanosPerSecond,
+		RequestCPUNanosPerSecond: loadStats.RequestCPUNanosPerSecond,
+		RequestsPerSecond:        loadStats.RequestsPerSecond,
+		RequestLocality: &allocator.RangeRequestLocalityInfo{
+			Counts:   localityInfo.LocalityCounts,
+			Duration: localityInfo.Duration,
+		},
+	}
 }
 
 // measureNanosRunning measures the difference in cpu time from when this

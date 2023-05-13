@@ -129,6 +129,7 @@ func TestTxnSpanRefresherRefreshesTransactions(t *testing.T) {
 		pErr         func() *kvpb.Error
 		expRefresh   bool
 		expRefreshTS hlc.Timestamp
+		expErr       bool
 	}{
 		{
 			pErr: func() *kvpb.Error {
@@ -180,18 +181,59 @@ func TestTxnSpanRefresherRefreshesTransactions(t *testing.T) {
 				return kvpb.NewErrorf("no refresh")
 			},
 			expRefresh: false,
+			expErr:     true,
 		},
 		{
-			name: "write_too_old flag",
+			name: "write_too_old flag (pending)",
 			onFirstSend: func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 				br := ba.CreateReply()
 				br.Txn = ba.Txn.Clone()
+				br.Txn.Status = roachpb.PENDING
 				br.Txn.WriteTooOld = true
 				br.Txn.WriteTimestamp = txn.WriteTimestamp.Add(20, 1)
 				return br, nil
 			},
 			expRefresh:   true,
 			expRefreshTS: txn.WriteTimestamp.Add(20, 1), // Same as br.Txn.WriteTimestamp.
+		},
+		{
+			name: "write_too_old flag (staging)",
+			onFirstSend: func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+				br := ba.CreateReply()
+				br.Txn = ba.Txn.Clone()
+				br.Txn.Status = roachpb.STAGING
+				br.Txn.WriteTooOld = true
+				br.Txn.WriteTimestamp = txn.WriteTimestamp.Add(20, 1)
+				return br, nil
+			},
+			expRefresh: false,
+			expErr:     false,
+		},
+		{
+			name: "write_too_old flag (committed)",
+			onFirstSend: func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+				br := ba.CreateReply()
+				br.Txn = ba.Txn.Clone()
+				br.Txn.Status = roachpb.COMMITTED
+				br.Txn.WriteTooOld = true
+				br.Txn.WriteTimestamp = txn.WriteTimestamp.Add(20, 1)
+				return br, nil
+			},
+			expRefresh: false,
+			expErr:     false,
+		},
+		{
+			name: "write_too_old flag (aborted)",
+			onFirstSend: func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+				br := ba.CreateReply()
+				br.Txn = ba.Txn.Clone()
+				br.Txn.Status = roachpb.ABORTED
+				br.Txn.WriteTooOld = true
+				br.Txn.WriteTimestamp = txn.WriteTimestamp.Add(20, 1)
+				return br, nil
+			},
+			expRefresh: false,
+			expErr:     false,
 		},
 	}
 	for _, tc := range cases {
@@ -279,6 +321,8 @@ func TestTxnSpanRefresherRefreshesTransactions(t *testing.T) {
 			if tc.expRefresh {
 				require.Nil(t, pErr)
 				require.NotNil(t, br)
+				require.NotNil(t, br.Txn)
+				require.False(t, br.Txn.WriteTooOld)
 				require.Equal(t, tc.expRefreshTS, br.Txn.WriteTimestamp)
 				require.Equal(t, tc.expRefreshTS, br.Txn.ReadTimestamp)
 				require.Equal(t, tc.expRefreshTS, tsr.refreshedTimestamp)
@@ -287,8 +331,15 @@ func TestTxnSpanRefresherRefreshesTransactions(t *testing.T) {
 				require.Equal(t, int64(1), tsr.metrics.ClientRefreshAutoRetries.Count())
 				require.Equal(t, int64(0), tsr.metrics.ServerRefreshSuccess.Count())
 			} else {
-				require.Nil(t, br)
-				require.NotNil(t, pErr)
+				if tc.expErr {
+					require.Nil(t, br)
+					require.NotNil(t, pErr)
+				} else {
+					require.Nil(t, pErr)
+					require.NotNil(t, br)
+					require.NotNil(t, br.Txn)
+					require.False(t, br.Txn.WriteTooOld)
+				}
 				require.Zero(t, tsr.refreshedTimestamp)
 				require.Equal(t, int64(0), tsr.metrics.ClientRefreshSuccess.Count())
 				require.Equal(t, int64(0), tsr.metrics.ClientRefreshFail.Count())
@@ -658,6 +709,9 @@ func TestTxnSpanRefresherSplitEndTxnOnAutoRetry(t *testing.T) {
 	scanArgs := kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: keyA, EndKey: keyB}}
 	putArgs := kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: keyB}}
 	etArgs := kvpb.EndTxnRequest{Commit: true}
+	putArgs.Sequence = 1
+	etArgs.Sequence = 2
+	etArgs.InFlightWrites = []roachpb.SequencedWrite{{Key: keyB, Sequence: 1}}
 
 	// Run the test with two slightly different configurations. When priorReads
 	// is true, issue a {Put, EndTxn} batch after having previously accumulated
@@ -677,6 +731,7 @@ func TestTxnSpanRefresherSplitEndTxnOnAutoRetry(t *testing.T) {
 				require.False(t, ba.CanForwardReadTimestamp)
 				require.IsType(t, &kvpb.PutRequest{}, ba.Requests[0].GetInner())
 				require.IsType(t, &kvpb.EndTxnRequest{}, ba.Requests[1].GetInner())
+				require.True(t, ba.Requests[1].GetEndTxn().IsParallelCommit())
 
 				pushedTxn := ba.Txn.Clone()
 				pushedTxn.WriteTimestamp = pushedTs1
@@ -725,6 +780,7 @@ func TestTxnSpanRefresherSplitEndTxnOnAutoRetry(t *testing.T) {
 				require.False(t, ba.CanForwardReadTimestamp)
 				require.Equal(t, pushedTs2, ba.Txn.ReadTimestamp)
 				require.IsType(t, &kvpb.EndTxnRequest{}, ba.Requests[0].GetInner())
+				require.False(t, ba.Requests[0].GetEndTxn().IsParallelCommit())
 
 				br := ba.CreateReply()
 				br.Txn = ba.Txn.Clone()
@@ -744,6 +800,7 @@ func TestTxnSpanRefresherSplitEndTxnOnAutoRetry(t *testing.T) {
 				require.IsType(t, &kvpb.ScanRequest{}, ba.Requests[0].GetInner())
 				require.IsType(t, &kvpb.PutRequest{}, ba.Requests[1].GetInner())
 				require.IsType(t, &kvpb.EndTxnRequest{}, ba.Requests[2].GetInner())
+				require.True(t, ba.Requests[2].GetEndTxn().IsParallelCommit())
 
 				pushedTxn := ba.Txn.Clone()
 				pushedTxn.WriteTimestamp = pushedTs1
@@ -783,6 +840,7 @@ func TestTxnSpanRefresherSplitEndTxnOnAutoRetry(t *testing.T) {
 				require.False(t, ba.CanForwardReadTimestamp)
 				require.Equal(t, pushedTs2, ba.Txn.ReadTimestamp)
 				require.IsType(t, &kvpb.EndTxnRequest{}, ba.Requests[0].GetInner())
+				require.False(t, ba.Requests[0].GetEndTxn().IsParallelCommit())
 
 				br := ba.CreateReply()
 				br.Txn = ba.Txn.Clone()

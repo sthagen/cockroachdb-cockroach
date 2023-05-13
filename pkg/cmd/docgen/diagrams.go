@@ -812,13 +812,12 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_func_stmt",
-		inline: []string{"opt_or_replace", "opt_func_param_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "common_func_opt_item", "create_func_opt_item", "routine_return_stmt", "func_param_with_default_list", "func_param_with_default", "func_as"},
+		inline: []string{"opt_or_replace", "opt_func_param_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "common_func_opt_item", "create_func_opt_item", "routine_return_stmt", "func_param_with_default_list", "func_param_with_default", "func_as", "opt_link_sym"},
 		unlink: []string{"opt_or_replace", "opt_func_param_with_default_list", "opt_return_set", "func_return_type", "opt_create_func_opt_list", "create_func_opt_list", "create_func_opt_item", "common_func_opt_item", "routine_return_stmt", "non_reserved_word_or_sconst", "func_param_with_default_list", "func_param_with_default", "a_expr", "func_as"},
 		replace: map[string]string{
 			"func_as":                     "'SCONST'",
 			"non_reserved_word_or_sconst": "'SQL'",
 			"'DEFAULT'":                   "",
-			"'SETOF'":                     "",
 			"'='":                         "",
 			"a_expr":                      ""},
 		nosplit: true,
@@ -856,7 +855,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "delete_stmt",
-		inline: []string{"opt_with_clause", "with_clause", "cte_list", "table_expr_opt_alias_idx", "table_name_opt_idx", "opt_where_clause", "where_clause", "returning_clause", "opt_sort_clause", "opt_limit_clause", "opt_only", "opt_descendant"},
+		inline: []string{"opt_with_clause", "with_clause", "cte_list", "table_expr_opt_alias_idx", "table_name_opt_idx", "opt_where_clause", "where_clause", "returning_clause", "opt_sort_clause", "opt_limit_clause", "opt_only", "opt_descendant", "opt_using_clause", "from_list"},
 		replace: map[string]string{
 			"relation_expr": "table_name",
 		},

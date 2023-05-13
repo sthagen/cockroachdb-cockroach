@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "replicationtestutils",
+    testonly = 1,
     srcs = [
         "encoding.go",
         "replication_helpers.go",
@@ -39,6 +40,7 @@ go_library(
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/contextutil",
+        "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/protoutil",
         "@com_github_cockroachdb_apd_v3//:apd",

@@ -148,17 +148,23 @@ WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
 		}
 
 		// We will enable panic injection on this connection in the vectorized
-		// engine (and will ignore the injected errors) in order to test that
-		// the panic-catching mechanism of error propagation works as expected.
+		// engine and optimizer (and will ignore the injected errors) in order
+		// to test that the panic-catching mechanism of error propagation works
+		// as expected.
 		// Note: it is important to enable this testing knob only after all
 		// other setup queries have already completed, including the smither
 		// instantiation (otherwise, the setup might fail because of the
 		// injected panics).
-		injectPanicsStmt := "SET testing_vectorize_inject_panics=true;"
-		if _, err := conn.Exec(injectPanicsStmt); err != nil {
+		injectVectorizePanicsStmt := "SET testing_vectorize_inject_panics=true;"
+		if _, err := conn.Exec(injectVectorizePanicsStmt); err != nil {
 			t.Fatal(err)
 		}
-		logStmt(injectPanicsStmt)
+		logStmt(injectVectorizePanicsStmt)
+		injectOptimizerPanicsStmt := "SET testing_optimizer_inject_panics=true;"
+		if _, err := conn.Exec(injectOptimizerPanicsStmt); err != nil {
+			t.Fatal(err)
+		}
+		logStmt(injectOptimizerPanicsStmt)
 
 		t.Status("smithing")
 		until := time.After(t.Spec().(*registry.TestSpec).Timeout / 2)
@@ -227,10 +233,12 @@ WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
 			if err != nil {
 				es := err.Error()
 				if strings.Contains(es, "internal error") {
-					// TODO(yuzefovich): we temporarily ignore internal errors
-					// that are because of #40929.
 					var expectedError bool
 					for _, exp := range []string{
+						// Optimizer panic-injection surfaces as an internal error.
+						"injected panic in optimizer",
+						// TODO(yuzefovich): we temporarily ignore internal errors
+						// that are because of #40929.
 						"could not parse \"0E-2019\" as type decimal",
 					} {
 						expectedError = expectedError || strings.Contains(es, exp)

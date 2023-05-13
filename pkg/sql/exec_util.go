@@ -1713,7 +1713,7 @@ type BackupRestoreTestingKnobs struct {
 
 	// RunAfterProcessingRestoreSpanEntry allows blocking the RESTORE job after a
 	// single RestoreSpanEntry has been processed and added to the SSTBatcher.
-	RunAfterProcessingRestoreSpanEntry func(ctx context.Context)
+	RunAfterProcessingRestoreSpanEntry func(ctx context.Context, entry *execinfrapb.RestoreSpanEntry)
 
 	// RunAfterExportingSpanEntry allows blocking the BACKUP job after a single
 	// span has been exported.
@@ -3152,6 +3152,10 @@ func (m *sessionDataMutator) SetVectorize(val sessiondatapb.VectorizeExecMode) {
 
 func (m *sessionDataMutator) SetTestingVectorizeInjectPanics(val bool) {
 	m.data.TestingVectorizeInjectPanics = val
+}
+
+func (m *sessionDataMutator) SetTestingOptimizerInjectPanics(val bool) {
+	m.data.TestingOptimizerInjectPanics = val
 }
 
 func (m *sessionDataMutator) SetOptimizerFKCascadesLimit(val int) {

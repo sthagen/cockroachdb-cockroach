@@ -74,6 +74,7 @@ server.oidc_authentication.scopes	string	openid	sets OIDC scopes to include with
 server.rangelog.ttl	duration	720h0m0s	if nonzero, entries in system.rangelog older than this duration are periodically purged	tenant-rw
 server.shutdown.connection_wait	duration	0s	the maximum amount of time a server waits for all SQL connections to be closed before proceeding with a drain. (note that the --drain-wait parameter for cockroach node drain may need adjustment after changing this setting)	tenant-rw
 server.shutdown.drain_wait	duration	0s	the amount of time a server waits in an unready state before proceeding with a drain (note that the --drain-wait parameter for cockroach node drain may need adjustment after changing this setting. --drain-wait is to specify the duration of the whole draining process, while server.shutdown.drain_wait is to set the wait time for health probes to notice that the node is not ready.)	tenant-rw
+server.shutdown.jobs_wait	duration	0s	the maximum amount of time a server waits for all currently executing jobs to notice drain request and to perform orderly shutdown	tenant-rw
 server.shutdown.query_wait	duration	10s	the timeout for waiting for active queries to finish during a drain (note that the --drain-wait parameter for cockroach node drain may need adjustment after changing this setting)	tenant-rw
 server.time_until_store_dead	duration	5m0s	the time after which if there is no new gossiped information about a store, it is considered dead	tenant-rw
 server.user_login.cert_password_method.auto_scram_promotion.enabled	boolean	true	whether to automatically promote cert-password authentication to use SCRAM	tenant-rw
@@ -252,7 +253,7 @@ sql.multiregion.drop_primary_region.enabled	boolean	true	allows dropping the PRI
 sql.notices.enabled	boolean	true	enable notices in the server/client protocol being sent	tenant-rw
 sql.optimizer.uniqueness_checks_for_gen_random_uuid.enabled	boolean	false	if enabled, uniqueness checks may be planned for mutations of UUID columns updated with gen_random_uuid(); otherwise, uniqueness is assumed due to near-zero collision probability	tenant-rw
 sql.schema.telemetry.recurrence	string	@weekly	cron-tab recurrence for SQL schema telemetry job	tenant-ro
-sql.show_ranges_deprecated_behavior.enabled	boolean	true	if set, SHOW RANGES and crdb_internal.ranges{_no_leases} behave with deprecated pre-v23.1 semantics. NB: the new SHOW RANGES interface has richer WITH options than pre-v23.1 SHOW RANGES.	tenant-rw
+sql.show_ranges_deprecated_behavior.enabled	boolean	false	if set, SHOW RANGES and crdb_internal.ranges{_no_leases} behave with deprecated pre-v23.1 semantics. NB: the new SHOW RANGES interface has richer WITH options than pre-v23.1 SHOW RANGES.	tenant-rw
 sql.spatial.experimental_box2d_comparison_operators.enabled	boolean	false	enables the use of certain experimental box2d comparison operators	tenant-rw
 sql.stats.activity.persisted_rows.max	integer	200000	maximum number of rows of statement and transaction activity that will be persisted in the system tables	tenant-rw
 sql.stats.automatic_collection.enabled	boolean	true	automatic statistics collection mode	tenant-rw
@@ -294,4 +295,4 @@ trace.opentelemetry.collector	string		address of an OpenTelemetry trace collecto
 trace.snapshot.rate	duration	0s	if non-zero, interval at which background trace snapshots are captured	tenant-rw
 trace.span_registry.enabled	boolean	true	if set, ongoing traces can be seen at https://<ui>/#/debug/tracez	tenant-rw
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.	tenant-rw
-version	version	1000023.1-6	set the active cluster version in the format '<major>.<minor>'	tenant-rw
+version	version	1000023.1-8	set the active cluster version in the format '<major>.<minor>'	tenant-rw

@@ -161,6 +161,39 @@ func TestZip(t *testing.T) {
 	})
 }
 
+// This tests the operation of zip using --include-range-info.
+func TestZipIncludeRangeInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	skip.UnderRace(t, "test too slow under race")
+
+	dir, cleanupFn := testutils.TempDir(t)
+	defer cleanupFn()
+
+	c := NewCLITest(TestCLIParams{
+		StoreSpecs: []base.StoreSpec{{
+			Path: dir,
+		}},
+	})
+	defer c.Cleanup()
+
+	out, err := c.RunWithCapture("debug zip --concurrency=1 --cpu-profile-duration=1s --include-range-info " + os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Strip any non-deterministic messages.
+	out = eraseNonDeterministicZipOutput(out)
+
+	// We use datadriven simply to read the golden output file; we don't actually
+	// run any commands. Using datadriven allows TESTFLAGS=-rewrite.
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "zip", "testzip_include_range_info"),
+		func(t *testing.T, td *datadriven.TestData) string {
+			return out
+		},
+	)
+}
+
 // This tests the operation of zip running concurrently.
 func TestConcurrentZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -533,9 +566,11 @@ func TestZipRetries(t *testing.T) {
 		}()
 
 		zr := zipCtx.newZipReporter("test")
+		zr.sqlOutputFilenameExtension = "json"
 		zc := debugZipContext{
-			z:       z,
-			timeout: 3 * time.Second,
+			z:              z,
+			clusterPrinter: zr,
+			timeout:        3 * time.Second,
 		}
 		if err := zc.dumpTableDataForZip(
 			zr,
@@ -557,16 +592,16 @@ func TestZipRetries(t *testing.T) {
 	for _, f := range r.File {
 		fmt.Fprintln(&fileList, f.Name)
 	}
-	const expected = `test/generate_series(1,15000) as t(x).txt
-test/generate_series(1,15000) as t(x).txt.err.txt
-test/generate_series(1,15000) as t(x).1.txt
-test/generate_series(1,15000) as t(x).1.txt.err.txt
-test/generate_series(1,15000) as t(x).2.txt
-test/generate_series(1,15000) as t(x).2.txt.err.txt
-test/generate_series(1,15000) as t(x).3.txt
-test/generate_series(1,15000) as t(x).3.txt.err.txt
-test/generate_series(1,15000) as t(x).4.txt
-test/generate_series(1,15000) as t(x).4.txt.err.txt
+	const expected = `test/generate_series(1,15000) as t(x).json
+test/generate_series(1,15000) as t(x).json.err.txt
+test/generate_series(1,15000) as t(x).1.json
+test/generate_series(1,15000) as t(x).1.json.err.txt
+test/generate_series(1,15000) as t(x).2.json
+test/generate_series(1,15000) as t(x).2.json.err.txt
+test/generate_series(1,15000) as t(x).3.json
+test/generate_series(1,15000) as t(x).3.json.err.txt
+test/generate_series(1,15000) as t(x).4.json
+test/generate_series(1,15000) as t(x).4.json.err.txt
 `
 	assert.Equal(t, expected, fileList.String())
 }

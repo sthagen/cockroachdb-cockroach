@@ -487,7 +487,6 @@ func registerKVGracefulDraining(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "kv/gracefuldraining/nodes=3",
 		Owner:   registry.OwnerKV,
-		Skip:    "https://github.com/cockroachdb/cockroach/issues/59094",
 		Cluster: r.MakeClusterSpec(4),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			nodes := c.Spec().NodeCount - 1
@@ -757,6 +756,7 @@ func registerKVScalability(r registry.Registry) {
 
 		const maxPerNodeConcurrency = 64
 		for i := nodes; i <= nodes*maxPerNodeConcurrency; i += nodes {
+			i := i // capture loop variable
 			c.Wipe(ctx, c.Range(1, nodes))
 			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, nodes))
 
@@ -962,7 +962,10 @@ func registerKVRestartImpact(r registry.Registry) {
 			nodes := c.Spec().NodeCount - 1
 			workloadNode := c.Spec().NodeCount
 			c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-			c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, nodes))
+			startOpts := option.DefaultStartOpts()
+			startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs,
+				"--vmodule=store_rebalancer=5,allocator=5,allocator_scorer=5,replicate_queue=5")
+			c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Range(1, nodes))
 
 			// The duration of the outage.
 			duration, err := time.ParseDuration(ifLocal(c, "20s", "10m"))

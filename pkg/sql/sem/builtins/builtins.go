@@ -2411,6 +2411,22 @@ var regularBuiltins = map[string]builtinDefinition{
 			Info:       "Convert an date to a string assuming the ISO, MDY DateStyle.",
 			Volatility: volatility.Immutable,
 		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "date", Typ: types.Date}, {Name: "format", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				d := tree.MustBeDDate(args[0])
+				f := tree.MustBeDString(args[1])
+				t, err := d.ToTime()
+				if err != nil {
+					return nil, err
+				}
+				s, err := tochar.TimeToChar(t, ctx.ToCharFormatCache, string(f))
+				return tree.NewDString(s), err
+			},
+			Info:       "Convert a timestamp with time zone to a string using the given format.",
+			Volatility: volatility.Stable,
+		},
 	),
 
 	"to_char_with_style": makeBuiltin(
@@ -5532,6 +5548,25 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 				}
 				skip := int(tree.MustBeDInt(args[2]))
 				return tree.NewDString(catalogkeys.PrettySpan(nil /* valDirs */, span, skip)), nil
+			},
+			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility: volatility.Immutable,
+		},
+	),
+
+	"crdb_internal.pretty_value": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				tree.ParamType{Name: "raw_value", Typ: types.Bytes},
+			},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				var v roachpb.Value
+				v.RawBytes = []byte(tree.MustBeDBytes(args[0]))
+				return tree.NewDString(v.PrettyPrint()), nil
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility: volatility.Immutable,

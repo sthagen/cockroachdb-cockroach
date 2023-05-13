@@ -659,6 +659,8 @@ has no relationship with the commit order of concurrent transactions.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(date: <a href="date.html">date</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an date to a string assuming the ISO, MDY DateStyle.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="to_char"></a><code>to_char(date: <a href="date.html">date</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert a timestamp with time zone to a string using the given format.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(interval: <a href="interval.html">interval</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string assuming the Postgres IntervalStyle.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="to_char"></a><code>to_char(interval: <a href="interval.html">interval</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert an interval to a string using the given format.</p>
@@ -1744,6 +1746,8 @@ Precision specifies how many decimal places will be preserved in Encoded Polylin
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="st_azimuth"></a><code>st_azimuth(geometry_a: geometry, geometry_b: geometry) &rarr; <a href="float.html">float</a></code></td><td><span class="funcdesc"><p>Returns the azimuth in radians of the segment defined by the given point geometries, or NULL if the two points are coincident.</p>
 <p>The azimuth is angle is referenced from north, and is positive clockwise: North = 0; East = π/2; South = π; West = 3π/2.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="st_bdpolyfromtext"></a><code>st_bdpolyfromtext(str: <a href="string.html">string</a>, srid: <a href="int.html">int</a>) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns a Polygon from multilinestring WKT with a SRID. If the input is not a multilinestring an error will be thrown.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="st_boundary"></a><code>st_boundary(geometry: geometry) &rarr; geometry</code></td><td><span class="funcdesc"><p>Returns the closure of the combinatorial boundary of this Geometry.</p>
 <p>This function utilizes the GEOS module.</p>
@@ -3220,6 +3224,8 @@ active for the current transaction.</p>
 <tr><td><a name="crdb_internal.pretty_key"></a><code>crdb_internal.pretty_key(raw_key: <a href="bytes.html">bytes</a>, skip_fields: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.pretty_span"></a><code>crdb_internal.pretty_span(raw_key_start: <a href="bytes.html">bytes</a>, raw_key_end: <a href="bytes.html">bytes</a>, skip_fields: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="crdb_internal.pretty_value"></a><code>crdb_internal.pretty_value(raw_value: <a href="bytes.html">bytes</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>This function is used only by CockroachDB’s developers for testing purposes.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.range_stats"></a><code>crdb_internal.range_stats(key: <a href="bytes.html">bytes</a>) &rarr; jsonb</code></td><td><span class="funcdesc"><p>This function is used to retrieve range statistics information as a JSON object.</p>
 </span></td><td>Volatile</td></tr>

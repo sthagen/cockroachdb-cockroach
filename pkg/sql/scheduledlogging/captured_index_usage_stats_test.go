@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -64,6 +65,7 @@ func (s *stubDurations) getOverlapDuration() time.Duration {
 
 func TestCaptureIndexUsageStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 102732)
 	sc := log.ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
@@ -281,7 +283,7 @@ func checkNumTotalEntriesAndNumIndexEntries(
 	expectedIndividualIndexEntries int,
 	scheduleCompleteChan chan struct{},
 ) error {
-	log.FlushFileSinks()
+	log.Flush()
 	// Fetch log entries.
 	entries, err := log.FetchEntriesFromFiles(
 		0,

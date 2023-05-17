@@ -1141,7 +1141,7 @@ var cmLogRe = regexp.MustCompile(`event_log\.go`)
 func checkStructuredLogs(t *testing.T, eventType string, startTime int64) []string {
 	var matchingEntries []string
 	testutils.SucceedsSoon(t, func() error {
-		log.FlushFileSinks()
+		log.Flush()
 		entries, err := log.FetchEntriesFromFiles(startTime,
 			math.MaxInt64, 10000, cmLogRe, log.WithMarkedSensitiveData)
 		if err != nil {
@@ -1278,8 +1278,7 @@ func waitForJobStatus(
 }
 
 // TestingSetIncludeParquetMetadata adds the option to turn on adding metadata
-// (primary key column names) to the parquet file which is used to convert parquet
-// data to JSON format
+// to the parquet file which is used in testing.
 func TestingSetIncludeParquetMetadata() func() {
 	includeParquetTestMetadata = true
 	return func() {

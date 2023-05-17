@@ -104,8 +104,9 @@ func registerFlowable(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "flowable",
-		Owner:   registry.OwnerSQLSessions,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(1),
+		Leases:  registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runFlowable(ctx, t, c)
 		},

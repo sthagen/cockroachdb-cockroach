@@ -540,6 +540,11 @@ func (md *Metadata) AllUserDefinedTypes() []*types.T {
 	return md.userDefinedTypesSlice
 }
 
+// AllUserDefinedFunctions returns all user defined functions used in this query.
+func (md *Metadata) AllUserDefinedFunctions() map[cat.StableID]*tree.Overload {
+	return md.udfDeps
+}
+
 // AddUserDefinedFunction adds a user-defined function to the metadata for this
 // query. If the function was resolved by name, the name will also be tracked.
 func (md *Metadata) AddUserDefinedFunction(
@@ -647,6 +652,7 @@ func (md *Metadata) DuplicateTable(
 	// Create new computed column expressions by remapping the column IDs in
 	// each ScalarExpr.
 	var computedCols map[ColumnID]ScalarExpr
+	var referencedColsInComputedExpressions ColSet
 	if len(tabMeta.ComputedCols) > 0 {
 		computedCols = make(map[ColumnID]ScalarExpr, len(tabMeta.ComputedCols))
 		for colID, e := range tabMeta.ComputedCols {
@@ -656,6 +662,9 @@ func (md *Metadata) DuplicateTable(
 			}
 			computedCols[ColumnID(newColID)] = remapColumnIDs(e, colMap)
 		}
+		// Add columns present in newScalarExpr to referencedColsInComputedExpressions.
+		referencedColsInComputedExpressions =
+			tabMeta.ColsInComputedColsExpressions.CopyAndMaybeRemap(colMap)
 	}
 
 	// Create new partial index predicate expressions by remapping the column
@@ -688,16 +697,17 @@ func (md *Metadata) DuplicateTable(
 	}
 
 	newTabMeta := TableMeta{
-		MetaID:                   newTabID,
-		Table:                    tabMeta.Table,
-		Alias:                    tabMeta.Alias,
-		IgnoreForeignKeys:        tabMeta.IgnoreForeignKeys,
-		Constraints:              constraints,
-		ComputedCols:             computedCols,
-		partialIndexPredicates:   partialIndexPredicates,
-		indexPartitionLocalities: tabMeta.indexPartitionLocalities,
-		checkConstraintsStats:    checkConstraintsStats,
-		notVisibleIndexMap:       tabMeta.notVisibleIndexMap,
+		MetaID:                        newTabID,
+		Table:                         tabMeta.Table,
+		Alias:                         tabMeta.Alias,
+		IgnoreForeignKeys:             tabMeta.IgnoreForeignKeys,
+		Constraints:                   constraints,
+		ComputedCols:                  computedCols,
+		ColsInComputedColsExpressions: referencedColsInComputedExpressions,
+		partialIndexPredicates:        partialIndexPredicates,
+		indexPartitionLocalities:      tabMeta.indexPartitionLocalities,
+		checkConstraintsStats:         checkConstraintsStats,
+		notVisibleIndexMap:            tabMeta.notVisibleIndexMap,
 	}
 	md.tables = append(md.tables, newTabMeta)
 	regionConfig, ok := md.TableAnnotation(tabID, regionConfigAnnID).(*multiregion.RegionConfig)

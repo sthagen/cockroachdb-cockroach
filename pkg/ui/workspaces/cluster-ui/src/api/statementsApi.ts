@@ -143,8 +143,16 @@ export type StatementMetadata = {
   implicitTxn: boolean;
   query: string;
   querySummary: string;
-  stmtTyp: string;
+  stmtType: string;
   vec: boolean;
+};
+
+type LatencyInfo = {
+  max: number;
+  min: number;
+  p50: number;
+  p90: number;
+  p99: number;
 };
 
 type Statistics = {
@@ -153,7 +161,9 @@ type Statistics = {
   firstAttemptCnt: Long;
   idleLat: NumericStat;
   indexes: string[];
+  lastErrorCode: string;
   lastExecAt: string;
+  latencyInfo: LatencyInfo;
   maxRetries: Long;
   nodes: Long[];
   numRows: NumericStat;
@@ -226,9 +236,17 @@ export function convertStatementRawFormatToAggregatedStatistics(
       idle_lat: s.statistics.statistics.idleLat,
       index_recommendations: s.statistics.index_recommendations,
       indexes: s.statistics.statistics.indexes,
+      last_error_code: s.statistics.statistics.lastErrorCode,
       last_exec_timestamp: stringToTimestamp(
         s.statistics.statistics.lastExecAt,
       ),
+      latency_info: {
+        max: s.statistics.statistics.latencyInfo.max,
+        min: s.statistics.statistics.latencyInfo.min,
+        p50: s.statistics.statistics.latencyInfo.p50,
+        p90: s.statistics.statistics.latencyInfo.p90,
+        p99: s.statistics.statistics.latencyInfo.p99,
+      },
       max_retries: s.statistics.statistics.maxRetries,
       nodes: s.statistics.statistics.nodes,
       num_rows: s.statistics.statistics.numRows,
@@ -240,7 +258,7 @@ export function convertStatementRawFormatToAggregatedStatistics(
       rows_written: s.statistics.statistics.rowsWritten,
       run_lat: s.statistics.statistics.runLat,
       service_lat: s.statistics.statistics.svcLat,
-      sql_type: s.metadata.stmtTyp,
+      sql_type: s.metadata.stmtType,
     },
   };
 }

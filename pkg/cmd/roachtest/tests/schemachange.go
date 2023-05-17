@@ -30,8 +30,9 @@ import (
 func registerSchemaChangeDuringKV(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    `schemachange/during/kv`,
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(5),
+		Leases:  registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			const fixturePath = `gs://cockroach-fixtures/workload/tpch/scalefactor=10/backup?AUTH=implicit`
 
@@ -307,8 +308,9 @@ func makeIndexAddTpccTest(
 ) registry.TestSpec {
 	return registry.TestSpec{
 		Name:    fmt.Sprintf("schemachange/index/tpcc/w=%d", warehouses),
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: spec,
+		Leases:  registry.MetamorphicLeases,
 		Timeout: length * 3,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
@@ -339,8 +341,9 @@ func makeSchemaChangeBulkIngestTest(
 ) registry.TestSpec {
 	return registry.TestSpec{
 		Name:    "schemachange/bulkingest",
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: r.MakeClusterSpec(numNodes),
+		Leases:  registry.MetamorphicLeases,
 		Timeout: length * 2,
 		// `fixtures import` (with the workload paths) is not supported in 2.1
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -425,8 +428,9 @@ func makeSchemaChangeDuringTPCC(
 ) registry.TestSpec {
 	return registry.TestSpec{
 		Name:    "schemachange/during/tpcc",
-		Owner:   registry.OwnerSQLSchema,
+		Owner:   registry.OwnerSQLFoundations,
 		Cluster: spec,
+		Leases:  registry.MetamorphicLeases,
 		Timeout: length * 3,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCC(ctx, t, c, tpccOptions{

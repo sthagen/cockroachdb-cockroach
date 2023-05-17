@@ -48,6 +48,7 @@ func registerDecommission(r registry.Registry) {
 			Name:    fmt.Sprintf("decommission/nodes=%d/duration=%s", numNodes, duration),
 			Owner:   registry.OwnerKV,
 			Cluster: r.MakeClusterSpec(numNodes),
+			Leases:  registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				if c.IsLocal() {
 					duration = 5 * time.Minute
@@ -64,6 +65,7 @@ func registerDecommission(r registry.Registry) {
 			Name:    fmt.Sprintf("drain-and-decommission/nodes=%d", numNodes),
 			Owner:   registry.OwnerKV,
 			Cluster: r.MakeClusterSpec(numNodes),
+			Leases:  registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runDrainAndDecommission(ctx, t, c, numNodes, duration)
 			},
@@ -75,6 +77,7 @@ func registerDecommission(r registry.Registry) {
 			Name:    "decommission/drains",
 			Owner:   registry.OwnerKV,
 			Cluster: r.MakeClusterSpec(numNodes),
+			Leases:  registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runDecommissionDrains(ctx, t, c)
 			},
@@ -87,6 +90,7 @@ func registerDecommission(r registry.Registry) {
 			Owner:   registry.OwnerKV,
 			Timeout: 10 * time.Minute,
 			Cluster: r.MakeClusterSpec(numNodes),
+			Leases:  registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runDecommissionRandomized(ctx, t, c)
 			},
@@ -112,6 +116,7 @@ func registerDecommission(r registry.Registry) {
 			Name:    "decommission/slow",
 			Owner:   registry.OwnerKV,
 			Cluster: r.MakeClusterSpec(numNodes),
+			Leases:  registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runDecommissionSlow(ctx, t, c)
 			},

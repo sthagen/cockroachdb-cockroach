@@ -114,33 +114,6 @@ CREATE TABLE s.a (a INT PRIMARY KEY);`)
 		}, base, plans, "distsql.html vec.txt vec-v.txt")
 	})
 
-	// Verify that we can issue the statement with prepare (which can happen
-	// depending on the client).
-	t.Run("prepare", func(t *testing.T) {
-		stmt, err := godb.Prepare("EXPLAIN ANALYZE (DEBUG) SELECT * FROM abc WHERE c=1")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer stmt.Close()
-		rows, err := stmt.Query()
-		if err != nil {
-			t.Fatal(err)
-		}
-		var rowsBuf bytes.Buffer
-		for rows.Next() {
-			var row string
-			if err := rows.Scan(&row); err != nil {
-				t.Fatal(err)
-			}
-			rowsBuf.WriteString(row)
-			rowsBuf.WriteByte('\n')
-		}
-		checkBundle(
-			t, rowsBuf.String(), "public.abc", nil,
-			base, plans, "stats-defaultdb.public.abc.sql", "distsql.html vec.txt vec-v.txt",
-		)
-	})
-
 	// This is a regression test for the situation where wrapped into the
 	// vectorized flow planNodes in the postqueries were messed up because the
 	// generation of EXPLAIN (VEC) diagrams modified planNodeToRowSources in
@@ -288,8 +261,9 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		r.Exec(t, "CREATE TABLE pterosaur (cardholder STRING PRIMARY KEY, cardno INT, INDEX (cardno));")
 		r.Exec(t, "INSERT INTO pterosaur VALUES ('pterodactyl', 5555555555554444);")
 		r.Exec(t, "CREATE STATISTICS jurassic FROM pterosaur;")
+		r.Exec(t, "CREATE FUNCTION test_redact() RETURNS STRING AS $body$ SELECT 'pterodactyl' $body$ LANGUAGE sql;")
 		rows := r.QueryStr(t,
-			"EXPLAIN ANALYZE (DEBUG, REDACT) SELECT max(cardno) FROM pterosaur WHERE cardholder = 'pterodactyl'",
+			"EXPLAIN ANALYZE (DEBUG, REDACT) SELECT max(cardno), test_redact() FROM pterosaur WHERE cardholder = 'pterodactyl'",
 		)
 		verboten := []string{"pterodactyl", "5555555555554444", fmt.Sprintf("%x", 5555555555554444)}
 		checkBundle(
@@ -316,6 +290,27 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		checkBundle(
 			t, fmt.Sprint(rows), "test_type2", nil, base, plans,
 			"distsql.html vec.txt vec-v.txt")
+	})
+
+	t.Run("udfs", func(t *testing.T) {
+		r.Exec(t, "CREATE FUNCTION add(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT a + b';")
+		r.Exec(t, "CREATE FUNCTION subtract(a INT, b INT) RETURNS INT IMMUTABLE LEAKPROOF LANGUAGE SQL AS 'SELECT a - b';")
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT add(3, 4);")
+		checkBundle(
+			t, fmt.Sprint(rows), "add", func(name, contents string) error {
+				if name == "schema.sql" {
+					reg := regexp.MustCompile("add")
+					if reg.FindString(contents) == "" {
+						return errors.Errorf("could not find definition for 'add' function in schema.sql")
+					}
+					reg = regexp.MustCompile("subtract")
+					if reg.FindString(contents) != "" {
+						return errors.Errorf("Found irrelevant user defined function 'substract' in schema.sql")
+					}
+				}
+				return nil
+			}, base, plans,
+			"distsql-1-subquery.html distsql-2-main-query.html vec-1-subquery-v.txt vec-1-subquery.txt vec-2-main-query-v.txt vec-2-main-query.txt")
 	})
 }
 

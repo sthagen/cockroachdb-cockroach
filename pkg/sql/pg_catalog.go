@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -1128,11 +1130,11 @@ func makeAllRelationsVirtualTableWithDescriptorIDIndex(
 					if err != nil {
 						if errors.Is(err, catalog.ErrDescriptorNotFound) ||
 							catalog.HasInactiveDescriptorError(err) {
-							// No table found, so no rows. In this case, we'll fall back to the
-							// full table scan if the index isn't complete - see the
-							// indexContainsNonTableDescriptorIDs parameter.
+							// No table found, so no rows. If know this value is
+							// not a hashed OID we can safely say the table was populated
+							// and skip an expensive step populating the full tables.
 							//nolint:returnerrcheck
-							return false, nil
+							return !IsMaybeHashedOid(oid.Oid(id)), nil
 						}
 						return false, err
 					}
@@ -1600,6 +1602,7 @@ func getComments(ctx context.Context, p *planner, descriptorID descpb.ID) ([]tre
 	WHEN 'IndexCommentType' THEN 3
 	WHEN 'SchemaCommentType' THEN 4
 	WHEN 'ConstraintCommentType' THEN 5
+	WHEN 'FunctionCommentType' THEN 6
 	END
 	AS type
 		FROM
@@ -1620,15 +1623,15 @@ WHERE object_id=$1`)
 		queryArgs...)
 }
 
-// populatePgCatalogFromComments populates the for the pg_description table
-// based on a set of fetched comments.
-func populatePgCatalogFromComments(
+// populatePgDescription populates the pg_description table for the given
+// object ID, or for all objects if id==0.
+func populatePgDescription(
 	ctx context.Context,
 	p *planner,
-	dbContext catalog.DatabaseDescriptor,
-	addRow func(...tree.Datum) error,
+	databaseID descpb.ID,
 	id oid.Oid,
-) (populated bool, err error) {
+	addRow func(...tree.Datum) error,
+) (populated bool, retErr error) {
 	comments, err := getComments(ctx, p, descpb.ID(id))
 	if err != nil {
 		return false, err
@@ -1671,7 +1674,7 @@ func populatePgCatalogFromComments(
 			if err != nil {
 				return false, err
 			}
-			objID = getOIDFromConstraint(c, dbContext.GetID(), schema.GetID(), tableDesc)
+			objID = getOIDFromConstraint(c, databaseID, schema.GetID(), tableDesc)
 			objSubID = tree.DZero
 			classOid = tree.NewDOid(catconstants.PgCatalogConstraintTableID)
 		case catalogkeys.IndexCommentType:
@@ -1680,6 +1683,12 @@ func populatePgCatalogFromComments(
 				descpb.IndexID(tree.MustBeDInt(objSubID)))
 			objSubID = tree.DZero
 			classOid = tree.NewDOid(catconstants.PgCatalogClassTableID)
+		case catalogkeys.FunctionCommentType:
+			// TODO: The type conversion to oid.Oid is safe since we use desc IDs
+			// for this, but it's not ideal. The backing column for objId should be
+			// changed to use the OID type.
+			objID = tree.NewDOid(oid.Oid(tree.MustBeDInt(objID)))
+			classOid = tree.NewDOid(catconstants.PgCatalogProcTableID)
 		}
 		if err := addRow(
 			objID,
@@ -1690,38 +1699,7 @@ func populatePgCatalogFromComments(
 		}
 	}
 
-	if id != 0 && populated {
-		return populated, nil
-	}
-
-	// Populate rows based on builtins as well.
-	fmtOverLoad := func(builtin tree.Overload) error {
-		return addRow(
-			tree.NewDOid(builtin.Oid),
-			tree.NewDOid(catconstants.PgCatalogProcTableID),
-			tree.DZero,
-			tree.NewDString(builtin.Info),
-		)
-	}
-	// For direct lookups match with builtins, if this fails
-	// we will do a full scan, since the OID might be an index
-	// or constraint.
-	if id != 0 {
-		builtin, matched := tree.OidToQualifiedBuiltinOverload[id]
-		if !matched {
-			return matched, err
-		}
-		return true, fmtOverLoad(*builtin.Overload)
-	}
-	for _, name := range builtins.AllBuiltinNames() {
-		_, overloads := builtinsregistry.GetBuiltinProperties(name)
-		for _, builtin := range overloads {
-			if err := fmtOverLoad(builtin); err != nil {
-				return false, err
-			}
-		}
-	}
-	return true, nil
+	return populated, nil
 }
 
 var pgCatalogDescriptionTable = virtualSchemaTable{
@@ -1733,15 +1711,17 @@ https://www.postgresql.org/docs/9.5/catalog-pg-description.html`,
 		p *planner,
 		dbContext catalog.DatabaseDescriptor,
 		addRow func(...tree.Datum) error) error {
-		_, err := populatePgCatalogFromComments(ctx, p, dbContext, addRow, 0)
-		return err
+		if _, err := populatePgDescription(ctx, p, dbContext.GetID(), 0 /* all comments */, addRow); err != nil {
+			return err
+		}
+		return nil
 	},
 	indexes: []virtualIndex{
 		{
 			incomplete: true,
 			populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
 				oid := tree.MustBeDOid(unwrappedConstraint)
-				return populatePgCatalogFromComments(ctx, p, dbContext, addRow, oid.Oid)
+				return populatePgDescription(ctx, p, dbContext.GetID(), oid.Oid, addRow)
 			},
 		},
 	},
@@ -4697,6 +4677,11 @@ type oidHasher struct {
 	h hash.Hash32
 }
 
+// IsMaybeHashedOid returns if the OID value is possibly a hashed value.
+func IsMaybeHashedOid(o oid.Oid) bool {
+	return o > oidext.CockroachPredefinedOIDMax
+}
+
 func makeOidHasher() oidHasher {
 	return oidHasher{h: fnv.New32()}
 }
@@ -4762,6 +4747,10 @@ func (h oidHasher) writeTypeTag(tag oidTypeTag) {
 
 func (h oidHasher) getOid() *tree.DOid {
 	i := h.h.Sum32()
+	// Ensure generated OID hashes are above the pre-defined max limit,
+	// this gives us a cheap filter.
+	i = i%(math.MaxUint32-oidext.CockroachPredefinedOIDMax) +
+		oidext.CockroachPredefinedOIDMax
 	h.h.Reset()
 	return tree.NewDOid(oid.Oid(i))
 }

@@ -67,6 +67,68 @@ const backendError = "Backend error!"
 // the test directory server.
 const notFoundTenantID = 99
 
+func TestProxyHandler_ValidateConnection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stop := stop.NewStopper()
+	defer stop.Stop(ctx)
+
+	// Create the directory server.
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(stop, nil /* timeSource */)
+	invalidTenantID := roachpb.MustMakeTenantID(99)
+	tenantID := roachpb.MustMakeTenantID(10)
+	tds.CreateTenant(tenantID, &tenant.Tenant{
+		TenantID:    tenantID.ToUint64(),
+		ClusterName: "my-tenant",
+	})
+	tenantWithoutNameID := roachpb.MustMakeTenantID(20)
+	tds.CreateTenant(tenantWithoutNameID, &tenant.Tenant{
+		TenantID: tenantWithoutNameID.ToUint64(),
+	})
+	require.NoError(t, tds.Start(ctx))
+
+	options := &ProxyOptions{}
+	options.testingKnobs.directoryServer = tds
+	s, _, _ := newSecureProxyServer(ctx, t, stop, options)
+
+	t.Run("not found/no cluster name", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, invalidTenantID, "")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster -99 not found", err.Error())
+	})
+	t.Run("not found", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, invalidTenantID, "foo-bar")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster foo-bar-99 not found", err.Error())
+	})
+	t.Run("found/tenant without name", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantWithoutNameID, "foo-bar")
+		require.NoError(t, err)
+	})
+	t.Run("found/tenant name matches", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantID, "my-tenant")
+		require.NoError(t, err)
+	})
+	t.Run("found/connection without name", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantID, "")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster -10 not found", err.Error())
+	})
+	t.Run("found/tenant name mismatch", func(t *testing.T) {
+		err := s.handler.validateConnection(ctx, tenantID, "foo-bar")
+		require.Regexp(t, "codeParamsRoutingFailed: cluster foo-bar-10 not found", err.Error())
+	})
+
+	// Stop the directory server.
+	tds.Stop(ctx)
+
+	// Directory hasn't started
+	t.Run("directory error", func(t *testing.T) {
+		// Use a new tenant ID here to force GetTenant.
+		err := s.handler.validateConnection(ctx, roachpb.MustMakeTenantID(100), "")
+		require.Regexp(t, "directory server has not been started", err.Error())
+	})
+}
+
 func TestProxyProtocol(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -235,25 +297,25 @@ func TestPrivateEndpointsACL(t *testing.T) {
 	tenant20 := roachpb.MustMakeTenantID(20)
 	tenant30 := roachpb.MustMakeTenantID(30)
 	tds.CreateTenant(tenant10, &tenant.Tenant{
-		Version:          "001",
-		TenantID:         tenant10.ToUint64(),
-		ClusterName:      "my-tenant",
-		ConnectivityType: tenant.ALLOW_PUBLIC | tenant.ALLOW_PRIVATE,
-		PrivateEndpoints: []string{"vpce-abc123"},
+		Version:                 "001",
+		TenantID:                tenant10.ToUint64(),
+		ClusterName:             "my-tenant",
+		ConnectivityType:        tenant.ALLOW_ALL,
+		AllowedPrivateEndpoints: []string{"vpce-abc123"},
 	})
 	tds.CreateTenant(tenant20, &tenant.Tenant{
-		Version:          "002",
-		TenantID:         tenant20.ToUint64(),
-		ClusterName:      "other-tenant",
-		ConnectivityType: tenant.ALLOW_PUBLIC | tenant.ALLOW_PRIVATE,
-		PrivateEndpoints: []string{"vpce-some-other-vpc"},
+		Version:                 "002",
+		TenantID:                tenant20.ToUint64(),
+		ClusterName:             "other-tenant",
+		ConnectivityType:        tenant.ALLOW_ALL,
+		AllowedPrivateEndpoints: []string{"vpce-some-other-vpc"},
 	})
 	tds.CreateTenant(tenant30, &tenant.Tenant{
-		Version:          "003",
-		TenantID:         tenant30.ToUint64(),
-		ClusterName:      "public-tenant",
-		ConnectivityType: tenant.ALLOW_PUBLIC,
-		PrivateEndpoints: []string{},
+		Version:                 "003",
+		TenantID:                tenant30.ToUint64(),
+		ClusterName:             "public-tenant",
+		ConnectivityType:        tenant.ALLOW_PUBLIC_ONLY,
+		AllowedPrivateEndpoints: []string{},
 	})
 	// All tenants map to the same pod.
 	for _, tenID := range []roachpb.TenantID{tenant10, tenant20, tenant30} {
@@ -322,11 +384,11 @@ func TestPrivateEndpointsACL(t *testing.T) {
 
 				// Remove endpoints and connection should be disconnected.
 				tds.UpdateTenant(tenant10, &tenant.Tenant{
-					Version:          "010",
-					TenantID:         tenant10.ToUint64(),
-					ClusterName:      "my-tenant",
-					ConnectivityType: tenant.ALLOW_PUBLIC | tenant.ALLOW_PRIVATE,
-					PrivateEndpoints: []string{},
+					Version:                 "010",
+					TenantID:                tenant10.ToUint64(),
+					ClusterName:             "my-tenant",
+					ConnectivityType:        tenant.ALLOW_ALL,
+					AllowedPrivateEndpoints: []string{},
 				})
 
 				// Wait until watcher has received the updated event.
@@ -352,6 +414,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 					time.Second, 5*time.Millisecond,
 					"Expected the connection to eventually fail",
 				)
+				require.Error(t, err)
 				require.Regexp(t, "connection reset by peer|unexpected EOF", err.Error())
 				require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 			},
@@ -380,6 +443,127 @@ func TestPrivateEndpointsACL(t *testing.T) {
 			codeProxyRefusedConnection,
 			"connection refused",
 		)
+	})
+}
+
+func TestAllowedCIDRRangesACL(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	te := newTester()
+	defer te.Close()
+
+	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Insecure: false,
+		// Need to disable the test tenant here because it appears as though
+		// we're not able to establish the necessary connections from within
+		// it. More investigation required (tracked with #76378).
+		DefaultTestTenant: base.TestTenantDisabled,
+	})
+	sql.(*server.TestServer).PGPreServer().TestingSetTrustClientProvidedRemoteAddr(true)
+	defer sql.Stopper().Stop(ctx)
+
+	// Create a default user.
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.Exec(t, `CREATE USER bob WITH PASSWORD 'builder'`)
+
+	// Create the directory server.
+	tds := tenantdirsvr.NewTestStaticDirectoryServer(sql.Stopper(), nil /* timeSource */)
+	tenant10 := roachpb.MustMakeTenantID(10)
+	tenant20 := roachpb.MustMakeTenantID(20)
+	tenant30 := roachpb.MustMakeTenantID(30)
+	tds.CreateTenant(tenant10, &tenant.Tenant{
+		Version:           "001",
+		TenantID:          tenant10.ToUint64(),
+		ClusterName:       "my-tenant",
+		ConnectivityType:  tenant.ALLOW_ALL,
+		AllowedCIDRRanges: []string{"127.0.0.1/32"},
+	})
+	tds.CreateTenant(tenant20, &tenant.Tenant{
+		Version:           "002",
+		TenantID:          tenant20.ToUint64(),
+		ClusterName:       "other-tenant",
+		ConnectivityType:  tenant.ALLOW_ALL,
+		AllowedCIDRRanges: []string{"10.0.0.8/32"},
+	})
+	tds.CreateTenant(tenant30, &tenant.Tenant{
+		Version:           "003",
+		TenantID:          tenant30.ToUint64(),
+		ClusterName:       "private-tenant",
+		ConnectivityType:  tenant.ALLOW_PRIVATE_ONLY,
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	})
+	// All tenants map to the same pod.
+	for _, tenID := range []roachpb.TenantID{tenant10, tenant20, tenant30} {
+		tds.AddPod(tenID, &tenant.Pod{
+			TenantID:       tenID.ToUint64(),
+			Addr:           sql.ServingSQLAddr(),
+			State:          tenant.RUNNING,
+			StateTimestamp: timeutil.Now(),
+		})
+	}
+	require.NoError(t, tds.Start(ctx))
+
+	options := &ProxyOptions{
+		SkipVerify:         true,
+		PollConfigInterval: 10 * time.Millisecond,
+	}
+	options.testingKnobs.directoryServer = tds
+	s, sqlAddr, _ := newSecureProxyServer(ctx, t, sql.Stopper(), options)
+
+	t.Run("public connection allowed", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/my-tenant-10.defaultdb?sslmode=require", sqlAddr)
+		te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
+			// Initial connection.
+			require.Equal(t, int64(1), s.metrics.CurConnCount.Value())
+			require.NoError(t, runTestQuery(ctx, conn))
+
+			// Remove ranges and connection should be disconnected.
+			tds.UpdateTenant(tenant10, &tenant.Tenant{
+				Version:           "010",
+				TenantID:          tenant10.ToUint64(),
+				ClusterName:       "my-tenant",
+				ConnectivityType:  tenant.ALLOW_ALL,
+				AllowedCIDRRanges: []string{},
+			})
+
+			// Wait until watcher has received the updated event.
+			testutils.SucceedsSoon(t, func() error {
+				ten, err := s.handler.directoryCache.LookupTenant(ctx, tenant10)
+				if err != nil {
+					return err
+				}
+				if ten.Version != "010" {
+					return errors.New("tenant is not up-to-date")
+				}
+				return nil
+			})
+
+			// Subsequent Exec calls will eventually fail.
+			var err error
+			require.Eventually(
+				t,
+				func() bool {
+					_, err = conn.Exec(ctx, "SELECT 1")
+					return err != nil
+				},
+				time.Second, 5*time.Millisecond,
+				"Expected the connection to eventually fail",
+			)
+			require.Regexp(t, "connection reset by peer|unexpected EOF", err.Error())
+			require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
+		})
+	})
+
+	t.Run("public connection disallowed on another tenant", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/other-tenant-20.defaultdb?sslmode=require", sqlAddr)
+		_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "connection refused")
+	})
+
+	t.Run("public connection disallowed on private tenant", func(t *testing.T) {
+		url := fmt.Sprintf("postgres://bob:builder@%s/private-tenant-30.defaultdb?sslmode=require", sqlAddr)
+		_ = te.TestConnectErr(ctx, t, url, codeProxyRefusedConnection, "connection refused")
 	})
 }
 
@@ -1077,8 +1261,9 @@ func TestDenylistUpdate(t *testing.T) {
 	tenantID := serverutils.TestTenantID()
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(sql.Stopper(), nil /* timeSource */)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
@@ -1141,6 +1326,7 @@ func TestDenylistUpdate(t *testing.T) {
 		time.Second, 5*time.Millisecond,
 		"Expected the connection to eventually fail",
 	)
+	require.Error(t, err)
 	require.Regexp(t, "closed|bad connection", err.Error())
 	require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 }
@@ -1166,8 +1352,9 @@ func TestDirectoryConnect(t *testing.T) {
 	tenants := startTestTenantPodsWithStopper(ctx, t, s, tenantID, 1, base.TestingKnobs{}, tenantStopper)
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
@@ -1279,8 +1466,9 @@ func TestConnectionRebalancingDisabled(t *testing.T) {
 	// Register one SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
@@ -1378,8 +1566,9 @@ func TestCancelQuery(t *testing.T) {
 	// Register one SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), timeSource)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
@@ -1711,8 +1900,9 @@ func TestPodWatcher(t *testing.T) {
 	// once the watcher has been established.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	for i := 0; i < 3; i++ {
 		tds.AddPod(tenantID, &tenant.Pod{
@@ -2197,8 +2387,9 @@ func TestAcceptedConnCountMetric(t *testing.T) {
 	// Register the SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),
@@ -2286,8 +2477,9 @@ func TestCurConnCountMetric(t *testing.T) {
 	// Register the SQL pod in the directory server.
 	tds := tenantdirsvr.NewTestStaticDirectoryServer(s.Stopper(), nil /* timeSource */)
 	tds.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
+		TenantID:          tenantID.ToUint64(),
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
 	})
 	tds.AddPod(tenantID, &tenant.Pod{
 		TenantID:       tenantID.ToUint64(),

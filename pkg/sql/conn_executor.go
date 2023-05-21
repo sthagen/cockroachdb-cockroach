@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -1357,6 +1358,9 @@ type connExecutor struct {
 		// comprising statements.
 		numRows int
 
+		// validateDbZoneConfig should the DB zone config on commit.
+		validateDbZoneConfig bool
+
 		// txnCounter keeps track of how many SQL txns have been open since
 		// the start of the session. This is used for logging, to
 		// distinguish statements that belong to separate SQL transactions.
@@ -1914,6 +1918,7 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 	} else {
 		ex.extraTxnState.descCollection.ReleaseAll(ctx)
 		ex.extraTxnState.jobs.reset()
+		ex.extraTxnState.validateDbZoneConfig = false
 		ex.extraTxnState.schemaChangerState.memAcc.Clear(ctx)
 		ex.extraTxnState.schemaChangerState = &SchemaChangerState{
 			mode:   ex.sessionData().NewSchemaChangerMode,
@@ -2888,7 +2893,7 @@ func (ex *connExecutor) setCopyLoggingFields(stmt statements.Statement[tree.Stat
 	ex.planner.stmt = Statement{
 		Statement: stmt,
 	}
-	ann := tree.MakeAnnotations(0)
+	ann := tree.MakeAnnotations(stmt.NumAnnotations)
 	ex.planner.extendedEvalCtx.Context.Annotations = &ann
 	ex.planner.extendedEvalCtx.Context.Placeholders = &tree.PlaceholderInfo{}
 	ex.planner.curPlan.init(&ex.planner.stmt, &ex.planner.instrumentation)
@@ -3294,9 +3299,12 @@ func (ex *connExecutor) setTransactionModes(
 			return err
 		}
 	}
-	// if modes.Isolation != tree.UnspecifiedIsolation {
-	// TODO(rafi): set the isolation level in the transaction state.
-	// }
+	if modes.Isolation != tree.UnspecifiedIsolation {
+		level := txnIsolationLevelToKV(modes.Isolation)
+		if err := ex.state.setIsolationLevel(level); err != nil {
+			return pgerror.WithCandidateCode(err, pgcode.ActiveSQLTransaction)
+		}
+	}
 	rwMode := modes.ReadWriteMode
 	if modes.AsOf.Expr != nil && asOfTs.IsEmpty() {
 		return errors.AssertionFailedf("expected an evaluated AS OF timestamp")
@@ -3313,6 +3321,45 @@ func (ex *connExecutor) setTransactionModes(
 		}
 	}
 	return ex.state.setReadOnlyMode(rwMode)
+}
+
+func txnIsolationLevelToKV(level tree.IsolationLevel) isolation.Level {
+	var ret isolation.Level
+	switch level {
+	case tree.UnspecifiedIsolation:
+		ret = isolation.Serializable
+	case tree.SerializableIsolation:
+		ret = isolation.Serializable
+	case tree.ReadCommittedIsolation:
+		ret = isolation.ReadCommitted
+	default:
+		log.Fatalf(context.Background(), "unknown isolation level: %s", level)
+	}
+	return ret
+}
+
+func kvTxnIsolationLevelToTree(level isolation.Level) tree.IsolationLevel {
+	var ret tree.IsolationLevel
+	switch level {
+	case isolation.Serializable:
+		ret = tree.SerializableIsolation
+	case isolation.ReadCommitted:
+		ret = tree.ReadCommittedIsolation
+	case isolation.Snapshot:
+		// TODO(rafi): handle SNAPSHOT isolation.
+	default:
+		log.Fatalf(context.Background(), "unknown isolation level: %s", level)
+	}
+	return ret
+}
+
+func (ex *connExecutor) txnIsolationLevelWithSessionDefault(
+	level tree.IsolationLevel,
+) isolation.Level {
+	if level == tree.UnspecifiedIsolation {
+		level = tree.IsolationLevel(ex.sessionData().DefaultTxnIsolationLevel)
+	}
+	return txnIsolationLevelToKV(level)
 }
 
 func txnPriorityToProto(mode tree.UserPriority) roachpb.UserPriority {
@@ -3412,14 +3459,15 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			RangeStatsFetcher:              p.execCfg.RangeStatsFetcher,
 			JobsProfiler:                   p,
 		},
-		Tracing:           &ex.sessionTracing,
-		MemMetrics:        &ex.memMetrics,
-		Descs:             ex.extraTxnState.descCollection,
-		TxnModesSetter:    ex,
-		jobs:              ex.extraTxnState.jobs,
-		statsProvider:     ex.server.sqlStats,
-		indexUsageStats:   ex.indexUsageStats,
-		statementPreparer: ex,
+		Tracing:              &ex.sessionTracing,
+		MemMetrics:           &ex.memMetrics,
+		Descs:                ex.extraTxnState.descCollection,
+		TxnModesSetter:       ex,
+		jobs:                 ex.extraTxnState.jobs,
+		validateDbZoneConfig: &ex.extraTxnState.validateDbZoneConfig,
+		statsProvider:        ex.server.sqlStats,
+		indexUsageStats:      ex.indexUsageStats,
+		statementPreparer:    ex,
 	}
 	evalCtx.copyFromExecCfg(ex.server.cfg)
 }

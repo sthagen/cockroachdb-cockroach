@@ -42,7 +42,7 @@ func TestDirectoryErrors(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	dir, dirServer := tenantdirsvr.SetupTestDirectory(t, ctx, stopper, nil /* timeSource */)
+	dir, _ := tenantdirsvr.SetupTestDirectory(t, ctx, stopper, nil /* timeSource */)
 
 	// Fail to find a tenant that does not exist.
 	_, err := dir.LookupTenant(ctx, roachpb.MustMakeTenantID(1000))
@@ -57,17 +57,8 @@ func TestDirectoryErrors(t *testing.T) {
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 1002 not in directory cache")
 
 	// Fail to find tenant that does not exist.
-	_, err = dir.LookupTenantPods(ctx, roachpb.MustMakeTenantID(1000), "")
+	_, err = dir.LookupTenantPods(ctx, roachpb.MustMakeTenantID(1000))
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant does not exist")
-
-	// Fail to find tenant when cluster name doesn't match.
-	tenantID := roachpb.MustMakeTenantID(10)
-	dirServer.CreateTenant(tenantID, &tenant.Tenant{
-		TenantID:    tenantID.ToUint64(),
-		ClusterName: "tenant-cluster",
-	})
-	_, err = dir.LookupTenantPods(ctx, tenantID, "unknown")
-	require.EqualError(t, err, "rpc error: code = NotFound desc = cluster name unknown doesn't match expected tenant-cluster")
 
 	// No-op when reporting failure for tenant that doesn't exit.
 	require.NoError(t, dir.ReportFailure(ctx, roachpb.MustMakeTenantID(1000), ""))
@@ -99,19 +90,21 @@ func TestWatchTenants(t *testing.T) {
 	// it before.
 	tenantID := roachpb.MustMakeTenantID(20)
 	baseTenant := &tenant.Tenant{
-		Version:          "010",
-		TenantID:         tenantID.ToUint64(),
-		ClusterName:      "my-tenant",
-		PrivateEndpoints: []string{"a"},
+		Version:                 "010",
+		TenantID:                tenantID.ToUint64(),
+		ClusterName:             "my-tenant",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16"},
+		AllowedPrivateEndpoints: []string{"a"},
 	}
 	tds.CreateTenant(tenantID, baseTenant)
 	resp := <-tenantWatcher
 	require.Equal(t, tenant.EVENT_ADDED, resp.Type)
 	require.Equal(t, &tenant.Tenant{
-		Version:          "010",
-		TenantID:         20,
-		ClusterName:      "my-tenant",
-		PrivateEndpoints: []string{"a"},
+		Version:                 "010",
+		TenantID:                20,
+		ClusterName:             "my-tenant",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16"},
+		AllowedPrivateEndpoints: []string{"a"},
 	}, resp.Tenant)
 	_, err := dir.TryLookupTenantPods(ctx, tenantID)
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 20 not in directory cache")
@@ -120,18 +113,20 @@ func TestWatchTenants(t *testing.T) {
 	tenantObj, err := dir.LookupTenant(ctx, tenantID)
 	require.NoError(t, err)
 	require.Equal(t, &tenant.Tenant{
-		Version:          "010",
-		TenantID:         20,
-		ClusterName:      "my-tenant",
-		PrivateEndpoints: []string{"a"},
+		Version:                 "010",
+		TenantID:                20,
+		ClusterName:             "my-tenant",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16"},
+		AllowedPrivateEndpoints: []string{"a"},
 	}, tenantObj)
 
 	// Update the tenant object.
 	updatedTenant := &tenant.Tenant{
-		Version:          "011",
-		TenantID:         20,
-		ClusterName:      "foo-bar",
-		PrivateEndpoints: []string{"a", "b"},
+		Version:                 "011",
+		TenantID:                20,
+		ClusterName:             "foo-bar",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16", "0.0.0.0/0"},
+		AllowedPrivateEndpoints: []string{"a", "b"},
 	}
 	tds.UpdateTenant(tenantID, updatedTenant)
 	resp = <-tenantWatcher
@@ -142,10 +137,11 @@ func TestWatchTenants(t *testing.T) {
 	tenantObj, err = dir.LookupTenant(ctx, tenantID)
 	require.NoError(t, err)
 	require.Equal(t, &tenant.Tenant{
-		Version:          "011",
-		TenantID:         20,
-		ClusterName:      "foo-bar",
-		PrivateEndpoints: []string{"a", "b"},
+		Version:                 "011",
+		TenantID:                20,
+		ClusterName:             "foo-bar",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16", "0.0.0.0/0"},
+		AllowedPrivateEndpoints: []string{"a", "b"},
 	}, tenantObj)
 
 	// Update the tenant object with an old version.
@@ -163,10 +159,11 @@ func TestWatchTenants(t *testing.T) {
 	tenantObj, err = dir.LookupTenant(ctx, tenantID)
 	require.NoError(t, err)
 	require.Equal(t, &tenant.Tenant{
-		Version:          "011",
-		TenantID:         20,
-		ClusterName:      "foo-bar",
-		PrivateEndpoints: []string{"a", "b"},
+		Version:                 "011",
+		TenantID:                20,
+		ClusterName:             "foo-bar",
+		AllowedCIDRRanges:       []string{"127.0.0.1/16", "0.0.0.0/0"},
+		AllowedPrivateEndpoints: []string{"a", "b"},
 	}, tenantObj)
 
 	// Finally, delete the tenant.
@@ -213,12 +210,13 @@ func TestWatchTenants(t *testing.T) {
 		if tds.WatchTenantsListenersCount() != 0 {
 			return errors.New("watchers have not been removed yet")
 		}
+
+		// Make sure watcher has attempted to restart, and invalidates entries.
+		if _, err := dir.LookupTenant(ctx, tenant10); err == nil {
+			return errors.New("entries have not been invalidated")
+		}
 		return nil
 	})
-
-	// Entry was invalidated.
-	_, err = dir.LookupTenant(ctx, tenant10)
-	require.Regexp(t, "directory server has not been started", err.Error())
 
 	// Trigger events, which will be missed by the tenant watcher.
 	tds.DeleteTenant(tenant10)
@@ -347,7 +345,7 @@ func TestWatchPods(t *testing.T) {
 	// that we attempted to call EnsurePod in the test directory server because
 	// the cache has no running pods. In the actual directory server, this
 	// should put the draining pod back to running.
-	pods, err = dir.LookupTenantPods(ctx, tenantID, "my-tenant")
+	pods, err = dir.LookupTenantPods(ctx, tenantID)
 	require.Regexp(t, "tenant has no pods", err)
 	require.Empty(t, pods)
 
@@ -394,7 +392,7 @@ func TestCancelLookups(t *testing.T) {
 	for i := 0; i < lookupCount; i++ {
 		wait.Add(1)
 		go func(i int) {
-			_, backgroundErrors[i] = dir.LookupTenantPods(ctx, tenantID, "")
+			_, backgroundErrors[i] = dir.LookupTenantPods(ctx, tenantID)
 			wait.Done()
 		}(i)
 	}
@@ -432,7 +430,7 @@ func TestResume(t *testing.T) {
 	for i := 0; i < lookupCount; i++ {
 		wait.Add(1)
 		go func(i int) {
-			pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+			pods, err := dir.LookupTenantPods(ctx, tenantID)
 			require.NoError(t, err)
 			addrs[i] = pods[0].Addr
 			wait.Done()
@@ -471,7 +469,7 @@ func TestDeleteTenant(t *testing.T) {
 	require.NoError(t, createTenant(tc, tenantID))
 
 	// Perform lookup to create entry in cache.
-	pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+	pods, err := dir.LookupTenantPods(ctx, tenantID)
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr := pods[0].Addr
@@ -479,11 +477,15 @@ func TestDeleteTenant(t *testing.T) {
 	// LookupTenant should work.
 	ten, err := dir.LookupTenant(ctx, tenantID)
 	require.NoError(t, err)
-	require.Equal(t, &tenant.Tenant{TenantID: 50, ClusterName: "tenant-cluster"}, ten)
+	require.Equal(t, &tenant.Tenant{
+		TenantID:          50,
+		ClusterName:       "tenant-cluster",
+		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+	}, ten)
 
 	// Report failure even though tenant is healthy - refresh should do nothing.
 	require.NoError(t, dir.ReportFailure(ctx, tenantID, addr))
-	pods, err = dir.LookupTenantPods(ctx, tenantID, "")
+	pods, err = dir.LookupTenantPods(ctx, tenantID)
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr = pods[0].Addr
@@ -509,7 +511,7 @@ func TestDeleteTenant(t *testing.T) {
 
 	// Now LookupTenantPods should return an error and the directory should no
 	// longer cache the tenant.
-	_, err = dir.LookupTenantPods(ctx, tenantID, "")
+	_, err = dir.LookupTenantPods(ctx, tenantID)
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 50 not found")
 	pods, err = dir.TryLookupTenantPods(ctx, tenantID)
 	require.EqualError(t, err, "rpc error: code = NotFound desc = tenant 50 not in directory cache")
@@ -533,7 +535,7 @@ func TestRefreshThrottling(t *testing.T) {
 	require.NoError(t, createTenant(tc, tenantID))
 
 	// Perform lookup to create entry in cache.
-	pods, err := dir.LookupTenantPods(ctx, tenantID, "")
+	pods, err := dir.LookupTenantPods(ctx, tenantID)
 	require.NoError(t, err)
 	require.NotEmpty(t, pods)
 	addr := pods[0].Addr

@@ -261,6 +261,11 @@ func getSink(
 			}
 		case isCloudStorageSink(u):
 			return validateOptionsAndMakeSink(changefeedbase.CloudStorageValidOptions, func() (Sink, error) {
+				var testingKnobs *TestingKnobs
+				if knobs, ok := serverCfg.TestingKnobs.Changefeed.(*TestingKnobs); ok {
+					testingKnobs = knobs
+				}
+
 				// Placeholder id for canary sink
 				var nodeID base.SQLInstanceID = 0
 				if serverCfg.NodeID != nil {
@@ -268,7 +273,7 @@ func getSink(
 				}
 				return makeCloudStorageSink(
 					ctx, sinkURL{URL: u}, nodeID, serverCfg.Settings, encodingOpts,
-					timestampOracle, serverCfg.ExternalStorageFromURI, user, metricsBuilder,
+					timestampOracle, serverCfg.ExternalStorageFromURI, user, metricsBuilder, testingKnobs,
 				)
 			})
 		case u.Scheme == changefeedbase.SinkSchemeExperimentalSQL:
@@ -307,6 +312,9 @@ func getSink(
 func validateSinkOptions(opts map[string]string, sinkSpecificOpts map[string]struct{}) error {
 	for opt := range opts {
 		if _, ok := changefeedbase.CommonOptions[opt]; ok {
+			continue
+		}
+		if _, retired := changefeedbase.RetiredOptions[opt]; retired {
 			continue
 		}
 		if sinkSpecificOpts != nil {

@@ -439,6 +439,41 @@ is directly or indirectly a member of the admin role) executes a query.
 | `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
 | `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
 
+### `role_based_audit_event`
+
+An event of type `role_based_audit_event` is an audit event recorded when an executed query belongs to a user whose role
+membership(s) correspond to any role that is enabled to emit an audit log via the sql.log.user_audit
+cluster setting.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Role` | The configured audit role that emitted this log. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Timestamp` | The timestamp of the event. Expressed as nanoseconds since the Unix epoch. | no |
+| `EventType` | The type of the event. | no |
+| `Statement` | A normalized copy of the SQL statement that triggered the event. The statement string contains a mix of sensitive and non-sensitive details (it is redactable). | partially |
+| `Tag` | The statement tag. This is separate from the statement string, since the statement string can contain sensitive information. The tag is guaranteed not to. | no |
+| `User` | The user account that triggered the event. The special usernames `root` and `node` are not considered sensitive. | depends |
+| `DescriptorID` | The primary object descriptor affected by the operation. Set to zero for operations that don't affect descriptors. | no |
+| `ApplicationName` | The application name for the session where the event was emitted. This is included in the event to ease filtering of logging output by application. | no |
+| `PlaceholderValues` | The mapping of SQL placeholders to their values, for prepared statements. | yes |
+| `ExecMode` | How the statement was being executed (exec/prepare, etc.) | no |
+| `NumRows` | Number of rows returned. For mutation statements (INSERT, etc) that do not produce result rows, this field reports the number of rows affected. | no |
+| `SQLSTATE` | The SQLSTATE code for the error, if an error was encountered. Empty/omitted if no error. | no |
+| `ErrorText` | The text of the error if any. | partially |
+| `Age` | Age of the query in milliseconds. | no |
+| `NumRetries` | Number of retries, when the txn was reretried automatically by the server. | no |
+| `FullTableScan` | Whether the query contains a full table scan. | no |
+| `FullIndexScan` | Whether the query contains a full secondary index scan of a non-partial index. | no |
+| `TxnCounter` | The sequence number of the SQL transaction inside its session. | no |
+| `BulkJobId` | The job id for bulk job (IMPORT/BACKUP/RESTORE). | no |
+
 ### `sensitive_table_access`
 
 An event of type `sensitive_table_access` is recorded when an access is performed to
@@ -2093,7 +2128,7 @@ Events of this type are only emitted when the cluster setting
 | Field | Description | Sensitive |
 |--|--|--|
 | `Reason` | The reason for the authentication failure. See below for possible values for type `AuthFailReason`. | no |
-| `Detail` | The detailed error for the authentication failure. | yes |
+| `Detail` | The detailed error for the authentication failure. | partially |
 | `Method` | The authentication method used. | no |
 
 
@@ -2673,6 +2708,7 @@ Note that because stats are scoped to the lifetime of the process, counters
 | `FlushIngestCount` |  | no |
 | `FlushIngestTableCount` |  | no |
 | `FlushIngestTableBytes` |  | no |
+| `IngestCount` | ingest_count is the number of successful ingest operations (counter). | no |
 | `MemtableSize` | memtable_size is the total size allocated to all memtables and (large) batches, in bytes (gauge). | no |
 | `MemtableCount` | memtable_count is the count of memtables (gauge). | no |
 | `MemtableZombieCount` | memtable_zombie_count is the count of memtables no longer referenced by the current DB state, but still in use by an iterator (gauge). | no |
@@ -2921,6 +2957,7 @@ contains common SQL event/execution details.
 | `MaxMemUsage` | The maximum amount of memory usage by nodes for this query. | no |
 | `MaxDiskUsage` | The maximum amount of disk usage by nodes for this query. | no |
 | `KVBytesRead` | The number of bytes read at the KV layer for this query. | no |
+| `KVPairsRead` | The number of key-value pairs read at the KV layer for this query. | no |
 | `KVRowsRead` | The number of rows read at the KV layer for this query. | no |
 | `NetworkMessages` | The number of network messages sent by nodes for this query. | no |
 | `IndexRecommendations` | Generated index recommendations for this query. | no |

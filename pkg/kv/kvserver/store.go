@@ -311,7 +311,8 @@ func newRaftConfig(
 		Storage:                   strg,
 		Logger:                    logger,
 
-		PreVote: true,
+		PreVote:     true,
+		CheckQuorum: storeCfg.RaftEnableCheckQuorum,
 	}
 }
 
@@ -1226,9 +1227,12 @@ func (sc *StoreConfig) SetDefaults(numStores int) {
 	if sc.RaftEntryCacheSize == 0 {
 		sc.RaftEntryCacheSize = defaultRaftEntryCacheSize
 	}
-	if envutil.EnvOrDefaultBool("COCKROACH_DISABLE_LEADER_FOLLOWS_LEASEHOLDER", false) {
+	if raftDisableLeaderFollowsLeaseholder {
 		sc.TestingKnobs.DisableLeaderFollowsLeaseholder = true
 		sc.TestingKnobs.AllowLeaseRequestProposalsWhenNotLeader = true // otherwise lease requests fail
+	}
+	if raftDisableQuiescence {
+		sc.TestingKnobs.DisableQuiescence = true
 	}
 }
 
@@ -2888,6 +2892,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		leaseHolderCount              int64
 		leaseExpirationCount          int64
 		leaseEpochCount               int64
+		leaseLivenessCount            int64
 		raftLeaderNotLeaseHolderCount int64
 		raftLeaderInvalidLeaseCount   int64
 		quiescentCount                int64
@@ -2959,6 +2964,9 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 			case roachpb.LeaseEpoch:
 				leaseEpochCount++
 			}
+			if metrics.LivenessLease {
+				leaseLivenessCount++
+			}
 		}
 		if metrics.Quiescent {
 			quiescentCount++
@@ -3017,6 +3025,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.LeaseHolderCount.Update(leaseHolderCount)
 	s.metrics.LeaseExpirationCount.Update(leaseExpirationCount)
 	s.metrics.LeaseEpochCount.Update(leaseEpochCount)
+	s.metrics.LeaseLivenessCount.Update(leaseLivenessCount)
 	s.metrics.QuiescentCount.Update(quiescentCount)
 	s.metrics.UninitializedCount.Update(uninitializedCount)
 	s.metrics.AverageQueriesPerSecond.Update(averageQueriesPerSecond)

@@ -39,6 +39,7 @@ var (
 	extendLifetime        time.Duration
 	wipePreserveCerts     bool
 	grafanaConfig         string
+	grafanaArch           string
 	grafanaurlOpen        bool
 	grafanaDumpDir        string
 	listDetails           bool
@@ -78,6 +79,8 @@ var (
 
 	// hostCluster is used for multi-tenant functionality.
 	hostCluster string
+
+	revertUpdate bool
 )
 
 func initFlags() {
@@ -107,8 +110,9 @@ func initFlags() {
 			vm.AllProviderNames()))
 	createCmd.Flags().BoolVar(&createVMOpts.GeoDistributed,
 		"geo", false, "Create geo-distributed cluster")
-	createCmd.Flags().BoolVar(&createVMOpts.EnableFIPS,
-		"fips", false, "Enable FIPS mode (uses custom AMI)")
+	createCmd.Flags().StringVar(&createVMOpts.Arch, "arch", "",
+		"architecture override for VM [amd64, arm64, fips]; N.B. fips implies amd64 with openssl")
+
 	// N.B. We set "usage=roachprod" as the default, custom label for billing tracking.
 	createCmd.Flags().StringToStringVar(&createVMOpts.CustomLabels,
 		"label", map[string]string{"usage": "roachprod"},
@@ -258,6 +262,9 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 	grafanaStartCmd.Flags().StringVar(&grafanaConfig,
 		"grafana-config", "", "URI to grafana json config, supports local and http(s) schemes")
 
+	grafanaStartCmd.Flags().StringVar(&grafanaArch, "arch", "",
+		"binary architecture override [amd64, arm64]")
+
 	grafanaURLCmd.Flags().BoolVar(&grafanaurlOpen,
 		"open", false, "open the grafana dashboard url on the browser")
 
@@ -302,6 +309,9 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 		"the volume type that should be created. Provide a volume type that is connected to"+
 			" the provider chosen for the cluster. If no volume type is provided the provider default will be used. "+
 			"Note: This volume will be deleted once the VM is deleted.")
+
+	updateCmd.Flags().BoolVar(&revertUpdate, "revert", false, "restore roachprod to the previous version "+
+		"which would have been renamed to roachprod.bak during the update process")
 
 	for _, cmd := range []*cobra.Command{createCmd, destroyCmd, extendCmd, logsCmd} {
 		cmd.Flags().StringVarP(&username, "username", "u", os.Getenv("ROACHPROD_USER"),

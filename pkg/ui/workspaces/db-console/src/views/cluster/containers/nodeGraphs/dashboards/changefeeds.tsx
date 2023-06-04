@@ -11,19 +11,32 @@
 import React from "react";
 
 import LineGraph from "src/views/cluster/components/linegraph";
-import { Metric, Axis } from "src/views/shared/components/metricQuery";
+import { Axis, Metric } from "src/views/shared/components/metricQuery";
 import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
-import { GraphDashboardProps } from "./dashboardUtils";
+import {
+  GraphDashboardProps,
+  nodeDisplayName,
+  storeIDsForNode,
+} from "./dashboardUtils";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import TimeSeriesQueryAggregator = cockroach.ts.tspb.TimeSeriesQueryAggregator;
 
 export default function (props: GraphDashboardProps) {
-  const { storeSources } = props;
+  const {
+    storeSources,
+    nodeIDs,
+    nodeDisplayNameByID,
+    storeIDsByNodeID,
+    tenantSource,
+  } = props;
 
   return [
     <LineGraph
       title="Max Changefeed Latency"
       isKvGraph={false}
       sources={storeSources}
+      tenantSource={tenantSource}
     >
       <Axis units={AxisUnits.Duration} label="time">
         <Metric
@@ -39,6 +52,7 @@ export default function (props: GraphDashboardProps) {
       title="Sink Byte Traffic"
       isKvGraph={false}
       sources={storeSources}
+      tenantSource={tenantSource}
     >
       <Axis units={AxisUnits.Bytes} label="bytes">
         <Metric
@@ -49,7 +63,12 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Sink Counts" isKvGraph={false} sources={storeSources}>
+    <LineGraph
+      title="Sink Counts"
+      isKvGraph={false}
+      sources={storeSources}
+      tenantSource={tenantSource}
+    >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
           name="cr.node.changefeed.emitted_messages"
@@ -64,7 +83,12 @@ export default function (props: GraphDashboardProps) {
       </Axis>
     </LineGraph>,
 
-    <LineGraph title="Sink Timings" isKvGraph={false} sources={storeSources}>
+    <LineGraph
+      title="Sink Timings"
+      isKvGraph={false}
+      sources={storeSources}
+      tenantSource={tenantSource}
+    >
       <Axis units={AxisUnits.Duration} label="time">
         <Metric
           name="cr.node.changefeed.emit_nanos"
@@ -83,6 +107,7 @@ export default function (props: GraphDashboardProps) {
       title="Changefeed Restarts"
       isKvGraph={false}
       sources={storeSources}
+      tenantSource={tenantSource}
     >
       <Axis units={AxisUnits.Count} label="actions">
         <Metric
@@ -90,6 +115,39 @@ export default function (props: GraphDashboardProps) {
           title="Retryable Errors"
           nonNegativeRate
         />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Ranges in catchup mode"
+      isKvGraph={false}
+      sources={storeSources}
+      tooltip="Total number of ranges with an active rangefeed that are performing catchup scan"
+    >
+      <Axis units={AxisUnits.Count} label="ranges">
+        <Metric
+          name="cr.node.distsender.rangefeed.catchup_ranges"
+          title="Ranges"
+          aggregator={TimeSeriesQueryAggregator.SUM}
+        />
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="RangeFeed catchup scans duration"
+      isKvGraph={false}
+      sources={storeSources}
+    >
+      <Axis units={AxisUnits.Duration} label="duration">
+        {nodeIDs.map(nid => (
+          <Metric
+            key={nid}
+            name="cr.store.kv.rangefeed.catchup_scan_nanos"
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
+            nonNegativeRate
+          />
+        ))}
       </Axis>
     </LineGraph>,
   ];

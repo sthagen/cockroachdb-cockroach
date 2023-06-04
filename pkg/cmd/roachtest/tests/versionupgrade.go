@@ -98,9 +98,6 @@ DROP TABLE splitmerge.t;
 }
 
 func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
-	if c.IsLocal() && runtime.GOARCH == "arm64" {
-		t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
-	}
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.All())
 	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All())
 	mvt.OnStartup("setup schema changer workload", func(ctx context.Context, l *logger.Logger, r *rand.Rand, helper *mixedversion.Helper) error {
@@ -136,32 +133,6 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runCmd := roachtestutil.NewCommand("./workload run schemachange").Flag("verbose", 1).Flag("max-ops", 10).Flag("concurrency", 2).Arg("{pgurl:1-%d}", len(c.All()))
 			randomNode := h.RandomNode(rng, c.All())
 			return c.RunE(ctx, option.NodeListOption{randomNode}, runCmd.String())
-		},
-	)
-	mvt.AfterUpgradeFinalized(
-		"check if GC TTL is pinned",
-		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
-			// TODO(irfansharif): This can be removed when the predecessor version
-			// in this test is v23.1, where the default is 4h. This test was only to
-			// make sure that existing clusters that upgrade to 23.1 retained their
-			// existing GC TTL.
-			l.Printf("checking if GC TTL is pinned to 24h")
-			var ttlSeconds int
-			query := `
-	SELECT
-		(crdb_internal.pb_to_json('cockroach.config.zonepb.ZoneConfig', raw_config_protobuf)->'gc'->'ttlSeconds')::INT
-	FROM crdb_internal.zones
-	WHERE target = 'RANGE default'
-	LIMIT 1
-`
-			if err := h.QueryRow(rng, query).Scan(&ttlSeconds); err != nil {
-				return fmt.Errorf("error querying GC TTL: %w", err)
-			}
-			expectedTTL := 24 * 60 * 60 // NB: 24h is what's used in the fixture
-			if ttlSeconds != expectedTTL {
-				return fmt.Errorf("unexpected GC TTL: actual (%d) != expected (%d)", ttlSeconds, expectedTTL)
-			}
-			return nil
 		},
 	)
 

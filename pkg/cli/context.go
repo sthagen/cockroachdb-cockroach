@@ -368,7 +368,9 @@ func setZipContextDefaults() {
 	zipCtx.files = fileSelection{}
 	zipCtx.redactLogs = false
 	zipCtx.redact = false
-	zipCtx.includeRangeInfo = false // we omit range info by default to keep lightweight debug zips
+	// Even though it makes debug.zip heavyweight, range infos are often the best source
+	// of information for range-level issues and so they are opt-out, not opt-in.
+	zipCtx.includeRangeInfo = true
 	zipCtx.cpuProfDuration = 5 * time.Second
 	zipCtx.concurrency = 15
 
@@ -629,8 +631,8 @@ var demoCtx = struct {
 // test that exercises command-line parsing.
 func setDemoContextDefaults() {
 	demoCtx.NumNodes = 1
-	demoCtx.SQLPoolMemorySize = 128 << 20 // 128MB, chosen to fit 9 nodes on 2GB machine.
-	demoCtx.CacheSize = 64 << 20          // 64MB, chosen to fit 9 nodes on 2GB machine.
+	demoCtx.SQLPoolMemorySize = 256 << 20 // 256MiB, chosen to fit 9 nodes on 4GB machine.
+	demoCtx.CacheSize = 64 << 20          // 64MiB, chosen to fit 9 nodes on 4GB machine.
 	demoCtx.UseEmptyDatabase = false
 	demoCtx.SimulateLatency = false
 	demoCtx.RunWorkload = false

@@ -26,6 +26,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
@@ -277,6 +278,14 @@ hosts file.
 				return err
 			}
 		} else {
+			machineType := func(clusterVMs vm.List) string {
+				res := clusterVMs[0].MachineType
+				// Display CPU architecture, other than amd64 (default).
+				if arch := clusterVMs[0].Labels["arch"]; arch != "" && arch != string(vm.ArchAMD64) {
+					res += fmt.Sprintf(" [%s]", arch)
+				}
+				return res
+			}
 			// Align columns left and separate with at least two spaces.
 			tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', tabwriter.AlignRight)
 			// N.B. colors use escape codes which don't play nice with tabwriter [1].
@@ -304,7 +313,7 @@ hosts file.
 					// N.B. Tabwriter doesn't support per-column alignment. It looks odd to have the cluster names right-aligned,
 					// so we make it left-aligned.
 					fmt.Fprintf(tw, "%s\t%s\t%d\t%s", name+strings.Repeat(" ", maxClusterName-len(name)), c.Clouds(),
-						len(c.VMs), c.VMs[0].MachineType)
+						len(c.VMs), machineType(c.VMs))
 					if !c.IsLocal() {
 						colorByCostBucket := func(cost float64) func(string, ...interface{}) string {
 							switch {
@@ -987,7 +996,7 @@ var getProvidersCmd = &cobra.Command{
 
 var grafanaStartCmd = &cobra.Command{
 	Use:   `grafana-start <cluster>`,
-	Short: `spins up a prometheus and grafana instance on the last node in the cluster`,
+	Short: `spins up a prometheus and grafana instance on the last node in the cluster; NOTE: for arm64 clusters, use --arch arm64`,
 	Args:  cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
 		var grafanaDashboardJSONs []string
@@ -1015,8 +1024,11 @@ var grafanaStartCmd = &cobra.Command{
 				return err
 			}
 		}
-
-		return roachprod.StartGrafana(context.Background(), config.Logger, args[0],
+		arch := vm.ArchAMD64
+		if grafanaArch == "arm64" {
+			arch = vm.ArchARM64
+		}
+		return roachprod.StartGrafana(context.Background(), config.Logger, args[0], arch,
 			grafanaConfigURL, grafanaDashboardJSONs, nil)
 	}),
 }
@@ -1271,16 +1283,55 @@ func validateAndConfigure(cmd *cobra.Command, args []string) {
 
 	// Validate architecture flag, if set.
 	if archOpt := cmd.Flags().Lookup("arch"); archOpt != nil && archOpt.Changed {
-		arch := strings.ToLower(archOpt.Value.String())
+		arch := vm.CPUArch(strings.ToLower(archOpt.Value.String()))
 
-		if arch != "amd64" && arch != "arm64" && arch != "fips" {
+		if arch != vm.ArchAMD64 && arch != vm.ArchARM64 && arch != vm.ArchFIPS {
 			printErrAndExit(fmt.Errorf("unsupported architecture %q", arch))
 		}
-		if arch != archOpt.Value.String() {
+		if string(arch) != archOpt.Value.String() {
 			// Set the canonical value.
-			_ = cmd.Flags().Set("arch", arch)
+			_ = cmd.Flags().Set("arch", string(arch))
 		}
 	}
+}
+
+var updateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "check TeamCity for a new roachprod binary and update if available",
+	Long: "Will attempt to download the latest master branch roachprod binary from teamcity" +
+		" and swap the current roachprod with it. The current roachprod binary will be backed up" +
+		" and can be restored via `roachprod update --revert`.",
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		currentBinary, err := os.Executable()
+		if err != nil {
+			return err
+		}
+
+		if revertUpdate {
+			if upgrade.PromptYesNo("Revert to previous version? Note: this will replace the" +
+				" current roachprod binary with a previous roachprod.bak binary.") {
+				if err := upgrade.SwapBinary(currentBinary, currentBinary+".bak"); err != nil {
+					return err
+				}
+				fmt.Println("roachprod successfully reverted, run `roachprod -v` to confirm.")
+			}
+			return nil
+		}
+
+		newBinary := currentBinary + ".new"
+		if err := upgrade.DownloadLatestRoadprod(newBinary); err != nil {
+			return err
+		}
+
+		if upgrade.PromptYesNo("Continue with update? This will overwrite any existing roachprod.bak binary.") {
+			if err := upgrade.SwapBinary(currentBinary, newBinary); err != nil {
+				return errors.WithDetail(err, "unable to update binary")
+			}
+
+			fmt.Println("Update successful: run `roachprod -v` to confirm.")
+		}
+		return nil
+	}),
 }
 
 func main() {
@@ -1299,7 +1350,6 @@ func main() {
 		syncCmd,
 		gcCmd,
 		setupSSHCmd,
-
 		statusCmd,
 		monitorCmd,
 		startCmd,
@@ -1333,6 +1383,7 @@ func main() {
 		rootStorageCmd,
 		snapshotCmd,
 		fixLongRunningAWSHostnamesCmd,
+		updateCmd,
 	)
 	setBashCompletionFunction()
 

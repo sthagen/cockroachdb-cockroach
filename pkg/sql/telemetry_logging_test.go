@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtestutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -44,7 +45,7 @@ func TestTelemetryLogging(t *testing.T) {
 	sc := log.ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
-	cleanup := logtestutils.InstallTelemetryLogFileSink(sc, t)
+	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_TELEMETRY)
 	defer cleanup()
 
 	st := logtestutils.StubTime{}
@@ -382,6 +383,7 @@ func TestTelemetryLogging(t *testing.T) {
 				MaxMemUsage:                        9223372036854775807,
 				MaxDiskUsage:                       9223372036854775807,
 				KVBytesRead:                        9223372036854775807,
+				KVPairsRead:                        9223372036854775807,
 				KVRowsRead:                         9223372036854775807,
 				NetworkMessages:                    9223372036854775807,
 				MvccValueBytes:                     9223372036854775807,
@@ -575,6 +577,7 @@ func TestTelemetryLogging(t *testing.T) {
 					require.Equal(t, tc.queryLevelStats.MvccSeeks, sampledQueryFromLog.MvccSeekCount)
 					require.Equal(t, tc.queryLevelStats.MvccValueBytes, sampledQueryFromLog.MvccValueBytes)
 					require.Equal(t, tc.queryLevelStats.MvccSteps, sampledQueryFromLog.MvccStepCount)
+					require.Equal(t, tc.queryLevelStats.KVPairsRead, sampledQueryFromLog.KVPairsRead)
 					require.Equal(t, tc.queryLevelStats.KVBatchRequestsIssued, sampledQueryFromLog.KvGrpcCalls)
 					require.Equal(t, tc.queryLevelStats.KVTime.Nanoseconds(), sampledQueryFromLog.KvTimeNanos)
 
@@ -694,7 +697,7 @@ func TestNoTelemetryLogOnTroubleshootMode(t *testing.T) {
 	sc := log.ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
-	cleanup := logtestutils.InstallTelemetryLogFileSink(sc, t)
+	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_TELEMETRY)
 	defer cleanup()
 
 	st := logtestutils.StubTime{}
@@ -803,7 +806,7 @@ func TestTelemetryLogJoinTypesAndAlgorithms(t *testing.T) {
 	sc := log.ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
-	cleanup := logtestutils.InstallTelemetryLogFileSink(sc, t)
+	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_TELEMETRY)
 	defer cleanup()
 
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -1042,7 +1045,7 @@ func TestTelemetryScanCounts(t *testing.T) {
 	sc := log.ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
-	cleanup := logtestutils.InstallTelemetryLogFileSink(sc, t)
+	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_TELEMETRY)
 	defer cleanup()
 
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -1312,7 +1315,7 @@ func TestFunctionBodyRedacted(t *testing.T) {
 	sc := log.ScopeWithoutShowLogs(t)
 	defer sc.Close(t)
 
-	cleanup := logtestutils.InstallTelemetryLogFileSink(sc, t)
+	cleanup := logtestutils.InstallLogFileSink(sc, t, logpb.Channel_TELEMETRY)
 	defer cleanup()
 
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})

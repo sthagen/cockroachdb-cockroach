@@ -164,6 +164,12 @@ var (
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaLeaseLivenessCount = metric.Metadata{
+		Name:        "leases.liveness",
+		Help:        "Number of replica leaseholders for the liveness range(s)",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Storage metrics.
 	metaLiveBytes = metric.Metadata{
@@ -440,6 +446,14 @@ var (
 		Help: "Number of batches that ran into uncertainty interval errors that were not " +
 			"successfully refreshed server side",
 		Measurement: "KV Transactions",
+		Unit:        metric.Unit_COUNT,
+	}
+
+	//Ingest metrics
+	metaIngestCount = metric.Metadata{
+		Name:        "storage.ingest.count",
+		Help:        "Number of successful ingestions performed",
+		Measurement: "Events",
 		Unit:        metric.Unit_COUNT,
 	}
 
@@ -2022,6 +2036,7 @@ type StoreMetrics struct {
 	LeaseTransferErrorCount   *metric.Counter
 	LeaseExpirationCount      *metric.Gauge
 	LeaseEpochCount           *metric.Gauge
+	LeaseLivenessCount        *metric.Gauge
 
 	// Storage metrics.
 	ResolveCommitCount *metric.Counter
@@ -2317,6 +2332,9 @@ type StoreMetrics struct {
 	AverageLockWaitDurationNanos   *metric.Gauge
 	MaxLockWaitDurationNanos       *metric.Gauge
 	MaxLockWaitQueueWaitersForLock *metric.Gauge
+
+	// Ingestion metrics
+	IngestCount *metric.Gauge
 
 	// Closed timestamp metrics.
 	ClosedTimestampMaxBehindNanos *metric.Gauge
@@ -2653,6 +2671,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		LeaseTransferErrorCount:   metric.NewCounter(metaLeaseTransferErrorCount),
 		LeaseExpirationCount:      metric.NewGauge(metaLeaseExpirationCount),
 		LeaseEpochCount:           metric.NewGauge(metaLeaseEpochCount),
+		LeaseLivenessCount:        metric.NewGauge(metaLeaseLivenessCount),
 
 		// Intent resolution metrics.
 		ResolveCommitCount: metric.NewCounter(metaResolveCommit),
@@ -2755,6 +2774,9 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		BatchCommitL0StallDuration:    metric.NewGauge(metaBatchCommitL0StallDuration),
 		BatchCommitWALRotWaitDuration: metric.NewGauge(metaBatchCommitWALRotDuration),
 		BatchCommitCommitWaitDuration: metric.NewGauge(metaBatchCommitCommitWaitDuration),
+
+		// Ingestion metrics
+		IngestCount: metric.NewGauge(metaIngestCount),
 
 		RdbCheckpoints: metric.NewGauge(metaRdbCheckpoints),
 
@@ -3106,6 +3128,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.FlushableIngestCount.Update(int64(m.Flush.AsIngestCount))
 	sm.FlushableIngestTableCount.Update(int64(m.Flush.AsIngestTableCount))
 	sm.FlushableIngestTableSize.Update(int64(m.Flush.AsIngestBytes))
+	sm.IngestCount.Update(int64(m.Ingest.Count))
 	sm.BatchCommitCount.Update(int64(m.BatchCommitStats.Count))
 	sm.BatchCommitDuration.Update(int64(m.BatchCommitStats.TotalDuration))
 	sm.BatchCommitSemWaitDuration.Update(int64(m.BatchCommitStats.SemaphoreWaitDuration))
@@ -3114,7 +3137,6 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.BatchCommitL0StallDuration.Update(int64(m.BatchCommitStats.L0ReadAmpWriteStallDuration))
 	sm.BatchCommitWALRotWaitDuration.Update(int64(m.BatchCommitStats.WALRotationDuration))
 	sm.BatchCommitCommitWaitDuration.Update(int64(m.BatchCommitStats.CommitWaitDuration))
-
 	// Update the maximum number of L0 sub-levels seen.
 	sm.l0SublevelsTracker.Lock()
 	sm.l0SublevelsTracker.swag.Record(timeutil.Now(), float64(m.Levels[0].Sublevels))

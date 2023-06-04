@@ -1,0 +1,356 @@
+subtest token
+
+token
+----
+rulebasedscanner.String{} false ""
+
+
+token
+  # Just a comment.
+----
+rulebasedscanner.String{} false ""
+
+token
+a b
+----
+rulebasedscanner.String{Value:"a", Quoted:false} false " b"
+
+token
+a,b
+----
+rulebasedscanner.String{Value:"a", Quoted:false} true "b"
+
+token
+a, b
+----
+rulebasedscanner.String{Value:"a", Quoted:false} true " b"
+
+
+token
+a  ,b
+----
+rulebasedscanner.String{Value:"a", Quoted:false} false "  ,b"
+
+token
+abc,def
+----
+rulebasedscanner.String{Value:"abc", Quoted:false} true "def"
+
+token
+"abc",def
+----
+rulebasedscanner.String{Value:"abc", Quoted:true} true "def"
+
+token
+"abc"def
+----
+rulebasedscanner.String{Value:"abc", Quoted:true} false "def"
+
+token
+# abc,def
+----
+rulebasedscanner.String{} false ""
+
+token
+# "abc
+----
+rulebasedscanner.String{} false ""
+
+
+token
+"abc
+----
+error: unterminated quoted string
+
+subtest end
+
+subtest field
+
+field
+----
+[]
+""
+
+field
+  # Just a comment.
+----
+[]
+""
+
+field
+a b c
+----
+[a]
+" b c"
+
+field
+  a  b # c d e
+----
+[a]
+"  b # c d e"
+
+field
+   a,b    
+----
+[a b]
+""
+
+field
+   a,b    c
+----
+[a b]
+"    c"
+
+field
+   a,b,    c
+----
+[a b c]
+""
+
+field
+   a,b    ,c
+----
+[a b]
+"    ,c"
+
+field
+a,"b",c  d
+----
+[a "b" c]
+"  d"
+
+field
+"a",b,c   d
+----
+["a" b c]
+"   d"
+
+field
+"a","b","c"   d
+----
+["a" "b" "c"]
+"   d"
+
+field
+"a, b ,c"   d
+----
+["a, b ,c"]
+"   d"
+
+field
+all,abc
+----
+[all abc]
+""
+
+field
+# all,abc
+----
+[]
+""
+
+field
+all,"abc
+----
+error: unterminated quoted string
+
+subtest end
+
+subtest whitespace
+
+file
+----
+rulebasedscanner.ScannedInput{}
+
+file
+# Just a comment.
+----
+rulebasedscanner.ScannedInput{}
+
+file
+#
+
+    # comment and empty lines
+
+#
+----
+rulebasedscanner.ScannedInput{}
+
+subtest end
+
+subtest whitespace_around_lines
+
+file
+#
+
+a     
+
+#
+----
+rulebasedscanner.ScannedInput{
+    Lines: {
+        {
+            Input:  "a",
+            Tokens: {
+                {
+                    {Value:"a", Quoted:false},
+                },
+            },
+        },
+    },
+    Linenos: {3},
+}
+
+file
+#
+
+      a
+
+#
+----
+rulebasedscanner.ScannedInput{
+    Lines: {
+        {
+            Input:  "a",
+            Tokens: {
+                {
+                    {Value:"a", Quoted:false},
+                },
+            },
+        },
+    },
+    Linenos: {3},
+}
+
+file
+#
+
+      a      
+
+b # tailing comment + whitespace   
+
+#
+----
+rulebasedscanner.ScannedInput{
+    Lines: {
+        {
+            Input:  "a",
+            Tokens: {
+                {
+                    {Value:"a", Quoted:false},
+                },
+            },
+        },
+        {
+            Input:  "b # tailing comment + whitespace",
+            Tokens: {
+                {
+                    {Value:"b", Quoted:false},
+                },
+            },
+        },
+    },
+    Linenos: {3, 5},
+}
+
+subtest end
+
+subtest fields
+
+file
+a b c
+----
+rulebasedscanner.ScannedInput{
+    Lines: {
+        {
+            Input:  "a b c",
+            Tokens: {
+                {
+                    {Value:"a", Quoted:false},
+                },
+                {
+                    {Value:"b", Quoted:false},
+                },
+                {
+                    {Value:"c", Quoted:false},
+                },
+            },
+        },
+    },
+    Linenos: {1},
+}
+
+file
+a b c
+d e
+----
+rulebasedscanner.ScannedInput{
+    Lines: {
+        {
+            Input:  "a b c",
+            Tokens: {
+                {
+                    {Value:"a", Quoted:false},
+                },
+                {
+                    {Value:"b", Quoted:false},
+                },
+                {
+                    {Value:"c", Quoted:false},
+                },
+            },
+        },
+        {
+            Input:  "d e",
+            Tokens: {
+                {
+                    {Value:"d", Quoted:false},
+                },
+                {
+                    {Value:"e", Quoted:false},
+                },
+            },
+        },
+    },
+    Linenos: {1, 2},
+}
+
+file
+#
+
+  a  b # c d e
+
+ d  e # b c
+
+#
+----
+rulebasedscanner.ScannedInput{
+    Lines: {
+        {
+            Input:  "a  b # c d e",
+            Tokens: {
+                {
+                    {Value:"a", Quoted:false},
+                },
+                {
+                    {Value:"b", Quoted:false},
+                },
+            },
+        },
+        {
+            Input:  "d  e # b c",
+            Tokens: {
+                {
+                    {Value:"d", Quoted:false},
+                },
+                {
+                    {Value:"e", Quoted:false},
+                },
+            },
+        },
+    },
+    Linenos: {3, 5},
+}
+
+
+subtest end

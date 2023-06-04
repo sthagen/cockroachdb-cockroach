@@ -29,7 +29,7 @@ import (
 //     indexes by table. For Order By, the index column ordering and column
 //     directions are the same as how it is in the Order By.
 //  2. Add a single-column index on any Range expression, comparison
-//     expression (=, <, >, <=, >=), and IS expression.
+//     expression (=, !=, <, >, <=, >=), IS and IS NOT expression.
 //  3. Add a single-column index on any column that appears in a JOIN predicate.
 //  4. If there exist multiple columns from the same table in a JOIN predicate,
 //     create a single index on all such columns.
@@ -123,8 +123,13 @@ func (ics *indexCandidateSet) categorizeIndexCandidates(expr opt.Expr) {
 	case *memo.EqExpr:
 		ics.addVariableExprIndex(expr.Left, ics.equalCandidates)
 		ics.addVariableExprIndex(expr.Right, ics.equalCandidates)
+	case *memo.NeExpr:
+		ics.addVariableExprIndex(expr.Left, ics.rangeCandidates)
+		ics.addVariableExprIndex(expr.Right, ics.rangeCandidates)
 	case *memo.IsExpr:
 		ics.addVariableExprIndex(expr.Left, ics.equalCandidates)
+	case *memo.IsNotExpr:
+		ics.addVariableExprIndex(expr.Left, ics.rangeCandidates)
 	case *memo.LtExpr:
 		ics.addVariableExprIndex(expr.Left, ics.rangeCandidates)
 		ics.addVariableExprIndex(expr.Right, ics.rangeCandidates)
@@ -139,16 +144,34 @@ func (ics *indexCandidateSet) categorizeIndexCandidates(expr opt.Expr) {
 		ics.addVariableExprIndex(expr.Right, ics.rangeCandidates)
 	case *memo.InnerJoinExpr:
 		ics.addJoinIndexes(expr.On)
+		ics.categorizeIndexCandidates(expr.Left)
+		ics.categorizeIndexCandidates(expr.Right)
+		return
 	case *memo.LeftJoinExpr:
 		ics.addJoinIndexes(expr.On)
+		ics.categorizeIndexCandidates(expr.Left)
+		ics.categorizeIndexCandidates(expr.Right)
+		return
 	case *memo.RightJoinExpr:
 		ics.addJoinIndexes(expr.On)
+		ics.categorizeIndexCandidates(expr.Left)
+		ics.categorizeIndexCandidates(expr.Right)
+		return
 	case *memo.FullJoinExpr:
 		ics.addJoinIndexes(expr.On)
+		ics.categorizeIndexCandidates(expr.Left)
+		ics.categorizeIndexCandidates(expr.Right)
+		return
 	case *memo.SemiJoinExpr:
 		ics.addJoinIndexes(expr.On)
+		ics.categorizeIndexCandidates(expr.Left)
+		ics.categorizeIndexCandidates(expr.Right)
+		return
 	case *memo.AntiJoinExpr:
 		ics.addJoinIndexes(expr.On)
+		ics.categorizeIndexCandidates(expr.Left)
+		ics.categorizeIndexCandidates(expr.Right)
+		return
 	case *memo.UnionExpr:
 		ics.addSetOperationIndexes(expr.LeftCols, expr.RightCols)
 	case *memo.IntersectExpr:

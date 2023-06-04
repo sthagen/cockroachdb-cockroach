@@ -49,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
@@ -111,6 +112,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -1309,6 +1311,9 @@ type ExecutorConfig struct {
 	// Role membership cache.
 	RoleMemberCache *MembershipCache
 
+	// Client cert expiration cache.
+	ClientCertExpirationCache *security.ClientCertExpirationCache
+
 	// SessionInitCache cache; contains information used during authentication
 	// and per-role default settings.
 	SessionInitCache *sessioninit.Cache
@@ -1763,6 +1768,8 @@ type StreamingTestingKnobs struct {
 	// CutoverProgressShouldUpdate overrides the standard logic
 	// for whether the job record is updated on a progress update.
 	CutoverProgressShouldUpdate func() bool
+
+	DistSQLRetryPolicy *retry.Options
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -2554,7 +2561,7 @@ func (st *SessionTracing) TraceRetryInformation(ctx context.Context, retries int
 
 // TraceExecStart conditionally emits a trace message at the moment
 // plan execution starts.
-func (st *SessionTracing) TraceExecStart(ctx context.Context, engine string) {
+func (st *SessionTracing) TraceExecStart(ctx context.Context, engine redact.SafeString) {
 	log.VEventfDepth(ctx, 2, 1, "execution starts: %s engine", engine)
 }
 

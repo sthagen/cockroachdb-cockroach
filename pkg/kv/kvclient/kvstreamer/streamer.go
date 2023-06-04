@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/bitmap"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -287,6 +288,7 @@ type Streamer struct {
 
 type streamerStatistics struct {
 	atomics struct {
+		kvPairsRead         *int64
 		batchRequestsIssued *int64
 		// resumeBatchRequests tracks the number of BatchRequests created for
 		// the ResumeSpans throughout the lifetime of the Streamer.
@@ -350,8 +352,11 @@ func max(a, b int64) int64 {
 // to interact with the account only after canceling the Streamer (because
 // memory accounts are not thread-safe).
 //
-// batchRequestsIssued should be incremented every time a new BatchRequest is
-// sent.
+// kvPairsRead should be incremented atomically with the sum of NumKeys
+// parameters of all received responses.
+//
+// batchRequestsIssued should be incremented atomically every time a new
+// BatchRequest is sent.
 func NewStreamer(
 	distSender *kvcoord.DistSender,
 	stopper *stop.Stopper,
@@ -360,6 +365,7 @@ func NewStreamer(
 	lockWaitPolicy lock.WaitPolicy,
 	limitBytes int64,
 	acc *mon.BoundAccount,
+	kvPairsRead *int64,
 	batchRequestsIssued *int64,
 	keyLocking lock.Strength,
 ) *Streamer {
@@ -372,9 +378,13 @@ func NewStreamer(
 		budget:     newBudget(acc, limitBytes),
 		keyLocking: keyLocking,
 	}
+	if kvPairsRead == nil {
+		kvPairsRead = new(int64)
+	}
 	if batchRequestsIssued == nil {
 		batchRequestsIssued = new(int64)
 	}
+	s.atomics.kvPairsRead = kvPairsRead
 	s.atomics.batchRequestsIssued = batchRequestsIssued
 	s.coordinator = workerCoordinator{
 		s:                      s,
@@ -599,14 +609,20 @@ func (s *Streamer) Enqueue(ctx context.Context, reqs []kvpb.RequestUnion) (retEr
 			}
 		}
 
+		var isScanStarted *bitmap.Bitmap
+		if numScansInReqs > 0 {
+			isScanStarted = bitmap.NewBitmap(len(reqs))
+		}
 		numGetsInReqs := int64(len(singleRangeReqs)) - numScansInReqs
 		overheadAccountedFor := requestUnionSliceOverhead + requestUnionOverhead*int64(cap(singleRangeReqs)) + // reqs
 			intSliceOverhead + intSize*int64(cap(positions)) + // positions
-			subRequestIdxOverhead // subRequestIdx
+			subRequestIdxOverhead + // subRequestIdx
+			isScanStarted.MemUsage() // isScanStarted
 		r := singleRangeBatch{
 			reqs:                 singleRangeReqs,
 			positions:            positions,
 			subRequestIdx:        subRequestIdx,
+			isScanStarted:        isScanStarted,
 			numGetsInReqs:        numGetsInReqs,
 			reqsReservedBytes:    requestsMemUsage(singleRangeReqs),
 			overheadAccountedFor: overheadAccountedFor,
@@ -854,12 +870,13 @@ func (w *workerCoordinator) logStatistics(ctx context.Context) {
 	avgResponseSize, _ := w.getAvgResponseSize()
 	log.VEventf(
 		ctx, 1,
-		"enqueueCalls=%d enqueuedRequests=%d enqueuedSingleRangeRequests=%d "+
+		"enqueueCalls=%d enqueuedRequests=%d enqueuedSingleRangeRequests=%d kvPairsRead=%d "+
 			"batchRequestsIssued=%d resumeBatchRequests=%d resumeSingleRangeRequests=%d "+
 			"numSpilledResults=%d emptyBatchResponses=%d droppedBatchResponses=%d avgResponseSize=%s",
 		w.s.enqueueCalls,
 		w.s.enqueuedRequests,
 		w.s.enqueuedSingleRangeRequests,
+		atomic.LoadInt64(w.s.atomics.kvPairsRead),
 		atomic.LoadInt64(w.s.atomics.batchRequestsIssued),
 		atomic.LoadInt64(&w.s.atomics.resumeBatchRequests),
 		atomic.LoadInt64(&w.s.atomics.resumeSingleRangeRequests),
@@ -1263,6 +1280,7 @@ func (w *workerCoordinator) performRequestAsync(
 				w.s.results.setError(err)
 				return
 			}
+			atomic.AddInt64(w.s.atomics.kvPairsRead, fp.kvPairsRead)
 
 			// Now adjust the budget based on the actual memory footprint of
 			// non-empty responses as well as resume spans, if any.
@@ -1371,6 +1389,12 @@ type singleRangeBatchResponseFootprint struct {
 	// need to be created for Get and Scan responses, respectively.
 	numGetResults, numScanResults         int
 	numIncompleteGets, numIncompleteScans int
+	// numStartedScans indicates how many Scan requests were just started. If a
+	// Scan response was received due to a Scan request that was the "resume"
+	// request (i.e. the pagination of the previous request), it's not included
+	// in this number.
+	numStartedScans int
+	kvPairsRead     int64
 }
 
 func (fp singleRangeBatchResponseFootprint) hasResults() bool {
@@ -1388,6 +1412,7 @@ func calculateFootprint(
 ) (fp singleRangeBatchResponseFootprint, _ error) {
 	for i, resp := range br.Responses {
 		reply := resp.GetInner()
+		fp.kvPairsRead += reply.Header().NumKeys
 		switch req.reqs[i].GetInner().(type) {
 		case *kvpb.GetRequest:
 			get := reply.(*kvpb.GetResponse)
@@ -1424,6 +1449,12 @@ func calculateFootprint(
 			if len(scan.BatchResponses) > 0 || scan.ResumeSpan == nil {
 				fp.responsesOverhead += scanResponseOverhead
 				fp.numScanResults++
+				if pos := req.positions[i]; !req.isScanStarted.IsSet(pos) {
+					// This is the first response to the enqueuedReqs[pos] Scan
+					// request.
+					fp.numStartedScans++
+					req.isScanStarted.Set(pos)
+				}
 			}
 			if scan.ResumeSpan != nil {
 				// This Scan wasn't completed.
@@ -1484,12 +1515,10 @@ func processSingleRangeResults(
 	defer s.budget.mu.Unlock()
 	s.mu.Lock()
 
-	// TODO(yuzefovich): some of the responses might be partial, yet the
-	// estimator doesn't distinguish the footprint of the full response vs
-	// the partial one. Think more about this.
-	s.mu.avgResponseEstimator.update(
-		fp.memoryFootprintBytes, int64(fp.numGetResults+fp.numScanResults),
-	)
+	// Gets cannot be resumed, so we include all of them here, but Scans can be
+	// resumed, so we only include Scans that were just started.
+	numRequestsStarted := fp.numGetResults + fp.numStartedScans
+	s.mu.avgResponseEstimator.update(fp.memoryFootprintBytes, numRequestsStarted)
 
 	// If we have any Scan results to create and the Scan requests can return
 	// multiple rows, we'll need to consult s.mu.numRangesPerScanRequest, so
@@ -1619,11 +1648,13 @@ func buildResumeSingleRangeBatch(
 	s *Streamer, req singleRangeBatch, br *kvpb.BatchResponse, fp singleRangeBatchResponseFootprint,
 ) (resumeReq singleRangeBatch) {
 	numIncompleteRequests := fp.numIncompleteGets + fp.numIncompleteScans
-	// We have to allocate the new Get and Scan requests, but we can reuse the
-	// reqs and the positions slices.
+	// We have to allocate the new Get and Scan requests, but we can reuse reqs,
+	// positions, and subRequestIdx slices.
 	resumeReq.reqs = req.reqs[:numIncompleteRequests]
 	resumeReq.positions = req.positions[:0]
 	resumeReq.subRequestIdx = req.subRequestIdx[:0]
+	// isScanStarted actually needs to be preserved between singleRangeBatches.
+	resumeReq.isScanStarted = req.isScanStarted
 	resumeReq.numGetsInReqs = int64(fp.numIncompleteGets)
 	// We've already reconciled the budget with the actual reservation for the
 	// requests with the ResumeSpans.

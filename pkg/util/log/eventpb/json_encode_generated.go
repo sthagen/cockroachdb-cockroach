@@ -1040,14 +1040,16 @@ func (m *ClientAuthenticationFailed) AppendJSONFields(printComma bool, b redact.
 
 	printComma, b = m.CommonSessionDetails.AppendJSONFields(printComma, b)
 
-	if m.Reason != 0 {
-		if printComma {
-			b = append(b, ',')
-		}
-		printComma = true
-		b = append(b, "\"Reason\":"...)
-		b = strconv.AppendInt(b, int64(m.Reason), 10)
+	if printComma {
+		b = append(b, ',')
 	}
+	printComma = true
+	b = append(b, "\"Reason\":"...)
+	// Enums are defined in our code, so are always safe to print without
+	// redaction.
+	b = append(b, '"')
+	b = append(b, m.Reason.String()...)
+	b = append(b, '"')
 
 	if m.Detail != "" {
 		if printComma {
@@ -1055,9 +1057,7 @@ func (m *ClientAuthenticationFailed) AppendJSONFields(printComma bool, b redact.
 		}
 		printComma = true
 		b = append(b, "\"Detail\":\""...)
-		b = append(b, redact.StartMarker()...)
-		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.Detail)))))
-		b = append(b, redact.EndMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.Detail)))
 		b = append(b, '"')
 	}
 
@@ -3949,6 +3949,30 @@ func (m *ReverseSchemaChange) AppendJSONFields(printComma bool, b redact.Redacta
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *RoleBasedAuditEvent) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLEventDetails.AppendJSONFields(printComma, b)
+
+	printComma, b = m.CommonSQLExecDetails.AppendJSONFields(printComma, b)
+
+	if m.Role != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"Role\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.Role)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *RuntimeStats) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
@@ -4480,6 +4504,15 @@ func (m *SampledQuery) AppendJSONFields(printComma bool, b redact.RedactableByte
 		printComma = true
 		b = append(b, "\"KVBytesRead\":"...)
 		b = strconv.AppendInt(b, int64(m.KVBytesRead), 10)
+	}
+
+	if m.KVPairsRead != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"KVPairsRead\":"...)
+		b = strconv.AppendInt(b, int64(m.KVPairsRead), 10)
 	}
 
 	if m.KVRowsRead != 0 {
@@ -5281,6 +5314,15 @@ func (m *StoreStats) AppendJSONFields(printComma bool, b redact.RedactableBytes)
 		printComma = true
 		b = append(b, "\"FlushIngestTableBytes\":"...)
 		b = strconv.AppendUint(b, uint64(m.FlushIngestTableBytes), 10)
+	}
+
+	if m.IngestCount != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"IngestCount\":"...)
+		b = strconv.AppendUint(b, uint64(m.IngestCount), 10)
 	}
 
 	if m.MemtableSize != 0 {

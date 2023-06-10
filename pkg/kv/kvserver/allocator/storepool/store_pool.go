@@ -1349,16 +1349,39 @@ func (sp *StorePool) GetLocalitiesPerReplica(
 	return localities
 }
 
+// getNodeLocalityWithString returns the locality information and the string
+// format for the given node.
+func (sp *StorePool) getNodeLocalityWithString(nodeID roachpb.NodeID) localityWithString {
+	nodeLocality := localityWithString{}
+	sp.localitiesMu.RLock()
+	defer sp.localitiesMu.RUnlock()
+	if locality, ok := sp.localitiesMu.nodeLocalities[nodeID]; ok {
+		nodeLocality = locality
+	}
+	// Return an empty localityWithString struct if nothing is found.
+	return nodeLocality
+}
+
 // GetNodeLocalityString returns the locality information for the given node
 // in its string format.
 func (sp *StorePool) GetNodeLocalityString(nodeID roachpb.NodeID) string {
-	sp.localitiesMu.RLock()
-	defer sp.localitiesMu.RUnlock()
-	locality, ok := sp.localitiesMu.nodeLocalities[nodeID]
-	if !ok {
-		return ""
-	}
-	return locality.str
+	return sp.getNodeLocalityWithString(nodeID).str
+}
+
+// getNodeLocality returns the locality information for the given node.
+func (sp *StorePool) getNodeLocality(nodeID roachpb.NodeID) roachpb.Locality {
+	return sp.getNodeLocalityWithString(nodeID).locality
+}
+
+// IsCrossRegionCrossZone takes in two replicas and compares the locality of
+// them based on their replica node IDs. It returns (bool, error, bool, error)
+// where the boolean values indicate whether the two replicas' nodes are in
+// different regions, different zones, along with any lookup errors.
+func (sp *StorePool) IsCrossRegionCrossZone(
+	firstReplica roachpb.ReplicaDescriptor, secReplica roachpb.ReplicaDescriptor,
+) (bool, error, bool, error) {
+	return sp.getNodeLocality(firstReplica.NodeID).IsCrossRegionCrossZone(
+		sp.getNodeLocality(secReplica.NodeID))
 }
 
 // IsStoreReadyForRoutineReplicaTransfer returns true iff the store's node is

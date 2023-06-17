@@ -18,7 +18,7 @@ require (
 	github.com/google/uuid v1.3.0
 	golang.org/x/crypto v0.7.0
 	golang.org/x/exp v0.0.0-20220827204233-334a2380cb91
-	golang.org/x/exp/typeparams v0.0.0-20220713135740-79cabaa25d75 // indirect
+	golang.org/x/exp/typeparams v0.0.0-20221208152030-732eee02a75a // indirect
 	golang.org/x/mod v0.8.0 // indirect
 	golang.org/x/net v0.8.0
 	golang.org/x/oauth2 v0.0.0-20221014153046-6fdb5e3db783
@@ -82,7 +82,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.1.0
 	github.com/Azure/azure-sdk-for-go/sdk/keyvault/azkeys v0.9.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v0.6.1
-	github.com/BurntSushi/toml v0.4.1
+	github.com/BurntSushi/toml v1.2.1
 	github.com/Masterminds/semver/v3 v3.1.1
 	github.com/MichaelTJones/walk v0.0.0-20161122175330-4748e29d5718
 	github.com/NYTimes/gziphandler v0.0.0-20170623195520-56545f4a5d46
@@ -109,17 +109,18 @@ require (
 	github.com/cockroachdb/apd/v3 v3.2.0
 	github.com/cockroachdb/circuitbreaker v2.2.2-0.20190114160014-a614b14ccf63+incompatible
 	github.com/cockroachdb/cmux v0.0.0-20170110192607-30d10be49292
-	github.com/cockroachdb/cockroach-go/v2 v2.3.3
+	github.com/cockroachdb/cockroach-go/v2 v2.3.5
 	github.com/cockroachdb/crlfmt v0.0.0-20221214225007-b2fc5c302548
 	github.com/cockroachdb/datadriven v1.0.3-0.20230413201302-be42291fc80f
 	github.com/cockroachdb/errors v1.9.1
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20230609131623-fe8461837052
+	github.com/cockroachdb/pebble v0.0.0-20230616214057-35fff949545f
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
+	github.com/cockroachdb/tokenbucket v0.0.0-20230613231145-182959a1fad6
 	github.com/cockroachdb/tools v0.0.0-20211112185054-642e51449b40
 	github.com/cockroachdb/ttycolor v0.0.0-20210902133924-c7d7dcdde4e8
 	github.com/codahale/hdrhistogram v0.0.0-20161010025455-3a0bb77429bd
@@ -228,7 +229,7 @@ require (
 	golang.org/x/term v0.6.0
 	gopkg.in/yaml.v2 v2.4.0
 	gopkg.in/yaml.v3 v3.0.1
-	honnef.co/go/tools v0.3.2
+	honnef.co/go/tools v0.4.3
 	vitess.io/vitess v0.0.0-00010101000000-000000000000
 )
 

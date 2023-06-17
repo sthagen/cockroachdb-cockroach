@@ -44,6 +44,12 @@ const cockroachDB = "github.com/cockroachdb/cockroach"
 //go:embed gcassert_paths.txt
 var rawGcassertPaths string
 
+func init() {
+	if bazel.BuiltWithBazel() {
+		bazel.SetGoEnv()
+	}
+}
+
 func dirCmd(
 	dir string, name string, args ...string,
 ) (*exec.Cmd, *bytes.Buffer, stream.Filter, error) {
@@ -479,12 +485,14 @@ func TestLint(t *testing.T) {
 					":!testutils/data_path.go",
 					":!util/log/tracebacks.go",
 					":!util/sdnotify/sdnotify_unix.go",
-					":!util/grpcutil",                     // GRPC_GO_* variables
-					":!roachprod",                         // roachprod requires AWS environment variables
-					":!cli/env.go",                        // The CLI needs the PGHOST variable.
-					":!cli/start.go",                      // The CLI needs the GOMEMLIMIT variable.
-					":!internal/codeowners/codeowners.go", // For BAZEL_TEST.
-					":!internal/team/team.go",             // For BAZEL_TEST.
+					":!util/grpcutil",                        // GRPC_GO_* variables
+					":!roachprod",                            // roachprod requires AWS environment variables
+					":!cli/env.go",                           // The CLI needs the PGHOST variable.
+					":!cli/start.go",                         // The CLI needs the GOMEMLIMIT variable.
+					":!internal/codeowners/codeowners.go",    // For BAZEL_TEST.
+					":!internal/team/team.go",                // For BAZEL_TEST.
+					":!util/log/test_log_scope.go",           // For TEST_UNDECLARED_OUTPUT_DIR, REMOTE_EXEC
+					":!testutils/datapathutils/data_path.go", // For TEST_UNDECLARED_OUTPUT_DIR, REMOTE_EXEC
 				},
 			},
 		} {
@@ -1810,6 +1818,45 @@ func TestLint(t *testing.T) {
 			t.Error(err)
 		}
 
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestUnused", func(t *testing.T) {
+		skip.UnderShort(t)
+		if !bazel.BuiltWithBazel() {
+			skip.IgnoreLint(t, "staticcheck takes care of U1000 in non-Bazel builds")
+		}
+		unusedBinary, err := bazel.Runfile("external/co_honnef_go_tools/cmd/unused/unused_/unused")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd, stderr, filter, err := dirCmd(
+			crdbDir,
+			unusedBinary,
+			pkgScope,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.ForEach(stream.Sequence(filter,
+			stream.Grep(crdbDir), // Only capture in-tree unused objects.
+			stream.GrepNot(`pkg/util/goschedstats/runtime_go1.19\.go`), // data structures contain "unused" fields (written/read by the runtime, but not us)
+			stream.GrepNot(`\.pb\.go`),
+			stream.GrepNot(`\.pb\.gw\.go`),
+			stream.GrepNot(`\.og\.go`),
+			stream.GrepNot(`\.eg\.go`),
+		), func(s string) {
+			t.Errorf("\n%s", s)
+		}); err != nil {
+			t.Error(err)
+		}
 		if err := cmd.Wait(); err != nil {
 			if out := stderr.String(); len(out) > 0 {
 				t.Fatalf("err=%s, stderr=%s", err, out)

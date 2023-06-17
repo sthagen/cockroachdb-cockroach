@@ -1,4 +1,3 @@
-load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -303,6 +302,7 @@ go_test(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/timeutil/pgdate",
+        "//pkg/util/uuid",
         "//pkg/workload/bank",
         "//pkg/workload/ledger",
         "//pkg/workload/workloadsql",
@@ -325,5 +325,3 @@ go_test(
         "@org_golang_x_text//collate",
     ],
 )
-
-get_x_data(name = "get_x_data")

@@ -183,7 +183,7 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 	{
 		publicSchemaValue := roachpb.Value{}
 		publicSchemaValue.SetInt(int64(keys.SystemPublicSchemaID))
-		nameInfo := descpb.NameInfo{ParentID: keys.SystemDatabaseID, Name: tree.PublicSchema}
+		nameInfo := descpb.NameInfo{ParentID: keys.SystemDatabaseID, Name: catconstants.PublicSchemaName}
 		add(catalogkeys.EncodeNameKey(ms.codec, &nameInfo), publicSchemaValue)
 	}
 
@@ -239,8 +239,9 @@ func (ms MetadataSchema) GetInitialValues() ([]roachpb.KeyValue, []roachpb.RKey)
 			splits = append(splits, roachpb.RKey(ms.codec.TablePrefix(id)))
 		}
 	} else {
-		tenantStartKey := roachpb.RKey(ms.codec.TenantPrefix())
-		tenantEndKey := tenantStartKey.PrefixEnd()
+		tenantSpan := ms.codec.TenantSpan()
+		tenantStartKey := roachpb.RKey(tenantSpan.Key)
+		tenantEndKey := roachpb.RKey(tenantSpan.EndKey)
 		splits = []roachpb.RKey{tenantStartKey, tenantEndKey}
 	}
 

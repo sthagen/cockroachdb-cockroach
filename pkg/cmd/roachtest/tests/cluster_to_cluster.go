@@ -583,17 +583,12 @@ func (rd *replicationDriver) compareTenantFingerprintsAtTimestamp(
 	rd.t.Status(fmt.Sprintf("comparing tenant fingerprints between start time %s and end time %s",
 		startTime.UTC(), endTime.UTC()))
 
-	// TODO(adityamaru,lidorcarmel): Once we agree on the format and precision we
-	// display all user facing timestamps with, we should revisit how we format
-	// the start time to ensure we are fingerprinting from the most accurate lower
-	// bound.
-	microSecondRFC3339Format := "2006-01-02 15:04:05.999999"
-	startTimeStr := startTime.Format(microSecondRFC3339Format)
+	startTimeDecimal := hlc.Timestamp{WallTime: startTime.UnixNano()}.AsOfSystemTime()
 	aost := hlc.Timestamp{WallTime: endTime.UnixNano()}.AsOfSystemTime()
 	fingerprintQuery := fmt.Sprintf(`
 SELECT *
-FROM crdb_internal.fingerprint(crdb_internal.tenant_span($1::INT), '%s'::TIMESTAMPTZ, true)
-AS OF SYSTEM TIME '%s'`, startTimeStr, aost)
+FROM crdb_internal.fingerprint(crdb_internal.tenant_span($1::INT), '%s'::DECIMAL, true)
+AS OF SYSTEM TIME '%s'`, startTimeDecimal, aost)
 
 	var srcFingerprint int64
 	fingerPrintMonitor := rd.newMonitor(ctx)
@@ -611,9 +606,19 @@ AS OF SYSTEM TIME '%s'`, startTimeStr, aost)
 		rd.t.L().Printf("fingerprinting the destination tenant took %s", fingerprintingDuration)
 		return nil
 	})
-
 	// If the goroutine gets cancelled or fataled, return before comparing fingerprints.
 	require.NoError(rd.t, fingerPrintMonitor.WaitE())
+	if srcFingerprint != destFingerprint {
+		startHlc := hlc.Timestamp{WallTime: startTime.UnixNano()}
+		endHlc := hlc.Timestamp{WallTime: endTime.UnixNano()}
+		rd.t.L().Printf("fingerpint mismatch: conducting table level fingerprints")
+		srcTenantConn := rd.c.Conn(ctx, rd.t.L(), 1, option.TenantName(rd.setup.src.name))
+		dstTenantConn := rd.c.Conn(ctx, rd.t.L(), rd.rs.srcNodes+1, option.TenantName(rd.setup.dst.name))
+		require.NoError(rd.t, replicationutils.InvestigateFingerprints(ctx, srcTenantConn, dstTenantConn,
+			startHlc,
+			endHlc))
+		rd.t.L().Printf("fingerprints by table seem to match")
+	}
 	require.Equal(rd.t, srcFingerprint, destFingerprint)
 }
 

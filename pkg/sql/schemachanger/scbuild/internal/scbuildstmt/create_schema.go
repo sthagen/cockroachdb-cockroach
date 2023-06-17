@@ -85,10 +85,6 @@ func CreateSchema(b BuildCtx, n *tree.CreateSchema) {
 		IsVirtual:   false,
 	}
 	b.Add(schemaElem)
-	b.Add(&scpb.SchemaName{
-		SchemaID: schemaID,
-		Name:     schemaName,
-	})
 	b.Add(&scpb.Namespace{
 		DatabaseID:   dbElem.DatabaseID,
 		SchemaID:     0,
@@ -129,15 +125,15 @@ func getSchemaName(b BuildCtx, n *tree.CreateSchema) (schemaName string) {
 
 // schemaExists returns true if `schema` has already been used.
 func schemaExists(b BuildCtx, schema tree.ObjectNamePrefix) bool {
-	// Check statically known schemas.
-	if schema.Schema() == tree.PublicSchema {
+	// Check statically known schemas: "public" or virtual schemas ("pg_catalog",
+	// "pg_information", "crdb_internal").
+	if schema.Schema() == catconstants.PublicSchemaName {
 		return true
 	}
-	for virtualSchema := range catconstants.VirtualSchemaNames {
-		if schema.Schema() == virtualSchema {
-			return true
-		}
+	if _, isVirtualSchema := catconstants.VirtualSchemaNames[schema.Schema()]; isVirtualSchema {
+		return true
 	}
+
 	// Check user defined schemas.
 	schemaElts := b.ResolveSchema(schema, ResolveParams{
 		IsExistenceOptional: true,

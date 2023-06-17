@@ -1044,6 +1044,12 @@ var (
 		Measurement: "Leader Transfers",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaRangeRaftLeaderRemovals = metric.Metadata{
+		Name:        "range.raftleaderremovals",
+		Help:        "Number of times the current Raft leader was removed from a range",
+		Measurement: "Raft leader removals",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaRangeLossOfQuorumRecoveries = metric.Metadata{
 		Name: "range.recoveries",
 		Help: `Count of offline loss of quorum recovery operations performed on ranges.
@@ -2013,7 +2019,18 @@ Note that the measurement does not include the duration for replicating the eval
 		Measurement: "Flush Utilization",
 		Unit:        metric.Unit_PERCENT,
 	}
-
+	metaWALBytesWritten = metric.Metadata{
+		Name:        "storage.wal.bytes_written",
+		Help:        "The number of bytes the storage engine has written to the WAL",
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaWALBytesIn = metric.Metadata{
+		Name:        "storage.wal.bytes_in",
+		Help:        "The number of logical bytes the storage engine has written to the WAL",
+		Measurement: "Events",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaStorageFsyncLatency = metric.Metadata{
 		Name:        "storage.wal.fsync.latency",
 		Help:        "The write ahead log fsync latency",
@@ -2199,6 +2216,7 @@ type StoreMetrics struct {
 	RangeAdds                   *metric.Counter
 	RangeRemoves                *metric.Counter
 	RangeRaftLeaderTransfers    *metric.Counter
+	RangeRaftLeaderRemovals     *metric.Counter
 	RangeLossOfQuorumRecoveries *metric.Counter
 
 	// Range snapshot metrics.
@@ -2250,6 +2268,8 @@ type StoreMetrics struct {
 	RaftSchedulerLatency      metric.IHistogram
 	RaftTimeoutCampaign       *metric.Counter
 	RaftStorageReadBytes      *metric.Counter
+	WALBytesWritten           *metric.Gauge
+	WALBytesIn                *metric.Gauge
 
 	// Raft message metrics.
 	//
@@ -2813,6 +2833,8 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		BatchCommitL0StallDuration:    metric.NewGauge(metaBatchCommitL0StallDuration),
 		BatchCommitWALRotWaitDuration: metric.NewGauge(metaBatchCommitWALRotDuration),
 		BatchCommitCommitWaitDuration: metric.NewGauge(metaBatchCommitCommitWaitDuration),
+		WALBytesWritten:               metric.NewGauge(metaWALBytesWritten),
+		WALBytesIn:                    metric.NewGauge(metaWALBytesIn),
 
 		// Ingestion metrics
 		IngestCount: metric.NewGauge(metaIngestCount),
@@ -2855,6 +2877,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeSnapshotSendQueueSize:                   metric.NewGauge(metaRangeSnapshotSendQueueSize),
 		RangeSnapshotRecvQueueSize:                   metric.NewGauge(metaRangeSnapshotRecvQueueSize),
 		RangeRaftLeaderTransfers:                     metric.NewCounter(metaRangeRaftLeaderTransfers),
+		RangeRaftLeaderRemovals:                      metric.NewCounter(metaRangeRaftLeaderRemovals),
 		RangeLossOfQuorumRecoveries:                  metric.NewCounter(metaRangeLossOfQuorumRecoveries),
 		DelegateSnapshotSendBytes:                    metric.NewCounter(metaDelegateSnapshotSendBytes),
 		DelegateSnapshotSuccesses:                    metric.NewCounter(metaDelegateSnapshotSuccesses),
@@ -3172,6 +3195,8 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.FlushableIngestTableCount.Update(int64(m.Flush.AsIngestTableCount))
 	sm.FlushableIngestTableSize.Update(int64(m.Flush.AsIngestBytes))
 	sm.IngestCount.Update(int64(m.Ingest.Count))
+	sm.WALBytesWritten.Update(int64(m.WAL.BytesWritten))
+	sm.WALBytesIn.Update(int64(m.WAL.BytesIn))
 	sm.BatchCommitCount.Update(int64(m.BatchCommitStats.Count))
 	sm.BatchCommitDuration.Update(int64(m.BatchCommitStats.TotalDuration))
 	sm.BatchCommitSemWaitDuration.Update(int64(m.BatchCommitStats.SemaphoreWaitDuration))
@@ -3180,6 +3205,7 @@ func (sm *StoreMetrics) updateEngineMetrics(m storage.Metrics) {
 	sm.BatchCommitL0StallDuration.Update(int64(m.BatchCommitStats.L0ReadAmpWriteStallDuration))
 	sm.BatchCommitWALRotWaitDuration.Update(int64(m.BatchCommitStats.WALRotationDuration))
 	sm.BatchCommitCommitWaitDuration.Update(int64(m.BatchCommitStats.CommitWaitDuration))
+
 	// Update the maximum number of L0 sub-levels seen.
 	sm.l0SublevelsTracker.Lock()
 	sm.l0SublevelsTracker.swag.Record(timeutil.Now(), float64(m.Levels[0].Sublevels))

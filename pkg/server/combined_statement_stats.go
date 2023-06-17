@@ -371,7 +371,8 @@ func isSortOptionOnActivityTable(sort serverpb.StatsSortOptions) bool {
 		serverpb.StatsSortOptions_CPU_TIME,
 		serverpb.StatsSortOptions_EXECUTION_COUNT,
 		serverpb.StatsSortOptions_P99_STMTS_ONLY,
-		serverpb.StatsSortOptions_CONTENTION_TIME:
+		serverpb.StatsSortOptions_CONTENTION_TIME,
+		serverpb.StatsSortOptions_PCT_RUNTIME:
 		return true
 	}
 	return false
@@ -911,6 +912,9 @@ GROUP BY
 	if it == nil || !it.HasResults() {
 		if it != nil {
 			err = closeIterator(it, err)
+			if err != nil {
+				return nil, serverError(ctx, err)
+			}
 		}
 		query = fmt.Sprintf(
 			queryFormat,
@@ -928,6 +932,9 @@ GROUP BY
 	// with data in-memory.
 	if !it.HasResults() {
 		err = closeIterator(it, err)
+		if err != nil {
+			return nil, serverError(ctx, err)
+		}
 		query = fmt.Sprintf(queryFormat, "crdb_internal.statement_statistics", whereClause)
 
 		it, err = ie.QueryIteratorEx(ctx, "stmts-with-memory-for-txn", nil,

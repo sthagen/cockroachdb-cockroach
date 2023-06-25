@@ -41,6 +41,8 @@
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: oid[], elem: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="array_append"></a><code>array_append(array: pg_lsn[], elem: pg_lsn) &rarr; pg_lsn[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: timetz[], elem: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_append"></a><code>array_append(array: tuple[], elem: tuple) &rarr; tuple[]</code></td><td><span class="funcdesc"><p>Appends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -84,6 +86,8 @@
 <tr><td><a name="array_cat"></a><code>array_cat(left: jsonb[], right: jsonb[]) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: oid[], right: oid[]) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="array_cat"></a><code>array_cat(left: pg_lsn[], right: pg_lsn[]) &rarr; pg_lsn[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_cat"></a><code>array_cat(left: timetz[], right: timetz[]) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Appends two arrays.</p>
 </span></td><td>Immutable</td></tr>
@@ -133,6 +137,8 @@
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: oid[], elem: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="array_position"></a><code>array_position(array: pg_lsn[], elem: pg_lsn) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: timetz[], elem: timetz) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_position"></a><code>array_position(array: tuple[], elem: tuple) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return the index of the first occurrence of <code>elem</code> in <code>array</code>.</p>
@@ -176,6 +182,8 @@
 <tr><td><a name="array_positions"></a><code>array_positions(array: jsonb[], elem: jsonb) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: oid[], elem: oid) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="array_positions"></a><code>array_positions(array: pg_lsn[], elem: pg_lsn) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_positions"></a><code>array_positions(array: timetz[], elem: timetz) &rarr; <a href="int.html">int</a>[]</code></td><td><span class="funcdesc"><p>Returns and array of indexes of all occurrences of <code>elem</code> in <code>array</code>.</p>
 </span></td><td>Immutable</td></tr>
@@ -221,6 +229,8 @@
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: oid, array: oid[]) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="array_prepend"></a><code>array_prepend(elem: pg_lsn, array: pg_lsn[]) &rarr; pg_lsn[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: timetz, array: timetz[]) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_prepend"></a><code>array_prepend(elem: tuple, array: tuple[]) &rarr; tuple[]</code></td><td><span class="funcdesc"><p>Prepends <code>elem</code> to <code>array</code>, returning the result.</p>
@@ -265,6 +275,8 @@
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: oid[], elem: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="array_remove"></a><code>array_remove(array: pg_lsn[], elem: pg_lsn) &rarr; pg_lsn[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: timetz[], elem: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_remove"></a><code>array_remove(array: tuple[], elem: tuple) &rarr; tuple[]</code></td><td><span class="funcdesc"><p>Remove from <code>array</code> all elements equal to <code>elem</code>.</p>
@@ -308,6 +320,8 @@
 <tr><td><a name="array_replace"></a><code>array_replace(array: jsonb[], toreplace: jsonb, replacewith: jsonb) &rarr; jsonb[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: oid[], toreplace: oid, replacewith: oid) &rarr; oid[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="array_replace"></a><code>array_replace(array: pg_lsn[], toreplace: pg_lsn, replacewith: pg_lsn) &rarr; pg_lsn[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="array_replace"></a><code>array_replace(array: timetz[], toreplace: timetz, replacewith: timetz) &rarr; timetz[]</code></td><td><span class="funcdesc"><p>Replace all occurrences of <code>toreplace</code> in <code>array</code> with <code>replacewith</code>.</p>
 </span></td><td>Immutable</td></tr>
@@ -1302,6 +1316,8 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <tr><td><a name="crdb_internal.tenant_span_stats"></a><code>crdb_internal.tenant_span_stats(database_id: <a href="int.html">int</a>) &rarr; tuple{int AS database_id, int AS table_id, int AS range_count, int AS approximate_disk_<a href="bytes.html">bytes</a>, int AS live_<a href="bytes.html">bytes</a>, int AS total_<a href="bytes.html">bytes</a>, float AS live_percentage}</code></td><td><span class="funcdesc"><p>Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for tables of the provided database id.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.tenant_span_stats"></a><code>crdb_internal.tenant_span_stats(database_id: <a href="int.html">int</a>, table_id: <a href="int.html">int</a>) &rarr; tuple{int AS database_id, int AS table_id, int AS range_count, int AS approximate_disk_<a href="bytes.html">bytes</a>, int AS live_<a href="bytes.html">bytes</a>, int AS total_<a href="bytes.html">bytes</a>, float AS live_percentage}</code></td><td><span class="funcdesc"><p>Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for the provided table id.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="crdb_internal.tenant_span_stats"></a><code>crdb_internal.tenant_span_stats(spans: tuple[]) &rarr; tuple{bytes AS start_key, bytes AS end_key, jsonb AS stats}</code></td><td><span class="funcdesc"><p>Returns SpanStats for the provided spans.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.testing_callback"></a><code>crdb_internal.testing_callback(name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>For internal CRDB testing only. The function calls a callback identified by <code>name</code> registered with the server by the test.</p>
 </span></td><td>Volatile</td></tr>

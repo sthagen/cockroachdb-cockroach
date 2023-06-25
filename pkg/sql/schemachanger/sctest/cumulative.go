@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -36,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/corpus"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
@@ -539,12 +541,13 @@ func (m *stageExecStmtMap) GetInjectionCallback(t *testing.T, rewrite bool) exec
 //     it, only when rewrite is enabled.
 func cumulativeTest(
 	t *testing.T,
-	relPath string,
+	testKind, relTestCaseDir string,
 	tf func(t *testing.T, path string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], stageExecMap *stageExecStmtMap),
 ) {
 	skip.UnderStress(t)
 	skip.UnderRace(t)
-	path := datapathutils.RewritableDataPath(t, relPath)
+	testCaseDir := datapathutils.RewritableDataPath(t, relTestCaseDir)
+	testCaseDefinition := filepath.Join(testCaseDir, filepath.Base(testCaseDir)+".definition")
 	var setup []statements.Statement[tree.Statement]
 	stageExecMap := makeStageExecStmtMap()
 	rewrite := false
@@ -560,7 +563,7 @@ func cumulativeTest(
 	// purpose is to run the "test"-ed statement, inject DMLs as specified, and
 	// collect output of those DML injections, so they can be used to rewrite the
 	// expected output of those DML injected in the second pass.
-	datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, testCaseDefinition, func(t *testing.T, d *datadriven.TestData) string {
 		// Assert that only one "test"-directive statement shows up and nothing can
 		// follow it afterwards.
 		require.Zero(t, numTestStmts, "only one test command per-test, "+
@@ -568,8 +571,14 @@ func cumulativeTest(
 		switch d.Cmd {
 		case "skip":
 			var issue int
+			var csv string
 			d.ScanArgs(t, "issue-num", &issue)
-			skip.WithIssue(t, issue)
+			d.MaybeScanArgs(t, "tests", &csv)
+			for _, skippedKind := range strings.Split(csv, ",") {
+				if strings.HasPrefix(t.Name(), skippedKind) {
+					skip.WithIssue(t, issue)
+				}
+			}
 		case "setup":
 			// Store setup stmts into `setup` slice (without executing them).
 			stmts, err := parser.Parse(d.Input)
@@ -577,8 +586,6 @@ func cumulativeTest(
 			require.NoError(t, err)
 			require.NotEmpty(t, stmts)
 		case "stage-exec":
-			// DML injected statements will only be executed on cumalative tests,
-			// for end-to-end tests these are fully ignored.
 			stageExecMap.ParseStageExec(t, d)
 		case "stage-query":
 			stageExecMap.ParseStageQuery(t, d)
@@ -592,7 +599,7 @@ func cumulativeTest(
 			}
 			rewrite = d.Rewrite
 			numTestStmts++
-			tf(t, path, rewrite, setup, testStmts, stageExecMap)
+			tf(t, testCaseDir, rewrite, setup, testStmts, stageExecMap)
 		default:
 			t.Fatalf("unknown command type %s", d.Cmd)
 		}
@@ -603,7 +610,7 @@ func cumulativeTest(
 	// all other directives, this pass effectively ignores them by returning
 	// d.Expected.
 	if rewrite {
-		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+		datadriven.RunTest(t, testCaseDefinition, func(t *testing.T, d *datadriven.TestData) string {
 			if d.Cmd == "stage-exec" || d.Cmd == "stage-query" {
 				// Retrieve the actual output of each DML injection block (from first
 				// pass), indexed by file:line.
@@ -632,9 +639,9 @@ func Rollback(t *testing.T, relPath string, newCluster NewClusterFunc) {
 		return n
 	}
 	var testRollbackCase func(
-		t *testing.T, path string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], ord, n int,
+		t *testing.T, testCaseDir string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], ord, n int,
 	)
-	testFunc := func(t *testing.T, path string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], _ *stageExecStmtMap) {
+	testFunc := func(t *testing.T, testCaseDir string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], _ *stageExecStmtMap) {
 		n := countRevertiblePostCommitStages(t, setup, stmts)
 		if n == 0 {
 			t.Logf("test case has no revertible post-commit stages, skipping...")
@@ -644,7 +651,7 @@ func Rollback(t *testing.T, relPath string, newCluster NewClusterFunc) {
 		for i := 1; i <= n; i++ {
 			if !t.Run(
 				fmt.Sprintf("rollback stage %d of %d", i, n),
-				func(t *testing.T) { testRollbackCase(t, path, rewrite, setup, stmts, i, n) },
+				func(t *testing.T) { testRollbackCase(t, testCaseDir, rewrite, setup, stmts, i, n) },
 			) {
 				return
 			}
@@ -652,7 +659,7 @@ func Rollback(t *testing.T, relPath string, newCluster NewClusterFunc) {
 	}
 
 	testRollbackCase = func(
-		t *testing.T, path string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], ord, n int,
+		t *testing.T, testCaseDir string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], ord, n int,
 	) {
 		var numInjectedFailures uint32
 		var numCheckedExplainInRollback uint32
@@ -667,10 +674,10 @@ func Rollback(t *testing.T, relPath string, newCluster NewClusterFunc) {
 					return nil
 				}
 				atomic.AddUint32(&numCheckedExplainInRollback, 1)
-				fileNameSuffix := fmt.Sprintf(".rollback_%d_of_%d", ord, n)
+				fileNameSuffix := fmt.Sprintf("__rollback_%d_of_%d", ord, n)
 				explainedStmt := fmt.Sprintf("rollback at post-commit stage %d of %d", ord, n)
 				const inRollback = true
-				checkExplainDiagrams(t, path, setup, stmts, explainedStmt, fileNameSuffix, p.CurrentState, inRollback, rewrite)
+				checkExplainDiagrams(t, testCaseDir, setup, stmts, explainedStmt, fileNameSuffix, p.CurrentState, inRollback, rewrite)
 				return nil
 			}
 			if s.Phase == scop.PostCommitPhase && s.Ordinal == ord {
@@ -715,7 +722,7 @@ func Rollback(t *testing.T, relPath string, newCluster NewClusterFunc) {
 			require.NotZero(t, atomic.LoadUint32(&numCheckedExplainInRollback))
 		}
 	}
-	cumulativeTest(t, relPath, testFunc)
+	cumulativeTest(t, "Rollback", relPath, testFunc)
 }
 
 // fetchDescriptorStateQuery returns the CREATE statements for all descriptors
@@ -826,7 +833,7 @@ func Pause(t *testing.T, relPath string, newCluster NewClusterFunc) {
 		))
 		require.Equal(t, uint32(1), atomic.LoadUint32(&numInjectedFailures))
 	}
-	cumulativeTest(t, relPath, testFunc)
+	cumulativeTest(t, "Pause", relPath, testFunc)
 }
 
 // ExecuteWithDMLInjection tests that the schema changer behaviour is sane
@@ -948,7 +955,7 @@ func ExecuteWithDMLInjection(t *testing.T, relPath string, newCluster NewCluster
 		}
 		require.Equal(t, errorDetected, schemaChangeErrorRegex != nil)
 	}
-	cumulativeTest(t, relPath, testFunc)
+	cumulativeTest(t, "ExecuteWithDMLInjection", relPath, testFunc)
 }
 
 // Used for saving corpus information in TestGenerateCorpus
@@ -978,7 +985,7 @@ func GenerateSchemaChangeCorpus(t *testing.T, path string, newCluster NewCluster
 	var testCorpusCollect func(
 		t *testing.T, setup, stmts []statements.Statement[tree.Statement],
 	)
-	testFunc := func(t *testing.T, path string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], _ *stageExecStmtMap) {
+	testFunc := func(t *testing.T, _ string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], _ *stageExecStmtMap) {
 		if !t.Run("starting",
 			func(t *testing.T) { testCorpusCollect(t, setup, stmts) },
 		) {
@@ -1002,7 +1009,7 @@ func GenerateSchemaChangeCorpus(t *testing.T, path string, newCluster NewCluster
 			context.Background(), t, setup, stmts, db, nil, nil, nil,
 		))
 	}
-	cumulativeTest(t, path, testFunc)
+	cumulativeTest(t, "GenerateSchemaChangeCorpus", path, testFunc)
 }
 
 // runAllBackups runs all the backup tests, disabling the random skipping.
@@ -1462,7 +1469,7 @@ SELECT * FROM crdb_internal.invalid_objects WHERE database_name != 'backups'
 		}
 	}
 
-	cumulativeTest(t, path, testFunc)
+	cumulativeTest(t, "Backup", path, testFunc)
 }
 
 func maybeGetDatabaseForIDs(
@@ -1509,7 +1516,7 @@ func processPlanInPhase(
 	var processOnce sync.Once
 	_, db, cleanup := newCluster(t, &scexec.TestingKnobs{
 		BeforeStage: func(p scplan.Plan, _ int) error {
-			if p.Params.ExecutionPhase == phaseToProcess {
+			if p.Params.ExecutionPhase == phaseToProcess && processFunc != nil {
 				processOnce.Do(func() { processFunc(p) })
 			}
 			return nil
@@ -1662,36 +1669,34 @@ func ValidateMixedVersionElements(t *testing.T, path string, newCluster NewMixed
 			skip.IgnoreLint(t, "skipping due to randomness")
 		}
 	}
+
 	testFunc := func(t *testing.T, path string, rewrite bool, setup, stmts []statements.Statement[tree.Statement], _ *stageExecStmtMap) {
-		if !t.Run("Starting",
+		// Skip this test if any of the stmts is not fully supported.
+		if err := areStmtsFullySupportedAtClusterVersion(t, setup, stmts, downlevelClusterFunc); err != nil {
+			skip.IgnoreLint(t, "test is skipped because", err.Error())
+		}
+
+		if !t.Run("pause upgrade and resume at each stage",
 			func(t *testing.T) { testValidateMixedVersionElements(t, setup, stmts) },
 		) {
 			return
 		}
 	}
+
 	testValidateMixedVersionElements = func(t *testing.T, setup, stmts []statements.Statement[tree.Statement]) {
-		// If any of the statements are not supported, then skip over this
-		// file for the corpus.
-		for _, stmt := range stmts {
-			if !scbuild.IsFullySupportedWithFalsePositive(stmt.AST, clusterversion.ClusterVersion{Version: clusterversion.ByKey(clusterversion.V22_2)}) {
-				return
-			}
-		}
 		postCommitCount, postCommitNonRevertibleCount := countPostCommitStages(t, setup, stmts)
 		stageCounts := []int{postCommitCount, postCommitNonRevertibleCount}
 		stageTypes := []scop.Phase{scop.PostCommitPhase, scop.PostCommitNonRevertiblePhase}
 
-		jobPauseResumeChannel := make(chan jobspb.JobID)
-		waitForPause := make(chan struct{})
 		for stageTypIdx := range stageCounts {
 			stageType := stageTypes[stageTypIdx]
-			for stageOrdinal := 1; stageOrdinal < stageCounts[stageTypIdx]+1; stageOrdinal++ {
-				t.Run(fmt.Sprintf("%s_%d_of_%d", stageType, stageType, stageCounts[stageTypIdx]+1), func(t *testing.T) {
+			for stageOrdinal := 1; stageOrdinal <= stageCounts[stageTypIdx]; stageOrdinal++ {
+				t.Run(fmt.Sprintf("%s_%d_of_%d", stageType, stageOrdinal, stageCounts[stageTypIdx]), func(t *testing.T) {
 					maybeRandomlySkip(t)
+					jobPauseResumeChannel := make(chan jobspb.JobID)
+					waitForPause := make(chan struct{})
 					pauseComplete := false
-					var db *gosql.DB
-					var cleanup func()
-					_, db, cleanup = newCluster(t, &scexec.TestingKnobs{
+					_, db, cleanup := newCluster(t, &scexec.TestingKnobs{
 						BeforeStage: func(p scplan.Plan, stageIdx int) error {
 							if stageOrdinal == p.Stages[stageIdx].Ordinal &&
 								p.Stages[stageIdx].Phase == stageType && !pauseComplete {
@@ -1703,18 +1708,21 @@ func ValidateMixedVersionElements(t *testing.T, path string, newCluster NewMixed
 							return nil
 						},
 					}, true /*down level*/)
+					tdb := sqlutils.MakeSQLRunner(db)
 
+					// Wait for the schema changer job to hit desired stage, pause the job,
+					// perform a cluster upgrade, and resume the job.
 					go func() {
 						jobID := <-jobPauseResumeChannel
 						_, err := db.Exec("PAUSE JOB $1", jobID)
 						require.NoError(t, err)
-						waitForPause <- struct{}{}
+						tdb.CheckQueryResultsRetry(t, fmt.Sprintf(
+							`SELECT status FROM [SHOW JOBS] WHERE job_id = %d`, jobID,
+						), [][]string{{"paused"}})
+						close(waitForPause)
 						_, err = db.Exec("SET CLUSTER SETTING VERSION=$1", clusterversion.TestingBinaryVersion.String())
 						require.NoError(t, err)
-						testutils.SucceedsSoon(t, func() error {
-							_, err = db.Exec("RESUME JOB $1", jobID)
-							return err
-						})
+						tdb.Exec(t, `RESUME JOB $1`, jobID)
 					}()
 
 					defer cleanup()
@@ -1724,25 +1732,13 @@ func ValidateMixedVersionElements(t *testing.T, path string, newCluster NewMixed
 						},
 					))
 
-					// All schema change jobs should succeed after migration.
-					detectJobsComplete := fmt.Sprintf(`
-SELECT
-    count(*)
-FROM
-    [SHOW JOBS]
-WHERE
-    job_type = 'NEW SCHEMA CHANGE'
-    AND status NOT IN ('%s')
-`,
-						string(jobs.StatusSucceeded))
+					// The resumed job should eventually succeed after upgrade.
+					query := `SELECT statement, status FROM [SHOW JOBS] WHERE job_type = 'NEW SCHEMA CHANGE' AND status != 'succeeded'`
 					testutils.SucceedsSoon(t, func() error {
-						var count int64
-						row := db.QueryRow(detectJobsComplete)
-						if err := row.Scan(&count); err != nil {
-							return err
-						}
-						if count > 0 {
-							return errors.AssertionFailedf("unexpected count of %d", count)
+						row := tdb.QueryStr(t, query)
+						if len(row) > 0 {
+							return errors.AssertionFailedf("expected 0 unsuccessful schema change jobs;"+
+								" get %d: %v", len(row), row[0])
 						}
 						return nil
 					})
@@ -1750,13 +1746,40 @@ WHERE
 			}
 		}
 	}
-	cumulativeTest(t, path, testFunc)
+
+	cumulativeTest(t, "ValidateMixedVersionElements", path, testFunc)
+}
+
+// areStmtsFullySupportedAtClusterVersion determines if `stmts` are fully supported
+// by running `stmts` in a transaction with declarative schema changer.
+// It returns any error it encounters.
+func areStmtsFullySupportedAtClusterVersion(
+	t *testing.T,
+	setup []statements.Statement[tree.Statement],
+	stmts []statements.Statement[tree.Statement],
+	clusterFunc func(t *testing.T, knobs *scexec.TestingKnobs) (_ serverutils.TestServerInterface, _ *gosql.DB, cleanup func()),
+) error {
+	ctx := context.Background()
+	s, db, cleanup := clusterFunc(t, nil /* knobs */)
+	defer cleanup()
+	cv := s.ClusterSettings().Version
+
+	// Sieve 1: check whether the statements are even implemented and the schema
+	// changer mode.
+	for _, stmt := range stmts {
+		if !scbuild.IsFullySupportedWithFalsePositive(stmt.AST, cv.ActiveVersion(ctx)) {
+			return scerrors.NotImplementedError(stmt.AST)
+		}
+	}
+	// Sieve 2: false positives might fall through sieve 1 and we need to actually run
+	// it to account for version gates in the builder.
+	return executeSchemaChangeTxn(ctx, t, setup, stmts, db, nil, nil, nil)
 }
 
 func BackupMixedVersionElements(t *testing.T, path string, newCluster NewMixedClusterFunc) {
-	testVersion := clusterversion.ClusterVersion{
-		Version: clusterversion.ByKey(clusterversion.V23_1_SchemaChangerDeprecatedIndexPredicates - 1),
-	}
+	//testVersion := clusterversion.ClusterVersion{
+	//	Version: clusterversion.ByKey(clusterversion.V23_1_SchemaChangerDeprecatedIndexPredicates - 1),
+	//}
 	var after [][]string // CREATE_STATEMENT for all descriptors after finishing `stmts` in each test case.
 	var dbName string
 	r, _ := randutil.NewTestRand()
@@ -2087,12 +2110,11 @@ SELECT * FROM crdb_internal.invalid_objects WHERE database_name != 'backups'
 	}
 
 	testFunc := func(t *testing.T, _ string, _ bool, setup, stmts []statements.Statement[tree.Statement], _ *stageExecStmtMap) {
-		for _, stmt := range stmts {
-			supported := scbuild.IsFullySupportedWithFalsePositive(stmt.AST, testVersion)
-			if !supported {
-				skip.IgnoreLint(t, "statement not supported in current release")
-			}
+		// Skip this test if any of the stmts is not fully supported.
+		if err := areStmtsFullySupportedAtClusterVersion(t, setup, stmts, downlevelClusterFunc); err != nil {
+			skip.IgnoreLint(t, "test is skipped because", err.Error())
 		}
+
 		postCommit, nonRevertible := countStages(t, setup, stmts)
 		n := postCommit + nonRevertible
 		t.Logf(
@@ -2112,5 +2134,5 @@ SELECT * FROM crdb_internal.invalid_objects WHERE database_name != 'backups'
 		}
 	}
 
-	cumulativeTest(t, path, testFunc)
+	cumulativeTest(t, "BackupMixedVersionElements", path, testFunc)
 }

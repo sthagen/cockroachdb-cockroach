@@ -349,49 +349,43 @@ SELECT * FROM [
 │
 └── • render
     │
-    └── • distinct
-        │ distinct on: arbiter_uniq_idx_distinct
-        │ nulls are distinct
+    └── • lookup join (anti)
+        │ table: regional_by_row_table@uniq_idx (partial index)
+        │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column4 = a)
+        │ pred: column5 > 0
         │
-        └── • render
+        └── • lookup join (anti)
+            │ table: regional_by_row_table@uniq_idx (partial index)
+            │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column4 = a)
+            │ pred: column5 > 0
             │
             └── • lookup join (anti)
-                │ table: regional_by_row_table@uniq_idx (partial index)
-                │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column4 = a)
-                │ pred: column5 > 0
+                │ table: regional_by_row_table@regional_by_row_table_b_key
+                │ equality cols are key
+                │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column5 = b)
                 │
                 └── • lookup join (anti)
-                    │ table: regional_by_row_table@uniq_idx (partial index)
-                    │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column4 = a)
-                    │ pred: column5 > 0
+                    │ table: regional_by_row_table@regional_by_row_table_b_key
+                    │ equality cols are key
+                    │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column5 = b)
                     │
-                    └── • lookup join (anti)
-                        │ table: regional_by_row_table@regional_by_row_table_b_key
-                        │ equality cols are key
-                        │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column5 = b)
+                    └── • cross join (anti)
                         │
-                        └── • lookup join (anti)
-                            │ table: regional_by_row_table@regional_by_row_table_b_key
-                            │ equality cols are key
-                            │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column5 = b)
+                        ├── • values
+                        │     size: 6 columns, 1 row
+                        │
+                        └── • union all
+                            │ limit: 1
                             │
-                            └── • cross join (anti)
-                                │
-                                ├── • values
-                                │     size: 6 columns, 1 row
-                                │
-                                └── • union all
-                                    │ limit: 1
-                                    │
-                                    ├── • scan
-                                    │     missing stats
-                                    │     table: regional_by_row_table@regional_by_row_table_pkey
-                                    │     spans: [/'ap-southeast-2'/7 - /'ap-southeast-2'/7]
-                                    │
-                                    └── • scan
-                                          missing stats
-                                          table: regional_by_row_table@regional_by_row_table_pkey
-                                          spans: [/'ca-central-1'/7 - /'ca-central-1'/7] [/'us-east-1'/7 - /'us-east-1'/7]
+                            ├── • scan
+                            │     missing stats
+                            │     table: regional_by_row_table@regional_by_row_table_pkey
+                            │     spans: [/'ap-southeast-2'/7 - /'ap-southeast-2'/7]
+                            │
+                            └── • scan
+                                  missing stats
+                                  table: regional_by_row_table@regional_by_row_table_pkey
+                                  spans: [/'ca-central-1'/7 - /'ca-central-1'/7] [/'us-east-1'/7 - /'us-east-1'/7]
 
 # Tests for locality optimized search.
 
@@ -1793,7 +1787,7 @@ VALUES ('us-east-1', 23, 24, 25, 26), ('ca-central-1', 30, 30, 31, 32)] OFFSET 2
             └── • scan buffer
                   label: buffer 1
 
-query TIIIIIIIIT colnames
+query TIIIIIIIIT colnames,rowsort
 SELECT * FROM (VALUES ('us-east-1', 23, 24, 25, 26), ('ca-central-1', 30, 30, 31, 32)) AS v(crdb_region, pk, pk2, a, b)
 LEFT JOIN regional_by_row_table t ON v.pk = t.pk;
 ----
@@ -1881,7 +1875,7 @@ CREATE TABLE regional_by_row_table_as (
   FAMILY (pk, a, b)
 ) LOCALITY REGIONAL BY ROW AS crdb_region_col
 
-query TI
+query TI rowsort
 INSERT INTO regional_by_row_table_as (pk) VALUES (1), (10), (20)
 RETURNING crdb_region_col, pk
 ----
@@ -3275,7 +3269,8 @@ index-join t88047
 query TTT
 SELECT * FROM t88047
 WHERE json_col->'loc' @> '{"state":"NY"}'
-  LIMIT 2
+ORDER BY 2
+LIMIT 2
 ----
 {"loc": {"state": "NY"}}  Big Apple          us-east-1
 {"loc": {"state": "NY"}}  Statue of Liberty  us-east-1
@@ -3287,7 +3282,8 @@ DROP INDEX t88047_inv_idx
 query TTT
 SELECT * FROM t88047
 WHERE json_col->'loc' @> '{"state":"NY"}'
-  LIMIT 2
+ORDER BY 2
+LIMIT 2
 ----
 {"loc": {"state": "NY"}}  Big Apple          us-east-1
 {"loc": {"state": "NY"}}  Statue of Liberty  us-east-1

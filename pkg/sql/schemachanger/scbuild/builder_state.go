@@ -101,7 +101,8 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 	// of it and investigate it further if needed.
 	if dst.current == scpb.Status_ABSENT &&
 		dst.target == scpb.ToAbsent &&
-		(target == scpb.ToPublic || target == scpb.Transient) {
+		(target == scpb.ToPublic || target == scpb.Transient) &&
+		dst.metadata.TargetIsLinkedToSchemaChange() {
 		panic(scerrors.NotImplementedErrorf(nil, "attempt to revive a ghost element:"+
 			" [elem=%v],[current=ABSENT],[target=ToAbsent],[newTarget=%v]", dst.element.String(), target.Status()))
 	}
@@ -1428,8 +1429,11 @@ func (b *builderState) WrapFunctionBody(
 	lang catpb.Function_Language,
 	refProvider scbuildstmt.ReferenceProvider,
 ) *scpb.FunctionBody {
-	bodyStr = b.replaceSeqNamesWithIDs(bodyStr)
-	bodyStr = b.serializeUserDefinedTypes(bodyStr)
+	if lang != catpb.Function_PLPGSQL {
+		// TODO(drewk): fix this to work with PL/pgSQL.
+		bodyStr = b.replaceSeqNamesWithIDs(bodyStr)
+		bodyStr = b.serializeUserDefinedTypes(bodyStr)
+	}
 	fnBody := &scpb.FunctionBody{
 		FunctionID: fnID,
 		Body:       bodyStr,
@@ -1539,8 +1543,6 @@ func (b *builderState) serializeUserDefinedTypes(queryStr string) string {
 		default:
 			return true, expr, nil
 		}
-		// semaCtx may be nil if this is a virtual view being created at
-		// init time.
 		var typ *types.T
 		typ, err = tree.ResolveType(b.ctx, typRef, b.semaCtx.TypeResolver)
 		if err != nil {

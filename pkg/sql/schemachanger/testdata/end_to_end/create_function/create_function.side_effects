@@ -31,6 +31,7 @@ $$;
 begin transaction #1
 # begin StatementPhase
 checking for feature: CREATE FUNCTION
+increment telemetry for sql.schema.create_function
 write *eventpb.CreateFunction to event log:
   functionName: defaultdb.public.f
   sql:
@@ -141,8 +142,8 @@ upsert descriptor #105
   +  dependedOnBy:
   +  - byId: true
   +    id: 110
-     families:
-     - columnIds:
+     formatVersion: 3
+     id: 105
   ...
        start: "1"
      unexposedParentSchemaId: 101
@@ -283,8 +284,8 @@ upsert descriptor #105
   +  dependedOnBy:
   +  - byId: true
   +    id: 110
-     families:
-     - columnIds:
+     formatVersion: 3
+     id: 105
   ...
        start: "1"
      unexposedParentSchemaId: 101

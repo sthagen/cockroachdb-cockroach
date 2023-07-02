@@ -100,16 +100,6 @@ type StoreTestingKnobs struct {
 	// no-op write, and the ForcedError field will be set.
 	TestingPostApplyFilter kvserverbase.ReplicaApplyFilter
 
-	// TestingBatchRequestFilter intercepts Node.Batch() to pass the actual batch
-	// request byte count to the test. A boolean value is returned here to filter
-	// out changes in node metrics that are irrelevant to the test.
-	TestingBatchRequestFilter func(*kvpb.BatchRequest) bool
-
-	// TestingBatchResponseFilter intercepts Node.Batch() to pass the actual batch
-	// request byte count to the test. A boolean value is returned here to filter
-	// out changes in node metrics that are irrelevant to the test.
-	TestingBatchResponseFilter func(*kvpb.BatchResponse) bool
-
 	// TestingResponseErrorEvent is called when an error is returned applying
 	// a command.
 	TestingResponseErrorEvent func(context.Context, *kvpb.BatchRequest, error)
@@ -261,6 +251,10 @@ type StoreTestingKnobs struct {
 	RefreshReasonTicksPeriod int
 	// DisableProcessRaft disables the process raft loop.
 	DisableProcessRaft func(roachpb.StoreID) bool
+	// DisableLivenessMapConnHealth disables the ConnHealth check in
+	// updateIsLiveMap, which is useful in tests where we manipulate the node's
+	// liveness record but still keep the connection alive.
+	DisableLivenessMapConnHealth bool
 	// DisableLastProcessedCheck disables checking on replica queue last processed times.
 	DisableLastProcessedCheck bool
 	// ReplicateQueueAcceptsUnsplit allows the replication queue to
@@ -492,6 +486,14 @@ type StoreTestingKnobs struct {
 	// it can be easily extended to validate other properties of baseQueue if
 	// required.
 	BaseQueueInterceptor func(ctx context.Context, bq *baseQueue)
+
+	// InjectReproposalError injects an error in tryReproposeWithNewLeaseIndex.
+	// If nil is returned, reproposal will be attempted.
+	InjectReproposalError func(p *ProposalData) error
+
+	// LeaseIndexFilter can return nonzero to override the automatically assigned
+	// LeaseAppliedIndex.
+	LeaseIndexFilter func(*ProposalData) kvpb.LeaseAppliedIndex
 
 	// FlowControlTestingKnobs provide fine-grained control over the various
 	// kvflowcontrol components for testing.

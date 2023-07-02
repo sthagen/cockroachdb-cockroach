@@ -261,6 +261,16 @@ func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedReques
 	b.p.rlocker().Lock()
 	defer b.p.rlocker().Unlock()
 
+	if p.v2SeenDuringApplication {
+		if useReproposalsV2 {
+			// We should never see a proposal that has already been on the apply loop
+			// passed to `Insert`. The only place where such proposals can be seen is
+			// `ReinsertLocked`.
+			return errors.AssertionFailedf("proposal that was already applied passed to propBuf.Insert: %+v", p)
+		}
+		return nil
+	}
+
 	if filter := b.testing.insertFilter; filter != nil {
 		if err := filter(p); err != nil {
 			return err
@@ -289,6 +299,13 @@ func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedReques
 // buffer back into the buffer to be reproposed at a new Raft log index. Unlike
 // Insert, it does not modify the command.
 func (b *propBuf) ReinsertLocked(ctx context.Context, p *ProposalData) error {
+	// NB: we can see proposals here that have already been applied
+	// (v2SeenDuringApplication==true). We want those to not be flushed again.
+	// However, we can also see a proposal here that is not applied yet while
+	// inserting but is applied by the time we flush. So we don't drop the
+	// proposal here, but instead in FlushLockedWithRaftGroup, to unify the two
+	// cases.
+
 	// Update the proposal buffer counter and determine which index we should
 	// insert at.
 	idx, err := b.allocateIndex(ctx, true /* wLocked */)
@@ -574,6 +591,12 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 
 			// We don't want deduct flow tokens for reproposed commands, and of
 			// course for proposals that didn't integrate with kvflowcontrol.
+			//
+			// TODO(tbg): with useReproposalsV2, we make new proposals in
+			// tryReproposeWithNewLeaseIndex that will have createdAtTicks ==
+			// proposedAtTicks. They will have !reproposal but raftAdmissionMeta=nil.
+			// What is createdAtTicks==proposedAtTicks even good for? The !reproposal
+			// condition already handles the case in which it isn't.
 			shouldAdmit := p.createdAtTicks == p.proposedAtTicks && !reproposal && p.raftAdmissionMeta != nil
 			if !shouldAdmit {
 				admitHandles = append(admitHandles, admitEntHandle{})
@@ -623,6 +646,12 @@ func (b *propBuf) maybeRejectUnsafeProposalLocked(
 		// with a raft group. Wait until that point to determine whether to reject
 		// the proposal or not.
 		return false
+	}
+	if p.v2SeenDuringApplication {
+		// Due to `refreshProposalsLocked`, we can end up with proposals that are
+		// already applied. We just want to drop those on the floor as we know
+		// that they have fully been taken care of.
+		return true
 	}
 	switch {
 	case p.Request.IsSingleRequestLeaseRequest():
@@ -932,7 +961,7 @@ func (b *propBuf) marshallLAIAndClosedTimestampToProposalLocked(
 	// capacity for this footer.
 	preLen := len(p.encodedCommand)
 	p.encodedCommand = p.encodedCommand[:preLen+buf.Size()]
-	_, err := protoutil.MarshalTo(buf, p.encodedCommand[preLen:])
+	_, err := protoutil.MarshalToSizedBuffer(buf, p.encodedCommand[preLen:])
 	return err
 }
 

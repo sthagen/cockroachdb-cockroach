@@ -13,11 +13,13 @@ package tests
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -129,9 +131,16 @@ func (bd *backupDriver) prepareCluster(ctx context.Context) {
 		// For now, only run the test on the cloud provider that also stores the backup.
 		bd.t.Skip(fmt.Sprintf("test configured to run on %s", bd.sp.backup.cloud))
 	}
+	version := strings.Replace(bd.sp.backup.version, "v", "", 1)
+	binaryPath, err := clusterupgrade.UploadVersion(ctx, bd.t, bd.t.L(), bd.c,
+		bd.sp.hardware.getCRDBNodes(), version)
+	require.NoError(bd.t, err)
 
-	bd.c.Put(ctx, bd.t.Cockroach(), "./cockroach")
-	bd.c.Start(ctx, bd.t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings(), bd.sp.hardware.getCRDBNodes())
+	require.NoError(bd.t, clusterupgrade.StartWithSettings(ctx, bd.t.L(), bd.c,
+		bd.sp.hardware.getCRDBNodes(),
+		option.DefaultStartOptsNoBackups(),
+		install.BinaryOption(binaryPath)))
+
 	bd.assertCorrectCockroachBinary(ctx)
 	if !bd.sp.backup.ignoreExistingBackups {
 		// This check allows the roachtest to fail fast, instead of when the

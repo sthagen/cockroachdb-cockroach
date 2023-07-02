@@ -148,6 +148,10 @@ type TreeAnnotator interface {
 // Telemetry allows incrementing schema change telemetry counters.
 type Telemetry interface {
 
+	// IncrementSchemaChangeCreateCounter increments the selected CREATE telemetry
+	// counter.
+	IncrementSchemaChangeCreateCounter(counterType string)
+
 	// IncrementSchemaChangeAlterCounter increments the selected ALTER telemetry
 	// counter.
 	IncrementSchemaChangeAlterCounter(counterType string, extra ...string)
@@ -192,6 +196,10 @@ type SchemaFeatureChecker interface {
 	CanPerformDropOwnedBy(
 		ctx context.Context, role username.SQLUsername,
 	) (bool, error)
+
+	// CanCreateCrossDBSequenceOwnerRef returns if cross database sequence
+	// owner references are allowed.
+	CanCreateCrossDBSequenceOwnerRef() error
 }
 
 // PrivilegeChecker checks an element's privileges.

@@ -363,15 +363,30 @@ func (r *Replica) propose(
 	// package is that proposals which are finished carry a raft command with a
 	// MaxLeaseIndex equal to the proposal command's max lease index.
 	defer func(prev kvpb.LeaseAppliedIndex) {
+		if useReproposalsV2 {
+			// The following poorly understood code is not necessary in V2 since
+			// we never mutate MaxLeaseIndex and don't hit propose() twice for
+			// the same *ProposalData.
+			return
+		}
 		if pErr != nil {
 			p.command.MaxLeaseIndex = prev
 		}
 	}(p.command.MaxLeaseIndex)
 
-	// Make sure the maximum lease index is unset. This field will be set in
-	// propBuf.Insert and its encoded bytes will be appended to the encoding
-	// buffer as a MaxLeaseFooter.
-	p.command.MaxLeaseIndex = 0
+	if !useReproposalsV2 {
+		// Make sure the maximum lease index is unset. This field will be set in
+		// propBuf.Insert and its encoded bytes will be appended to the encoding
+		// buffer as a MaxLeaseFooter.
+		p.command.MaxLeaseIndex = 0
+	} else {
+		if p.command.MaxLeaseIndex > 0 {
+			// TODO: there are a number of other fields that should still be unset.
+			// Verify them all. Some architectural improvements where we pass in a
+			// subset of ProposalData and then complete it here would be even better.
+			return kvpb.NewError(errors.AssertionFailedf("MaxLeaseIndex is set: %+v", p))
+		}
+	}
 
 	if crt := p.command.ReplicatedEvalResult.ChangeReplicas; crt != nil {
 		if err := checkReplicationChangeAllowed(p.command, r.Desc(), r.StoreID()); err != nil {
@@ -567,11 +582,11 @@ var errRemoved = errors.New("replica removed")
 func (r *Replica) stepRaftGroup(req *kvserverpb.RaftMessageRequest) error {
 	// We're processing an incoming raft message (from a batch that may
 	// include MsgVotes), so don't campaign if we wake up our raft
-	// group.
-	return r.withRaftGroup(false, func(raftGroup *raft.RawNode) (bool, error) {
+	// group to avoid election ties.
+	const mayCampaign = false
+	return r.withRaftGroup(mayCampaign, func(raftGroup *raft.RawNode) (bool, error) {
 		// If we're a follower, and we receive a message from a non-leader replica
-		// while quiesced, we wake up the leader too. This prevents spurious
-		// elections.
+		// while quiesced, we wake up the leader too to prevent spurious elections.
 		//
 		// This typically happens in the case of a partial network partition where
 		// some other replica is partitioned away from the leader but can reach this
@@ -590,17 +605,16 @@ func (r *Replica) stepRaftGroup(req *kvserverpb.RaftMessageRequest) error {
 			st := r.raftBasicStatusRLocked()
 			hasLeader := st.RaftState == raft.StateFollower && st.Lead != 0
 			fromLeader := uint64(req.FromReplica.ReplicaID) == st.Lead
-
-			var wakeLeader, mayCampaign bool
-			if hasLeader && !fromLeader {
-				// TODO(erikgrinaker): This is likely to result in election ties, find
-				// some way to avoid that.
-				wakeLeader, mayCampaign = true, true
-			}
+			wakeLeader := hasLeader && !fromLeader
 			r.maybeUnquiesceLocked(wakeLeader, mayCampaign)
 		}
 		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, timeutil.Now())
-		if req.Message.Type == raftpb.MsgSnap {
+		switch req.Message.Type {
+		case raftpb.MsgPreVote, raftpb.MsgVote:
+			// If we receive a (pre)vote request, and we find our leader to be dead or
+			// removed, forget it so we can grant the (pre)votes.
+			r.maybeForgetLeaderOnVoteRequestLocked()
+		case raftpb.MsgSnap:
 			// Occasionally a snapshot message may arrive under an outdated term,
 			// which would lead to Raft discarding the snapshot. This should be
 			// really rare in practice, but it does happen in tests and in particular
@@ -1099,7 +1113,8 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			// If the raft leader got removed, campaign on the leaseholder. Uses
 			// forceCampaignLocked() to bypass PreVote+CheckQuorum, since we otherwise
 			// wouldn't get prevotes from other followers who recently heard from the
-			// old leader. We know the leader isn't around anymore anyway.
+			// old leader and haven't applied the conf change. We know the leader
+			// isn't around anymore anyway.
 			leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
 			raftStatus := raftGroup.BasicStatus()
 			if shouldCampaignAfterConfChange(ctx, r.store.ClusterSettings(), r.store.StoreID(),
@@ -2116,9 +2131,19 @@ func shouldCampaignOnWake(
 	return !livenessEntry.IsLive
 }
 
-// maybeCampaignOnWakeLocked is called when the range wakes from a
-// dormant state (either the initial "raftGroup == nil" state or after
-// being quiescent) and campaigns for raft leadership if appropriate.
+// maybeCampaignOnWakeLocked is called when the replica wakes from a dormant
+// state (either the initial "raftGroup == nil" state or after being quiescent),
+// and campaigns for raft leadership if appropriate: if it has no leader, or it
+// finds a dead leader in liveness.
+//
+// This will use PreVote+CheckQuorum, so it won't disturb an established leader
+// if one currently exists. However, if other replicas wake up to find a dead
+// leader in liveness, they will forget it and grant us a prevote, allowing us
+// to win an election immediately if a quorum considers the leader dead.
+//
+// This may result in a tie if multiple replicas wake simultaneously. However,
+// if other replicas wake in response to our (pre)vote request, they won't
+// campaign to avoid the tie.
 func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	// Raft panics if a node that is not currently a member of the
 	// group tries to campaign. This method should never be called
@@ -2137,6 +2162,64 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus, livenessMap, r.descRLocked(), r.requiresExpirationLeaseRLocked()) {
 		r.campaignLocked(ctx)
 	}
+}
+
+// maybeForgetLeaderOnVoteRequestLocked is called when receiving a (Pre)Vote
+// request. If the current leader is not live (according to liveness) or not in
+// our range descriptor, we forget it and become a leaderless follower.
+//
+// Normally, with PreVote+CheckQuorum, we won't grant a (pre)vote if we've heard
+// from a leader in the past election timeout interval. However, sometimes we
+// want to call an election despite a recent leader. Forgetting the leader
+// allows us to grant the (pre)vote, and if a quorum of replicas agree that the
+// leader is dead they can win an election. Used specifically when:
+//
+//   - Unquiescing to a dead leader. The first replica to wake will campaign,
+//     the others won't to avoid ties but should grant the vote. See
+//     maybeUnquiesceLocked().
+//
+//   - Stealing leadership from a leader who can't heartbeat liveness.
+//     Otherwise, noone will be able to acquire an epoch lease, and the range is
+//     unavailable. See shouldCampaignOnLeaseRequestRedirect().
+//
+//   - For backwards compatibility in mixed 23.1/23.2 clusters, where 23.2 first
+//     enabled CheckQuorum. The above two cases hold with 23.1. Additionally, when
+//     the leader is removed from the range in 23.1, the first replica in the
+//     range will campaign using (pre)vote, so 23.2 nodes must grant it.
+//
+// TODO(erikgrinaker): The above cases are only relevant with epoch leases and
+// 23.1 compatibility. Consider removing this when no longer needed.
+func (r *Replica) maybeForgetLeaderOnVoteRequestLocked() {
+	raftStatus := r.mu.internalRaftGroup.BasicStatus()
+	livenessMap, _ := r.store.livenessMap.Load().(livenesspb.IsLiveMap)
+	if shouldForgetLeaderOnVoteRequest(raftStatus, livenessMap, r.descRLocked()) {
+		r.forgetLeaderLocked(r.AnnotateCtx(context.TODO()))
+	}
+}
+
+func shouldForgetLeaderOnVoteRequest(
+	raftStatus raft.BasicStatus, livenessMap livenesspb.IsLiveMap, desc *roachpb.RangeDescriptor,
+) bool {
+	// If we're not a follower with a leader, there's noone to forget.
+	if raftStatus.RaftState != raft.StateFollower || raftStatus.Lead == raft.None {
+		return false
+	}
+
+	// If the leader isn't in our descriptor, assume it was removed and
+	// forget about it.
+	replDesc, ok := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(raftStatus.Lead))
+	if !ok {
+		return true
+	}
+
+	// If we don't know about the leader's liveness, assume it's dead and forget it.
+	livenessEntry, ok := livenessMap[replDesc.NodeID]
+	if !ok {
+		return true
+	}
+
+	// Forget the leader if it's no longer live.
+	return !livenessEntry.IsLive
 }
 
 // shouldCampaignOnLeaseRequestRedirect returns whether a replica that is
@@ -2221,10 +2304,12 @@ func shouldCampaignOnLeaseRequestRedirect(
 // Only followers enforce the CheckQuorum recent leader condition though, so if
 // a quorum of followers consider the leader dead and choose to become
 // pre-candidates and campaign then they will grant prevotes and can hold an
-// election without waiting out the election timeout, but this can result in
-// election ties if a quorum does so simultaneously. Followers and
-// pre-candidates will also grant any number of pre-votes, both for themselves
-// and anyone else that's eligible.
+// election without waiting out the election timeout. This can result in
+// election ties, so it's often better for followers to choose to forget their
+// current leader via forgetLeaderLocked(), allowing them to immediately grant
+// (pre)votes without campaigning themselves. Followers and pre-candidates will
+// also grant any number of pre-votes, both for themselves and anyone else
+// that's eligible.
 func (r *Replica) campaignLocked(ctx context.Context) {
 	log.VEventf(ctx, 3, "campaigning")
 	if err := r.mu.internalRaftGroup.Campaign(); err != nil {
@@ -2248,6 +2333,43 @@ func (r *Replica) forceCampaignLocked(ctx context.Context) {
 		log.VEventf(ctx, 1, "failed to campaign: %s", err)
 	}
 	r.store.enqueueRaftUpdateCheck(r.RangeID)
+}
+
+// forgetLeaderLocked forgets a follower's current raft leader, remaining a
+// leaderless follower in the current term. The replica will not campaign unless
+// the election timeout elapses. However, this allows it to grant (pre)votes if
+// a different candidate is campaigning, or revert to a follower if it receives
+// a message from the leader. It still won't grant prevotes to a lagging
+// follower. This is a noop on non-followers.
+//
+// This is useful with PreVote+CheckQuorum, where a follower will not grant
+// (pre)votes if it has a current leader. Forgetting the leader allows the
+// replica to vote without waiting out the election timeout if it has good
+// reason to believe the current leader is dead. If a quorum of followers
+// independently consider the leader dead, a campaigner can win despite them
+// having heard from a leader recently (in ticks).
+//
+// The motivating case is a quiesced range that unquiesces to a long-dead
+// leader: the first replica will campaign and solicit pre-votes, but normally
+// the other replicas won't grant the prevote because they heard from the leader
+// in the past election timeout (in ticks), requiring waiting for an election
+// timeout. However, if they independently see the leader dead in liveness when
+// unquiescing, they can forget the leader and grant the prevote. If a quorum of
+// replicas independently consider the leader dead, the candidate wins the
+// election. If the leader isn't dead after all, the replica will revert to a
+// follower upon hearing from it.
+//
+// In particular, since a quorum must agree that the leader is dead and forget
+// it for a candidate to win a pre-campaign, this avoids disruptions during
+// partial/asymmetric partitions where individual replicas can mistakenly
+// believe the leader is dead and steal leadership away, which can otherwise
+// lead to persistent unavailability.
+func (r *Replica) forgetLeaderLocked(ctx context.Context) {
+	log.VEventf(ctx, 3, "forgetting leader")
+	msg := raftpb.Message{To: uint64(r.replicaID), Type: raftpb.MsgForgetLeader}
+	if err := r.mu.internalRaftGroup.Step(msg); err != nil {
+		log.VEventf(ctx, 1, "failed to forget leader: %s", err)
+	}
 }
 
 // a lastUpdateTimesMap is maintained on the Raft leader to keep track of the

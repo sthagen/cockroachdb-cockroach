@@ -1297,11 +1297,11 @@ func TestLogic_pg_extension(
 	runLogicTest(t, "pg_extension")
 }
 
-func TestLogic_pg_lsn(
+func TestLogic_pg_lsn_mixed(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "pg_lsn")
+	runLogicTest(t, "pg_lsn_mixed")
 }
 
 func TestLogic_pgcrypto_builtins(
@@ -2051,6 +2051,13 @@ func TestLogic_udf_oid_ref(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_oid_ref")
+}
+
+func TestLogic_udf_plpgsql(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_plpgsql")
 }
 
 func TestLogic_udf_record(

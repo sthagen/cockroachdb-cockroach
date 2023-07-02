@@ -11,6 +11,7 @@ CREATE UNIQUE INDEX idx ON t(b);
 begin transaction #1
 # begin StatementPhase
 checking for feature: CREATE FUNCTION
+increment telemetry for sql.schema.create_function
 write *eventpb.CreateFunction to event log:
   functionName: defaultdb.public.t
   sql:
@@ -68,6 +69,7 @@ upsert descriptor #101
   -  version: "1"
   +  version: "2"
 checking for feature: CREATE INDEX
+increment telemetry for sql.schema.create_index
 write *eventpb.CreateIndex to event log:
   indexName: idx
   mutationId: 1
@@ -242,6 +244,12 @@ upsert descriptor #104
   +        "2": idx
   +      name: t
   +    relevantStatements:
+  +    - statement:
+  +        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
+  +          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
+  +        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
+  +          1 $$"
+  +        statementTag: CREATE FUNCTION
   +    - statement:
   +        redactedStatement: CREATE UNIQUE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹b›)
   +        statement: CREATE UNIQUE INDEX idx ON t (b)
@@ -475,6 +483,12 @@ upsert descriptor #104
   -        "2": idx
   -      name: t
   -    relevantStatements:
+  -    - statement:
+  -        redactedStatement: "CREATE FUNCTION ‹defaultdb›.‹public›.‹t›()\n\tRETURNS
+  -          INT8\n\tLANGUAGE SQL\n\tAS $$SELECT ‹1›;$$"
+  -        statement: "CREATE FUNCTION t()\n\tRETURNS INT8\n\tLANGUAGE SQL\n\tAS $$ SELECT
+  -          1 $$"
+  -        statementTag: CREATE FUNCTION
   -    - statement:
   -        redactedStatement: CREATE UNIQUE INDEX ‹idx› ON ‹defaultdb›.‹public›.‹t› (‹b›)
   -        statement: CREATE UNIQUE INDEX idx ON t (b)

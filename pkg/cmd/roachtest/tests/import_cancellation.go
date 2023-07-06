@@ -38,6 +38,9 @@ func registerImportCancellation(r registry.Registry) {
 			Cluster:   r.MakeClusterSpec(6, spec.CPU(32)),
 			Leases:    registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+				if c.Spec().Cloud != spec.GCE {
+					t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
+				}
 				runImportCancellation(ctx, t, c, rangeTombstones)
 			},
 		})
@@ -85,12 +88,6 @@ func runImportCancellation(
 	}
 	stmt := fmt.Sprintf(`SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = '%s'`, rtEnable)
 	if _, err := conn.Exec(stmt); err != nil {
-		t.Fatal(err)
-	}
-	// Increase AddSSTable concurrency to speed up the imports. Otherwise the
-	// lineitem (the largest tpch table) IMPORT will extend the test duration
-	// significantly.
-	if _, err := conn.Exec(`SET CLUSTER SETTING kv.bulk_io_write.concurrent_addsstable_requests = 10`); err != nil {
 		t.Fatal(err)
 	}
 

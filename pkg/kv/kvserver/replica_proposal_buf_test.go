@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
@@ -34,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -65,6 +65,10 @@ type testProposer struct {
 	// If nil, rejectProposalWithLeaseTransferRejectedLocked() panics.
 	onRejectProposalWithLeaseTransferRejectedLocked func(
 		lease *roachpb.Lease, reason raftutil.ReplicaNeedsSnapshotStatus)
+	onRejectProposalWithErrLocked func(*ProposalData, *kvpb.Error)
+	onProposalsDropped            func(
+		ents []raftpb.Entry, proposalData []*ProposalData, stateType raft.StateType,
+	)
 	// validLease is returned by ownsValidLease()
 	validLease bool
 	// leaderNotLive is returned from shouldCampaignOnRedirect().
@@ -91,6 +95,7 @@ type testProposerRaft struct {
 	// proposals are the commands that the propBuf flushed (i.e. passed to the
 	// Raft group) and have not yet been consumed with consumeProposals().
 	proposals  []kvserverpb.RaftCommand
+	onProp     func(raftpb.Message) error // invoked on Step with MsgProp
 	campaigned bool
 }
 
@@ -99,6 +104,11 @@ var _ proposerRaft = &testProposerRaft{}
 func (t *testProposerRaft) Step(msg raftpb.Message) error {
 	if msg.Type != raftpb.MsgProp {
 		return nil
+	}
+	if t.onProp != nil {
+		if err := t.onProp(msg); err != nil {
+			return err
+		}
 	}
 	// Decode and save all the commands.
 	for _, e := range msg.Entries {
@@ -124,11 +134,6 @@ func (t testProposerRaft) Status() raft.Status {
 
 func (t testProposerRaft) BasicStatus() raft.BasicStatus {
 	return t.status.BasicStatus
-}
-
-func (t testProposerRaft) ProposeConfChange(i raftpb.ConfChangeI) error {
-	// TODO(andrei, nvanbenschoten): Capture the message and test against it.
-	return nil
 }
 
 func (t *testProposerRaft) Campaign() error {
@@ -186,7 +191,14 @@ func (t *testProposer) withGroupLocked(fn func(proposerRaft) error) error {
 	return fn(t.raftGroup)
 }
 
-func (rp *testProposer) onErrProposalDropped(ents []raftpb.Entry, stateType raft.StateType) {}
+func (rp *testProposer) onErrProposalDropped(
+	ents []raftpb.Entry, props []*ProposalData, typ raft.StateType,
+) {
+	if rp.onProposalsDropped == nil {
+		return
+	}
+	rp.onProposalsDropped(ents, props, typ)
+}
 
 func (t *testProposer) leaseDebugRLocked() string {
 	return ""
@@ -265,6 +277,15 @@ func (t *testProposer) rejectProposalWithLeaseTransferRejectedLocked(
 	t.onRejectProposalWithLeaseTransferRejectedLocked(lease, reason)
 }
 
+func (t *testProposer) rejectProposalWithErrLocked(
+	_ context.Context, prop *ProposalData, pErr *kvpb.Error,
+) {
+	if t.onRejectProposalWithErrLocked == nil {
+		panic("unexpected rejectProposalWithErrLocked() call")
+	}
+	t.onRejectProposalWithErrLocked(prop, pErr)
+}
+
 // proposalCreator holds on to a lease and creates proposals using it.
 type proposalCreator struct {
 	lease kvserverpb.LeaseStatus
@@ -292,12 +313,19 @@ func (pc proposalCreator) newLeaseTransferProposal(lease roachpb.Lease) *Proposa
 func (pc proposalCreator) newProposal(ba *kvpb.BatchRequest) *ProposalData {
 	var lease *roachpb.Lease
 	var isLeaseRequest bool
+	var cr *kvserverpb.ChangeReplicas
 	switch v := ba.Requests[0].GetInner().(type) {
 	case *kvpb.RequestLeaseRequest:
 		lease = &v.Lease
 		isLeaseRequest = true
 	case *kvpb.TransferLeaseRequest:
 		lease = &v.Lease
+	case *kvpb.EndTxnRequest:
+		if crt := v.InternalCommitTrigger.GetChangeReplicasTrigger(); crt != nil {
+			cr = &kvserverpb.ChangeReplicas{
+				ChangeReplicasTrigger: *crt,
+			}
+		}
 	}
 	p := &ProposalData{
 		ctx:   context.Background(),
@@ -306,6 +334,7 @@ func (pc proposalCreator) newProposal(ba *kvpb.BatchRequest) *ProposalData {
 			ReplicatedEvalResult: kvserverpb.ReplicatedEvalResult{
 				IsLeaseRequest: isLeaseRequest,
 				State:          &kvserverpb.ReplicaState{Lease: lease},
+				ChangeReplicas: cr,
 			},
 		},
 		Request:     ba,
@@ -316,15 +345,11 @@ func (pc proposalCreator) newProposal(ba *kvpb.BatchRequest) *ProposalData {
 }
 
 func (pc proposalCreator) encodeProposal(p *ProposalData) []byte {
-	cmdLen := p.command.Size()
-	needed := raftlog.RaftCommandPrefixLen + cmdLen + kvserverpb.MaxRaftCommandFooterSize()
-	data := make([]byte, raftlog.RaftCommandPrefixLen, needed)
-	raftlog.EncodeRaftCommandPrefix(data, raftlog.EntryEncodingStandardWithoutAC, p.idKey)
-	data = data[:raftlog.RaftCommandPrefixLen+p.command.Size()]
-	if _, err := protoutil.MarshalToSizedBuffer(p.command, data[raftlog.RaftCommandPrefixLen:]); err != nil {
+	b, err := raftlog.EncodeCommand(context.Background(), p.command, p.idKey, nil /* raftAdmissionMeta */)
+	if err != nil {
 		panic(err)
 	}
-	return data
+	return b
 }
 
 // TestProposalBuffer tests the basic behavior of the Raft proposal buffer.
@@ -805,6 +830,161 @@ func TestProposalBufferRejectUnsafeLeaseTransfer(t *testing.T) {
 			require.Zero(t, tracker.Count())
 		})
 	}
+}
+
+func TestProposalBufferLinesUpEntriesAndProposals(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	proposer := uint64(1)
+	proposerFirstIndex := kvpb.RaftIndex(5)
+
+	var matchingDroppedProposalsSeen int
+	p := testProposer{
+		onProposalsDropped: func(ents []raftpb.Entry, props []*ProposalData, _ raft.StateType) {
+			require.Equal(t, len(ents), len(props))
+			for i := range ents {
+				if ents[i].Type == raftpb.EntryNormal {
+					require.Nil(t, props[i].command.ReplicatedEvalResult.ChangeReplicas)
+				} else {
+					require.NotNil(t, props[i].command.ReplicatedEvalResult.ChangeReplicas)
+				}
+				matchingDroppedProposalsSeen++
+			}
+		},
+	}
+	var pc proposalCreator
+	require.Equal(t, proposer, uint64(p.getReplicaID()))
+
+	// Drop all proposals, since then we'll see the (ents,props) pair in
+	// onErrProposalDropped.
+	r := &testProposerRaft{onProp: func(msg raftpb.Message) error {
+		return raft.ErrProposalDropped
+	}}
+	p.raftGroup = r
+	p.fi = proposerFirstIndex
+
+	var b propBuf
+	// Make the proposal buffer large so that all the proposals we're putting in
+	// get flushed together. (At the time of writing, default size is 4).
+	b.arr.adjustSize(100)
+	clock := hlc.NewClockForTesting(nil)
+	tr := tracker.NewLockfreeTracker()
+	b.Init(&p, tr, clock, cluster.MakeTestingClusterSettings())
+
+	now := clock.Now()
+
+	// Make seven proposals:
+	// [put, put, put, confchange, put, put, put].
+	var pds []*ProposalData
+
+	for i := 0; i < 3; i++ {
+		pds = append(pds, pc.newPutProposal(now))
+	}
+
+	{
+		k := keys.LocalMax // unimportant
+		var ba kvpb.BatchRequest
+		ba.Add(&kvpb.EndTxnRequest{
+			RequestHeader: kvpb.RequestHeader{
+				Key: k,
+			},
+			Commit: true,
+			InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+				ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
+					Desc: roachpb.NewRangeDescriptor(1, roachpb.RKeyMin, roachpb.RKeyMax,
+						roachpb.MakeReplicaSet([]roachpb.ReplicaDescriptor{{NodeID: 1, StoreID: 1, ReplicaID: 1}}),
+					),
+				},
+			},
+		})
+		pds = append(pds, pc.newProposal(&ba))
+	}
+
+	for i := 0; i < 3; i++ {
+		pds = append(pds, pc.newPutProposal(now))
+	}
+
+	for _, pd := range pds {
+		_, tok := b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+		require.NoError(t, b.Insert(ctx, pd, tok.Move(ctx)))
+	}
+	require.NoError(t, b.flushLocked(ctx))
+	require.Equal(t, len(pds), matchingDroppedProposalsSeen)
+}
+
+// TestProposalBufferRejectStaleChangeReplicasConfChange is a regression test
+// for [1]. See also TestInvalidConfChangeRejection for an end-to-end test.
+//
+// [1]: https://github.com/cockroachdb/cockroach/issues/105797
+func TestProposalBufferRejectStaleChangeReplicasConfChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	proposer := uint64(1)
+	proposerFirstIndex := kvpb.RaftIndex(5)
+
+	var p testProposer
+	var pc proposalCreator
+	require.Equal(t, proposer, uint64(p.getReplicaID()))
+
+	var seenErr *kvpb.Error
+	p.onRejectProposalWithErrLocked = func(proposalData *ProposalData, pErr *kvpb.Error) {
+		require.NotNil(t, pErr)
+		seenErr = pErr
+	}
+
+	r := &testProposerRaft{
+		onProp: func(msg raftpb.Message) error {
+			// Mimic what RawNode does when it gets a conf change that isn't
+			// compatible with its active config: proposing an empty entry instead. In
+			// practice, because the config is set when applying commands, this can
+			// happen when a stale ChangeReplicas is proposed but the RawNode has
+			// already applied newer config changes.
+			//
+			// See https://github.com/etcd-io/raft/blob/4abd9e927c6d5db930dfdb80237ac584449aeec7/raft.go#L1254-L1257.
+			if msg.Entries[0].Type == raftpb.EntryConfChangeV2 {
+				msg.Entries[0] = raftpb.Entry{Type: raftpb.EntryNormal}
+			}
+			return nil
+		},
+	}
+	p.raftGroup = r
+	p.fi = proposerFirstIndex
+
+	var b propBuf
+	clock := hlc.NewClockForTesting(nil)
+	tr := tracker.NewLockfreeTracker()
+	b.Init(&p, tr, clock, cluster.MakeTestingClusterSettings())
+
+	k := keys.LocalMax // unimportant
+	var ba kvpb.BatchRequest
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key: k,
+		},
+		Commit: true,
+		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+			ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
+				Desc: roachpb.NewRangeDescriptor(1, roachpb.RKeyMin, roachpb.RKeyMax,
+					roachpb.MakeReplicaSet([]roachpb.ReplicaDescriptor{{NodeID: 1, StoreID: 1, ReplicaID: 1}}),
+				),
+			},
+		},
+	})
+	pd := pc.newProposal(&ba)
+
+	_, tok := b.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
+	err := b.Insert(ctx, pd, tok.Move(ctx))
+	require.NoError(t, err)
+	require.NoError(t, b.flushLocked(ctx))
+	require.ErrorContains(t, seenErr.GoError(), `config change rejected by raft`)
+	// NB: we don't check that the proposals map is empty because the test harness
+	// currently doesn't do it (we'd really be testing the test harness only
+	// anyway). We have coverage for this end-to-end through
+	// TestInvalidConfChangeRejection, though.
 }
 
 // Test that the propBuf properly assigns closed timestamps to proposals being

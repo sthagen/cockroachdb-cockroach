@@ -362,6 +362,11 @@ type EngineIterator interface {
 	// Value returns the current value as a byte slice.
 	// REQUIRES: latest positioning function returned valid=true.
 	Value() ([]byte, error)
+	// ValueLen returns the length of the current value. ValueLen should be
+	// preferred when the actual value is not needed. In some circumstances, the
+	// storage engine may be able to avoid loading the value.
+	// REQUIRES: latest positioning function returned valid=true.
+	ValueLen() int
 	// CloneContext is a low-level method only for use in the storage package,
 	// that provides sufficient context that the iterator may be cloned.
 	CloneContext() CloneContext
@@ -631,14 +636,22 @@ type Writer interface {
 	// actually removes entries from the storage engine, rather than inserting
 	// MVCC tombstones.
 	//
+	// If the caller knows the size of the value that is being cleared, they
+	// should set ClearOptions.{ValueSizeKnown, ValueSize} accordingly to
+	// improve the storage engine's ability to prioritize compactions.
+	//
 	// It is safe to modify the contents of the arguments after it returns.
-	ClearMVCC(key MVCCKey) error
+	ClearMVCC(key MVCCKey, opts ClearOptions) error
 	// ClearUnversioned removes an unversioned item from the db. It is for use
 	// with inline metadata (not intents) and other unversioned keys (like
 	// Range-ID local keys). It does not affect range keys.
 	//
+	// If the caller knows the size of the value that is being cleared, they
+	// should set ClearOptions.{ValueSizeKnown, ValueSize} accordingly to
+	// improve the storage engine's ability to prioritize compactions.
+	//
 	// It is safe to modify the contents of the arguments after it returns.
-	ClearUnversioned(key roachpb.Key) error
+	ClearUnversioned(key roachpb.Key, opts ClearOptions) error
 	// ClearIntent removes an intent from the db. Unlike ClearMVCC and
 	// ClearUnversioned, this is a higher-level method that may make changes in
 	// parts of the key space that are not only a function of the input, and may
@@ -653,14 +666,18 @@ type Writer interface {
 	// that does a <single-clear, put> pair. If there isn't a performance
 	// decrease, we can stop tracking txnDidNotUpdateMeta and still optimize
 	// ClearIntent by always doing single-clear.
-	ClearIntent(key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID) error
+	ClearIntent(key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions) error
 	// ClearEngineKey removes the given point key from the engine. It does not
 	// affect range keys.  Note that clear actually removes entries from the
 	// storage engine. This is a general-purpose and low-level method that should
 	// be used sparingly, only when the other Clear* methods are not applicable.
 	//
+	// If the caller knows the size of the value that is being cleared, they
+	// should set ClearOptions.{ValueSizeKnown, ValueSize} accordingly to
+	// improve the storage engine's ability to prioritize compactions.
+	//
 	// It is safe to modify the contents of the arguments after it returns.
-	ClearEngineKey(key EngineKey) error
+	ClearEngineKey(key EngineKey, opts ClearOptions) error
 
 	// ClearRawRange removes point and/or range keys from start (inclusive) to end
 	// (exclusive) using Pebble range tombstones. It can be applied to a range
@@ -837,6 +854,31 @@ type Writer interface {
 	BufferedSize() int
 }
 
+// ClearOptions holds optional parameters to methods that clear keys from the
+// storage engine.
+type ClearOptions struct {
+	// ValueSizeKnown indicates whether the ValueSize carries a meaningful
+	// value. If false, ValueSize is ignored.
+	ValueSizeKnown bool
+	// ValueSize may be provided to indicate the size of the existing KV
+	// record's value that is being removed. ValueSize should be the encoded
+	// value size that the storage engine observes. If the value is a
+	// MVCCMetadata, ValueSize should be the length of the encoded MVCCMetadata.
+	// If the value is a MVCCValue, ValueSize should be the length of the
+	// encoded MVCCValue.
+	//
+	// Setting ValueSize and ValueSizeKnown improves the storage engine's
+	// ability to estimate space amplification and prioritize compactions.
+	// Without it, compaction heuristics rely on average value sizes which are
+	// susceptible to over and under estimation.
+	//
+	// If the true value size is unknown, leave ValueSizeKnown false.
+	// Correctness is not compromised if ValueSize is incorrect; the underlying
+	// key will always be cleared regardless of whether its value size matches
+	// the provided value.
+	ValueSize uint32
+}
+
 // ReadWriter is the read/write interface to an engine's data.
 type ReadWriter interface {
 	Reader
@@ -951,6 +993,8 @@ type Engine interface {
 	// CompactRange ensures that the specified range of key value pairs is
 	// optimized for space efficiency.
 	CompactRange(start, end roachpb.Key) error
+	// GetTableMetrics returns information about sstables that overlap start and end.
+	GetTableMetrics(start, end roachpb.Key) ([]enginepb.SSTableMetricsInfo, error)
 	// RegisterFlushCompletedCallback registers a callback that will be run for
 	// every successful flush. Only one callback can be registered at a time, so
 	// registering again replaces the previous callback. The callback must
@@ -1474,7 +1518,10 @@ func ClearRangeWithHeuristic(
 			if err != nil {
 				return err
 			}
-			if err = w.ClearEngineKey(key); err != nil {
+			if err = w.ClearEngineKey(key, ClearOptions{
+				ValueSizeKnown: true,
+				ValueSize:      uint32(iter.ValueLen()),
+			}); err != nil {
 				return err
 			}
 		}
@@ -1554,6 +1601,13 @@ var ingestDelayTime = settings.RegisterDurationSetting(
 	time.Second*5,
 )
 
+var preIngestDelayEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"pebble.pre_ingest_delay.enabled",
+	"controls whether the pre-ingest delay mechanism is active",
+	false,
+)
+
 // PreIngestDelay may choose to block for some duration if L0 has an excessive
 // number of files in it or if PendingCompactionBytesEstimate is elevated. This
 // it is intended to be called before ingesting a new SST, since we'd rather
@@ -1565,6 +1619,9 @@ var ingestDelayTime = settings.RegisterDurationSetting(
 // compaction limit is exceeded, it waits for the maximum delay.
 func preIngestDelay(ctx context.Context, eng Engine, settings *cluster.Settings) {
 	if settings == nil {
+		return
+	}
+	if !preIngestDelayEnabled.Get(&settings.SV) {
 		return
 	}
 	metrics := eng.GetMetrics()

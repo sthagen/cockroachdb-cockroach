@@ -145,7 +145,7 @@ type admitEntHandle struct {
 type singleBatchProposer interface {
 	getReplicaID() roachpb.ReplicaID
 	flowControlHandle(ctx context.Context) kvflowcontrol.Handle
-	onErrProposalDropped([]raftpb.Entry, raft.StateType)
+	onErrProposalDropped([]raftpb.Entry, []*ProposalData, raft.StateType)
 }
 
 // A proposer is an object that uses a propBuf to coordinate Raft proposals.
@@ -192,6 +192,11 @@ type proposer interface {
 		lease *roachpb.Lease,
 		reason raftutil.ReplicaNeedsSnapshotStatus,
 	)
+	// rejectProposalWithErrLocked rejects the proposal with the given error. This
+	// should only be used if none of the other `rejectProposalX` methods apply.
+	rejectProposalWithErrLocked(
+		ctx context.Context, prop *ProposalData, pErr *kvpb.Error,
+	)
 
 	// leaseDebugRLocked returns info on the current lease.
 	leaseDebugRLocked() string
@@ -203,7 +208,6 @@ type proposerRaft interface {
 	Step(raftpb.Message) error
 	Status() raft.Status
 	BasicStatus() raft.BasicStatus
-	ProposeConfChange(raftpb.ConfChangeI) error
 	Campaign() error
 }
 
@@ -544,7 +548,7 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 			}
 
 			ents = ents[len(ents):]
-			firstProp, nextProp = i, i
+			firstProp, nextProp = i+1, i+1
 			admitHandles = admitHandles[len(admitHandles):]
 
 			confChangeCtx := kvserverpb.ConfChangeContext{
@@ -563,14 +567,49 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 				continue
 			}
 
-			if err := raftGroup.ProposeConfChange(
-				cc,
+			typ, data, err := raftpb.MarshalConfChange(cc)
+			if err != nil {
+				firstErr = err
+				continue
+			}
+			sl := []raftpb.Entry{{Type: typ, Data: data}}
+			// Send config change in a single-element batch. We go through
+			// proposeBatch since there's observability in there.
+			//
+			// TODO(replication): we can construct a proper admitEntHandle here by
+			// pulling the initialization code from the "regular" branch to the top so
+			// that it can be shared. For now, this is fine since conf changes are
+			// internal commands anyway and unlikely to be sent at significant volume.
+			if err := proposeBatch(
+				ctx, b.p, raftGroup, sl, []admitEntHandle{{}}, []*ProposalData{p},
 			); err != nil && !errors.Is(err, raft.ErrProposalDropped) {
 				// Silently ignore dropped proposals (they were always silently
 				// ignored prior to the introduction of ErrProposalDropped).
 				// TODO(bdarnell): Handle ErrProposalDropped better.
 				// https://github.com/cockroachdb/cockroach/issues/21849
 				firstErr = err
+				continue
+			}
+			if sl[0].Type == raftpb.EntryNormal {
+				// If we are trying to commit a ChangeReplicas but the lease has since
+				// changed, it's possible that the new leaseholder has already committed
+				// additional replication changes that our RawNode has applied. In that
+				// case, its config may be incompatible with what our stale
+				// ChangeReplicas wants to do, and raft will "reject" it by proposing an
+				// empty entry instead. We don't need this protection since it is
+				// conferred by our below-raft checks (plus, on the leaseholder, latches
+				// that linearize application of replication changes). In fact, it's
+				// detrimental, because an empty entry doesn't map back to our inflight
+				// proposal, and so in effect the stale ChangeReplicas will never "show
+				// up" as replicated, essentially leaking a proposal and the associated
+				// latches. We could disable the raft check, but there currently isn't
+				// an option for that. Instead, we detect when RawNode has replaced our
+				// entry with a "normal" entry and terminate the proposal here (note
+				// that it is currently not in the proposals map).
+				b.p.rejectProposalWithErrLocked(ctx, p, kvpb.NewErrorf(`config change rejected by raft; please retry`))
+				// At the time of writing, this is superfluous, but if any code gets
+				// added at the end of the loop likely it shouldn't affect this
+				// proposal since we're skipping it.
 				continue
 			}
 		} else {
@@ -1006,7 +1045,7 @@ func proposeBatch(
 				log.Event(p.ctx, "entry dropped")
 			}
 		}
-		p.onErrProposalDropped(ents, raftGroup.BasicStatus().RaftState)
+		p.onErrProposalDropped(ents, props, raftGroup.BasicStatus().RaftState)
 		return nil //nolint:returnerrcheck
 	}
 	if err == nil {
@@ -1312,7 +1351,9 @@ func (rp *replicaProposer) withGroupLocked(fn func(raftGroup proposerRaft) error
 	})
 }
 
-func (rp *replicaProposer) onErrProposalDropped(ents []raftpb.Entry, stateType raft.StateType) {
+func (rp *replicaProposer) onErrProposalDropped(
+	ents []raftpb.Entry, _ []*ProposalData, stateType raft.StateType,
+) {
 	n := int64(len(ents))
 	rp.store.metrics.RaftProposalsDropped.Inc(n)
 	if stateType == raft.StateLeader {

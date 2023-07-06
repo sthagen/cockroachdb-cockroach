@@ -133,10 +133,6 @@ func (r *Replica) evalAndPropose(
 		return nil, nil, "", nil, pErr
 	}
 
-	// Attach the endCmds to the proposal and assume responsibility for
-	// releasing the concurrency guard if the proposal makes it to Raft.
-	proposal.ec = endCmds{repl: r, g: g, st: *st}
-
 	// Pull out proposal channel to return. proposal.doneCh may be set to
 	// nil if it is signaled in this function.
 	proposalCh := proposal.doneCh
@@ -156,6 +152,12 @@ func (r *Replica) evalAndPropose(
 		endTxns := proposal.Local.DetachEndTxns(pErr != nil /* alwaysOnly */)
 		r.handleReadWriteLocalEvalResult(ctx, *proposal.Local)
 
+		// NB: it is intentional that this returns both an error and results.
+		// Some actions should also be taken if the command itself fails. For
+		// example, discovered intents should be pushed to make sure they get
+		// dealt with proactively rather than waiting for a future command to
+		// find them.
+		proposal.ec = makeUnreplicatedEndCmds(r, g, *st)
 		pr := proposalResult{
 			Reply:              proposal.Local.Reply,
 			Err:                pErr,
@@ -165,6 +167,10 @@ func (r *Replica) evalAndPropose(
 		proposal.finishApplication(ctx, pr)
 		return proposalCh, func() {}, "", nil, nil
 	}
+
+	// Make it a truly replicated proposal. We measure the replication latency
+	// from this point on.
+	proposal.ec = makeReplicatedEndCmds(r, g, *st, timeutil.Now())
 
 	log.VEventf(proposal.ctx, 2,
 		"proposing command to write %d new keys, %d new values, %d new intents, "+
@@ -2601,7 +2607,10 @@ func handleTruncatedStateBelowRaftPreApply(
 		// avoid allocating when constructing Raft log keys (16 bytes).
 		prefix := prefixBuf.RaftLogPrefix()
 		for idx := currentTruncatedState.Index + 1; idx <= suggestedTruncatedState.Index; idx++ {
-			if err := readWriter.ClearUnversioned(keys.RaftLogKeyFromPrefix(prefix, idx)); err != nil {
+			if err := readWriter.ClearUnversioned(
+				keys.RaftLogKeyFromPrefix(prefix, idx),
+				storage.ClearOptions{},
+			); err != nil {
 				return false, errors.Wrapf(err, "unable to clear truncated Raft entries for %+v at index %d",
 					suggestedTruncatedState, idx)
 			}

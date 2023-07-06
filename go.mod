@@ -116,7 +116,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20230630180611-032c398e6711
+	github.com/cockroachdb/pebble v0.0.0-20230701135918-609ae80aea41
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -167,7 +167,6 @@ require (
 	github.com/klauspost/compress v1.15.15
 	github.com/klauspost/pgzip v1.2.5
 	github.com/knz/bubbline v0.0.0-20230422210153-e176cdfe1c43
-	github.com/knz/go-libedit v1.10.2-0.20230621133438-5f2b2e7387c5
 	github.com/knz/strtime v0.0.0-20200318182718-be999391ffa9
 	github.com/kr/pretty v0.3.1
 	github.com/kr/text v0.2.0
@@ -196,6 +195,7 @@ require (
 	github.com/pierrre/geohash v1.0.0
 	github.com/pires/go-proxyproto v0.7.0
 	github.com/pkg/browser v0.0.0-20210115035449-ce105d075bb4
+	github.com/pkg/errors v0.9.1
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/pressly/goose/v3 v3.5.3
 	github.com/prometheus/client_golang v1.12.1
@@ -361,7 +361,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/openzipkin/zipkin-go v0.2.5 // indirect
 	github.com/pelletier/go-toml v1.9.3 // indirect
-	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pkg/profile v1.6.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/pquerna/cachecontrol v0.0.0-20200921180117-858c6e7e6b7e // indirect

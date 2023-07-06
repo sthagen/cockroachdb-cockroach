@@ -5209,6 +5209,75 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			Volatility: volatility.Stable,
 		},
 	),
+	"crdb_internal.repair_catalog_corruption": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemRepair,
+			DistsqlBlocklist: true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "descriptor_id", Typ: types.Int},
+				{Name: "corruption", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			// See the kv_repairable_catalog_corruptions virtual view definition for
+			// details about the different corruption types.
+			// Presently, 'descriptor' and 'namespace' are supported by this builtin.
+			Body: `
+SELECT
+	CASE corruption
+	WHEN 'descriptor'
+	THEN (
+		SELECT
+			max(
+				crdb_internal.unsafe_upsert_descriptor(
+					id,
+					crdb_internal.repaired_descriptor(
+						descriptor,
+						(SELECT array_agg(id) AS desc_id_array FROM system.descriptor),
+						(
+							SELECT
+								array_agg(id) AS job_id_array
+							FROM
+								system.jobs
+							WHERE
+								status NOT IN ('failed', 'succeeded', 'canceled', 'revert-failed')
+						)
+					),
+					true
+				)
+			)
+		FROM
+			system.descriptor
+		WHERE
+			id = $1
+	)
+	WHEN 'namespace'
+	THEN (
+		SELECT
+			max(
+				crdb_internal.unsafe_delete_namespace_entry(
+					"parentID",
+					"parentSchemaID",
+					name,
+					id,
+					true
+				)
+			)
+		FROM
+			system.namespace
+		WHERE
+			id = $1 AND id NOT IN (SELECT id FROM system.descriptor)
+	)
+	ELSE NULL
+	END
+`,
+			Info: "repair_catalog_corruption(descriptor_id,corruption) attempts to repair corrupt" +
+				" records in system tables associated with that descriptor id",
+			Volatility: volatility.Volatile,
+			Language:   tree.FunctionLangSQL,
+		},
+	),
 
 	"crdb_internal.force_error": makeBuiltin(
 		tree.FunctionProperties{
@@ -6993,6 +7062,34 @@ table's zone configuration this will return NULL.`,
 				return tree.MakeDBool(true), nil
 			},
 			Info:       `This function is used to clear the collected SQL statistics.`,
+			Volatility: volatility.Volatile,
+		},
+	),
+	"crdb_internal.reset_activity_tables": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errors.New("crdb_internal.reset_activity_tables() requires admin privilege")
+				}
+				if evalCtx.SQLStatsController == nil {
+					return nil, errors.AssertionFailedf("sql stats controller not set")
+				}
+				if err := evalCtx.SQLStatsController.ResetActivityTables(ctx); err != nil {
+					return nil, err
+				}
+				return tree.MakeDBool(true), nil
+			},
+			Info:       `This function is used to clear the {statement|transaction} activity system tables.`,
 			Volatility: volatility.Volatile,
 		},
 	),

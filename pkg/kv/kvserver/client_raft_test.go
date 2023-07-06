@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -42,9 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -3289,113 +3288,6 @@ HAVING
 	if len(matrix) > 0 {
 		t.Fatalf("more than %d voting replicas: %s", repFactor, sqlutils.MatrixToStr(matrix))
 	}
-}
-
-func TestDecommission(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Five nodes is too much to reliably run under testrace with our aggressive
-	// liveness timings.
-	skip.UnderRace(t, "#39807 and #37811")
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 5, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationAuto,
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				SpanConfig: &spanconfig.TestingKnobs{
-					ConfigureScratchRange: true,
-				},
-			},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-
-	k := tc.ScratchRange(t)
-	admin, err := tc.GetAdminClient(ctx, t, 0)
-	require.NoError(t, err)
-
-	// Decommission the first node, which holds most of the leases.
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{1},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	requireNoReplicas := func(storeID roachpb.StoreID, repFactor int) {
-		attempt := 0
-		testutils.SucceedsSoon(t, func() error {
-			attempt++
-			desc := tc.LookupRangeOrFatal(t, k)
-			for _, rDesc := range desc.Replicas().VoterDescriptors() {
-				store, err := tc.Servers[int(rDesc.NodeID-1)].Stores().GetStore(rDesc.StoreID)
-				require.NoError(t, err)
-				if err := store.ForceReplicationScanAndProcess(); err != nil {
-					return err
-				}
-			}
-			if sl := desc.Replicas().FilterToDescriptors(func(rDesc roachpb.ReplicaDescriptor) bool {
-				return rDesc.StoreID == storeID
-			}); len(sl) > 0 {
-				return errors.Errorf("still a replica on s%d: %s on attempt %d", storeID, &desc, attempt)
-			}
-			if len(desc.Replicas().VoterDescriptors()) != repFactor {
-				return errors.Errorf("expected %d replicas: %s on attempt %d", repFactor, &desc, attempt)
-			}
-			return nil
-		})
-	}
-
-	const triplicated = 3
-
-	requireNoReplicas(1, triplicated)
-
-	runner := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-	ts := timeutil.Now()
-
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{2},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	// Both s1 and s2 are out, so neither ought to have replicas.
-	requireNoReplicas(1, triplicated)
-	requireNoReplicas(2, triplicated)
-
-	// Going from three replicas to three replicas should have used atomic swaps
-	// only. We didn't verify this before the first decommissioning op because
-	// lots of ranges were over-replicated due to ranges recently having split
-	// off from the five-fold replicated system ranges.
-	requireOnlyAtomicChanges(t, runner, tc.LookupRangeOrFatal(t, k).RangeID, triplicated, ts)
-
-	sqlutils.SetZoneConfig(t, runner, "RANGE default", "num_replicas: 1")
-
-	const single = 1
-
-	// The range should drop down to one replica on a non-decommissioning store.
-	requireNoReplicas(1, single)
-	requireNoReplicas(2, single)
-
-	// Decommission two more nodes. Only n5 is left; getting the replicas there
-	// can't use atomic replica swaps because the leaseholder can't be removed.
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{3, 4},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	requireNoReplicas(1, single)
-	requireNoReplicas(2, single)
-	requireNoReplicas(3, single)
-	requireNoReplicas(4, single)
 }
 
 // TestReplicateRogueRemovedNode ensures that a rogue removed node
@@ -6931,5 +6823,65 @@ func TestStoreMetricsOnIncomingOutgoingMsg(t *testing.T) {
 			"raft.sent.cross_zone.bytes":   0,
 		}
 		require.Equal(t, expected, actual)
+	})
+}
+
+// TestInvalidConfChangeRejection is a regression test for [1]. See also
+// TestProposalBufferRejectStaleChangeReplicasConfChange for a unit test.
+//
+// [1]: https://github.com/cockroachdb/cockroach/issues/105797
+func TestInvalidConfChangeRejection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This is a regression test against a stuck command, so set a timeout to get
+	// a shot at a graceful failure on regression.
+	ctx, cancel := context.WithTimeout(context.Background(), testutils.DefaultSucceedsSoonDuration)
+	defer cancel()
+
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
+	defer tc.Stopper().Stop(ctx)
+
+	k := tc.ScratchRange(t)
+
+	repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(keys.MustAddr(k))
+
+	// Try to leave a joint config even though we're not in one. This is something
+	// that will lead raft to propose an empty entry instead of our conf change.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/105797
+	var ba kvpb.BatchRequest
+	now := tc.Server(0).Clock().Now()
+	txn := roachpb.MakeTransaction("fake", k, isolation.Serializable, roachpb.NormalUserPriority, now, 500*time.Millisecond.Nanoseconds(), 1)
+	ba.Txn = &txn
+	ba.Timestamp = now
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key: k,
+		},
+		Commit: true,
+		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+			ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
+				Desc: repl.Desc(),
+			},
+		},
+	})
+
+	_, pErr := repl.Send(ctx, &ba)
+	require.ErrorContains(t, pErr.GoError(), `config change rejected by raft`)
+
+	// We didn't leak the latch.
+	_, err := tc.Servers[0].DB().Get(ctx, k)
+	require.NoError(t, err)
+
+	// Double check that we don't have a proposal in the map. (We may not have
+	// leaked the latch, but still leaked the proposal). This is morally always
+	// zero, but since it's a TestCluster guard against another random request
+	// blipping in.
+	testutils.SucceedsSoon(t, func() error {
+		if n := repl.State(ctx).NumPending; n > 0 {
+			return errors.Errorf("%d proposals pending", n)
+		}
+		return nil
 	})
 }

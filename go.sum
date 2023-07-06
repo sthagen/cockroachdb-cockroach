@@ -490,8 +490,8 @@ github.com/cockroachdb/gostdlib v1.19.0/go.mod h1:+dqqpARXbE/gRDEhCak6dm0l14AaTy
 github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f/go.mod h1:Vz9DsVWQQhf3vs21MhPMZpMGSht7O/2vFW2xusFUVOs=
 github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b h1:r6VH0faHjZeQy818SGhaone5OnYfxFR/+AzdY3sf5aE=
 github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b/go.mod h1:Vz9DsVWQQhf3vs21MhPMZpMGSht7O/2vFW2xusFUVOs=
-github.com/cockroachdb/pebble v0.0.0-20230630180611-032c398e6711 h1:WeWqSh8LDNQu1Prwi9sgHj0D1w7o1shkLa7Td3NMoQM=
-github.com/cockroachdb/pebble v0.0.0-20230630180611-032c398e6711/go.mod h1:FN5O47SBEz5+kO9fG8UTR64g2WS1u5ZFCgTvxGjoSks=
+github.com/cockroachdb/pebble v0.0.0-20230701135918-609ae80aea41 h1:lYBVTS2P5fx79WWjoR/Gf4Fx5sZiIVCFWpuxntyiskY=
+github.com/cockroachdb/pebble v0.0.0-20230701135918-609ae80aea41/go.mod h1:FN5O47SBEz5+kO9fG8UTR64g2WS1u5ZFCgTvxGjoSks=
 github.com/cockroachdb/redact v1.1.3/go.mod h1:BVNblN9mBWFyMyqK1k3AAiSxhvhfK2oOZZ2lK+dpvRg=
 github.com/cockroachdb/redact v1.1.5 h1:u1PMllDkdFfPWaNGMyLD1+so+aq3uUItthCFqzwPJ30=
 github.com/cockroachdb/redact v1.1.5/go.mod h1:BVNblN9mBWFyMyqK1k3AAiSxhvhfK2oOZZ2lK+dpvRg=
@@ -1524,8 +1524,6 @@ github.com/knz/bubbline v0.0.0-20230422210153-e176cdfe1c43 h1:uhwfuoL9LDMUGlxcs3
 github.com/knz/bubbline v0.0.0-20230422210153-e176cdfe1c43/go.mod h1:ucXvyrucVy4jp/4afdKWNW1TVO73GMI72VNINzyT678=
 github.com/knz/catwalk v0.1.4 h1:GgCxHbPp+nzyZBJcNL/CJd1aba4ACoeuI1lnsshAPkY=
 github.com/knz/catwalk v0.1.4/go.mod h1:Q+Yj4ny4AXgrOOyWyDGY/HJzmbGH8MFnsUqvCAiUT5s=
-github.com/knz/go-libedit v1.10.2-0.20230621133438-5f2b2e7387c5 h1:62iTw+D4JtoXL7yp4S5Ruyc82qmbWdnwuuSZ3tmcuSw=
-github.com/knz/go-libedit v1.10.2-0.20230621133438-5f2b2e7387c5/go.mod h1:dmDChGdWopkB61HsdDN0/fxKAMIYljKTu+AG9uc4qVY=
 github.com/knz/lipgloss-convert v0.1.0 h1:qUPUt6r8mqvi9DIV3nBPu3kEmFyHrZtXzv0BlPBPLNQ=
 github.com/knz/lipgloss-convert v0.1.0/go.mod h1:S14GmtoiW/VAHqB7xEzuZOt0/G6GQ2dfjJN0fHpm30Q=
 github.com/knz/strtime v0.0.0-20200318182718-be999391ffa9 h1:GQE1iatYDRrIidq4Zf/9ZzKWyrTk2sXOYc1JADbkAjQ=

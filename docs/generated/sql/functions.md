@@ -3279,6 +3279,8 @@ that has execution latency greater than the ‘minExecutionLatency’. If the
 ‘expiresAfter’ argument is empty, then the statement bundle request never
 expires until the statement bundle is collected</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.reset_activity_tables"></a><code>crdb_internal.reset_activity_tables() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the {statement|transaction} activity system tables.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.reset_index_usage_stats"></a><code>crdb_internal.reset_index_usage_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected index usage statistics.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.reset_sql_stats"></a><code>crdb_internal.reset_sql_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected SQL statistics.</p>
@@ -3304,6 +3306,8 @@ table. Returns an error if validation fails.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.set_vmodule"></a><code>crdb_internal.set_vmodule(vmodule_string: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the equivalent of the <code>--vmodule</code> flag on the gateway node processing this request; it affords control over the logging verbosity of different files. Example syntax: <code>crdb_internal.set_vmodule('recordio=2,file=1,gfs*=3')</code>. Reset with: <code>crdb_internal.set_vmodule('')</code>. Raising the verbosity can severely affect performance.</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.sstable_metrics"></a><code>crdb_internal.sstable_metrics(node_id: <a href="int.html">int</a>, store_id: <a href="int.html">int</a>, start_key: <a href="bytes.html">bytes</a>, end_key: <a href="bytes.html">bytes</a>) &rarr; tuple{int AS node_id,, int AS store_id, int AS level, int AS file_num, jsonb AS metrics}</code></td><td><span class="funcdesc"><p>Returns statistics for the sstables containing keys in the range start_key and end_key for the provided node id.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.table_span"></a><code>crdb_internal.table_span(table_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a>[]</code></td><td><span class="funcdesc"><p>This function returns the span that contains the keys for the given table.</p>
 </span></td><td>Leakproof</td></tr>
 <tr><td><a name="crdb_internal.trace_id"></a><code>crdb_internal.trace_id() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the current trace ID or an error if no trace is open.</p>
@@ -3350,6 +3354,8 @@ table. Returns an error if validation fails.</p>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
 <tr><td><a name="crdb_internal.force_delete_table_data"></a><code>crdb_internal.force_delete_table_data(id: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function can be used to clear the data belonging to a table, when the table cannot be dropped.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.repair_catalog_corruption"></a><code>crdb_internal.repair_catalog_corruption(descriptor_id: <a href="int.html">int</a>, corruption: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>repair_catalog_corruption(descriptor_id,corruption) attempts to repair corrupt records in system tables associated with that descriptor id</p>
 </span></td><td>Volatile</td></tr></tbody>
 </table>
 

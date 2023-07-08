@@ -4331,6 +4331,61 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Immutable,
 		},
 	),
+	"crdb_internal.merge_aggregated_stmt_metadata": makeBuiltin(arrayProps(),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				metadata := &appstatspb.AggregatedStatementMetadata{}
+
+				var other appstatspb.AggregatedStatementMetadata
+				for _, metadataDatum := range arr.Array {
+					if metadataDatum == tree.DNull {
+						continue
+					}
+
+					metadataJSON := tree.MustBeDJSON(metadataDatum).JSON
+					// Ensure we start with an empty slice, otherwise the decode method below
+					// will just append the JSON datum value to what's already there.
+					other.Databases = nil
+					err := sqlstatsutil.DecodeAggregatedMetadataJSON(metadataJSON, &other)
+					//  Failure to decode should NOT return an error. Instead let's just ignore
+					// this JSON object that is not the correct format.
+					if err != nil {
+						continue
+					}
+
+					// Aggregate relevant stats.
+					metadata.Databases = util.CombineUnique(metadata.Databases, other.Databases)
+
+					metadata.DistSQLCount += other.DistSQLCount
+					metadata.FailedCount += other.FailedCount
+					metadata.FullScanCount += other.FullScanCount
+					metadata.VecCount += other.VecCount
+					metadata.TotalCount += other.TotalCount
+				}
+
+				// Set the constant info from the last decoded metadata object. If there were no
+				// elements then we can skip this as we are already at the zero values.
+				if len(arr.Array) > 0 {
+					metadata.ImplicitTxn = other.ImplicitTxn
+					metadata.Query = other.Query
+					metadata.QuerySummary = other.QuerySummary
+					metadata.StmtType = other.StmtType
+				}
+
+				aggregatedJSON, err := sqlstatsutil.BuildStmtDetailsMetadataJSON(metadata)
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDJSON(aggregatedJSON), nil
+			},
+			Info:       "Merge an array of AggregatedStatementMetadata into a single JSONB object",
+			Volatility: volatility.Immutable,
+		},
+	),
 
 	// Enum functions.
 	"enum_first": makeBuiltin(
@@ -4952,7 +5007,7 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Volatile,
 			Language:   tree.FunctionLangSQL,
 		},
-		// This overload is deprecated. Use CREATE TENANT instead.
+		// This overload is deprecated. Use CREATE VIRTUAL CLUSTER instead.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "name", Typ: types.String},
@@ -4960,7 +5015,7 @@ value if you rely on the HLC for accuracy.`,
 			ReturnType: tree.FixedReturnType(types.Int),
 			Body:       `SELECT crdb_internal.create_tenant(json_build_object('name', $1))`,
 			Info: `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb).
-DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
+DO NOT USE -- USE 'CREATE VIRTUAL CLUSTER' INSTEAD`,
 			Volatility: volatility.Volatile,
 			Language:   tree.FunctionLangSQL,
 		},
@@ -4996,7 +5051,7 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Body:       `SELECT crdb_internal.destroy_tenant($1, false)`,
-			Info:       "DO NOT USE -- USE 'DROP TENANT' INSTEAD.",
+			Info:       "DO NOT USE -- USE 'DROP VIRTUAL CLUSTER' INSTEAD.",
 			Volatility: volatility.Volatile,
 			Language:   tree.FunctionLangSQL,
 		},
@@ -5022,7 +5077,7 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 				}
 				return args[0], nil
 			},
-			Info:       "DO NOT USE -- USE 'DROP TENANT IMMEDIATE' INSTEAD.",
+			Info:       "DO NOT USE -- USE 'DROP VIRTUAL CLUSTER IMMEDIATE' INSTEAD.",
 			Volatility: volatility.Volatile,
 		},
 	),

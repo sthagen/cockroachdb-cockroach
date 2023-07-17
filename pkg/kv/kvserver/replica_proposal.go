@@ -533,10 +533,16 @@ func (r *Replica) leasePostApplyLocked(
 	// seconds) in any case due to the liveness heartbeats. And the system config
 	// will be gossiped rarely because it falls on a range with an epoch-based
 	// range lease that is only reacquired extremely infrequently.
-	if iAmTheLeaseHolder {
+	//
+	// TODO(erikgrinaker): This and MaybeGossipNodeLivenessRaftMuLocked should
+	// check whether the replica intersects the liveness span rather than contains
+	// the entirety of it.
+	if iAmTheLeaseHolder && kvserverbase.ContainsKeyRange(
+		r.descRLocked(), keys.NodeLivenessSpan.Key, keys.NodeLivenessSpan.EndKey) {
 		// NB: run these in an async task to keep them out of the critical section
 		// (r.mu is held here).
-		_ = r.store.stopper.RunAsyncTask(r.AnnotateCtx(context.Background()), "lease-triggers", func(ctx context.Context) {
+		ctx := r.AnnotateCtx(context.Background())
+		_ = r.store.stopper.RunAsyncTask(ctx, "lease-gossip", func(ctx context.Context) {
 			// Re-acquire the raftMu, as we are now in an async task.
 			r.raftMu.Lock()
 			defer r.raftMu.Unlock()
@@ -813,6 +819,25 @@ type proposalResult struct {
 	Err                *kvpb.Error
 	EncounteredIntents []roachpb.Intent
 	EndTxns            []result.EndTxnIntents
+}
+
+func makeProposalResult(
+	br *kvpb.BatchResponse, pErr *kvpb.Error, ei []roachpb.Intent, eti []result.EndTxnIntents,
+) proposalResult {
+	return proposalResult{
+		Reply:              br,
+		Err:                pErr,
+		EncounteredIntents: ei,
+		EndTxns:            eti,
+	}
+}
+
+func makeProposalResultPErr(err *kvpb.Error) proposalResult {
+	return proposalResult{Err: err}
+}
+
+func makeProposalResultErr(err error) proposalResult {
+	return proposalResult{Err: kvpb.NewError(err)}
 }
 
 // evaluateProposal generates a Result from the given request by

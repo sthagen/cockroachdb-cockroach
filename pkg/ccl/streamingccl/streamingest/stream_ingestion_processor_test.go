@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -179,7 +180,7 @@ func TestStreamIngestionProcessor(t *testing.T) {
 	ctx := context.Background()
 
 	tc := testcluster.StartTestCluster(t, 1 /* nodes */, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled},
+		ServerArgs: base.TestServerArgs{DefaultTestTenant: base.TODOTestTenantDisabled},
 	})
 	defer tc.Stopper().Stop(ctx)
 	db := tc.Server(0).InternalDB().(descs.DB)
@@ -650,7 +651,7 @@ func TestRandomClientGeneration(t *testing.T) {
 
 	randomStreamClient.ClearInterceptors()
 	randomStreamClient.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
-		return sstMaker(t, keyValues)
+		return replicationtestutils.SSTMaker(t, keyValues)
 	})
 	randomStreamClient.RegisterInterception(cancelAfterCheckpoints)
 	randomStreamClient.RegisterInterception(validateFnWithValidator(t, streamValidator))

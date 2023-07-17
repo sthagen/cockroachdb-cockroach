@@ -778,7 +778,12 @@ func TestClusterInflightTracesVirtualTable(t *testing.T) {
 			},
 		}
 		var rowIdx int
-		rows := sqlDB.Query(t, `SELECT trace_id, node_id, trace_str, jaeger_json from crdb_internal.cluster_inflight_traces WHERE trace_id=$1`, traceID)
+		rows := sqlDB.Query(t, `
+                  SELECT trace_id, node_id, trace_str, jaeger_json
+                  FROM crdb_internal.cluster_inflight_traces
+                  WHERE trace_id = $1
+                  ORDER BY node_id;`, // sort by node_id in case instances are returned out of order
+			traceID)
 		defer rows.Close()
 		for rows.Next() {
 			var traceID, nodeID int
@@ -979,7 +984,7 @@ func TestTxnContentionEventsTableMultiTenant(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				// Test is designed to run with explicit tenants. No need to
 				// implicitly create a tenant.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 			},
 		})
 	defer tc.Stopper().Stop(ctx)

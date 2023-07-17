@@ -1488,8 +1488,9 @@ func (cf *changeFrontier) manageProtectedTimestamps(
 	recordID := progress.ProtectedTimestampRecord
 	if recordID == uuid.Nil {
 		ptr := createProtectedTimestampRecord(
-			ctx, cf.flowCtx.Codec(), cf.spec.JobID, AllTargets(cf.spec.Feed), highWater, progress,
+			ctx, cf.flowCtx.Codec(), cf.spec.JobID, AllTargets(cf.spec.Feed), highWater,
 		)
+		progress.ProtectedTimestampRecord = ptr.ID.GetUUID()
 		if err := pts.Protect(ctx, ptr); err != nil {
 			return err
 		}
@@ -1653,6 +1654,14 @@ func makeSchemaChangeFrontier(
 		spanFrontier:     &spanFrontier{Frontier: sf},
 		initialHighWater: initialHighWater,
 		latestTs:         initialHighWater,
+
+		// latestKV timestamp is set to the current time to make
+		// sure that even if the target table does not have any
+		// KV events coming in, that the changefeed will remain
+		// running for at least changefeedbase.IdleTimeout time
+		// to ensure that sql pod in serverless deployment does
+		// not get shutdown immediately after changefeed starts.
+		latestKV: timeutil.Now(),
 	}, nil
 }
 

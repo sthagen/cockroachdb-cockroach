@@ -383,6 +383,12 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 	recordBytesReceived snapshotRecordMetrics,
 ) (IncomingSnapshot, error) {
 	assertStrategy(ctx, header, kvserverpb.SnapshotRequest_KV_BATCH)
+	if fn := s.cfg.TestingKnobs.BeforeRecvAcceptedSnapshot; fn != nil {
+		fn()
+	}
+	snapshotCtx := ctx
+	ctx, rSp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "receive snapshot data")
+	defer rSp.Finish() // Ensure that the tracing span is closed, even if Receive errors.
 
 	// These stopwatches allow us to time the various components of Receive().
 	// - totalTime Stopwatch measures the total time spent within this function.
@@ -421,7 +427,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 		}
 		if req.Header != nil {
 			err := errors.New("client error: provided a header mid-stream")
-			return noSnap, sendSnapshotError(ctx, s, stream, err)
+			return noSnap, sendSnapshotError(snapshotCtx, s, stream, err)
 		}
 
 		if req.KVBatch != nil {
@@ -487,7 +493,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 			if err != nil {
 				err = errors.Wrap(err, "client error: invalid snapshot")
-				return noSnap, sendSnapshotError(ctx, s, stream, err)
+				return noSnap, sendSnapshotError(snapshotCtx, s, stream, err)
 			}
 
 			inSnap := IncomingSnapshot{
@@ -786,7 +792,7 @@ func (s *Store) throttleSnapshot(
 		select {
 		case permit = <-task.GetWaitChan():
 			// Got a spot in the snapshotQueue, continue with sending the snapshot.
-			if fn := s.cfg.TestingKnobs.AfterSendSnapshotThrottle; fn != nil {
+			if fn := s.cfg.TestingKnobs.AfterSnapshotThrottle; fn != nil {
 				fn()
 			}
 			log.Event(ctx, "acquired spot in the snapshot snapshotQueue")
@@ -1017,7 +1023,7 @@ func (s *Store) receiveSnapshot(
 	}
 
 	if fn := s.cfg.TestingKnobs.ReceiveSnapshot; fn != nil {
-		if err := fn(header); err != nil {
+		if err := fn(ctx, header); err != nil {
 			// NB: we intentionally don't mark this error as errMarkSnapshotError so
 			// that we don't end up retrying injected errors in tests.
 			return sendSnapshotError(ctx, s, stream, err)
@@ -1123,8 +1129,6 @@ func (s *Store) receiveSnapshot(
 			s.metrics.RangeSnapshotUnknownRcvdBytes.Inc(inc)
 		}
 	}
-	ctx, rSp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "receive snapshot data")
-	defer rSp.Finish() // Ensure that the tracing span is closed, even if ss.Receive errors
 	inSnap, err := ss.Receive(ctx, s, stream, *header, recordBytesReceived)
 	if err != nil {
 		return err

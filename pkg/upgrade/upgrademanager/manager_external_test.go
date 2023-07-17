@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
@@ -301,11 +303,7 @@ func TestMigrateUpdatesReplicaVersion(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		for _, s := range tc.Servers {
 			id := s.NodeID()
-			live, err := nl.IsLive(id)
-			if err != nil {
-				return err
-			}
-			if !live {
+			if !nl.GetNodeVitalityFromCache(id).IsLive(livenesspb.Upgrade) {
 				return errors.Newf("n%s not live yet", id)
 			}
 		}
@@ -675,6 +673,8 @@ func TestMigrationFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.WithIssue(t, 106648)
+
 	ctx := context.Background()
 
 	// Configure the range of versions used by the test
@@ -692,7 +692,7 @@ func TestMigrationFailure(t *testing.T) {
 	// Create a storage cluster for the tenant
 	testCluster := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SQLEvalContext: &eval.TestingKnobs{
 					TenantLogicalVersionKeyOverride: startVersionKey,

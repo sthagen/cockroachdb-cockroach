@@ -1277,11 +1277,11 @@ type replicaProposer Replica
 var _ proposer = &replicaProposer{}
 
 func (rp *replicaProposer) locker() sync.Locker {
-	return &rp.mu.RWMutex
+	return &rp.mu.ReplicaMutex
 }
 
 func (rp *replicaProposer) rlocker() sync.Locker {
-	return rp.mu.RWMutex.RLocker()
+	return &rp.mu.ReplicaMutex
 }
 
 func (rp *replicaProposer) getReplicaID() roachpb.ReplicaID {
@@ -1457,5 +1457,5 @@ func (rp *replicaProposer) rejectProposalWithErrLocked(
 	ctx context.Context, prop *ProposalData, pErr *kvpb.Error,
 ) {
 	(*Replica)(rp).cleanupFailedProposalLocked(prop)
-	prop.finishApplication(ctx, proposalResult{Err: pErr})
+	prop.finishApplication(ctx, makeProposalResultPErr(pErr))
 }

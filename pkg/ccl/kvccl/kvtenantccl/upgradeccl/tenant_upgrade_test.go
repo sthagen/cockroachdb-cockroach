@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
@@ -63,7 +64,7 @@ func TestTenantUpgrade(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Test validates tenant behavior. No need for the default test
 			// tenant.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Settings:          settings,
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
@@ -225,7 +226,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Test validates tenant behavior. No need for the default test
 			// tenant here.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Settings:          settings,
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
@@ -311,6 +312,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 	}
 
 	t.Run("upgrade tenant have it crash then resume", func(t *testing.T) {
+		skip.WithIssue(t, 106279)
 		// Create a tenant before upgrading anything and verify its version.
 		const initialTenantID = 10
 		tenantInfo := mkTenant(t, initialTenantID)

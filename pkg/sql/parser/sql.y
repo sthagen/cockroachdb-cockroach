@@ -25,18 +25,16 @@ package parser
 
 import (
     "fmt"
+    "math"
     "strings"
 
     "go/constant"
 
     "github.com/cockroachdb/cockroach/pkg/geo/geopb"
-    "github.com/cockroachdb/cockroach/pkg/roachpb"
     "github.com/cockroachdb/cockroach/pkg/security/username"
-    "github.com/cockroachdb/cockroach/pkg/sql/lexbase"
     "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
     "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
-    "github.com/cockroachdb/cockroach/pkg/sql/roleoption"
     "github.com/cockroachdb/cockroach/pkg/sql/scanner"
     "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
     "github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
@@ -3818,6 +3816,11 @@ restore_options:
   {
     $$.val = &tree.RestoreOptions{UnsafeRestoreIncompatibleVersion: true}
   }
+| EXECUTION LOCALITY '=' string_or_placeholder
+  {
+    $$.val = &tree.RestoreOptions{ExecutionLocality: $4.expr()}
+  }
+
 
 virtual_cluster_opt:
   TENANT  { /* SKIP DOC */ }

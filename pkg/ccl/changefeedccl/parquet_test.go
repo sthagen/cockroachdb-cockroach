@@ -46,7 +46,7 @@ func TestParquetRows(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// TODO(#98816): cdctest.GetHydratedTableDescriptor does not work with tenant dbs.
 		// Once it is fixed, this flag can be removed.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -159,7 +159,7 @@ func TestParquetRows(t *testing.T) {
 
 func makeRangefeedReaderAndDecoder(
 	t *testing.T, s serverutils.TestServerInterface,
-) (func(t *testing.T) *kvpb.RangeFeedValue, func(), cdcevent.Decoder) {
+) (func(t testing.TB) *kvpb.RangeFeedValue, func(), cdcevent.Decoder) {
 	tableDesc := cdctest.GetHydratedTableDescriptor(t, s.ExecutorConfig(), "foo")
 	popRow, cleanup := cdctest.MakeRangeFeedValueReader(t, s.ExecutorConfig(), tableDesc)
 	targets := changefeedbase.Targets{}

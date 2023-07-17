@@ -143,7 +143,7 @@ func TestAdminDebugExpVar(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -168,7 +168,7 @@ func TestAdminDebugMetrics(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -193,7 +193,7 @@ func TestAdminDebugPprof(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -214,7 +214,7 @@ func TestAdminDebugTrace(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -243,7 +243,7 @@ func TestAdminDebugAuth(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
@@ -301,7 +301,7 @@ func TestAdminDebugRedirect(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
@@ -401,7 +401,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
@@ -548,7 +548,7 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -564,7 +564,7 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -709,7 +709,7 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -733,7 +733,7 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails with
 		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -761,7 +761,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 				// Disable the default test tenant for now as this tests fails
 				// with it enabled. Tracked with #81590.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 			})
 			defer s.Stopper().Stop(context.Background())
 			ts := s.(*TestServer)
@@ -931,7 +931,7 @@ func TestAdminAPIZoneDetails(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
@@ -1038,7 +1038,7 @@ func TestAdminAPIUsers(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -1079,7 +1079,7 @@ func TestAdminAPIEvents(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -1209,7 +1209,7 @@ func TestAdminAPISettings(t *testing.T) {
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -1330,7 +1330,7 @@ func TestAdminAPIUIData(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -1441,7 +1441,7 @@ func TestAdminAPIUISeparateData(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -1484,7 +1484,7 @@ func TestClusterAPI(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -1538,7 +1538,7 @@ func TestHealthAPI(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(ctx)
 	ts := s.(*TestServer)
@@ -1633,7 +1633,7 @@ func TestAdminAPIJobs(t *testing.T) {
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: &jobs.TestingKnobs{
 				IntervalOverrides: jobs.TestingIntervalOverrides{
@@ -1844,7 +1844,7 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
@@ -1969,7 +1969,7 @@ func TestAdminAPILocations(t *testing.T) {
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
@@ -2014,7 +2014,7 @@ func TestAdminAPIQueryPlan(t *testing.T) {
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
@@ -2052,7 +2052,7 @@ func TestAdminAPIRangeLogByRangeID(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -2121,7 +2121,7 @@ func TestAdminAPIFullRangeLog(t *testing.T) {
 		base.TestServerArgs{
 			// Disable the default test tenant for now as this tests fails
 			// with it enabled. Tracked with #81590.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					DisableSplitQueue: true,
@@ -2466,7 +2466,7 @@ func TestEndpointTelemetryBasic(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(context.Background())
 
@@ -2499,7 +2499,6 @@ func checkNodeCheckResultReady(
 	require.Equal(t, serverpb.DecommissionPreCheckResponse_NodeCheckResult{
 		NodeID:                nID,
 		DecommissionReadiness: serverpb.DecommissionPreCheckResponse_READY,
-		LivenessStatus:        livenesspb.NodeLivenessStatus_LIVE,
 		ReplicaCount:          replicaCount,
 		CheckedRanges:         nil,
 	}, checkResult)
@@ -2615,16 +2614,16 @@ func TestDecommissionPreCheckUnready(t *testing.T) {
 
 	awaitDecommissioned := func(nID roachpb.NodeID) {
 		testutils.SucceedsSoon(t, func() error {
-			livenesses, err := adminSrv.NodeLiveness().(*liveness.NodeLiveness).GetLivenessesFromKV(ctx)
+			livenesses, err := adminSrv.NodeLiveness().(*liveness.NodeLiveness).ScanNodeVitalityFromKV(ctx)
 			if err != nil {
 				return err
 			}
-			for _, nodeLiveness := range livenesses {
-				if nodeLiveness.NodeID == nID {
-					if nodeLiveness.Membership == livenesspb.MembershipStatus_DECOMMISSIONED {
+			for nodeID, nodeLiveness := range livenesses {
+				if nodeID == nID {
+					if nodeLiveness.IsDecommissioned() {
 						return nil
 					} else {
-						return errors.Errorf("n%d has membership: %s", nID, nodeLiveness.Membership)
+						return errors.Errorf("n%d has membership: %s", nID, nodeLiveness.MembershipStatus())
 					}
 				}
 			}
@@ -2859,7 +2858,6 @@ func TestDecommissionPreCheckInvalidNode(t *testing.T) {
 	require.Equal(t, serverpb.DecommissionPreCheckResponse_NodeCheckResult{
 		NodeID:                invalidDecommissioningNodeID,
 		DecommissionReadiness: serverpb.DecommissionPreCheckResponse_UNKNOWN,
-		LivenessStatus:        livenesspb.NodeLivenessStatus_UNKNOWN,
 		ReplicaCount:          0,
 		CheckedRanges:         nil,
 	}, resp.CheckedNodes[1])
@@ -3020,7 +3018,7 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Disable the default test tenant for now as this tests fails
 			// with it enabled. Tracked with #81590.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Insecure:          true, // allows admin client without setting up certs
 		},
 	})
@@ -3205,7 +3203,7 @@ func TestAdminPrivilegeChecker(t *testing.T) {
 	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -3356,7 +3354,7 @@ func TestDatabaseAndTableIndexRecommendations(t *testing.T) {
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Disable the default test tenant for now as this tests fails
 		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			UnusedIndexRecommendKnobs: &idxusage.UnusedIndexRecommendationTestingKnobs{
 				GetCreatedAt:   stubTime.getCreatedAt,

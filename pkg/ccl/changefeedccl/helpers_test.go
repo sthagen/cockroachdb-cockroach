@@ -395,7 +395,7 @@ func startTestFullServer(
 		Knobs: knobs,
 		// This test suite is already probabilistically running with
 		// tenants. No need for the test tenant.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		UseDatabase:       `d`,
 		ExternalIODir:     options.externalIODir,
 		Settings:          options.settings,
@@ -686,6 +686,19 @@ func expectNotice(t *testing.T, s serverutils.TestTenantInterface, sql string, e
 	sqlDB.Exec(t, sql)
 
 	require.Equal(t, expected, actual)
+}
+
+func loadProgress(
+	t *testing.T, jobFeed cdctest.EnterpriseTestFeed, jobRegistry *jobs.Registry,
+) jobspb.Progress {
+	t.Helper()
+	jobID := jobFeed.JobID()
+	job, err := jobRegistry.LoadJob(context.Background(), jobID)
+	require.NoError(t, err)
+	if job.Status().Terminal() {
+		t.Errorf("tried to load progress for job %v but it has reached terminal status %s with error %s", job, job.Status(), jobFeed.FetchTerminalJobErr())
+	}
+	return job.Progress()
 }
 
 func feed(

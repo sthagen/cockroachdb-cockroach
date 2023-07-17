@@ -247,7 +247,7 @@ func TestBackupRestoreJobTagAndLabel(t *testing.T) {
 	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, numNodes, numAccounts, InitManualReplication,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					DistSQL: &execinfra.TestingKnobs{
 						SetupFlowCb: func(ctx context.Context, _ base.SQLInstanceID, _ *execinfrapb.SetupFlowRequest) error {
@@ -339,7 +339,7 @@ func TestBackupRestorePartitioned(t *testing.T) {
 	args := base.TestClusterArgs{
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "west"},
 					// NB: This has the same value as an az in the east region
@@ -349,7 +349,7 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				}},
 			},
 			1: {
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "east"},
 					// NB: This has the same value as an az in the west region
@@ -359,7 +359,7 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				}},
 			},
 			2: {
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "east"},
 					{Key: "az", Value: "az2"},
@@ -493,7 +493,7 @@ func TestBackupRestoreExecLocality(t *testing.T) {
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {
 				ExternalIODir:     "/west0",
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "0"},
 					{Key: "region", Value: "west"},
@@ -501,7 +501,7 @@ func TestBackupRestoreExecLocality(t *testing.T) {
 			},
 			1: {
 				ExternalIODir:     "/west1",
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "1"},
 					{Key: "region", Value: "west"},
@@ -509,7 +509,7 @@ func TestBackupRestoreExecLocality(t *testing.T) {
 			},
 			2: {
 				ExternalIODir:     "/east0",
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "0"},
 					{Key: "region", Value: "east"},
@@ -517,7 +517,7 @@ func TestBackupRestoreExecLocality(t *testing.T) {
 			},
 			3: {
 				ExternalIODir:     "/east1",
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "1"},
 					{Key: "region", Value: "east"},
@@ -564,6 +564,19 @@ func TestBackupRestoreExecLocality(t *testing.T) {
 		requireHasSSTs(t, path.Join(dir, "east1", "c"))
 		// Check that no other node has data in it.
 		requireHasNoSSTs(t, path.Join(dir, "east0", "c"), path.Join(dir, "west0", "c"), path.Join(dir, "west1", "c"))
+
+		// TODO(dt): ideally we'd send the RESTORE stmt to a node that cannot reach
+		// the backup files at all to show that the locality filter means a node
+		// which _can_ reach the files then runs it and it succeeds, however RESTORE
+		// _statement_ evaluation, to even create the job, requires reading the from
+		// the backup to verify it can be restored at all. Thus while specifying an
+		// execution locality filter is useful for restricting the execution to only
+		// those nodes with access to the data files, it is still on the operator to
+		// send the initial statement to a node with access.
+		var id int64
+		n4.QueryRow(t, "RESTORE DATABASE data FROM $1 WITH EXECUTION LOCALITY = $2, NEW_DB_NAME = 'restored', DETACHED",
+			"nodelocal://0/c", "tier=1,region=east").Scan(&id)
+		n4.CheckQueryResults(t, fmt.Sprintf("SELECT status FROM [SHOW JOB WHEN COMPLETE %d]", id), [][]string{{"succeeded"}})
 	})
 }
 
@@ -1648,7 +1661,7 @@ func TestRestoreCheckpointing(t *testing.T) {
 		},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}
-	testServerArgs := base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled}
+	testServerArgs := base.TestServerArgs{DefaultTestTenant: base.TODOTestTenantDisabled}
 	params.ServerArgs = testServerArgs
 	params.ServerArgs.Knobs = knobs
 
@@ -3432,7 +3445,6 @@ func startBackgroundWrites(
 
 func TestBackupRestoreWithConcurrentWrites(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 58211, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	const rows = 10
@@ -5418,7 +5430,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 	defer cleanupFn()
 	// Test fails when run within a tenant. More investigation is
 	// required. Tracked with #76378.
-	args := base.TestServerArgs{ExternalIODir: dir, DefaultTestTenant: base.TestTenantDisabled}
+	args := base.TestServerArgs{ExternalIODir: dir, DefaultTestTenant: base.TODOTestTenantDisabled}
 
 	// Setup for sequence ownership backup/restore tests in the same database.
 	backupLoc := localFoo + `/d`
@@ -6025,7 +6037,7 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 	params.ServerArgs.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	// This test instantiates its own secondary tenants below. No need to run
 	// it probabilistically under a test tenant.
-	params.ServerArgs.DefaultTestTenant = base.TestTenantDisabled
+	params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
 	tc := testcluster.StartTestCluster(t, 1, params)
 	defer tc.Stopper().Stop(ctx)
 
@@ -6337,7 +6349,7 @@ func TestRestoreErrorPropagates(t *testing.T) {
 	// below which is expected to fail, doesn't. This may be a problem with the
 	// testing knobs being incorrectly applied to the cluster. More
 	// investigation is required. Tracked with #76378.
-	params.ServerArgs.DefaultTestTenant = base.TestTenantDisabled
+	params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
 	jobsTableKey := keys.SystemSQLCodec.TablePrefix(uint32(systemschema.JobsTable.GetID()))
 	var shouldFail, failures int64
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
@@ -6413,7 +6425,7 @@ func TestProtectedTimestampsFailDueToLimits(t *testing.T) {
 		params.ServerArgs.Knobs.ProtectedTS = &protectedts.TestingKnobs{
 			DisableProtectedTimestampForMultiTenant: true}
 		// Test fails within a tenant. Tracked with #76378.
-		params.ServerArgs.DefaultTestTenant = base.TestTenantDisabled
+		params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
 		tc := testcluster.StartTestCluster(t, 1, params)
 		defer tc.Stopper().Stop(ctx)
 		db := tc.ServerConn(0)
@@ -6446,7 +6458,7 @@ func TestPaginatedBackupTenant(t *testing.T) {
 		Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 		// Disabled to probabilistically spin up a tenant in each server because the
 		// test explicitly sets up tenants to test on.
-		DefaultTestTenant: base.TestTenantDisabled}
+		DefaultTestTenant: base.TODOTestTenantDisabled}
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
 	var numExportRequests int
 
@@ -6930,7 +6942,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 
 		// Disabled to probabilistically spin up a tenant in each server because the
 		// test explicitly sets up tenants to test on.
-		DefaultTestTenant: base.TestTenantDisabled},
+		DefaultTestTenant: base.TODOTestTenantDisabled},
 	}
 
 	const numAccounts = 1
@@ -7020,7 +7032,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				// by creating a tenant. Furthermore, the test requires that
 				// it run from the system tenant because it restores tenants.
 				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Knobs:             base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 			}},
 		)
@@ -7184,7 +7196,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				// by creating a tenant. Furthermore, the test requires that
 				// it run from the system tenant because it restores tenants.
 				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 			}},
 		)
 		defer restoreTC.Stopper().Stop(ctx)
@@ -7238,7 +7250,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				// it run from the system tenant because it queries the
 				// system.tenants table. Disable the default test tenant because
 				// it's not necessary.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 					TenantTestingKnobs: &sql.TenantTestingKnobs{
@@ -7347,7 +7359,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				// by creating a tenant. Furthermore, the test requires that
 				// it run from the system tenant because it restores tenants.
 				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 			}},
 		)
 		defer restoreTC.Stopper().Stop(ctx)
@@ -7372,7 +7384,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				// by creating a tenant. Furthermore, the test requires that
 				// it run from the system tenant because it restores tenants.
 				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 			}},
 		)
 		defer restoreTC.Stopper().Stop(ctx)
@@ -9230,7 +9242,7 @@ func TestGCDropIndexSpanExpansion(t *testing.T) {
 		// the cause of the hang is the fact that we're waiting on the GC to
 		// complete, and we don't have visibility into the GC completing from
 		// the tenant. More investigation is required. Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			GCJob: &sql.GCJobTestingKnobs{
 				RunBeforePerformGC: func(id jobspb.JobID) error {
@@ -9402,7 +9414,7 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				// Disabled to run within tenants because the function that sets up the restoring cluster
 				// has not been configured yet to run within tenants.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(), // speeds up test
 					SpanConfig: &spanconfig.TestingKnobs{
@@ -9472,7 +9484,7 @@ func TestExportRequestBelowGCThresholdOnDataExcludedFromBackup(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Test fails when run within a tenant as zone config
 			// updates are not allowed by default. Tracked with 73768.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 		},
 	}
 	args.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
@@ -9566,7 +9578,7 @@ func TestExcludeDataFromBackupDoesNotHoldupGC(t *testing.T) {
 	params.ServerArgs.ExternalIODir = dir
 	// Test fails when run within a tenant. More investigation is
 	// required. Tracked with #76378.
-	params.ServerArgs.DefaultTestTenant = base.TestTenantDisabled
+	params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		DisableGCQueue:            true,
 		DisableLastProcessedCheck: true,
@@ -11135,7 +11147,7 @@ func TestRestoreMemoryMonitoringWithShadowing(t *testing.T) {
 	restoreProcessorKnobCount := atomic.Uint32{}
 
 	args := base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			DistSQL: &execinfra.TestingKnobs{
 				BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
@@ -11188,7 +11200,7 @@ func TestRestoreMemoryMonitoringMinWorkerMemory(t *testing.T) {
 	const numAccounts = 100
 
 	args := base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	}
 	params := base.TestClusterArgs{ServerArgs: args}
 	_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)

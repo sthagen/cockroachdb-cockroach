@@ -23,6 +23,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl/tenantcostserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -63,7 +64,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 
 	params := base.TestServerArgs{
 		Settings:          st,
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	}
 
 	s, mainDB, _ := serverutils.StartServer(t, params)
@@ -74,6 +75,13 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{
 		TenantID: tenantID,
 		Settings: st,
+		TestingKnobs: base.TestingKnobs{
+			SQLEvalContext: &eval.TestingKnobs{
+				// We disable the randomization of some batch sizes because with
+				// some low values the test takes much longer.
+				ForceProductionValues: true,
+			},
+		},
 	})
 	defer tenant1.Stopper().Stop(ctx)
 	defer tenantDB1.Close()
@@ -87,7 +95,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 	}
 	testCases := []testCase{
 		{ // Insert statement
-			sql:   "INSERT INTO abcd (SELECT t%2, t%3, t, -t FROM generate_series(1,50000) g(t))",
+			sql:   "INSERT INTO abcd (SELECT t%2, t%3, t, -t FROM generate_series(1,20000) g(t))",
 			count: 1,
 		},
 		{ // Point query
@@ -121,6 +129,10 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 		{ // No kv IO, lots of network egress.
 			sql:   "SELECT 'deadbeef' FROM generate_series(1, 50000)",
 			count: 10,
+		},
+		{ // Delete (this also ensures that two runs work with the same dataset)
+			sql:   "DELETE FROM abcd WHERE true",
+			count: 1,
 		},
 	}
 
@@ -183,12 +195,7 @@ func TestEstimateQueryRUConsumption(t *testing.T) {
 	// Check the estimated RU aggregate for all the queries against the actual
 	// measured RU consumption for the tenant.
 	tenantMeasuredRUs = getTenantRUs() - tenantStartRUs
-	// Usually, the difference is within 0.25 delta, but in rare cases it can be
-	// outside of that delta (when ran on the gceworker, it was outside the 0.5
-	// delta within 6 minutes of stressing), so we allow for generous 0.75
-	// delta. This still provides a good enough sanity check for the RU
-	// estimation.
-	const deltaFraction = 0.75
+	const deltaFraction = 0.05
 	allowedDelta := tenantMeasuredRUs * deltaFraction
 	require.InDeltaf(t, tenantMeasuredRUs, tenantEstimatedRUs, allowedDelta,
 		"estimated RUs (%d) were not within %f RUs of the expected value (%f)",

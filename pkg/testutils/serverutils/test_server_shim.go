@@ -20,13 +20,13 @@ package serverutils
 import (
 	"context"
 	gosql "database/sql"
-	"flag"
-	"math/rand"
 	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvprober"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
@@ -47,71 +48,59 @@ import (
 
 // DefaultTestTenantMessage is a message that is printed when a test is run
 // with the default test tenant. This is useful for debugging test failures.
-const DefaultTestTenantMessage = "Running test with the default test tenant. " +
-	"If you are only seeing a test case failure when this message appears, there may be a " +
-	"problem with your test case running within tenants."
+const DefaultTestTenantMessage = `
+Test server was configured to route SQL queries to a secondary tenant (virtual cluster).
+If you are only seeing a test failure when this message appears, there may be a problem
+specific to cluster virtualization or multi-tenancy.
 
-// TenantModeFlagName is the exported name of the tenantMode flag, for use
-// in other packages.
-const TenantModeFlagName = "tenantMode"
+To investigate, consider using "COCKROACH_TEST_TENANT=true" to force-enable just
+the secondary tenant in all runs (or, alternatively, "false" to force-disable), or use
+"COCKROACH_INTERNAL_DISABLE_METAMORPHIC_TESTING=false" to disable all random test variables altogether.`
 
-var tenantModeFlag = flag.String(
-	TenantModeFlagName, tenantModeDefault,
-	"tenantMode in which to run tests. Options are forceTenant, forceNoTenant, and default "+
-		"which alternates between tenant and no-tenant mode probabilistically. Note that the two force "+
-		"modes are ignored if the test is already forced to run in one of the two modes.")
-
-const (
-	tenantModeForceTenant   = "forceTenant"
-	tenantModeForceNoTenant = "forceNoTenant"
-	tenantModeDefault       = "default"
-)
-
-var PreventStartTenantError = errors.New("attempting to manually start a tenant while " +
+var PreventStartTenantError = errors.New("attempting to manually start a server for a secondary tenant while " +
 	"DefaultTestTenant is set to TestTenantProbabilisticOnly")
 
 // ShouldStartDefaultTestTenant determines whether a default test tenant
 // should be started for test servers or clusters, to serve SQL traffic by
-// default. It defaults to 50% probability, but can be overridden by the
-// tenantMode test flag or the COCKROACH_TEST_TENANT_MODE environment variable.
-// If both the environment variable and the test flag are set, the environment
-// variable wins out.
+// default.
+// This can be overridden either via the build tag `metamorphic_disable`
+// or just for test tenants via COCKROACH_TEST_TENANT.
 func ShouldStartDefaultTestTenant(t testing.TB, serverArgs base.TestServerArgs) bool {
 	// Explicit cases for enabling or disabling the default test tenant.
-	if serverArgs.DefaultTestTenant == base.TestTenantDisabled {
-		return false
-	}
-	if serverArgs.DefaultTestTenant == base.TestTenantEnabled {
+	if serverArgs.DefaultTestTenant.TestTenantAlwaysEnabled() {
 		return true
 	}
+	if serverArgs.DefaultTestTenant.TestTenantAlwaysDisabled() {
+		if issueNum, label := serverArgs.DefaultTestTenant.IssueRef(); issueNum != 0 {
+			t.Logf("cluster virtualization disabled due to issue: #%d (expected label: %s)", issueNum, label)
+		}
+		return false
+	}
 
-	// Probabilistic cases for enabling or disabling the default test tenant.
-	var defaultProbabilityOfStartingTestTenant = 0.5
 	if skip.UnderBench() {
 		// Until #83461 is resolved, we want to make sure that we don't use the
 		// multi-tenant setup so that the comparison against old single-tenant
 		// SHAs in the benchmarks is fair.
-		defaultProbabilityOfStartingTestTenant = 0
-	}
-	var probabilityOfStartingDefaultTestTenant float64
-
-	tenantModeTestString, envSet := envutil.EnvString("COCKROACH_TEST_TENANT_MODE", 0)
-	if !envSet {
-		tenantModeTestString = *tenantModeFlag
+		return false
 	}
 
-	switch tenantModeTestString {
-	case tenantModeForceTenant:
-		probabilityOfStartingDefaultTestTenant = 1.0
-	case tenantModeForceNoTenant:
-		probabilityOfStartingDefaultTestTenant = 0.0
-	case tenantModeDefault:
-		probabilityOfStartingDefaultTestTenant = defaultProbabilityOfStartingTestTenant
-	default:
-		t.Fatal("invalid setting of tenantMode flag")
+	// Obey the env override if present.
+	if str, present := envutil.EnvString("COCKROACH_TEST_TENANT", 0); present {
+		v, err := strconv.ParseBool(str)
+		if err != nil {
+			panic(err)
+		}
+		return v
 	}
 
-	return rand.Float64() <= probabilityOfStartingDefaultTestTenant
+	// Note: we ask the metamorphic framework for a "disable" value, instead
+	// of an "enable" value, because it probabilistically returns its default value
+	// more often than not and that is what we want.
+	enabled := !util.ConstantWithMetamorphicTestBoolWithoutLogging("disable-test-tenant", false)
+	if enabled {
+		t.Log(DefaultTestTenantMessage)
+	}
+	return enabled
 }
 
 // TestServerInterface defines test server functionality that tests need; it is
@@ -317,6 +306,10 @@ type TestServerInterface interface {
 	// BinaryVersionOverride returns the value of an override if set using
 	// TestingKnobs.
 	BinaryVersionOverride() roachpb.Version
+
+	// KvProber returns a *kvprober.Prober, which is useful when asserting the
+	//correctness of the prober from integration tests.
+	KvProber() *kvprober.Prober
 }
 
 // TestServerFactory encompasses the actual implementation of the shim
@@ -341,14 +334,17 @@ func InitTestServerFactory(impl TestServerFactory) {
 func StartServer(
 	t testing.TB, params base.TestServerArgs,
 ) (TestServerInterface, *gosql.DB, *kv.DB) {
-	preventFurtherTenants := params.DefaultTestTenant == base.TestTenantProbabilisticOnly
+	allowAdditionalTenants := params.DefaultTestTenant.AllowAdditionalTenants()
 	// Determine if we should probabilistically start a test tenant
 	// for this server.
 	startDefaultSQLServer := ShouldStartDefaultTestTenant(t, params)
 	if !startDefaultSQLServer {
 		// If we're told not to start a test tenant, set the
 		// disable flag explicitly.
-		params.DefaultTestTenant = base.TestTenantDisabled
+		//
+		// TODO(#76378): review the definition of params.DefaultTestTenant
+		// so we do not need this weird sentinel value.
+		params.DefaultTestTenant = base.InternalNonDefaultDecision
 	}
 
 	s, err := NewServer(params)
@@ -364,7 +360,7 @@ func StartServer(
 		t.Log(DefaultTestTenantMessage)
 	}
 
-	if preventFurtherTenants {
+	if !allowAdditionalTenants {
 		s.DisableStartTenant(PreventStartTenantError)
 	}
 

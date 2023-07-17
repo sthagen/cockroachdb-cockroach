@@ -849,6 +849,13 @@ func TestLogic_geospatial_meta(
 	runLogicTest(t, "geospatial_meta")
 }
 
+func TestLogic_geospatial_regression(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "geospatial_regression")
+}
+
 func TestLogic_geospatial_zm(
 	t *testing.T,
 ) {
@@ -910,13 +917,6 @@ func TestLogic_group_join(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "group_join")
-}
-
-func TestLogic_guardrails(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "guardrails")
 }
 
 func TestLogic_hash_join(

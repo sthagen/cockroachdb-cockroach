@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvprober"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
@@ -60,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	addrutil "github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -298,7 +300,8 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.TempStorageConfig.Settings = st
 	}
 
-	cfg.DisableDefaultTestTenant = params.DefaultTestTenant == base.TestTenantDisabled
+	// TODO(#76378): Review this assignment to ensure it does not interfere with randomization.
+	cfg.DisableDefaultTestTenant = params.DefaultTestTenant.TestTenantAlwaysDisabled()
 
 	if cfg.TestingKnobs.Store == nil {
 		cfg.TestingKnobs.Store = &kvserver.StoreTestingKnobs{}
@@ -494,7 +497,7 @@ func (ts *TestServer) PGServer() interface{} {
 
 // PGPreServer exposes the pgwire.PreServeConnHandler instance used by
 // the TestServer.
-func (ts *TestServer) PGPreServer() *pgwire.PreServeConnHandler {
+func (ts *TestServer) PGPreServer() interface{} {
 	if ts != nil {
 		return ts.pgPreServer
 	}
@@ -543,6 +546,7 @@ func (ts *TestServer) TestTenants() []serverutils.TestTenantInterface {
 func (ts *TestServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 	clusterID := ts.sqlServer.execCfg.NodeInfo.LogicalClusterID
 	if err := base.CheckEnterpriseEnabled(ts.st, clusterID(), "SQL servers"); err != nil {
+		log.Shoutf(ctx, severity.ERROR, "test tenant requested by configuration, but code organization prevents start!\n%v", err)
 		// If not enterprise enabled, we won't be able to use SQL Servers so eat
 		// the error and return without creating/starting a SQL server.
 		ts.cfg.DisableDefaultTestTenant = true
@@ -551,7 +555,7 @@ func (ts *TestServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 
 	// If the flag has been set to disable the default test tenant, don't start
 	// it here.
-	if ts.params.DefaultTestTenant == base.TestTenantDisabled || ts.cfg.DisableDefaultTestTenant {
+	if ts.params.DefaultTestTenant.TestTenantAlwaysDisabled() || ts.cfg.DisableDefaultTestTenant {
 		return nil
 	}
 
@@ -645,8 +649,10 @@ func (ts *TestServer) Start(ctx context.Context) error {
 		// If the server requests a shutdown, do that simply by stopping the
 		// stopper.
 		select {
-		case <-ts.Server.ShutdownRequested():
-			ts.Stopper().Stop(ts.Server.AnnotateCtx(context.Background()))
+		case req := <-ts.Server.ShutdownRequested():
+			shutdownCtx := ts.Server.AnnotateCtx(context.Background())
+			log.Infof(shutdownCtx, "server requesting spontaneous shutdown: %v", req.ShutdownCause())
+			ts.Stopper().Stop(shutdownCtx)
 		case <-ts.Stopper().ShouldQuiesce():
 		}
 	}()
@@ -699,7 +705,7 @@ func (t *TestTenant) PGServer() interface{} {
 
 // PGPreServer exposes the pgwire.PreServeConnHandler instance used by
 // the TestServer.
-func (ts *TestTenant) PGPreServer() *pgwire.PreServeConnHandler {
+func (ts *TestTenant) PGPreServer() interface{} {
 	if ts != nil {
 		return ts.pgPreServer
 	}
@@ -1179,8 +1185,10 @@ func (ts *TestServer) StartTenant(
 		// If the server requests a shutdown, do that simply by stopping the
 		// tenant's stopper.
 		select {
-		case <-sw.ShutdownRequested():
-			stopper.Stop(sw.AnnotateCtx(context.Background()))
+		case req := <-sw.ShutdownRequested():
+			shutdownCtx := sw.AnnotateCtx(context.Background())
+			log.Infof(shutdownCtx, "server requesting spontaneous shutdown: %v", req.ShutdownCause())
+			stopper.Stop(shutdownCtx)
 		case <-stopper.ShouldQuiesce():
 		}
 	}()
@@ -1830,6 +1838,11 @@ func (ts *TestServer) BinaryVersionOverride() roachpb.Version {
 		return roachpb.Version{}
 	}
 	return knobs.(*TestingKnobs).BinaryVersionOverride
+}
+
+// KvProber is part of the TestServerInterface.
+func (ts *TestServer) KvProber() *kvprober.Prober {
+	return ts.Server.kvProber
 }
 
 type testServerFactoryImpl struct{}

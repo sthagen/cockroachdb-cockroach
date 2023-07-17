@@ -97,7 +97,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/collector"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -1944,8 +1943,11 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 		}
 
 		traceCollector := p.ExecCfg().TraceCollector
-		var iter *collector.Iterator
-		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next(ctx) {
+		iter, err := traceCollector.StartIter(ctx, traceID)
+		if err != nil {
+			return false, err
+		}
+		for ; iter.Valid(); iter.Next(ctx) {
 			nodeID, recording := iter.Value()
 			traceString := recording.String()
 			traceJaegerJSON, err := recording.ToJaegerJSON("", "", fmt.Sprintf("node %d", nodeID))
@@ -1959,12 +1961,6 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 				tree.NewDString(traceJaegerJSON)); err != nil {
 				return false, err
 			}
-		}
-		if err != nil {
-			return false, err
-		}
-		if iter.Error() != nil {
-			return false, iter.Error()
 		}
 
 		return true, nil
@@ -4596,6 +4592,7 @@ CREATE TABLE crdb_internal.gossip_nodes (
 			var gossipLiveness livenesspb.Liveness
 			if err := g.GetInfoProto(gossip.MakeNodeLivenessKey(d.NodeID), &gossipLiveness); err == nil {
 				if now.Before(gossipLiveness.Expiration.ToTimestamp().GoTime()) {
+					// TODO(baptist): This isn't the right way to check livenesses.
 					alive[d.NodeID] = true
 				}
 			}
@@ -4703,9 +4700,16 @@ CREATE TABLE crdb_internal.kv_node_liveness (
 			return err
 		}
 
-		livenesses, err := nl.GetLivenessesFromKV(ctx)
+		nodeVitality, err := nl.ScanNodeVitalityFromKV(ctx)
 		if err != nil {
 			return err
+		}
+
+		var livenesses []livenesspb.Liveness
+		for _, v := range nodeVitality {
+			// We want the generated liveness which will simulate the expiration if
+			// the liveness record is not being updated.
+			livenesses = append(livenesses, v.GenLiveness())
 		}
 
 		sort.Slice(livenesses, func(i, j int) bool {

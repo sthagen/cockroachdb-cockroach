@@ -1248,6 +1248,9 @@ func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
 		if notice.Hint != "" {
 			t.noticeBuffer = append(t.noticeBuffer, "HINT: "+notice.Hint)
 		}
+		if notice.Code != "" && notice.Code != "00000" {
+			t.noticeBuffer = append(t.noticeBuffer, "SQLSTATE: "+string(notice.Code))
+		}
 	})
 
 	return gosql.OpenDB(connector)
@@ -2313,8 +2316,9 @@ func (t *logicTest) maybeBackupRestore(
 		}
 	}
 
-	backupLocation := fmt.Sprintf("gs://cockroachdb-backup-testing/logic-test-backup-restore-nightly/%s?AUTH=implicit",
-		strconv.FormatInt(timeutil.Now().UnixNano(), 10))
+	bucket := testutils.BackupTestingBucket()
+	backupLocation := fmt.Sprintf("gs://%s/logic-test-backup-restore-nightly/%s?AUTH=implicit",
+		bucket, strconv.FormatInt(timeutil.Now().UnixNano(), 10))
 
 	// Perform the backup and restore as root.
 	t.setUser(username.RootUser, 0 /* nodeIdx */)

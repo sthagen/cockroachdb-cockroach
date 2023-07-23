@@ -2258,6 +2258,7 @@ func addOuterColsToFuncDep(outerCols opt.ColSet, fdset *props.FuncDepSet) {
 // joins that are used internally when deriving logical properties and
 // statistics.
 type joinPropsHelper struct {
+	evalCtx  *eval.Context
 	join     RelExpr
 	joinType opt.Operator
 
@@ -2276,7 +2277,7 @@ type joinPropsHelper struct {
 func (h *joinPropsHelper) init(b *logicalPropsBuilder, joinExpr RelExpr) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
-	*h = joinPropsHelper{join: joinExpr}
+	*h = joinPropsHelper{evalCtx: b.evalCtx, join: joinExpr}
 
 	switch join := joinExpr.(type) {
 	case *LookupJoinExpr:
@@ -2514,7 +2515,9 @@ func (h *joinPropsHelper) setFuncDeps(rel *props.Relational) {
 		// created new possibilities for simplifying removed columns.
 		rel.FuncDeps.ProjectCols(rel.OutputCols)
 	}
-	h.addSelfJoinImpliedFDs(rel)
+	if h.evalCtx.SessionData().OptimizerUseImprovedJoinElimination {
+		h.addSelfJoinImpliedFDs(rel)
+	}
 }
 
 // addSelfJoinImpliedFDs adds any extra equality FDs that are implied by a self
@@ -2526,57 +2529,54 @@ func (h *joinPropsHelper) addSelfJoinImpliedFDs(rel *props.Relational) {
 		// There are no equalities between left and right columns.
 		return
 	}
-	// Map from the table ID to the column ordinals within the table.
-	getTables := func(cols opt.ColSet) map[opt.TableID]intsets.Fast {
-		var tables map[opt.TableID]intsets.Fast
+	// Retrieve the tables that originate the given columns.
+	getTables := func(cols opt.ColSet) intsets.Fast {
+		var tables intsets.Fast
 		cols.ForEach(func(col opt.ColumnID) {
 			if tab := md.ColumnMeta(col).Table; tab != opt.TableID(0) {
-				if tables == nil {
-					tables = make(map[opt.TableID]intsets.Fast)
-				}
-				colOrds := tables[tab]
-				colOrds.Add(tab.ColumnOrdinal(col))
-				tables[tab] = colOrds
+				tables.Add(int(tab))
 			}
 		})
 		return tables
 	}
-	leftTables := getTables(leftCols)
-	if leftTables == nil {
+	leftTables, rightTables := getTables(leftCols), getTables(rightCols)
+	if leftTables.Empty() || rightTables.Empty() {
 		return
 	}
-	rightTables := getTables(rightCols)
-	if rightTables == nil {
-		return
-	}
-	for leftTable, leftTableOrds := range leftTables {
-		for rightTable, rightTableOrds := range rightTables {
+	leftTables.ForEach(func(left int) {
+		leftTable := opt.TableID(left)
+		baseTabFDs := MakeTableFuncDep(md, leftTable)
+		rightTables.ForEach(func(right int) {
+			rightTable := opt.TableID(right)
 			if md.TableMeta(leftTable).Table.ID() != md.TableMeta(rightTable).Table.ID() {
-				continue
+				return
 			}
 			// This is a self-join. If there are equalities between columns at the
 			// same ordinal positions in each (meta) table and those columns form a
-			// key on each input, *every* pair of columns at the same ordinal position
-			// is equal.
+			// key on the base table, *every* pair of columns at the same ordinal
+			// position is equal.
 			var eqCols opt.ColSet
-			colOrds := leftTableOrds.Intersection(rightTableOrds)
-			for colOrd, ok := colOrds.Next(0); ok; colOrd, ok = colOrds.Next(colOrd + 1) {
+			var outColOrds intsets.Fast
+			numCols := md.Table(leftTable).ColumnCount()
+			for colOrd := 0; colOrd < numCols; colOrd++ {
 				leftCol, rightCol := leftTable.ColumnID(colOrd), rightTable.ColumnID(colOrd)
-				if rel.FuncDeps.AreColsEquiv(leftCol, rightCol) {
-					eqCols.Add(leftCol)
-					eqCols.Add(rightCol)
+				if rel.OutputCols.Contains(leftCol) && rel.OutputCols.Contains(rightCol) {
+					outColOrds.Add(colOrd)
+					if rel.FuncDeps.AreColsEquiv(leftCol, rightCol) {
+						eqCols.Add(leftCol)
+						eqCols.Add(rightCol)
+					}
 				}
 			}
-			if !eqCols.Empty() && h.leftProps.FuncDeps.ColsAreStrictKey(eqCols) &&
-				h.rightProps.FuncDeps.ColsAreStrictKey(eqCols) {
+			if !eqCols.Empty() && baseTabFDs.ColsAreStrictKey(eqCols) {
 				// Add equalities between each pair of columns at the same ordinal
 				// position, ignoring those that aren't part of the output.
-				for colOrd, ok := colOrds.Next(0); ok; colOrd, ok = colOrds.Next(colOrd + 1) {
+				outColOrds.ForEach(func(colOrd int) {
 					rel.FuncDeps.AddEquivalency(leftTable.ColumnID(colOrd), rightTable.ColumnID(colOrd))
-				}
+				})
 			}
-		}
-	}
+		})
+	})
 }
 
 func (h *joinPropsHelper) cardinality() props.Cardinality {

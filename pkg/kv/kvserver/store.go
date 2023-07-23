@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -67,6 +68,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -256,6 +258,12 @@ var ExportRequestsLimit = settings.RegisterIntSetting(
 	settings.PositiveInt,
 )
 
+// raftStepDownOnRemoval is a metamorphic test parameter that makes Raft leaders
+// step down on demotion or removal. Following an upgrade, clusters may have
+// replicas with mixed settings, because it's only changed when initializing
+// replicas. Varying it makes sure we handle this state.
+var raftStepDownOnRemoval = util.ConstantWithMetamorphicTestBool("raft-step-down-on-removal", true)
+
 // TestStoreConfig has some fields initialized with values relevant in tests.
 func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 	return testStoreConfig(clock, clusterversion.TestingBinaryVersion)
@@ -298,6 +306,7 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 }
 
 func newRaftConfig(
+	ctx context.Context,
 	strg raft.Storage,
 	id uint64,
 	appliedIndex kvpb.RaftIndex,
@@ -305,18 +314,33 @@ func newRaftConfig(
 	logger raft.Logger,
 ) *raft.Config {
 	return &raft.Config{
-		ID:                        id,
-		Applied:                   uint64(appliedIndex),
-		AsyncStorageWrites:        true,
-		ElectionTick:              storeCfg.RaftElectionTimeoutTicks,
-		HeartbeatTick:             storeCfg.RaftHeartbeatIntervalTicks,
-		MaxUncommittedEntriesSize: storeCfg.RaftMaxUncommittedEntriesSize,
-		MaxCommittedSizePerReady:  storeCfg.RaftMaxCommittedSizePerReady,
-		MaxSizePerMsg:             storeCfg.RaftMaxSizePerMsg,
-		MaxInflightMsgs:           storeCfg.RaftMaxInflightMsgs,
-		MaxInflightBytes:          storeCfg.RaftMaxInflightBytes,
-		Storage:                   strg,
-		Logger:                    logger,
+		ID:                          id,
+		Applied:                     uint64(appliedIndex),
+		AsyncStorageWrites:          true,
+		ElectionTick:                storeCfg.RaftElectionTimeoutTicks,
+		HeartbeatTick:               storeCfg.RaftHeartbeatIntervalTicks,
+		MaxUncommittedEntriesSize:   storeCfg.RaftMaxUncommittedEntriesSize,
+		MaxCommittedSizePerReady:    storeCfg.RaftMaxCommittedSizePerReady,
+		DisableConfChangeValidation: true, // see https://github.com/cockroachdb/cockroach/issues/105797
+		MaxSizePerMsg:               storeCfg.RaftMaxSizePerMsg,
+		MaxInflightMsgs:             storeCfg.RaftMaxInflightMsgs,
+		MaxInflightBytes:            storeCfg.RaftMaxInflightBytes,
+		Storage:                     strg,
+		Logger:                      logger,
+
+		// StepDownOnRemoval requires 23.2. Otherwise, in a mixed-version cluster, a
+		// 23.2 leader may step down when it demotes itself to learner, but a
+		// designated follower (first in the range) running 23.1 will only campaign
+		// once the leader is entirely removed from the range descriptor (see
+		// shouldCampaignOnConfChange). This would leave the range without a leader,
+		// having to wait out an election timeout.
+		//
+		// We only set this on replica initialization, so replicas without
+		// StepDownOnRemoval may remain on 23.2 nodes until they restart. That's
+		// totally fine, we just can't rely on this behavior until 24.1, but
+		// we currently don't either.
+		StepDownOnRemoval: storeCfg.Settings.Version.IsActive(ctx, clusterversion.V23_2) &&
+			raftStepDownOnRemoval,
 
 		PreVote:     true,
 		CheckQuorum: storeCfg.RaftEnableCheckQuorum,
@@ -1180,6 +1204,8 @@ type StoreConfig struct {
 
 	// RangeLogWriter is used to write entries to the system.rangelog table.
 	RangeLogWriter RangeLogWriter
+
+	ExternalStorage *cloud.ExternalStorageAccessor
 }
 
 // logRangeAndNodeEventsEnabled is used to enable or disable logging range events
@@ -1992,15 +2018,6 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// due to a split crashing halfway will simply be resolved on the
 	// next split attempt. They can otherwise be ignored.
 	//
-	// Note that we do not create raft groups at this time; they will be created
-	// on-demand the first time they are needed. This helps reduce the amount of
-	// election-related traffic in a cold start.
-	// Raft initialization occurs when we propose a command on this range or
-	// receive a raft message addressed to it.
-	// TODO(bdarnell): Also initialize raft groups when read leases are needed.
-	// TODO(bdarnell): Scan all ranges at startup for unapplied log entries
-	// and initialize those groups.
-	//
 	// TODO(peter): While we have to iterate to find the replica descriptors
 	// serially, we can perform the migrations and replica creation
 	// concurrently. Note that while we can perform this initialization
@@ -2051,17 +2068,16 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			return errors.AssertionFailedf("no tenantID for initialized replica %s", rep)
 		}
 
-		// For replicas that use expiration-based leases, eagerly initialize the
-		// Raft group and unquiesce it. We don't quiesce ranges with expiration
-		// leases, and we want to eagerly acquire leases for them, which happens
-		// during Raft ticks. We rely on Raft pre-vote to avoid disturbing
-		// established Raft leaders.
+		// Eagerly unquiesce replicas that use expiration-based leases. We don't
+		// quiesce ranges with expiration leases, and we want to eagerly acquire
+		// leases for them, which happens during Raft ticks. We rely on Raft
+		// pre-vote to avoid disturbing established Raft leaders.
 		//
 		// NB: cluster settings haven't propagated yet, so we have to check the last
 		// known lease instead of relying on shouldUseExpirationLeaseRLocked(). We
 		// also check Sequence > 0 to omit ranges that haven't seen a lease yet.
 		if l, _ := rep.GetLease(); l.Type() == roachpb.LeaseExpiration && l.Sequence > 0 {
-			rep.maybeInitializeRaftGroup(ctx)
+			rep.maybeUnquiesce(true /* wakeLeader */, true /* mayCampaign */)
 		}
 	}
 

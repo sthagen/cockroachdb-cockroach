@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
@@ -63,18 +64,20 @@ func TestSharedProcessTenantNodeLocalAccess(t *testing.T) {
 	}()
 
 	tc := serverutils.StartNewTestCluster(t, nodeCount, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{DefaultTestTenant: base.TODOTestTenantDisabled},
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				ExternalIODir:     dirs[0],
 			},
 			1: {
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				ExternalIODir:     dirs[1],
 			},
 			2: {
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				ExternalIODir:     dirs[2],
 			},
 		},
@@ -135,7 +138,7 @@ func TestSharedProcessServerInheritsTempStorageLimit(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Settings:          st,
 		TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(st, specialSize),
-		DefaultTestTenant: base.TODOTestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -158,7 +161,7 @@ func TestServerControllerHTTP(t *testing.T) {
 	ctx := context.Background()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TODOTestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -283,7 +286,7 @@ VALUES($1, $2, $3, $4, $5, (SELECT user_id FROM system.users WHERE username = $3
 	t.Logf("retrieving session list from system tenant via cookie")
 
 	c := &http.Cookie{
-		Name:     server.TenantSelectCookieName,
+		Name:     authserver.TenantSelectCookieName,
 		Value:    catconstants.SystemTenantName,
 		Path:     "/",
 		HttpOnly: true,
@@ -334,7 +337,9 @@ func TestServerControllerDefaultHTTPTenant(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TODOTestTenantDisabled})
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	_, sql, err := s.StartSharedProcessTenant(ctx, base.TestSharedProcessTenantArgs{
@@ -358,7 +363,7 @@ func TestServerControllerDefaultHTTPTenant(t *testing.T) {
 
 	tenantCookie := ""
 	for _, c := range resp.Cookies() {
-		if c.Name == server.TenantSelectCookieName {
+		if c.Name == authserver.TenantSelectCookieName {
 			tenantCookie = c.Value
 		}
 	}
@@ -383,7 +388,7 @@ func TestServerControllerBadHTTPCookies(t *testing.T) {
 	require.NoError(t, err)
 
 	c := &http.Cookie{
-		Name:     server.TenantSelectCookieName,
+		Name:     authserver.TenantSelectCookieName,
 		Value:    "some-nonexistent-tenant",
 		Path:     "/",
 		HttpOnly: true,
@@ -420,7 +425,7 @@ func TestServerControllerMultiNodeTenantStartup(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
-			DefaultTestTenant: base.TODOTestTenantDisabled,
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		}})
 	defer func() {
 		t.Logf("stopping test cluster")
@@ -472,7 +477,7 @@ func TestServerStartStop(t *testing.T) {
 	ctx := context.Background()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TODOTestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -635,7 +640,7 @@ func TestServiceShutdownUsesGracefulDrain(t *testing.T) {
 	ctx := context.Background()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TODOTestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 

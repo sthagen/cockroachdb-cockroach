@@ -25,6 +25,7 @@ import "util/hlc/timestamp.proto";
 import "clusterversion/cluster_version.proto";
 import "google/protobuf/timestamp.proto";
 import "server/autoconfig/autoconfigpb/autoconfig.proto";
+import "util/tracing/tracingpb/recorded_span.proto";
 
 enum EncryptionMode {
   Passphrase = 0;
@@ -477,7 +478,13 @@ message RestoreDetails {
 
   roachpb.Locality execution_locality = 30 [(gogoproto.nullable) = false];
   
-  // NEXT ID: 31.
+  bool experimental_online = 31;
+  
+  // DownloadSpans indicates this job is the download-step of a multi-step
+  // online restore.
+  repeated roachpb.Span download_spans = 32 [(gogoproto.nullable) = false]; 
+
+  // NEXT ID: 33.
 }
 
 
@@ -493,6 +500,11 @@ message RestoreProgress {
   }
 
   repeated FrontierEntry checkpoint = 2 [(gogoproto.nullable) = false];
+
+  // TotalDownloadRequired is set in the download job for an online restore, and
+  // reflects the total amount that was initially found to be needing to be 
+  // downloaded. 
+  uint64 total_download_required = 3;
 }
 
 message ImportDetails {
@@ -1413,4 +1425,8 @@ message RetriableExecutionFailure {
   // that the error was too large. While the structure may be lost, at least
   // some information will be preserved.
   string truncated_error = 6;
+}
+
+message TraceData {
+  repeated util.tracing.tracingpb.RecordedSpan collected_spans = 1 [(gogoproto.nullable) = false];
 }

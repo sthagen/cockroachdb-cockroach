@@ -1069,7 +1069,7 @@ FROM
 NULL  NULL
 
 # Regression test for #28817. Do not allow special functions in ON clause.
-query error generator functions are not allowed in ON
+query error pq: generate_series\(\): set-returning functions are not allowed in ON
 SELECT * FROM foo JOIN bar ON generate_series(0, 1) < 2
 
 query error aggregate functions are not allowed in JOIN conditions
@@ -1205,3 +1205,15 @@ FROM task AS task0_ WHERE EXISTS (
 11  taskWithPatient1WithValidSite1  5
 12  taskWithPatient2WithValidSite1  6
 13  taskWithPatient3WithValidSite2  7
+
+# Regression test for #106371 - only infer self-join equalities if the original
+# equality columns form a key over the *base* table, not just the join inputs.
+statement ok
+CREATE TABLE t106371 (x INT NOT NULL, y INT NOT NULL);
+INSERT INTO t106371 VALUES (1, 1), (1, 2);
+
+query IIII
+SELECT * FROM (SELECT * FROM t106371 ORDER BY y LIMIT 1) a
+JOIN (SELECT DISTINCT ON (x) * FROM (SELECT * FROM t106371 WHERE y = 2)) b ON a.x = b.x;
+----
+1  1  1  2

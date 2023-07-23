@@ -219,6 +219,7 @@ func TestBackupRestoreMultiNodeRemote(t *testing.T) {
 func TestBackupRestoreJobTagAndLabel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderRaceWithIssue(t, 107336)
 
 	const numAccounts = 1000
 	ctx := context.Background()
@@ -247,7 +248,6 @@ func TestBackupRestoreJobTagAndLabel(t *testing.T) {
 	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, numNodes, numAccounts, InitManualReplication,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					DistSQL: &execinfra.TestingKnobs{
 						SetupFlowCb: func(ctx context.Context, _ base.SQLInstanceID, _ *execinfrapb.SetupFlowRequest) error {
@@ -672,15 +672,18 @@ func TestBackupRestoreAppend(t *testing.T) {
 		sqlDB.ExpectErr(t, "A full backup cannot be written to \"/subdir\", a user defined subdirectory",
 			"BACKUP INTO $4 IN ($1, $2, $3) AS OF SYSTEM TIME "+tsBefore, append(test.collectionsWithSubdir, specifiedSubdir)...)
 
-		sqlDB.QueryRow(t, "UPDATE data.bank SET balance = 100 RETURNING cluster_logical_timestamp()").Scan(&ts1)
+		sqlDB.RunWithRetriableTxn(t, func(txn *gosql.Tx) error {
+			return txn.QueryRow("UPDATE data.bank SET balance = 100 RETURNING cluster_logical_timestamp()").Scan(&ts1)
+		})
 		sqlDB.Exec(t, "BACKUP INTO LATEST IN ($1, $2, $3) AS OF SYSTEM TIME "+ts1, test.collections...)
 
 		// Append to latest again, just to prove we can append to an appended one and
 		// that appended didn't e.g. mess up LATEST.
 		sqlDB.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&ts1again)
 		sqlDB.Exec(t, "BACKUP INTO LATEST IN ($1, $2, $3) AS OF SYSTEM TIME "+ts1again, test.collections...)
-
-		sqlDB.QueryRow(t, "UPDATE data.bank SET balance = 200 RETURNING cluster_logical_timestamp()").Scan(&ts2)
+		sqlDB.RunWithRetriableTxn(t, func(txn *gosql.Tx) error {
+			return txn.QueryRow("UPDATE data.bank SET balance = 200 RETURNING cluster_logical_timestamp()").Scan(&ts2)
+		})
 		rowsTS2 := sqlDB.QueryStr(t, "SELECT * from data.bank ORDER BY id")
 
 		// Start a new full-backup in the collection version.
@@ -1004,6 +1007,7 @@ func backupAndRestore(
 	sqlDB := sqlutils.MakeSQLRunner(conn)
 	storageConn := tc.StorageClusterConn()
 	storageSQLDB := sqlutils.MakeSQLRunner(storageConn)
+	storageSQLDB.Exec(t, "SET DATABASE=defaultdb")
 	{
 		sqlDB.Exec(t, `CREATE INDEX balance_idx ON data.bank (balance)`)
 		testutils.SucceedsSoon(t, func() error {
@@ -1065,7 +1069,6 @@ SELECT payload FROM "".crdb_internal.system_jobs ORDER BY created DESC LIMIT 10
 			backupManifest := &backuppb.BackupManifest{}
 			backupPayload, ok := payload.Details.(*jobspb.Payload_Backup)
 			if !ok {
-				t.Logf("job %T is not a backup: %v", payload.Details, payload.Details)
 				continue
 			}
 			backupDetails := backupPayload.Backup
@@ -5428,9 +5431,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 	const numAccounts = 1
 	_, origDB, dir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
-	// Test fails when run within a tenant. More investigation is
-	// required. Tracked with #76378.
-	args := base.TestServerArgs{ExternalIODir: dir, DefaultTestTenant: base.TODOTestTenantDisabled}
+	args := base.TestServerArgs{ExternalIODir: dir}
 
 	// Setup for sequence ownership backup/restore tests in the same database.
 	backupLoc := localFoo + `/d`
@@ -5440,6 +5441,11 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 	origDB.Exec(t, `CREATE SEQUENCE d.seq OWNED BY d.t.a`)
 	origDB.Exec(t, `BACKUP DATABASE d TO $1`, backupLoc)
 
+	getTableDescriptorFromTestCluster := func(tc *testcluster.TestCluster, database string, table string) catalog.TableDescriptor {
+		srv := tc.TenantOrServer(0)
+		return desctestutils.TestingGetPublicTableDescriptor(srv.DB(), srv.Codec(), database, table)
+	}
+
 	// When restoring a database which has a owning table and an owned sequence,
 	// the ownership relationship should be preserved and remapped post restore.
 	t.Run("test restoring database should preserve ownership dependency", func(t *testing.T) {
@@ -5447,12 +5453,11 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		defer tc.Stopper().Stop(context.Background())
 
 		newDB := sqlutils.MakeSQLRunner(tc.Conns[0])
-		kvDB := tc.Server(0).DB()
 
 		newDB.Exec(t, `RESTORE DATABASE d FROM $1`, backupLoc)
 
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "t")
-		seqDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "seq")
+		tableDesc := getTableDescriptorFromTestCluster(tc, "d", "t")
+		seqDesc := getTableDescriptorFromTestCluster(tc, "d", "seq")
 
 		require.True(t, seqDesc.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
 		require.Equal(t, tableDesc.GetID(), seqDesc.GetSequenceOpts().SequenceOwner.OwnerTableID,
@@ -5477,14 +5482,14 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		defer tc.Stopper().Stop(context.Background())
 
 		newDB := sqlutils.MakeSQLRunner(tc.Conns[0])
-		kvDB := tc.Server(0).DB()
+
 		newDB.Exec(t, `CREATE DATABASE d`)
 		newDB.Exec(t, `USE d`)
 		newDB.ExpectErr(t, `pq: cannot restore sequence "seq" without referenced owner`,
 			`RESTORE TABLE seq FROM $1`, backupLoc)
 
 		newDB.Exec(t, `RESTORE TABLE seq FROM $1 WITH skip_missing_sequence_owners`, backupLoc)
-		seqDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "seq")
+		seqDesc := getTableDescriptorFromTestCluster(tc, "d", "seq")
 		require.False(t, seqDesc.GetSequenceOpts().HasOwner(), "unexpected owner of restored sequence.")
 	})
 
@@ -5499,7 +5504,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 			defer tc.Stopper().Stop(context.Background())
 
 			newDB := sqlutils.MakeSQLRunner(tc.Conns[0])
-			kvDB := tc.Server(0).DB()
+
 			newDB.Exec(t, `CREATE DATABASE d`)
 			newDB.Exec(t, `USE d`)
 			newDB.ExpectErr(t, `pq: cannot restore sequence "seq" without referenced owner table`,
@@ -5509,7 +5514,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 				`RESTORE TABLE t FROM $1`, backupLoc)
 			newDB.Exec(t, `RESTORE TABLE t FROM $1 WITH skip_missing_sequence_owners`, backupLoc)
 
-			tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "t")
+			tableDesc := getTableDescriptorFromTestCluster(tc, "d", "t")
 
 			require.Equal(t, 0, tableDesc.PublicColumns()[0].NumOwnsSequences(),
 				"expected restored table to own 0 sequences",
@@ -5519,7 +5524,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 				`RESTORE TABLE seq FROM $1`, backupLoc)
 			newDB.Exec(t, `RESTORE TABLE seq FROM $1 WITH skip_missing_sequence_owners`, backupLoc)
 
-			seqDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d", "seq")
+			seqDesc := getTableDescriptorFromTestCluster(tc, "d", "seq")
 			require.False(t, seqDesc.GetSequenceOpts().HasOwner(), "unexpected sequence owner after restore")
 		})
 
@@ -5530,13 +5535,12 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		defer tc.Stopper().Stop(context.Background())
 
 		newDB := sqlutils.MakeSQLRunner(tc.Conns[0])
-		kvDB := tc.Server(0).DB()
 
 		newDB.Exec(t, `CREATE DATABASE restore_db`)
 		newDB.Exec(t, `RESTORE d.* FROM $1 WITH into_db='restore_db'`, backupLoc)
 
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "restore_db", "t")
-		seqDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "restore_db", "seq")
+		tableDesc := getTableDescriptorFromTestCluster(tc, "restore_db", "t")
+		seqDesc := getTableDescriptorFromTestCluster(tc, "restore_db", "seq")
 
 		require.True(t, seqDesc.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
 		require.Equal(t, tableDesc.GetID(), seqDesc.GetSequenceOpts().SequenceOwner.OwnerTableID,
@@ -5579,14 +5583,13 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 			defer tc.Stopper().Stop(context.Background())
 
 			newDB := sqlutils.MakeSQLRunner(tc.Conns[0])
-			kvDB := tc.Server(0).DB()
 
 			newDB.ExpectErr(t, "pq: cannot restore sequence \"seq\" without referenced owner|"+
 				"pq: cannot restore table \"t\" without referenced sequence",
 				`RESTORE DATABASE d2 FROM $1`, backupLocD2D3)
 			newDB.Exec(t, `RESTORE DATABASE d2 FROM $1 WITH skip_missing_sequence_owners`, backupLocD2D3)
 
-			tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d2", "t")
+			tableDesc := getTableDescriptorFromTestCluster(tc, "d2", "t")
 			require.Equal(t, 0, tableDesc.PublicColumns()[0].NumOwnsSequences(),
 				"expected restored table to own no sequences.",
 			)
@@ -5596,12 +5599,12 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 				`RESTORE DATABASE d3 FROM $1`, backupLocD2D3)
 			newDB.Exec(t, `RESTORE DATABASE d3 FROM $1 WITH skip_missing_sequence_owners`, backupLocD2D3)
 
-			seqDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq")
+			seqDesc := getTableDescriptorFromTestCluster(tc, "d3", "seq")
 			require.False(t, seqDesc.GetSequenceOpts().HasOwner(), "unexpected sequence owner after restore")
 
 			// Sequence dependencies inside the database should still be preserved.
-			sd := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq2")
-			td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "t")
+			sd := getTableDescriptorFromTestCluster(tc, "d3", "seq2")
+			td := getTableDescriptorFromTestCluster(tc, "d3", "t")
 
 			require.True(t, sd.GetSequenceOpts().HasOwner(), "no owner found for seq2")
 			require.Equal(t, td.GetID(), sd.GetSequenceOpts().SequenceOwner.OwnerTableID,
@@ -5624,13 +5627,12 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		defer tc.Stopper().Stop(context.Background())
 
 		newDB := sqlutils.MakeSQLRunner(tc.Conns[0])
-		kvDB := tc.Server(0).DB()
 
 		newDB.Exec(t, `RESTORE DATABASE d2, d3 FROM $1`, backupLocD2D3)
 
 		// d2.t owns d3.seq should be preserved.
-		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d2", "t")
-		seqDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq")
+		tableDesc := getTableDescriptorFromTestCluster(tc, "d2", "t")
+		seqDesc := getTableDescriptorFromTestCluster(tc, "d3", "seq")
 
 		require.True(t, seqDesc.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
 		require.Equal(t, tableDesc.GetID(), seqDesc.GetSequenceOpts().SequenceOwner.OwnerTableID,
@@ -5647,9 +5649,9 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 		)
 
 		// d3.t owns d2.seq and d3.seq2 should be preserved.
-		td := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "t")
-		sd := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d2", "seq")
-		sdSeq2 := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "d3", "seq2")
+		td := getTableDescriptorFromTestCluster(tc, "d3", "t")
+		sd := getTableDescriptorFromTestCluster(tc, "d2", "seq")
+		sdSeq2 := getTableDescriptorFromTestCluster(tc, "d3", "seq2")
 
 		require.True(t, sd.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
 		require.True(t, sdSeq2.GetSequenceOpts().HasOwner(), "no sequence owner after restore")
@@ -6035,9 +6037,7 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODir = dir
 	params.ServerArgs.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
-	// This test instantiates its own secondary tenants below. No need to run
-	// it probabilistically under a test tenant.
-	params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
+	params.ServerArgs.DefaultTestTenant = base.TestControlsTenantsExplicitly
 	tc := testcluster.StartTestCluster(t, 1, params)
 	defer tc.Stopper().Stop(ctx)
 
@@ -6345,12 +6345,17 @@ func TestRestoreErrorPropagates(t *testing.T) {
 	defer dirCleanupFn()
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODir = dir
-	// When this test runs under the default test tenant, the RESTORE command
-	// below which is expected to fail, doesn't. This may be a problem with the
-	// testing knobs being incorrectly applied to the cluster. More
-	// investigation is required. Tracked with #76378.
-	params.ServerArgs.DefaultTestTenant = base.TODOTestTenantDisabled
-	jobsTableKey := keys.SystemSQLCodec.TablePrefix(uint32(systemschema.JobsTable.GetID()))
+	// TODO(ssd): The way we inject the error requires that we
+	// intercept the actual batch request for job table write. To
+	// keep this from being flakey, we need to disable various
+	// automatic jobs.  Unfortunately, if we disable the span
+	// configuration job, we can't start a tenant.
+	params.ServerArgs.DefaultTestTenant = base.TestNeedsTightIntegrationBetweenAPIsAndTestingKnobs
+	var jobsTableKey = struct {
+		syncutil.Mutex
+		key roachpb.Key
+	}{}
+
 	var shouldFail, failures int64
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
@@ -6360,12 +6365,18 @@ func TestRestoreErrorPropagates(t *testing.T) {
 			if !ba.IsWrite() {
 				return nil
 			}
+			jobsTableKey.Lock()
+			defer jobsTableKey.Unlock()
+			if len(jobsTableKey.key) == 0 {
+				return nil
+			}
+
 			for _, ru := range ba.Requests {
 				r := ru.GetInner()
 				switch r.(type) {
 				case *kvpb.ConditionalPutRequest, *kvpb.PutRequest:
 					key := r.Header().Key
-					if bytes.HasPrefix(key, jobsTableKey) && atomic.LoadInt64(&shouldFail) > 0 {
+					if bytes.HasPrefix(key, jobsTableKey.key) && atomic.LoadInt64(&shouldFail) > 0 {
 						return kvpb.NewError(errors.Errorf("boom %d", atomic.AddInt64(&failures, 1)))
 					}
 				}
@@ -6381,6 +6392,11 @@ func TestRestoreErrorPropagates(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	db := tc.ServerConn(0)
 	runner := sqlutils.MakeSQLRunner(db)
+
+	jobsTableKey.Lock()
+	jobsTableKey.key = tc.TenantOrServer(0).Codec().TablePrefix(uint32(systemschema.JobsTable.GetID()))
+	jobsTableKey.Unlock()
+
 	runner.Exec(t, `SET CLUSTER SETTING jobs.metrics.interval.poll = '30s'`)
 	runner.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false`)
 	runner.Exec(t, `SET CLUSTER SETTING sql.stats.system_tables_autostats.enabled = false`)
@@ -6455,10 +6471,8 @@ func TestPaginatedBackupTenant(t *testing.T) {
 
 	const numAccounts = 1
 	serverArgs := base.TestServerArgs{
-		Knobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
-		// Disabled to probabilistically spin up a tenant in each server because the
-		// test explicitly sets up tenants to test on.
-		DefaultTestTenant: base.TODOTestTenantDisabled}
+		Knobs:             base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
+		DefaultTestTenant: base.TestControlsTenantsExplicitly}
 	params := base.TestClusterArgs{ServerArgs: serverArgs}
 	var numExportRequests int
 
@@ -6940,9 +6954,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 			},
 		},
 
-		// Disabled to probabilistically spin up a tenant in each server because the
-		// test explicitly sets up tenants to test on.
-		DefaultTestTenant: base.TODOTestTenantDisabled},
+		DefaultTestTenant: base.TestControlsTenantsExplicitly},
 	}
 
 	const numAccounts = 1
@@ -7027,12 +7039,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 	t.Run("restore-tenant10-to-latest", func(t *testing.T) {
 		restoreTC := testcluster.StartTestCluster(
 			t, singleNode, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-				ExternalIODir: dir,
-				// This test already exercises the tenant codepaths explicitly
-				// by creating a tenant. Furthermore, the test requires that
-				// it run from the system tenant because it restores tenants.
-				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir:     dir,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				Knobs:             base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 			}},
 		)
@@ -7191,12 +7199,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 	t.Run("restore-t10-from-cluster-backup", func(t *testing.T) {
 		restoreTC := testcluster.StartTestCluster(
 			t, singleNode, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-				ExternalIODir: dir,
-				// This test already exercises the tenant codepaths explicitly
-				// by creating a tenant. Furthermore, the test requires that
-				// it run from the system tenant because it restores tenants.
-				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir:     dir,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 			}},
 		)
 		defer restoreTC.Stopper().Stop(ctx)
@@ -7244,13 +7248,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 	t.Run("restore-all-from-cluster-backup", func(t *testing.T) {
 		restoreTC := testcluster.StartTestCluster(
 			t, singleNode, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-				ExternalIODir: dir,
-				// This test already exercises the tenant codepaths explicitly
-				// by creating a tenant. Furthermore, the test requires that
-				// it run from the system tenant because it queries the
-				// system.tenants table. Disable the default test tenant because
-				// it's not necessary.
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir:     dir,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 					TenantTestingKnobs: &sql.TenantTestingKnobs{
@@ -7354,12 +7353,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 	t.Run("restore-tenant10-to-ts1", func(t *testing.T) {
 		restoreTC := testcluster.StartTestCluster(
 			t, singleNode, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-				ExternalIODir: dir,
-				// This test already exercises the tenant codepaths explicitly
-				// by creating a tenant. Furthermore, the test requires that
-				// it run from the system tenant because it restores tenants.
-				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir:     dir,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 			}},
 		)
 		defer restoreTC.Stopper().Stop(ctx)
@@ -7379,12 +7374,8 @@ func TestBackupRestoreTenant(t *testing.T) {
 	t.Run("restore-tenant20-to-latest", func(t *testing.T) {
 		restoreTC := testcluster.StartTestCluster(
 			t, singleNode, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-				ExternalIODir: dir,
-				// This test already exercises the tenant codepaths explicitly
-				// by creating a tenant. Furthermore, the test requires that
-				// it run from the system tenant because it restores tenants.
-				// Disable the default test tenant because it's not necessary.
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir:     dir,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 			}},
 		)
 		defer restoreTC.Stopper().Stop(ctx)
@@ -11147,7 +11138,6 @@ func TestRestoreMemoryMonitoringWithShadowing(t *testing.T) {
 	restoreProcessorKnobCount := atomic.Uint32{}
 
 	args := base.TestServerArgs{
-		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			DistSQL: &execinfra.TestingKnobs{
 				BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
@@ -11199,11 +11189,7 @@ func TestRestoreMemoryMonitoringMinWorkerMemory(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	const numAccounts = 100
 
-	args := base.TestServerArgs{
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	}
-	params := base.TestClusterArgs{ServerArgs: args}
-	_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 
 	// 4 restore workers means we need minimum 2 workers to start restore.

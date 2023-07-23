@@ -367,16 +367,19 @@ const userSQLRolesReducerObj = new CachedDataReducer(
 export const invalidateUserSQLRoles = userSQLRolesReducerObj.invalidateData;
 export const refreshUserSQLRoles = userSQLRolesReducerObj.refresh;
 
+export const statementDiagnosticInvalidationPeriod = moment.duration(5, "m");
 const statementDiagnosticsReportsReducerObj = new CachedDataReducer(
   clusterUiApi.getStatementDiagnosticsReports,
   "statementDiagnosticsReports",
-  moment.duration(5, "m"),
+  statementDiagnosticInvalidationPeriod,
   moment.duration(1, "m"),
 );
 export const refreshStatementDiagnosticsRequests =
   statementDiagnosticsReportsReducerObj.refresh;
 export const invalidateStatementDiagnosticsRequests =
   statementDiagnosticsReportsReducerObj.invalidateData;
+export const RECEIVE_STATEMENT_DIAGNOSTICS_REPORT =
+  statementDiagnosticsReportsReducerObj.RECEIVE;
 
 const dataDistributionReducerObj = new CachedDataReducer(
   api.getDataDistribution,
@@ -528,6 +531,15 @@ const tenantsListObj = new CachedDataReducer(
 
 export const refreshTenantsList = tenantsListObj.refresh;
 
+const connectivityObj = new CachedDataReducer(
+  api.getNetworkConnectivity,
+  "connectivity",
+  moment.duration(30, "s"),
+  moment.duration(1, "minute"),
+);
+
+export const refreshConnectivity = connectivityObj.refresh;
+
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
   events: CachedDataReducerState<
@@ -592,6 +604,7 @@ export interface APIReducersState {
   snapshot: KeyedCachedDataReducerState<clusterUiApi.GetTracingSnapshotResponse>;
   rawTrace: KeyedCachedDataReducerState<clusterUiApi.GetTraceResponse>;
   tenants: CachedDataReducerState<api.ListTenantsResponseMessage>;
+  connectivity: CachedDataReducerState<api.NetworkConnectivityResponse>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -647,6 +660,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [statementFingerprintInsightsReducerObj.actionNamespace]:
     statementFingerprintInsightsReducerObj.reducer,
   [tenantsListObj.actionNamespace]: tenantsListObj.reducer,
+  [connectivityObj.actionNamespace]: connectivityObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

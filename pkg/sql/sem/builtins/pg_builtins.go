@@ -566,16 +566,16 @@ func makeToRegOverload(typ *types.T, helpText string) builtinDefinition {
 
 // Format the array {type,othertype} as type, othertype.
 // If there are no args, output the empty string.
-const getFunctionArgStringQuery = `SELECT 
-										COALESCE(
-										    (SELECT trim('{}' FROM replace(
-										        array_agg(unnest(proargtypes)::REGTYPE::TEXT)::TEXT,
-										        ',', ', ')))
-										    , '')
-                    FROM pg_catalog.pg_proc
-                    WHERE oid=$1
-                    GROUP BY oid, proargtypes
-                    LIMIT 1`
+const getFunctionArgStringQuery = `
+SELECT COALESCE(
+    (SELECT trim('{}' FROM replace(
+        (
+            SELECT array_agg(unnested::REGTYPE::TEXT)
+            FROM unnest(proargtypes) AS unnested
+        )::TEXT, ',', ', '))
+    ), '')
+FROM pg_catalog.pg_proc WHERE oid=$1 GROUP BY oid, proargtypes LIMIT 1
+`
 
 var pgBuiltins = map[string]builtinDefinition{
 	// See https://www.postgresql.org/docs/9.6/static/functions-info.html.
@@ -726,6 +726,23 @@ var pgBuiltins = map[string]builtinDefinition{
 		},
 	),
 
+	"pg_get_function_arg_default": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}, {Name: "arg_num", Typ: types.Int4}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Body:       "SELECT NULL",
+			Info: "Get textual representation of a function argument's default value. " +
+				"The second argument of this function is the argument number among all " +
+				"arguments (i.e. proallargtypes, *not* proargtypes), starting with 1, " +
+				"because that's how information_schema.sql uses it. Currently, this " +
+				"always returns NULL, since CockroachDB does not support default values.",
+			Volatility:        volatility.Stable,
+			CalledOnNullInput: true,
+			Language:          tree.FunctionLangSQL,
+		},
+	),
+
 	// pg_get_function_result returns the types of the result of a builtin
 	// function. Multi-return builtins currently are returned as anyelement, which
 	// is a known incompatibility with Postgres.
@@ -832,7 +849,7 @@ var pgBuiltins = map[string]builtinDefinition{
 					return tree.DNull, nil
 				}
 				res.ExplicitCatalog = false
-				return tree.NewDString(fmt.Sprintf(`%s.%s`, res.Schema(), res.Object())), nil
+				return tree.NewDString(fmt.Sprintf(`%s.%s`, res.SchemaName.String(), res.ObjectName.String())), nil
 			},
 			Info:       "Returns the name of the sequence used by the given column_name in the table table_name.",
 			Volatility: volatility.Stable,
@@ -2162,6 +2179,31 @@ var pgBuiltins = map[string]builtinDefinition{
 			},
 			Info:       "Returns the scale of the given type with type modifier",
 			Volatility: volatility.Immutable,
+		},
+	),
+
+	"nameconcatoid": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "name", Typ: types.String}, {Name: "oid", Typ: types.Oid}},
+			ReturnType: tree.FixedReturnType(types.Name),
+			Body: `
+SELECT
+  CASE WHEN length($1::text || '_' || $2::text) > 63
+	THEN (substring($1 from 1 for 63 - length($2::text) - 1) || '_' || $2::text)::name
+	ELSE ($1::text || '_' || $2::text)::name
+	END
+`,
+			Info: "Used in the information_schema to produce specific_name " +
+				"columns, which are supposed to be unique per schema. " +
+				"The result is the same as ($1::text || '_' || $2::text)::name " +
+				"except that, if it would not fit in 63 characters, we make it do so " +
+				"by truncating the name input (not the oid).",
+			Volatility:        volatility.Immutable,
+			CalledOnNullInput: true,
+			Language:          tree.FunctionLangSQL,
 		},
 	),
 }

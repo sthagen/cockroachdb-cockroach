@@ -3125,8 +3125,8 @@ func (tssi *tableSpanStatsIterator) ResolvedType() *types.T {
 }
 
 var tableMetricsGeneratorType = types.MakeLabeledTuple(
-	[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Bytes, types.Json},
-	[]string{"node_id,", "store_id", "level", "file_num", "approximate_span_bytes", "metrics"},
+	[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Int, types.Json},
+	[]string{"node_id", "store_id", "level", "file_num", "approximate_span_bytes", "metrics"},
 )
 
 // tableMetricsIterator implements tree.ValueGenerator; it returns a set of
@@ -3186,7 +3186,7 @@ func (tmi *tableMetricsIterator) Values() (tree.Datums, error) {
 		tree.NewDInt(tree.DInt(tmi.storeID)),
 		tree.NewDInt(tree.DInt(metricsInfo.Level)),
 		tree.NewDInt(tree.DInt(metricsInfo.TableID)),
-		tree.NewDBytes(tree.DBytes(metricsInfo.ApproximateSpanBytes)),
+		tree.NewDInt(tree.DInt(metricsInfo.ApproximateSpanBytes)),
 		metricsJson,
 	}, nil
 }
@@ -3314,7 +3314,7 @@ func makeSpanStatsGenerator(
 	spans := make([]roachpb.Span, 0, argSpans.Len())
 	for _, span := range argSpans.Array {
 		s := tree.MustBeDTuple(span)
-		if s.D[0] == tree.DNull || s.D[1] == tree.DNull {
+		if len(s.D) != 2 || s.D[0] == tree.DNull || s.D[1] == tree.DNull {
 			continue
 		}
 		startKey := roachpb.Key(tree.MustBeDBytes(s.D[0]))

@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -44,7 +45,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -4381,81 +4381,6 @@ func TestUninitializedReplicaRemainsQuiesced(t *testing.T) {
 	}
 }
 
-// TestInitRaftGroupOnRequest verifies that an uninitialized Raft group
-// is initialized if a request is received, even if the current range
-// lease points to a different replica.
-func TestInitRaftGroupOnRequest(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-	lisReg := listenerutil.NewListenerRegistry()
-	defer lisReg.Close()
-
-	const numServers int = 2
-	stickyServerArgs := make(map[int]base.TestServerArgs)
-	for i := 0; i < numServers; i++ {
-		stickyServerArgs[i] = base.TestServerArgs{
-			StoreSpecs: []base.StoreSpec{
-				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
-				},
-			},
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-				},
-			},
-		}
-	}
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numServers,
-		base.TestClusterArgs{
-			ReplicationMode:     base.ReplicationManual,
-			ReusableListenerReg: lisReg,
-			ServerArgsPerNode:   stickyServerArgs,
-		})
-	defer tc.Stopper().Stop(ctx)
-
-	// Split so we can rely on RHS range being quiescent after a restart.
-	// We use UserTableDataMin to avoid having the range activated to
-	// gossip system table data.
-	splitKey := bootstrap.TestingUserTableDataMin()
-	tc.SplitRangeOrFatal(t, splitKey)
-	tc.AddVotersOrFatal(t, splitKey, tc.Target(1))
-	desc := tc.LookupRangeOrFatal(t, splitKey)
-	leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
-	require.NoError(t, err)
-
-	require.NoError(t, tc.Restart())
-
-	followerIdx := int(leaseHolder.StoreID) % numServers
-	followerStore := tc.GetFirstStoreFromServer(t, followerIdx)
-
-	repl := followerStore.LookupReplica(roachpb.RKey(splitKey))
-	require.NotNil(t, repl)
-
-	// TODO(spencer): Raft messages seem to turn up
-	// occasionally on restart, which initialize the replica, so
-	// this is not a test failure. Not sure how to work around this
-	// problem.
-	// Verify the raft group isn't initialized yet.
-	if repl.IsRaftGroupInitialized() {
-		log.Errorf(ctx, "expected raft group to be uninitialized")
-	}
-	// Send an increment and verify that initializes the Raft group.
-	//
-	// NB: We don't know who has the lease, so we ignore any errors (i.e.
-	// NotLeaseHolderError). We only care that it initializes the Raft group.
-	_, pErr := kv.SendWrapped(ctx, followerStore.TestSender(), incrementArgs(splitKey, 1))
-	_ = pErr // appease returncheck linter
-
-	require.True(t, repl.IsRaftGroupInitialized(), "expected raft group to be initialized")
-}
-
 // TestFailedConfChange verifies correct behavior after a configuration change
 // experiences an error when applying EndTxn. Specifically, it verifies that
 // https://github.com/cockroachdb/cockroach/issues/13506 has been fixed.
@@ -6622,7 +6547,7 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 				// Set a large election timeout. We don't want replicas to call
 				// elections due to timeouts, we want them to campaign and obtain
 				// votes despite PreVote+CheckQuorum.
-				RaftElectionTimeoutTicks: 200,
+				RaftElectionTimeoutTicks: 300,
 			},
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
@@ -6676,6 +6601,9 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 	tc.RemoveVotersOrFatal(t, key, tc.Target(0))
 	t.Logf("n1 removed from range")
 
+	// Make sure we didn't time out on the above.
+	require.NoError(t, ctx.Err())
+
 	require.Eventually(t, func() bool {
 		logStatus(repl2.RaftStatus())
 		logStatus(repl3.RaftStatus())
@@ -6685,6 +6613,8 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 		}
 		return false
 	}, 10*time.Second, 500*time.Millisecond)
+
+	require.NoError(t, ctx.Err())
 }
 
 // TestRaftUnquiesceLeaderNoProposal tests that unquiescing a Raft leader does
@@ -7029,4 +6959,66 @@ func TestStoreMetricsOnIncomingOutgoingMsg(t *testing.T) {
 		}
 		require.Equal(t, expected, actual)
 	})
+}
+
+// TestInvalidConfChangeRejection is a regression test for [1]. It proposes
+// an (intentionally) invalid configuration change and makes sure that raft
+// does not drop it.
+//
+// [1]: https://github.com/cockroachdb/cockroach/issues/105797
+func TestInvalidConfChangeRejection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This is a regression test against a stuck command, so set a timeout to get
+	// a shot at a graceful failure on regression.
+	ctx, cancel := context.WithTimeout(context.Background(), testutils.DefaultSucceedsSoonDuration)
+	defer cancel()
+
+	// When our configuration change shows up below raft, we need to apply it as a
+	// no-op, since the config change is intentionally invalid and assertions
+	// would fail if we were to try to actually apply it.
+	injErr := errors.New("injected error")
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+			TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
+				if args.Req != nil && args.Req.Txn != nil && args.Req.Txn.Name == "fake" {
+					return 0, kvpb.NewError(injErr)
+				}
+				return 0, nil
+			}}}},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	k := tc.ScratchRange(t)
+
+	repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(keys.MustAddr(k))
+
+	// Try to leave a joint config even though we're not in one. This is something
+	// that will lead raft to propose an empty entry instead of our conf change.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/105797
+	var ba kvpb.BatchRequest
+	now := tc.Server(0).Clock().Now()
+	txn := roachpb.MakeTransaction("fake", k, isolation.Serializable, roachpb.NormalUserPriority, now, 500*time.Millisecond.Nanoseconds(), 1)
+	ba.Txn = &txn
+	ba.Timestamp = now
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key: k,
+		},
+		Commit: true,
+		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+			ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
+				Desc: repl.Desc(),
+			},
+		},
+	})
+
+	_, pErr := repl.Send(ctx, &ba)
+	// Verify that we see the configuration change below raft, where we rejected it
+	// (since it would've otherwise blow up the Replica: after all, we intentionally
+	// proposed an invalid configuration change.
+	require.True(t, errors.Is(pErr.GoError(), injErr), "%+v", pErr.GoError())
 }

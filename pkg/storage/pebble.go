@@ -52,7 +52,7 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/objstorage/shared"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/replay"
 	"github.com/cockroachdb/pebble/sstable"
@@ -855,7 +855,7 @@ func (p *Pebble) SetStoreID(ctx context.Context, storeID int32) error {
 		return nil
 	}
 	p.storeIDPebbleLog.Set(ctx, storeID)
-	// Note that SetCreatorID only does something if shared storage is configured
+	// Note that SetCreatorID only does something if remote storage is configured
 	// in the pebble options. The version gate protects against accidentally
 	// setting the creator ID on an older store.
 	if storeID != base.TempStoreID && p.minVersion.AtLeast(clusterversion.ByKey(clusterversion.V23_1SetPebbleCreatorID)) {
@@ -1131,7 +1131,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 
 	if cfg.SharedStorage != nil {
 		esWrapper := &externalStorageWrapper{p: p, es: cfg.SharedStorage, ctx: ctx}
-		opts.Experimental.SharedStorage = shared.MakeSimpleFactory(map[shared.Locator]shared.Storage{
+		opts.Experimental.RemoteStorage = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
 			"": esWrapper,
 		})
 		opts.Experimental.CreateOnShared = true
@@ -2032,22 +2032,27 @@ func (p *Pebble) GetTableMetrics(start, end roachpb.Key) ([]enginepb.SSTableMetr
 			}
 
 			tableID := sstableInfo.TableInfo.FileNum
-			approximateSpanBytes := sstableInfo.Properties.UserProperties["approximate-span-bytes"]
-			metricsInfo = append(metricsInfo, enginepb.SSTableMetricsInfo{TableID: uint64(tableID), Level: int32(level), ApproximateSpanBytes: []byte(approximateSpanBytes), TableInfoJSON: marshalTableInfo})
+			approximateSpanBytes, err := strconv.ParseUint(sstableInfo.Properties.UserProperties["approximate-span-bytes"], 10, 64)
+			if err != nil {
+				return []enginepb.SSTableMetricsInfo{}, err
+			}
+			metricsInfo = append(metricsInfo, enginepb.SSTableMetricsInfo{TableID: uint64(tableID), Level: int32(level), ApproximateSpanBytes: approximateSpanBytes, TableInfoJSON: marshalTableInfo})
 		}
 	}
 	return metricsInfo, nil
 }
 
 // ApproximateDiskBytes implements the Engine interface.
-func (p *Pebble) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
+func (p *Pebble) ApproximateDiskBytes(
+	from, to roachpb.Key,
+) (bytes, remoteBytes, externalBytes uint64, _ error) {
 	fromEncoded := EngineKey{Key: from}.Encode()
 	toEncoded := EngineKey{Key: to}.Encode()
-	count, err := p.db.EstimateDiskUsage(fromEncoded, toEncoded)
+	bytes, remoteBytes, externalBytes, err := p.db.EstimateDiskUsageByBackingType(fromEncoded, toEncoded)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
-	return count, nil
+	return bytes, remoteBytes, externalBytes, nil
 }
 
 // Compact implements the Engine interface.
@@ -2166,6 +2171,9 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	var formatVers pebble.FormatMajorVersion
 	// Cases are ordered from newer to older versions.
 	switch {
+	case !version.Less(clusterversion.ByKey(clusterversion.V23_2_PebbleFormatVirtualSSTables)):
+		formatVers = pebble.ExperimentalFormatVirtualSSTables
+
 	case !version.Less(clusterversion.ByKey(clusterversion.V23_2_PebbleFormatDeleteSizedAndObsolete)):
 		formatVers = pebble.ExperimentalFormatDeleteSizedAndObsolete
 

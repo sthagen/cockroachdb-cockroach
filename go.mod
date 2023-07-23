@@ -116,7 +116,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20230701135918-609ae80aea41
+	github.com/cockroachdb/pebble v0.0.0-20230721205111-94f91669304b
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -208,6 +208,7 @@ require (
 	github.com/sasha-s/go-deadlock v0.3.1
 	github.com/shirou/gopsutil/v3 v3.21.12
 	github.com/slack-go/slack v0.9.5
+	github.com/snowflakedb/gosnowflake v1.3.4
 	github.com/spf13/afero v1.9.2
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/pflag v1.0.5
@@ -218,7 +219,7 @@ require (
 	github.com/xdg-go/scram v1.1.2
 	github.com/xdg-go/stringprep v1.0.4
 	github.com/zabawaba99/go-gitignore v0.0.0-20200117185801-39e6bddfb292
-	go.etcd.io/raft/v3 v3.0.0-20230626154957-a10cd4571633
+	go.etcd.io/raft/v3 v3.0.0-20230717153924-72a6e6c9f3ee
 	go.opentelemetry.io/otel v1.0.0-RC3
 	go.opentelemetry.io/otel/exporters/jaeger v1.0.0-RC3
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.0.0-RC3
@@ -272,6 +273,7 @@ require (
 	github.com/charmbracelet/bubbletea v0.23.1 // indirect
 	github.com/charmbracelet/lipgloss v0.6.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.1.0 // indirect
+	github.com/dgrijalva/jwt-go v3.2.0+incompatible // indirect
 	github.com/dimchansky/utfbom v1.1.1 // indirect
 	github.com/djherbis/atime v1.1.0 // indirect
 	github.com/docker/go-units v0.4.0 // indirect

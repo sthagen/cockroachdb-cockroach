@@ -61,9 +61,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -341,6 +344,7 @@ func restore(
 			spanCh,
 		)
 	}
+
 	// Count number of import spans.
 	var numImportSpans int
 	var countTasks []func(ctx context.Context) error
@@ -399,6 +403,25 @@ func restore(
 	tasks = append(tasks, generativeCheckpointLoop)
 
 	runRestore := func(ctx context.Context) error {
+		if details.ExperimentalOnline {
+			log.Warningf(ctx, "EXPERIMENTAL ONLINE RESTORE being used")
+			return sendAddRemoteSSTs(
+				ctx,
+				execCtx,
+				job,
+				dataToRestore,
+				endTime,
+				encryption,
+				kmsEnv,
+				details.URIs,
+				backupLocalityInfo,
+				filter,
+				numImportSpans,
+				simpleImportSpans,
+				progCh,
+				genSpan,
+			)
+		}
 		return distRestore(
 			ctx,
 			execCtx,
@@ -528,6 +551,11 @@ var _ jobs.TraceableJob = &restoreResumer{}
 
 // ForceRealSpan implements the TraceableJob interface.
 func (r *restoreResumer) ForceRealSpan() bool {
+	return true
+}
+
+// DumpTraceAfterRun implements the TraceableJob interface.
+func (r *restoreResumer) DumpTraceAfterRun() bool {
 	return true
 }
 
@@ -1514,12 +1542,17 @@ func (r *restoreResumer) Resume(ctx context.Context, execCtx interface{}) error 
 }
 
 func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) error {
-	details := r.job.Details().(jobspb.RestoreDetails)
 	p := execCtx.(sql.JobExecContext)
 	r.execCfg = p.ExecCfg()
 
+	details := r.job.Details().(jobspb.RestoreDetails)
+
 	if err := maybeRelocateJobExecution(ctx, r.job.ID(), p, details.ExecutionLocality, "RESTORE"); err != nil {
 		return err
+	}
+
+	if len(details.DownloadSpans) > 0 {
+		return r.doDownloadFiles(ctx, p)
 	}
 
 	mem := p.ExecCfg().RootMemoryMonitor.MakeBoundAccount()
@@ -2374,6 +2407,13 @@ func (r *restoreResumer) OnFailOrCancel(
 	p := execCtx.(sql.JobExecContext)
 	r.execCfg = p.ExecCfg()
 
+	details := r.job.Details().(jobspb.RestoreDetails)
+
+	// If this is a download-only job, there's no cleanup to do on cancel.
+	if len(details.DownloadSpans) > 0 {
+		return nil
+	}
+
 	// Emit to the event log that the job has started reverting.
 	emitRestoreJobEvent(ctx, p, jobs.StatusReverting, r.job)
 
@@ -2390,7 +2430,6 @@ func (r *restoreResumer) OnFailOrCancel(
 		return err
 	}
 
-	details := r.job.Details().(jobspb.RestoreDetails)
 	logutil.LogJobCompletion(ctx, restoreJobEventType, r.job.ID(), false, jobErr, r.restoreStats.Rows)
 
 	execCfg := execCtx.(sql.JobExecContext).ExecCfg()
@@ -3107,6 +3146,175 @@ func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context) error {
 	return nil
 }
 
+var onlineRestoreGate = envutil.EnvOrDefaultBool("COCKROACH_UNSAFE_RESTORE", false)
+
+// sendAddRemoteSSTs is a stubbed out, very simplisitic version of restore used
+// to test out ingesting "remote" SSTs. It will be replaced with a real distsql
+// plan and processors in the future.
+func sendAddRemoteSSTs(
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	job *jobs.Job,
+	dataToRestore restorationData,
+	restoreTime hlc.Timestamp,
+	encryption *jobspb.BackupEncryptionOptions,
+	kmsEnv cloud.KMSEnv,
+	uris []string,
+	backupLocalityInfo []jobspb.RestoreDetails_BackupLocalityInfo,
+	spanFilter spanCoveringFilter,
+	numImportSpans int,
+	useSimpleImportSpans bool,
+	progCh chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
+	genSpan func(ctx context.Context, spanCh chan execinfrapb.RestoreSpanEntry) error,
+) error {
+	defer close(progCh)
+
+	if !onlineRestoreGate {
+		return errors.AssertionFailedf("experimental restore mode not supported")
+	}
+
+	if encryption != nil {
+		return errors.AssertionFailedf("encryption not supported with online restore")
+	}
+	if useSimpleImportSpans {
+		return errors.AssertionFailedf("useSimpleImportSpans is not supported with online restore")
+	}
+	if len(uris) > 1 {
+		return errors.AssertionFailedf("online restore can only restore data from a full backup")
+	}
+
+	restoreSpanEntriesCh := make(chan execinfrapb.RestoreSpanEntry, 1)
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		return genSpan(ctx, restoreSpanEntriesCh)
+	})
+	remainingBytesInTargetRange := int64(512 << 20)
+
+	// We lost the string URIs for the backup storage locations very early in the
+	// process of planning the restore, when the backups were resolved, and the
+	// parsed proto versions -- which we usually prefer -- were attached to the
+	// backup manifests and the individual files during span generation. However
+	// for telling pebble the locations of the files we need those raw string URIs
+	// again. We could plumb them side-by-side with the proto versions, but for
+	// now we'll just reverse engineer them: we'll make a map that has the proto
+	// version of every URI we might have parsed -- all the default backup URIs
+	// and any locality bucket URIs -- to the raw URI that produces that proto.
+	// We can then look in this map using the proto attached to each file to find
+	// the URI for that file.
+	// TODO(dt/butler): should we plumb the original string instead?
+	urisForDirs := make(map[string]string)
+	for _, u := range uris {
+		dir, err := cloud.ExternalStorageConfFromURI(u, username.SQLUsername{})
+		if err != nil {
+			return err
+		}
+		urisForDirs[dir.String()] = u
+	}
+	for _, loc := range backupLocalityInfo {
+		for _, u := range loc.URIsByOriginalLocalityKV {
+			dir, err := cloud.ExternalStorageConfFromURI(u, username.SQLUsername{})
+			if err != nil {
+				return err
+			}
+			urisForDirs[dir.String()] = u
+		}
+	}
+
+	openedStorages := make(map[cloudpb.ExternalStorage]cloud.ExternalStorage)
+	defer func() {
+		for _, es := range openedStorages {
+			es.Close()
+		}
+	}()
+
+	for entry := range restoreSpanEntriesCh {
+		for _, file := range entry.Files {
+
+			log.Infof(ctx, "Experimental restore: sending span %s of file %s",
+				file.BackupFileEntrySpan, file.Path)
+
+			restoringSubspan := file.BackupFileEntrySpan.Intersect(entry.Span)
+
+			// NB: Since the restored span is a subset of the BackupFileEntrySpan,
+			// these counts may be an overestimate of what actually gets restored.
+			counts := file.BackupFileEntryCounts
+
+			if counts.DataSize > remainingBytesInTargetRange {
+				log.Infof(ctx, "Experimental restore: need to split since %d > %d",
+					counts.DataSize, remainingBytesInTargetRange,
+				)
+				expiration := execCtx.ExecCfg().Clock.Now().AddDuration(time.Hour)
+				if err := execCtx.ExecCfg().DB.AdminSplit(ctx, restoringSubspan.Key, expiration); err != nil {
+					log.Warningf(ctx, "failed to split during experimental restore: %v", err)
+				}
+				if _, err := execCtx.ExecCfg().DB.AdminScatter(ctx, restoringSubspan.Key, 4<<20); err != nil {
+					log.Warningf(ctx, "failed to scatter during experimental restore: %v", err)
+				}
+			}
+
+			if file.BackingFileSize == 0 {
+				if _, ok := openedStorages[file.Dir]; !ok {
+					es, err := execCtx.ExecCfg().DistSQLSrv.ExternalStorage(ctx, file.Dir)
+					if err != nil {
+						return err
+					}
+					openedStorages[file.Dir] = es
+				}
+
+				sz, err := openedStorages[file.Dir].Size(ctx, file.Path)
+				if err != nil {
+					return err
+				}
+				file.BackingFileSize = uint64(sz)
+			}
+			uri, ok := urisForDirs[file.Dir.String()]
+			if !ok {
+				return errors.AssertionFailedf("URI not found for %s", file.Dir.String())
+			}
+
+			loc := kvpb.AddSSTableRequest_RemoteFile{
+				Locator:         uri,
+				Path:            file.Path,
+				BackingFileSize: file.BackingFileSize,
+			}
+			// TODO(dt): see if KV has any better ideas for making these up.
+			fileStats := &enginepb.MVCCStats{
+				ContainsEstimates: 1,
+				KeyBytes:          counts.DataSize / 2,
+				ValBytes:          counts.DataSize / 2,
+				LiveBytes:         counts.DataSize,
+				KeyCount:          counts.Rows + counts.IndexEntries,
+				LiveCount:         counts.Rows + counts.IndexEntries,
+			}
+			var err error
+			_, remainingBytesInTargetRange, err = execCtx.ExecCfg().DB.AddRemoteSSTable(ctx,
+				restoringSubspan, loc,
+				fileStats)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	downloadSpans := dataToRestore.getSpans()
+
+	log.Infof(ctx, "creating job to track downloads in %d spans", len(downloadSpans))
+	downloadJobRecord := jobs.Record{
+		Description: fmt.Sprintf("Background Data Download for %s", job.Payload().Description),
+		Username:    job.Payload().UsernameProto.Decode(),
+		Details:     jobspb.RestoreDetails{DownloadSpans: downloadSpans},
+		Progress:    jobspb.RestoreProgress{},
+	}
+
+	return execCtx.ExecCfg().InternalDB.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
+	) error {
+		_, err := execCtx.ExecCfg().JobRegistry.CreateJobWithTxn(ctx, downloadJobRecord, job.ID()+1, txn)
+		return err
+	})
+}
+
 var _ jobs.Resumer = &restoreResumer{}
 
 func init() {
@@ -3121,3 +3329,94 @@ func init() {
 		jobs.UsesTenantCostControl,
 	)
 }
+
+func (r *restoreResumer) doDownloadFiles(ctx context.Context, execCtx sql.JobExecContext) error {
+	details := r.job.Details().(jobspb.RestoreDetails)
+	total := r.job.Progress().Details.(*jobspb.Progress_Restore).Restore.TotalDownloadRequired
+
+	// If this is the first resumption of this job, we need to find out the total
+	// amount we expect to download and persist it so that we can indiciate our
+	// progress as that number goes down later.
+	if total == 0 {
+		log.Infof(ctx, "calculating total download size (across all stores) to complete restore")
+		if err := r.job.NoTxn().RunningStatus(ctx, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
+			return jobs.RunningStatus("Calculating total download size..."), nil
+		}); err != nil {
+			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(r.job.ID()))
+		}
+
+		for _, span := range details.DownloadSpans {
+			resp, err := execCtx.ExecCfg().TenantStatusServer.SpanStats(ctx, &roachpb.SpanStatsRequest{
+				Spans: []roachpb.Span{span},
+			})
+			if err != nil {
+				return err
+			}
+			for _, stats := range resp.SpanToStats {
+				total += stats.ExternalFileBytes
+			}
+		}
+
+		if total == 0 {
+			return nil
+		}
+
+		if err := r.job.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+			prog := details.(*jobspb.Progress_Restore).Restore
+			prog.TotalDownloadRequired = total
+			return 0.0
+		}); err != nil {
+			return err
+		}
+
+		if err := r.job.NoTxn().RunningStatus(ctx, func(_ context.Context, _ jobspb.Details) (jobs.RunningStatus, error) {
+			return jobs.RunningStatus(fmt.Sprintf("Downloading %s of restored data...", sz(total))), nil
+		}); err != nil {
+			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(r.job.ID()))
+		}
+	}
+
+	var lastProgressUpdate time.Time
+	for rt := retry.StartWithCtx(
+		ctx, retry.Options{InitialBackoff: time.Second * 10, Multiplier: 1.2, MaxBackoff: time.Minute * 5},
+	); ; rt.Next() {
+
+		var remaining uint64
+		for _, span := range details.DownloadSpans {
+			resp, err := execCtx.ExecCfg().TenantStatusServer.SpanStats(ctx, &roachpb.SpanStatsRequest{
+				Spans: []roachpb.Span{span},
+			})
+			if err != nil {
+				return err
+			}
+			for _, stats := range resp.SpanToStats {
+				remaining += stats.ExternalFileBytes
+			}
+		}
+
+		fractionComplete := float32(total-remaining) / float32(total)
+		log.Infof(ctx, "restore download phase, %s downloaded, %s remaining of %s total (%.1f complete)",
+			sz(total-remaining), sz(remaining), sz(total), fractionComplete,
+		)
+
+		if remaining == 0 {
+			return nil
+		}
+
+		if timeutil.Since(lastProgressUpdate) > time.Minute {
+			if err := r.job.NoTxn().FractionProgressed(ctx, func(ctx context.Context, details jobspb.ProgressDetails) float32 {
+				return fractionComplete
+			}); err != nil {
+				return err
+			}
+			lastProgressUpdate = timeutil.Now()
+		}
+	}
+}
+
+type sz int64
+
+func (b sz) String() string { return string(humanizeutil.IBytes(int64(b))) }
+
+// TODO(dt): move this to humanizeutil and allow-list it there.
+//func (b sz) SafeValue()     {}

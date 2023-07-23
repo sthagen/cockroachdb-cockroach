@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,11 +31,12 @@ import (
 // CREATE TABLE AS and CREATE MATERIALIZED VIEW AS.
 func TestCreateAsVTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	testCluster := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
-	defer testCluster.Stopper().Stop(ctx)
-	sqlRunner := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	sqlRunner := sqlutils.MakeSQLRunner(db)
 	var p parser.Parser
 
 	i := 0
@@ -74,6 +76,27 @@ func TestCreateAsVTable(t *testing.T) {
 			}
 
 			fqName := name.FQString()
+			if s.StartedDefaultTestTenant() {
+				// Some of the virtual tables are currently only available in
+				// the system tenant.
+				// TODO(yuzefovich): update this list when #54252 is addressed.
+				onlySystemTenant := map[string]struct{}{
+					`"".crdb_internal.gossip_alerts`:                  {},
+					`"".crdb_internal.gossip_liveness`:                {},
+					`"".crdb_internal.gossip_nodes`:                   {},
+					`"".crdb_internal.kv_flow_controller`:             {},
+					`"".crdb_internal.kv_flow_control_handles`:        {},
+					`"".crdb_internal.kv_flow_token_deductions`:       {},
+					`"".crdb_internal.kv_node_status`:                 {},
+					`"".crdb_internal.kv_node_liveness`:               {},
+					`"".crdb_internal.kv_store_status`:                {},
+					`"".crdb_internal.node_tenant_capabilities_cache`: {},
+					`"".crdb_internal.tenant_usage_details`:           {},
+				}
+				if _, ok := onlySystemTenant[fqName]; ok {
+					continue
+				}
+			}
 			// Filter by trace_id to prevent error when selecting from
 			// crdb_internal.cluster_inflight_traces:
 			// "pq: a trace_id value needs to be specified".
@@ -101,6 +124,7 @@ func TestCreateAsVTable(t *testing.T) {
 
 func TestCreateAsShow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
 		sql   string
@@ -137,9 +161,6 @@ func TestCreateAsShow(t *testing.T) {
 		{
 			sql:   "SHOW CREATE TABLE show_create_tbl",
 			setup: "CREATE TABLE show_create_tbl (id int PRIMARY KEY)",
-			// TODO(sql-foundations): Fix `relation "show_create_tbl" does not exist` error in job.
-			//  See https://github.com/cockroachdb/cockroach/issues/106260.
-			skip: true,
 		},
 		{
 			sql:   "SHOW CREATE FUNCTION show_create_fn",
@@ -157,23 +178,14 @@ func TestCreateAsShow(t *testing.T) {
 		{
 			sql:   "SHOW INDEXES FROM show_indexes_tbl",
 			setup: "CREATE TABLE show_indexes_tbl (id int PRIMARY KEY)",
-			// TODO(sql-foundations): Fix `relation "show_indexes_tbl" does not exist` error in job.
-			//  See https://github.com/cockroachdb/cockroach/issues/106260.
-			skip: true,
 		},
 		{
 			sql:   "SHOW COLUMNS FROM show_columns_tbl",
 			setup: "CREATE TABLE show_columns_tbl (id int PRIMARY KEY)",
-			// TODO(sql-foundations): Fix `relation "show_columns_tbl" does not exist` error in job.
-			//  See https://github.com/cockroachdb/cockroach/issues/106260.
-			skip: true,
 		},
 		{
 			sql:   "SHOW CONSTRAINTS FROM show_constraints_tbl",
 			setup: "CREATE TABLE show_constraints_tbl (id int PRIMARY KEY)",
-			// TODO(sql-foundations): Fix `relation "show_constraints_tbl" does not exist` error in job.
-			//  See https://github.com/cockroachdb/cockroach/issues/106260.
-			skip: true,
 		},
 		{
 			sql: "SHOW PARTITIONS FROM DATABASE defaultdb",
@@ -181,16 +193,10 @@ func TestCreateAsShow(t *testing.T) {
 		{
 			sql:   "SHOW PARTITIONS FROM TABLE show_partitions_tbl",
 			setup: "CREATE TABLE show_partitions_tbl (id int PRIMARY KEY)",
-			// TODO(sql-foundations): Fix `relation "show_partitions_tbl" does not exist` error in job.
-			//  See https://github.com/cockroachdb/cockroach/issues/106260.
-			skip: true,
 		},
 		{
 			sql:   "SHOW PARTITIONS FROM INDEX show_partitions_idx_tbl@show_partitions_idx_tbl_pkey",
 			setup: "CREATE TABLE show_partitions_idx_tbl (id int PRIMARY KEY)",
-			// TODO(sql-foundations): Fix `relation "show_partitions_idx_tbl" does not exist` error in job.
-			//  See https://github.com/cockroachdb/cockroach/issues/106260.
-			skip: true,
 		},
 		{
 			sql: "SHOW GRANTS",
@@ -285,9 +291,9 @@ func TestCreateAsShow(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	testCluster := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
-	defer testCluster.Stopper().Stop(ctx)
-	sqlRunner := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	sqlRunner := sqlutils.MakeSQLRunner(db)
 
 	for i, testCase := range testCases {
 		t.Run(testCase.sql, func(t *testing.T) {
@@ -295,6 +301,11 @@ func TestCreateAsShow(t *testing.T) {
 				return
 			}
 			if testCase.setup != "" {
+				if s.StartedDefaultTestTenant() && strings.Contains(testCase.setup, "create_tenant") {
+					// Only the system tenant has the ability to create other
+					// tenants.
+					return
+				}
 				sqlRunner.Exec(t, testCase.setup)
 			}
 			createTableStmt := fmt.Sprintf(
@@ -320,4 +331,57 @@ FROM [SHOW JOBS]
 WHERE job_type IN ('SCHEMA CHANGE', 'NEW SCHEMA CHANGE')
 AND status != 'succeeded'`
 	sqlRunner.CheckQueryResultsRetry(t, query, [][]string{})
+}
+
+func TestFormat(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		sql            string
+		setup          string
+		expectedFormat string
+	}{
+		{
+			sql:            "CREATE TABLE ctas_implicit_columns_tbl AS SELECT * FROM ctas_implicit_columns_source_tbl",
+			setup:          "CREATE TABLE ctas_implicit_columns_source_tbl (id int PRIMARY KEY)",
+			expectedFormat: "CREATE TABLE defaultdb.public.ctas_implicit_columns_tbl (id) AS SELECT * FROM defaultdb.public.ctas_implicit_columns_source_tbl",
+		},
+		{
+			sql:            "CREATE TABLE ctas_explicit_columns_tbl (id) AS SELECT * FROM ctas_explicit_columns_source_tbl",
+			setup:          "CREATE TABLE ctas_explicit_columns_source_tbl (id int PRIMARY KEY)",
+			expectedFormat: "CREATE TABLE defaultdb.public.ctas_explicit_columns_tbl (id) AS SELECT * FROM defaultdb.public.ctas_explicit_columns_source_tbl",
+		},
+	}
+
+	ctx := context.Background()
+	testCluster := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	defer testCluster.Stopper().Stop(ctx)
+	sqlRunner := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
+	var p parser.Parser
+
+	for _, tc := range testCases {
+		t.Run(tc.sql, func(t *testing.T) {
+			sqlRunner.Exec(t, tc.setup)
+			sqlRunner.Exec(t, tc.sql)
+
+			statements, err := p.Parse(tc.sql)
+			require.NoError(t, err)
+			require.Len(t, statements, 1)
+			var name string
+			switch stmt := statements[0].AST.(type) {
+			case *tree.CreateTable:
+				name = stmt.Table.Table()
+			default:
+				require.Failf(t, "missing case", "unexpected type %T", stmt)
+			}
+			query := fmt.Sprintf(
+				`SELECT description
+FROM [SHOW JOBS]
+WHERE job_type IN ('SCHEMA CHANGE', 'NEW SCHEMA CHANGE')
+AND description LIKE '%%%s%%'`,
+				name,
+			)
+			sqlRunner.CheckQueryResults(t, query, [][]string{{tc.expectedFormat}})
+		})
+	}
 }

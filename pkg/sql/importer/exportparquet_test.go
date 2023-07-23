@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -100,6 +99,18 @@ func validateParquetFile(
 		validationStmt)
 	require.NoError(t, err)
 
+	// It's possible to have a set of rows where each row has no columns.
+	// Ex.    CREATE TABLE public.tabl͛e1 (
+	//                rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+	//                CONSTRAINT tabl͛e1_pkey PRIMARY KEY (rowid ASC)
+	//        )
+	// In this case, the parquet file will simply contain no datums, but
+	// the SELECT above returns a slice of empty slices [[], [], []...].
+	// Thus, we override the array of test datums as an empty slice [].
+	if len(test.datums) > 0 && len(test.datums[0]) == 0 {
+		test.datums = make([]tree.Datums, 0)
+	}
+
 	meta, readDatums, err := crlparquet.ReadFile(paths[0])
 	require.NoError(t, err)
 
@@ -169,21 +180,13 @@ func validateDatum(t *testing.T, expected tree.Datum, actual tree.Datum, typ *ty
 func TestRandomParquetExports(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
-	defer ccl.TestingEnableEnterprise()()
 	dbName := "rand"
 	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Test fails when run within a test tenant. More
-		// investigation is required. Tracked with #76378.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-		UseDatabase:       dbName,
-		ExternalIODir:     dir,
-		Knobs: base.TestingKnobs{
-			DistSQL: &execinfra.TestingKnobs{
-				Export: &importer.ExportTestingKnobs{EnableParquetTestMetadata: true},
-			},
-		},
+		UseDatabase:   dbName,
+		ExternalIODir: dir,
 	})
 	ctx := context.Background()
 	defer srv.Stopper().Stop(ctx)
@@ -192,7 +195,7 @@ func TestRandomParquetExports(t *testing.T) {
 	sqlDB.Exec(t, fmt.Sprintf("CREATE DATABASE %s", dbName))
 
 	var tableName string
-	idb := srv.ExecutorConfig().(sql.ExecutorConfig).InternalDB
+	idb := srv.TenantOrServer().ExecutorConfig().(sql.ExecutorConfig).InternalDB
 	// Try at most 10 times to populate a random table with at least 10 rows.
 	{
 		var (
@@ -274,20 +277,13 @@ func TestRandomParquetExports(t *testing.T) {
 func TestBasicParquetTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	dir, dirCleanupFn := testutils.TempDir(t)
 	defer dirCleanupFn()
 	dbName := "baz"
 	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Test fails when run within a test tenant. More
-		// investigation is required. Tracked with #76378.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-		UseDatabase:       dbName,
-		ExternalIODir:     dir,
-		Knobs: base.TestingKnobs{
-			DistSQL: &execinfra.TestingKnobs{
-				Export: &importer.ExportTestingKnobs{EnableParquetTestMetadata: true},
-			},
-		},
+		UseDatabase:   dbName,
+		ExternalIODir: dir,
 	})
 	ctx := context.Background()
 	defer srv.Stopper().Stop(ctx)
@@ -295,8 +291,8 @@ func TestBasicParquetTypes(t *testing.T) {
 
 	sqlDB.Exec(t, fmt.Sprintf("CREATE DATABASE %s", dbName))
 
-	// instantiating an internal executor to easily get datums from the table
-	ie := srv.ExecutorConfig().(sql.ExecutorConfig).InternalDB.Executor()
+	// Instantiating an internal executor to easily get datums from the table.
+	ie := srv.TenantOrServer().ExecutorConfig().(sql.ExecutorConfig).InternalDB.Executor()
 
 	sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY, x STRING, y INT, z FLOAT NOT NULL, a BOOL, 
 INDEX (y))`)
@@ -425,8 +421,7 @@ func TestMemoryMonitor(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			DistSQL: &execinfra.TestingKnobs{
 				Export: &importer.ExportTestingKnobs{
-					EnableParquetTestMetadata: true,
-					MemoryMonitor:             mm,
+					MemoryMonitor: mm,
 				},
 			},
 		},

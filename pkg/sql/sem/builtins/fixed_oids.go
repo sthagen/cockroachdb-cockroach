@@ -2424,11 +2424,14 @@ var builtinOidsArray = []string{
 	2451: `st_asmvtgeom(geometry: geometry, bbox: box2d) -> geometry`,
 	2452: `crdb_internal.repaired_descriptor(descriptor: bytes, valid_descriptor_ids: int[], valid_job_ids: int[]) -> bytes`,
 	2453: `crdb_internal.reset_activity_tables() -> bool`,
-	2454: `crdb_internal.sstable_metrics(node_id: int, store_id: int, start_key: bytes, end_key: bytes) -> tuple{int AS node_id,, int AS store_id, int AS level, int AS file_num, bytes AS approximate_span_bytes, jsonb AS metrics}`,
+	2454: `crdb_internal.sstable_metrics(node_id: int, store_id: int, start_key: bytes, end_key: bytes) -> tuple{int AS node_id, int AS store_id, int AS level, int AS file_num, int AS approximate_span_bytes, jsonb AS metrics}`,
 	2455: `crdb_internal.repair_catalog_corruption(descriptor_id: int, corruption: string) -> bool`,
 	2456: `crdb_internal.merge_aggregated_stmt_metadata(input: jsonb[]) -> jsonb`,
 	2457: `crdb_internal.request_job_execution_details(jobID: int) -> bool`,
 	2458: `pg_sequence_last_value(sequence_oid: oid) -> int`,
+	2459: `nameconcatoid(name: string, oid: oid) -> name`,
+	2460: `pg_get_function_arg_default(func_oid: oid, arg_num: int4) -> string`,
+	2461: `crdb_internal.plpgsql_raise(severity: string, message: string, detail: string, hint: string, code: string) -> int`,
 }
 
 var builtinOidsBySignature map[string]oid.Oid

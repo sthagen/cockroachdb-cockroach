@@ -2772,22 +2772,11 @@ var varGen = map[string]sessionVar{
 		// It should only be set at connection time.
 		Hidden: true,
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			if strings.ToLower(s) == "database" {
-				m.SetReplicationMode(sessiondatapb.ReplicationMode_REPLICATION_MODE_DATABASE)
-				return nil
-			}
-			b, err := paramparse.ParseBoolVar("replication", s)
+			mode, err := ReplicationModeFromString(s)
 			if err != nil {
-				return pgerror.Newf(
-					pgcode.InvalidParameterValue,
-					`parameter "replication" requires a boolean value or "database"`,
-				)
+				return err
 			}
-			if b {
-				m.SetReplicationMode(sessiondatapb.ReplicationMode_REPLICATION_MODE_ENABLED)
-			} else {
-				m.SetReplicationMode(sessiondatapb.ReplicationMode_REPLICATION_MODE_DISABLED)
-			}
+			m.SetReplicationMode(mode)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
@@ -2803,6 +2792,48 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalFalse,
 	},
+
+	// CockroachDB extension.
+	`max_connections`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			maxConn := maxNumNonAdminConnections.Get(&evalCtx.ExecCfg.Settings.SV)
+			return strconv.FormatInt(maxConn, 10), nil
+		},
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_improved_join_elimination`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_improved_join_elimination`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_improved_join_elimination", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseImprovedJoinElimination(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseImprovedJoinElimination), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+}
+
+func ReplicationModeFromString(s string) (sessiondatapb.ReplicationMode, error) {
+	if strings.ToLower(s) == "database" {
+		return sessiondatapb.ReplicationMode_REPLICATION_MODE_DATABASE, nil
+	}
+	b, err := paramparse.ParseBoolVar("replication", s)
+	if err != nil {
+		return 0, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			`parameter "replication" requires a boolean value or "database"`,
+		)
+	}
+	if b {
+		return sessiondatapb.ReplicationMode_REPLICATION_MODE_ENABLED, nil
+	}
+	return sessiondatapb.ReplicationMode_REPLICATION_MODE_DISABLED, nil
 }
 
 // We want test coverage for this on and off so make it metamorphic.

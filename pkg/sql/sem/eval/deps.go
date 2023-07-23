@@ -499,6 +499,19 @@ type ClientNoticeSender interface {
 	// BufferClientNotice buffers the notice to send to the client.
 	// This is flushed before the connection is closed.
 	BufferClientNotice(ctx context.Context, notice pgnotice.Notice)
+	// SendClientNotice immediately flushes the notice to the client. This is used
+	// to implement PLpgSQL RAISE statements; most cases should use
+	// BufferClientNotice.
+	SendClientNotice(ctx context.Context, notice pgnotice.Notice) error
+}
+
+// DeferredRoutineSender allows a nested routine to send the information needed
+// for its own evaluation to a parent routine. This is used to defer execution
+// for tail-call optimization. It can only be used during local execution.
+type DeferredRoutineSender interface {
+	// SendDeferredRoutine sends a local nested routine and its arguments to its
+	// parent routine.
+	SendDeferredRoutine(expr *tree.RoutineExpr, args tree.Datums)
 }
 
 // PrivilegedAccessor gives access to certain queries that would otherwise

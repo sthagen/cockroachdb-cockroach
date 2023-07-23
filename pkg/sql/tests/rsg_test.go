@@ -22,8 +22,6 @@ import (
 	"testing"
 	"time"
 
-	// Enable CCL statements.
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -354,7 +352,8 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 					continue
 				case "crdb_internal.reset_sql_stats",
 					"crdb_internal.check_consistency",
-					"crdb_internal.request_statement_bundle":
+					"crdb_internal.request_statement_bundle",
+					"crdb_internal.reset_activity_tables":
 					// Skipped due to long execution time.
 					continue
 				}
@@ -416,7 +415,11 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 			limit = " LIMIT 100"
 		}
 		s := fmt.Sprintf("SELECT %s(%s) %s", nb.name, strings.Join(args, ", "), limit)
-		return db.exec(t, ctx, s)
+		// Use a re-settable timeout since in concurrent scenario some operations may
+		// involve schema changes like truncates. In general this should make
+		// this test more resilient as the timeouts are reset as long progress
+		// is made on *some* connection.
+		return db.execWithResettableTimeout(t, ctx, s, *flagRSGExecTimeout, *flagRSGGoRoutines)
 	})
 }
 
@@ -489,7 +492,7 @@ var ignoredErrorPatterns = []string{
 	"unsupported binary operator",
 	"unsupported comparison operator",
 	"memory budget exceeded",
-	"generator functions are not allowed in",
+	"set-returning functions are not allowed in",
 	"txn already encountered an error; cannot be used anymore",
 	"no data source matches prefix",
 	"index .* already contains column",
@@ -612,7 +615,6 @@ var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
 func TestRandomSyntaxSQLSmith(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer ccl.TestingEnableEnterprise()()
 
 	var smither *sqlsmith.Smither
 
@@ -766,7 +768,6 @@ func testRandomSyntax(
 		skip.IgnoreLint(t, "enable with '-rsg <duration>'")
 	}
 	ctx := context.Background()
-	defer ccl.TestingEnableEnterprise()()
 
 	params, _ := tests.CreateTestServerParams()
 	params.UseDatabase = databaseName

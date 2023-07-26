@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -1516,12 +1515,24 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   latency_seconds_p99 FLOAT
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		hasViewActivityOrViewActivityRedacted, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
-		if err != nil {
+		shouldRedactError := false
+		// Check if the user is admin.
+		if isAdmin, err := p.HasAdminRole(ctx); err != nil {
 			return err
-		}
-		if !hasViewActivityOrViewActivityRedacted {
-			return noViewActivityOrViewActivityRedactedRoleError(p.User())
+		} else if !isAdmin {
+			// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
+			// privileges.
+			if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
+				return err
+			} else if hasViewActivityRedacted {
+				shouldRedactError = true
+			} else if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
+				return err
+			} else if !hasViewActivity {
+				// If the user is not admin and does not have VIEWACTIVITY or VIEWACTIVITYREDACTED,
+				// return insufficient privileges error.
+				return noViewActivityOrViewActivityRedactedRoleError(p.User())
+			}
 		}
 
 		var alloc tree.DatumAlloc
@@ -1530,8 +1541,12 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 
 		statementVisitor := func(_ context.Context, stats *appstatspb.CollectedStatementStatistics) error {
 			errString := tree.DNull
-			if stats.Stats.SensitiveInfo.LastErr != "" {
-				errString = alloc.NewDString(tree.DString(stats.Stats.SensitiveInfo.LastErr))
+			if shouldRedactError {
+				errString = alloc.NewDString(tree.DString("<redacted>"))
+			} else {
+				if stats.Stats.SensitiveInfo.LastErr != "" {
+					errString = alloc.NewDString(tree.DString(stats.Stats.SensitiveInfo.LastErr))
+				}
 			}
 
 			errCode := tree.DNull
@@ -3311,7 +3326,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 				return err
 			}
 			treeNode, err := fnDesc.ToCreateExpr()
-			treeNode.FuncName.ObjectNamePrefix = tree.ObjectNamePrefix{
+			treeNode.Name.ObjectNamePrefix = tree.ObjectNamePrefix{
 				ExplicitSchema: true,
 				SchemaName:     tree.Name(fnIDToScName[fnDesc.GetID()]),
 			}
@@ -3319,7 +3334,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 				return err
 			}
 			for i := range treeNode.Options {
-				if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
+				if body, ok := treeNode.Options[i].(tree.RoutineBodyStr); ok {
 					typeReplacedBody, err := formatFunctionQueryTypesForDisplay(ctx, &p.semaCtx, p.SessionData(), string(body))
 					if err != nil {
 						return err
@@ -3334,7 +3349,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 					}
 					p := &treeNode.Options[i]
 					// Add two new lines just for better formatting.
-					*p = "\n" + tree.FunctionBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
+					*p = "\n" + tree.RoutineBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
 				}
 			}
 
@@ -6123,12 +6138,12 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 		hasData := func(startID, endID descpb.ID) (found bool, _ error) {
 			startPrefix := p.extendedEvalCtx.Codec.TablePrefix(uint32(startID))
 			endPrefix := p.extendedEvalCtx.Codec.TablePrefix(uint32(endID - 1)).PrefixEnd()
-			var b kv.Batch
+			b := p.Txn().NewBatch()
 			b.Header.MaxSpanRequestKeys = 1
 			scanRequest := kvpb.NewScan(startPrefix, endPrefix, false).(*kvpb.ScanRequest)
 			scanRequest.ScanFormat = kvpb.BATCH_RESPONSE
 			b.AddRawRequest(scanRequest)
-			err = p.execCfg.DB.Run(ctx, &b)
+			err = p.execCfg.DB.Run(ctx, b)
 			if err != nil {
 				return false, err
 			}
@@ -7415,6 +7430,7 @@ CREATE TABLE crdb_internal.cluster_locks (
     granted             BOOL,
     contended           BOOL NOT NULL,
     duration            INTERVAL,
+    isolation_level 		STRING NOT NULL,
     INDEX(table_id),
     INDEX(database_name),
     INDEX(table_name),
@@ -7543,7 +7559,7 @@ func genClusterLocksGenerator(
 		var resumeSpan *roachpb.Span
 
 		fetchLocks := func(key, endKey roachpb.Key) error {
-			b := kv.Batch{}
+			b := p.Txn().NewBatch()
 			queryLocksRequest := &kvpb.QueryLocksRequest{
 				RequestHeader: kvpb.RequestHeader{
 					Key:    key,
@@ -7560,7 +7576,7 @@ func genClusterLocksGenerator(
 			b.Header.MaxSpanRequestKeys = int64(rowinfra.ProductionKVBatchSize)
 			b.Header.TargetBytes = int64(rowinfra.GetDefaultBatchBytesLimit(p.extendedEvalCtx.TestingKnobs.ForceProductionValues))
 
-			err := p.txn.Run(ctx, &b)
+			err := p.txn.Run(ctx, b)
 			if err != nil {
 				return err
 			}
@@ -7689,6 +7705,7 @@ func genClusterLocksGenerator(
 				tree.MakeDBool(tree.DBool(granted)),          /* granted */
 				tree.MakeDBool(len(curLock.Waiters) > 0),     /* contended */
 				durationDatum,                                /* duration */
+				tree.NewDString(kvTxnIsolationLevelToTree(curLock.LockHolder.IsoLevel).String()), /* isolation_level */
 			}, nil
 
 		}, nil, nil

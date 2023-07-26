@@ -26,6 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -160,6 +162,8 @@ type connector struct {
 	defaultZoneCfg  *zonepb.ZoneConfig
 	addrs           []string
 
+	earlyShutdownIfMissingTenantRecord bool
+
 	startCh  chan struct{} // closed when connector has started up
 	startErr error
 
@@ -186,6 +190,27 @@ type connector struct {
 		specificOverrides              map[string]settings.EncodedValue
 
 		// notifyCh is closed when there are changes to overrides.
+		notifyCh chan struct{}
+	}
+
+	// testingEmulateOldVersionSettingsClient is set to true when the
+	// connector should emulate the version where it processed all
+	// events as settings events. Used only for testing.
+	testingEmulateOldVersionSettingsClient bool
+
+	metadataMu struct {
+		syncutil.Mutex
+
+		// receivedFirstMetadata is set to true when the first batch of
+		// metadata bits has been received.
+		receivedFirstMetadata bool
+
+		tenantName   roachpb.TenantName
+		dataState    mtinfopb.TenantDataState
+		serviceMode  mtinfopb.TenantServiceMode
+		capabilities *tenantcapabilitiespb.TenantCapabilities
+
+		// notifyCh is closed when there are changes to the metadata.
 		notifyCh chan struct{}
 	}
 }
@@ -251,6 +276,8 @@ func NewConnector(cfg ConnectorConfig, addrs []string) Connector {
 		rpcRetryOptions: cfg.RPCRetryOptions,
 		defaultZoneCfg:  cfg.DefaultZoneConfig,
 		addrs:           addrs,
+
+		earlyShutdownIfMissingTenantRecord: cfg.ShutdownTenantConnectorEarlyIfNoRecordPresent,
 	}
 
 	c.mu.nodeDescs = make(map[roachpb.NodeID]*roachpb.NodeDescriptor)
@@ -259,6 +286,7 @@ func NewConnector(cfg ConnectorConfig, addrs []string) Connector {
 	c.settingsMu.allTenantOverrides = make(map[string]settings.EncodedValue)
 	c.settingsMu.specificOverrides = make(map[string]settings.EncodedValue)
 	c.settingsMu.notifyCh = make(chan struct{})
+	c.metadataMu.notifyCh = make(chan struct{})
 	return c
 }
 
@@ -311,7 +339,7 @@ func (c *connector) Start(ctx context.Context) error {
 
 func (c *connector) internalStart(ctx context.Context) error {
 	gossipStartupCh := make(chan struct{})
-	settingsStartupCh := make(chan struct{})
+	settingsStartupCh := make(chan error)
 	bgCtx := c.AnnotateCtx(context.Background())
 
 	if err := c.rpcContext.Stopper.RunAsyncTask(bgCtx, "connector-gossip", func(ctx context.Context) {
@@ -339,9 +367,13 @@ func (c *connector) internalStart(ctx context.Context) error {
 		case <-gossipStartupCh:
 			log.Infof(ctx, "kv connector gossip subscription started")
 			gossipStartupCh = nil
-		case <-settingsStartupCh:
-			log.Infof(ctx, "kv connector tenant settings started")
+		case err := <-settingsStartupCh:
 			settingsStartupCh = nil
+			if err != nil {
+				log.Infof(ctx, "kv connector initialization error: %v", err)
+				return err
+			}
+			log.Infof(ctx, "kv connector tenant settings started")
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.rpcContext.Stopper.ShouldQuiesce():

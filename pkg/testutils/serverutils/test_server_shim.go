@@ -138,12 +138,8 @@ type TestServerInterface interface {
 	// Note: use ServingRPCAddr() instead unless specific reason not to.
 	RPCAddr() string
 
-	// LeaseManager() returns the *sql.LeaseManager as an interface{}.
+	// LeaseManager returns the *sql.LeaseManager as an interface{}.
 	LeaseManager() interface{}
-
-	// InternalExecutorInternalExecutorFactory returns a
-	// insql.InternalDB as an interface{}.
-	InternalDB() interface{}
 
 	// GossipI returns the gossip used by the TestServer.
 	// The real return type is *gossip.Gossip.
@@ -247,6 +243,12 @@ type TestServerInterface interface {
 	// DisableStartTenant prevents manual starting of tenants. If an attempt at
 	// starting a tenant is made, the server will return the specified error.
 	DisableStartTenant(reason error)
+
+	// WaitForTenantReadiness waits until the tenant record is known
+	// to the in-RAM caches. Trying to start a tenant server before
+	// this is called can run into a "missing record" error even
+	// if the tenant record exists in KV.
+	WaitForTenantReadiness(ctx context.Context, tenantID roachpb.TenantID) error
 
 	// ScratchRange splits off a range suitable to be used as KV scratch space.
 	// (it doesn't overlap system spans or SQL tables).

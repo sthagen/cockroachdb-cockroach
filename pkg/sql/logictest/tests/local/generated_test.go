@@ -1528,6 +1528,13 @@ func TestLogic_privileges_table(
 	runLogicTest(t, "privileges_table")
 }
 
+func TestLogic_procedure(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure")
+}
+
 func TestLogic_propagate_input_ordering(
 	t *testing.T,
 ) {
@@ -2081,18 +2088,18 @@ func TestLogic_statement_statistics_errors(
 	runLogicTest(t, "statement_statistics_errors")
 }
 
+func TestLogic_statement_statistics_errors_redacted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "statement_statistics_errors_redacted")
+}
+
 func TestLogic_stats(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "stats")
-}
-
-func TestLogic_stored_procedures(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "stored_procedures")
 }
 
 func TestLogic_storing(
@@ -2347,11 +2354,25 @@ func TestLogic_udf_insert(
 	runLogicTest(t, "udf_insert")
 }
 
+func TestLogic_udf_observability(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_observability")
+}
+
 func TestLogic_udf_oid_ref(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_oid_ref")
+}
+
+func TestLogic_udf_options(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_options")
 }
 
 func TestLogic_udf_plpgsql(
@@ -2361,11 +2382,32 @@ func TestLogic_udf_plpgsql(
 	runLogicTest(t, "udf_plpgsql")
 }
 
+func TestLogic_udf_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_privileges")
+}
+
 func TestLogic_udf_record(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_record")
+}
+
+func TestLogic_udf_regressions(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_regressions")
+}
+
+func TestLogic_udf_schema_change(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_schema_change")
 }
 
 func TestLogic_udf_setof(
@@ -2380,6 +2422,20 @@ func TestLogic_udf_star(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_star")
+}
+
+func TestLogic_udf_subquery(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_subquery")
+}
+
+func TestLogic_udf_unsupported(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_unsupported")
 }
 
 func TestLogic_udf_update(

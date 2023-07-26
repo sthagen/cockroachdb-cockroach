@@ -2233,6 +2233,11 @@ func (a *Allocator) TransferLeaseTarget(
 	forceDecisionWithoutStats bool,
 	opts allocator.TransferLeaseOptions,
 ) roachpb.ReplicaDescriptor {
+	if a.knobs != nil {
+		if blockFn := a.knobs.BlockTransferTarget; blockFn != nil && blockFn() {
+			return roachpb.ReplicaDescriptor{}
+		}
+	}
 	excludeLeaseRepl := opts.ExcludeLeaseRepl
 	if a.leaseholderShouldMoveDueToPreferences(ctx, storePool, conf, leaseRepl, existing) ||
 		a.leaseholderShouldMoveDueToIOOverload(ctx, storePool, existing, leaseRepl.StoreID(), a.IOOverloadOptions()) {
@@ -2635,7 +2640,7 @@ func (a Allocator) shouldTransferLeaseForAccessLocality(
 		}
 	}
 
-	log.KvDistribution.VEventf(ctx, 1,
+	log.KvDistribution.VEventf(ctx, 5,
 		"shouldTransferLease qpsStats: %+v, replicaLocalities: %+v, replicaWeights: %+v",
 		qpsStats, replicaLocalities, replicaWeights)
 	sourceWeight := math.Max(minReplicaWeight, replicaWeights[source.Node.NodeID])
@@ -2752,7 +2757,7 @@ func loadBasedLeaseRebalanceScore(
 
 	log.KvDistribution.VEventf(
 		ctx,
-		2,
+		5,
 		"node: %d, sourceWeight: %.2f, remoteWeight: %.2f, remoteLatency: %v, "+
 			"rebalanceThreshold: %.2f, meanLeases: %.2f, sourceLeaseCount: %d, overfullThreshold: %d, "+
 			"remoteLeaseCount: %d, underfullThreshold: %d, totalScore: %d",
@@ -2827,7 +2832,7 @@ func (a Allocator) PreferredLeaseholders(
 			if !ok {
 				continue
 			}
-			if constraint.ConjunctionsCheck(storeDesc, preference.Constraints) {
+			if constraint.CheckStoreConjunction(storeDesc, preference.Constraints) {
 				preferred = append(preferred, repl)
 			}
 		}

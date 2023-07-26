@@ -110,6 +110,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logmetrics"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
@@ -493,7 +494,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		AmbientCtx:              cfg.AmbientCtx,
 		Stopper:                 stopper,
 		Clock:                   clock,
-		DB:                      db,
+		Storage:                 liveness.NewKVStorage(db),
 		Gossip:                  g,
 		LivenessThreshold:       nlActive,
 		RenewalDuration:         nlRenewal,
@@ -714,6 +715,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	tenantCapabilitiesWatcher := tenantcapabilitieswatcher.New(
 		clock,
+		cfg.Settings,
 		rangeFeedFactory,
 		keys.TenantsTableID,
 		stopper,
@@ -917,6 +919,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		gcoords.Stores,
 		tenantUsage,
 		tenantSettingsWatcher,
+		tenantCapabilitiesWatcher,
 		spanConfig.kvAccessor,
 		spanConfig.reporter,
 	)
@@ -1840,9 +1843,16 @@ func (s *Server) PreStart(ctx context.Context) error {
 		})
 	})
 
+	// Init a log metrics registry.
+	logRegistry := logmetrics.NewRegistry()
+	if logRegistry == nil {
+		panic(errors.AssertionFailedf("nil log metrics registry at server startup"))
+	}
+
 	// We can now add the node registry.
 	s.recorder.AddNode(
 		s.registry,
+		logRegistry,
 		s.node.Descriptor,
 		s.node.startedAt,
 		s.cfg.AdvertiseAddr,

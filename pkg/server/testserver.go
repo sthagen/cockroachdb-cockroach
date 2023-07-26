@@ -758,6 +758,11 @@ func (t *TestTenant) DistSenderI() interface{} {
 	return t.sql.execCfg.DistSender
 }
 
+// InternalDB is part of the serverutils.TestTenantInterface.
+func (t *TestTenant) InternalDB() interface{} {
+	return t.sql.internalDB
+}
+
 // InternalExecutor is part of the serverutils.TestTenantInterface.
 func (t *TestTenant) InternalExecutor() interface{} {
 	return t.sql.internalExecutor
@@ -906,6 +911,8 @@ func (ts *TestServer) StartSharedProcessTenant(
 	}
 	tenantExists := tenantRow != nil
 
+	justCreated := false
+	var tenantID roachpb.TenantID
 	if tenantExists {
 		// A tenant with the given name already exists; let's check that
 		// it matches the ID that this call wants (if any).
@@ -914,8 +921,10 @@ func (ts *TestServer) StartSharedProcessTenant(
 			return nil, nil, errors.Newf("a tenant with name %q exists, but its ID is %d instead of %d",
 				args.TenantName, id, args.TenantID)
 		}
+		tenantID = roachpb.MustMakeTenantID(id)
 	} else {
 		// The tenant doesn't exist; let's create it.
+		justCreated = true
 		if args.TenantID.IsSet() {
 			// Create with name and ID.
 			_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
@@ -929,9 +938,10 @@ func (ts *TestServer) StartSharedProcessTenant(
 			if err != nil {
 				return nil, nil, err
 			}
+			tenantID = args.TenantID
 		} else {
 			// Create with name alone; allocate an ID automatically.
-			_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
+			row, err := ts.InternalExecutor().(*sql.InternalExecutor).QueryRowEx(
 				ctx,
 				"create-tenant",
 				nil, /* txn */
@@ -942,7 +952,12 @@ func (ts *TestServer) StartSharedProcessTenant(
 			if err != nil {
 				return nil, nil, err
 			}
+			id := uint64(*row[0].(*tree.DInt))
+			tenantID = roachpb.MustMakeTenantID(id)
 		}
+	}
+
+	if justCreated {
 		// Also mark it for shared-process execution.
 		_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
 			ctx,
@@ -955,6 +970,11 @@ func (ts *TestServer) StartSharedProcessTenant(
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+
+	// Wait for the rangefeed to catch up.
+	if err := ts.WaitForTenantReadiness(ctx, tenantID); err != nil {
+		return nil, nil, err
 	}
 
 	// Instantiate the tenant server.
@@ -1001,6 +1021,35 @@ func (t *TestTenant) MigrationServer() interface{} {
 // HTTPAuthServer is part of the TestTenantInterface.
 func (t *TestTenant) HTTPAuthServer() interface{} {
 	return t.t.authentication
+}
+
+// WaitForTenantReadiness is part of TestServerInterface.
+func (ts *TestServer) WaitForTenantReadiness(ctx context.Context, tenantID roachpb.TenantID) error {
+	// Restarting the watcher forces a new initial scan which is
+	// faster than waiting out the closed timestamp interval
+	// required to see new updates.
+	ts.node.tenantInfoWatcher.TestingRestart()
+
+	log.Infof(ctx, "waiting for rangefeed to catch up with record for tenant %v", tenantID)
+	_, infoWatcher, err := ts.node.waitForTenantWatcherReadiness(ctx)
+	if err != nil {
+		return err
+	}
+
+	for {
+		_, infoCh, found := infoWatcher.GetInfo(tenantID)
+		if found {
+			log.Infof(ctx, "cached record found for tenant %v", tenantID)
+			return nil
+		}
+		// Not found: wait and try again.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-infoCh:
+			continue
+		}
+	}
 }
 
 // StartTenant is part of the serverutils.TestServerInterface.
@@ -1082,6 +1131,13 @@ func (ts *TestServer) StartTenant(
 		}
 	}
 
+	if !params.SkipWaitForTenantCache {
+		// Wait until the rangefeed has caught up with the tenant creation.
+		if err := ts.WaitForTenantReadiness(ctx, params.TenantID); err != nil {
+			return nil, err
+		}
+	}
+
 	st := params.Settings
 	if st == nil {
 		st = cluster.MakeTestingClusterSettings()
@@ -1155,18 +1211,13 @@ func (ts *TestServer) StartTenant(
 	baseCfg.DisableTLSForHTTP = params.DisableTLSForHTTP
 	baseCfg.EnableDemoLoginEndpoint = params.EnableDemoLoginEndpoint
 
-	// Waiting for capabilities can take 3+ seconds since the
-	// rangefeedcache needs to wait for the closed timestamp
-	// before flushing updates. To avoid paying this cost in all
-	// cases, we only set the nodelocal storage capability if the
-	// caller has configured an ExternalIODir since nodelocal
-	// storage only works with that configured.
+	// Waiting for capabilities can time To avoid paying this cost in all
+	// cases, we only set the nodelocal storage capability if the caller has
+	// configured an ExternalIODir since nodelocal storage only works with
+	// that configured.
 	//
-	// TODO(ssd): We should do more here. We could have the caller
-	// pass in explicitly that they want these capabilities. Or,
-	// we could modify the system in some way to avoid waiting on
-	// capabilities for so long. Also, note that this doesn't
-	// apply to StartSharedProcessTenant.
+	// TODO(ssd): We do not set this capability in
+	// StartSharedProcessTenant.
 	shouldGrantNodelocalCap := ts.params.ExternalIODir != ""
 	canGrantNodelocalCap := ts.ClusterSettings().Version.IsActive(ctx, clusterversion.V23_1TenantCapabilities)
 	if canGrantNodelocalCap && shouldGrantNodelocalCap {
@@ -1179,6 +1230,10 @@ func (ts *TestServer) StartTenant(
 				return nil, err
 			}
 		} else {
+			// Restart the capabilities watcher. Restarting the watcher
+			// forces a new initial scan which is faster than waiting out
+			// the closed timestamp interval required to see new updates.
+			ts.tenantCapabilitiesWatcher.TestingRestart()
 			if err := testutils.SucceedsSoonError(func() error {
 				capabilities, found := ts.TenantCapabilitiesReader().GetCapabilities(params.TenantID)
 				if !found {
@@ -1431,7 +1486,7 @@ func (ts *TestServer) InternalExecutor() interface{} {
 	return ts.sqlServer.internalExecutor
 }
 
-// InternalDB is part of the serverutils.TestServerInterface.
+// InternalDB is part of the serverutils.TestTenantInterface.
 func (ts *TestServer) InternalDB() interface{} {
 	return ts.sqlServer.internalDB
 }

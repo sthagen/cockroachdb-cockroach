@@ -69,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logmetrics"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/schedulerlatency"
@@ -639,9 +640,16 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		})
 	})
 
+	// Init a log metrics registry.
+	logRegistry := logmetrics.NewRegistry()
+	if logRegistry == nil {
+		panic(errors.AssertionFailedf("nil log metrics registry at server startup"))
+	}
+
 	// We can now add the node registry.
 	s.recorder.AddNode(
 		s.registry,
+		logRegistry,
 		roachpb.NodeDescriptor{
 			NodeID: s.rpcContext.NodeID.Get(),
 		},
@@ -975,8 +983,10 @@ func makeTenantSQLServerArgs(
 	promRuleExporter := metric.NewPrometheusRuleExporter(ruleRegistry)
 
 	var rpcTestingKnobs rpc.ContextTestingKnobs
+	var testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent bool
 	if p, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
 		rpcTestingKnobs = p.ContextTestingKnobs
+		testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent = p.ShutdownTenantConnectorEarlyIfNoRecordPresent
 	}
 
 	// This tenant's SQL server only serves SQL connections and SQL-to-SQL
@@ -1041,6 +1051,8 @@ func makeTenantSQLServerArgs(
 		RPCContext:        rpcContext,
 		RPCRetryOptions:   rpcRetryOptions,
 		DefaultZoneConfig: &baseCfg.DefaultZoneConfig,
+
+		ShutdownTenantConnectorEarlyIfNoRecordPresent: testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent,
 	}
 	kvAddressConfig := kvtenant.KVAddressConfig{RemoteAddresses: sqlCfg.TenantKVAddrs, LoopbackAddress: sqlCfg.TenantLoopbackAddr}
 	tenantConnect, err := kvtenant.Factory.NewConnector(tcCfg, kvAddressConfig)

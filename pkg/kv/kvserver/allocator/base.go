@@ -76,7 +76,7 @@ func IsStoreValid(
 		return true
 	}
 	for _, subConstraints := range constraints {
-		if constraintsOK := constraint.ConjunctionsCheck(
+		if constraintsOK := constraint.CheckStoreConjunction(
 			store, subConstraints.Constraints,
 		); constraintsOK {
 			return true
@@ -95,6 +95,9 @@ type TestingKnobs struct {
 		Desc() *roachpb.RangeDescriptor
 		StoreID() roachpb.StoreID
 	}) *raft.Status
+	// BlockTransferTarget can be used to block returning any transfer targets
+	// from TransferLeaseTarget.
+	BlockTransferTarget func() bool
 }
 
 // QPSRebalanceThreshold is much like rangeRebalanceThreshold, but for

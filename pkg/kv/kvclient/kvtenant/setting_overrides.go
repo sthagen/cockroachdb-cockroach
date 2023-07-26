@@ -13,8 +13,11 @@ package kvtenant
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -24,7 +27,7 @@ import (
 // runTenantSettingsSubscription listens for tenant setting override changes.
 // It closes the given channel once the initial set of overrides were obtained.
 // Exits when the context is done.
-func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh chan struct{}) {
+func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh chan<- error) {
 	for ctx.Err() == nil {
 		client, err := c.getClient(ctx)
 		if err != nil {
@@ -47,6 +50,11 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 			c.settingsMu.receivedFirstAllTenantOverrides = false
 			c.settingsMu.receivedFirstSpecificOverrides = false
 		}()
+		func() {
+			c.metadataMu.Lock()
+			defer c.metadataMu.Unlock()
+			c.metadataMu.receivedFirstMetadata = false
+		}()
 
 		for {
 			e, err := stream.Recv()
@@ -60,36 +68,125 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 				break
 			}
 			if e.Error != (errorspb.EncodedError{}) {
-				// Hard logical error. We expect io.EOF next.
+				// Hard logical error.
 				err := errors.DecodeError(ctx, e.Error)
 				log.Errorf(ctx, "error consuming TenantSettings RPC: %v", err)
+				if startupCh != nil && errors.Is(err, &kvpb.MissingRecordError{}) && c.earlyShutdownIfMissingTenantRecord {
+					startupCh <- err
+					close(startupCh)
+					c.tryForgetClient(ctx, client)
+					return
+				}
+				// Other errors, or configuration tells us to continue if the
+				// tenant record in missing: in that case we continue the
+				// loop. We're expecting io.EOF from the server next, which
+				// will lead us to reconnect and retry.
+				//
+				// However, don't hammer the server with retries if there was
+				// an actual error reported: we wait a bit before the retry.
+				select {
+				case <-time.After(1 * time.Second):
+
+				case <-ctx.Done():
+					// Shutdown or cancellation short circuits the wait and retry.
+					return
+				}
 				continue
 			}
 
-			settingsReady, err := c.processSettingsEvent(e)
-			if err != nil {
-				log.Errorf(ctx, "error processing tenant settings event: %v", err)
+			if c.testingEmulateOldVersionSettingsClient {
+				// The old version of the settings client does not understand anything
+				// else than setting events.
+				e.EventType = kvpb.TenantSettingsEvent_SETTING_EVENT
+			}
+
+			var reconnect bool
+			switch e.EventType {
+			case kvpb.TenantSettingsEvent_METADATA_EVENT:
+				err := c.processMetadataEvent(ctx, e)
+				if err != nil {
+					log.Errorf(ctx, "error processing tenant settings event: %v", err)
+					reconnect = true
+				}
+
+			case kvpb.TenantSettingsEvent_SETTING_EVENT:
+				settingsReady, err := c.processSettingsEvent(ctx, e)
+				if err != nil {
+					log.Errorf(ctx, "error processing tenant settings event: %v", err)
+					reconnect = true
+					break
+				}
+
+				// Signal that startup is complete once we have enough events
+				// to start. Note: we do not connect this condition to
+				// receiving the tenant metadata (via processMetadataEvent) for
+				// compatibility with pre-v23.2 servers which only send
+				// setting override events.
+				//
+				// Luckily, we are guaranteed that once we receive the setting
+				// overrides the metadata has been received as well (in v23.1+
+				// servers that send it) because when it is sent it is always
+				// sent prior to the setting overrides.
+				if settingsReady {
+					log.Infof(ctx, "received initial tenant settings")
+
+					if startupCh != nil {
+						startupCh <- nil
+						close(startupCh)
+						startupCh = nil
+					}
+				}
+			}
+
+			if reconnect {
 				_ = stream.CloseSend()
 				c.tryForgetClient(ctx, client)
 				break
-			}
-
-			// Signal that startup is complete once we have enough events to start.
-			if settingsReady {
-				log.Infof(ctx, "received initial tenant settings")
-
-				if startupCh != nil {
-					close(startupCh)
-					startupCh = nil
-				}
 			}
 		}
 	}
 }
 
+// processMetadataEvent updates the tenant metadata based on the event.
+func (c *connector) processMetadataEvent(ctx context.Context, e *kvpb.TenantSettingsEvent) error {
+	c.metadataMu.Lock()
+	defer c.metadataMu.Unlock()
+
+	c.metadataMu.receivedFirstMetadata = true
+	c.metadataMu.capabilities = e.Capabilities
+	c.metadataMu.tenantName = e.Name
+	// TODO(knz): Remove the cast once we have proper typing in the
+	// protobuf, which requires breaking a dependency cycle.
+	c.metadataMu.dataState = mtinfopb.TenantDataState(e.DataState)
+	c.metadataMu.serviceMode = mtinfopb.TenantServiceMode(e.ServiceMode)
+
+	log.Infof(ctx, "received tenant metadata: name=%q dataState=%v serviceMode=%v\ncapabilities=%+v",
+		c.metadataMu.tenantName, c.metadataMu.dataState, c.metadataMu.serviceMode, c.metadataMu.capabilities)
+
+	// Signal watchers that there was an update.
+	close(c.metadataMu.notifyCh)
+	c.metadataMu.notifyCh = make(chan struct{})
+
+	return nil
+}
+
+// TenantInfo accesses the tenant metadata.
+func (c *connector) TenantInfo() (tenantcapabilities.Entry, <-chan struct{}) {
+	c.metadataMu.Lock()
+	defer c.metadataMu.Unlock()
+
+	return tenantcapabilities.Entry{
+		TenantID:           c.tenantID,
+		TenantCapabilities: c.metadataMu.capabilities,
+		Name:               c.metadataMu.tenantName,
+		DataState:          c.metadataMu.dataState,
+		ServiceMode:        c.metadataMu.serviceMode,
+	}, c.metadataMu.notifyCh
+}
+
 // processSettingsEvent updates the setting overrides based on the event.
 func (c *connector) processSettingsEvent(
-	e *kvpb.TenantSettingsEvent,
+	ctx context.Context, e *kvpb.TenantSettingsEvent,
 ) (settingsReady bool, err error) {
 	c.settingsMu.Lock()
 	defer c.settingsMu.Unlock()
@@ -120,6 +217,8 @@ func (c *connector) processSettingsEvent(
 	default:
 		return false, errors.Newf("unknown precedence value %d", e.Precedence)
 	}
+
+	log.Infof(ctx, "received %d setting overrides with precedence %v (incremental=%v)", len(e.Overrides), e.Precedence, e.Incremental)
 
 	// If the event is not incremental, clear the map.
 	if !e.Incremental {

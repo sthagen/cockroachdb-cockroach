@@ -109,6 +109,21 @@ var EagerLeaseAcquisitionConcurrency = settings.RegisterIntSetting(
 	settings.NonNegativeInt,
 )
 
+// LeaseCheckPreferencesOnAcquisitionEnabled controls whether lease preferences
+// are checked upon acquiring a new lease. If the new lease violates the
+// configured preferences, it is enqueued in the replicate queue for
+// processing.
+//
+// TODO(kvoli): Remove this cluster setting in 24.1, once we wish to enable
+// this by default or is subsumed by another mechanism.
+var LeaseCheckPreferencesOnAcquisitionEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.lease.check_preferences_on_acquisition.enabled",
+	"controls whether lease preferences are checked on lease acquisition, "+
+		"if the new lease violates preferences, it is queued for processing",
+	true,
+)
+
 var leaseStatusLogLimiter = func() *log.EveryN {
 	e := log.Every(15 * time.Second)
 	e.ShouldLog() // waste the first shot
@@ -445,6 +460,8 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 	return nil
 }
 
+var logFailedHeartbeatOwnLiveness = log.Every(10 * time.Second)
+
 // requestLease sends a synchronous transfer lease or lease request to the
 // specified replica. It is only meant to be called from requestLeaseAsync,
 // since it does not coordinate with other in-flight lease requests.
@@ -465,9 +482,8 @@ func (p *pendingLeaseRequest) requestLease(
 	if status.Lease.Type() == roachpb.LeaseEpoch && status.State == kvserverpb.LeaseState_EXPIRED {
 		var err error
 		// If this replica is previous & next lease holder, manually heartbeat to become live.
-		if status.OwnedBy(nextLeaseHolder.StoreID) &&
-			p.repl.store.StoreID() == nextLeaseHolder.StoreID {
-			if err = p.repl.store.cfg.NodeLiveness.Heartbeat(ctx, status.Liveness); err != nil {
+		if status.OwnedBy(nextLeaseHolder.StoreID) && p.repl.store.StoreID() == nextLeaseHolder.StoreID {
+			if err = p.repl.store.cfg.NodeLiveness.Heartbeat(ctx, status.Liveness); err != nil && logFailedHeartbeatOwnLiveness.ShouldLog() {
 				log.Errorf(ctx, "failed to heartbeat own liveness record: %s", err)
 			}
 		} else if status.Liveness.Epoch == status.Lease.Epoch {
@@ -945,7 +961,7 @@ func (r *Replica) AdminTransferLease(
 		raftStatus := r.raftStatusRLocked()
 		raftFirstIndex := r.raftFirstIndexRLocked()
 		snapStatus := raftutil.ReplicaMayNeedSnapshot(raftStatus, raftFirstIndex, nextLeaseHolder.ReplicaID)
-		if snapStatus != raftutil.NoSnapshotNeeded && !bypassSafetyChecks {
+		if snapStatus != raftutil.NoSnapshotNeeded && !bypassSafetyChecks && !r.store.cfg.TestingKnobs.DisableAboveRaftLeaseTransferSafetyChecks {
 			r.store.metrics.LeaseTransferErrorCount.Inc(1)
 			log.VEventf(ctx, 2, "not initiating lease transfer because the target %s may "+
 				"need a snapshot: %s", nextLeaseHolder, snapStatus)
@@ -1536,25 +1552,67 @@ func (r *Replica) hasCorrectLeaseTypeRLocked(lease roachpb.Lease) bool {
 	return hasExpirationLease == r.shouldUseExpirationLeaseRLocked()
 }
 
-// LeaseViolatesPreferences checks if current replica owns the lease and if it
-// violates the lease preferences defined in the span config. If there is an
-// error or no preferences defined then it will return false and consider that
-// to be in-conformance.
+// leasePreferencesStatus represents the state of satisfying lease preferences.
+type leasePreferencesStatus int
+
+const (
+	// leasePreferencesUnknown indicates the preferences status cannot be
+	// determined.
+	leasePreferencesUnknown leasePreferencesStatus = iota
+	// leasePreferencesViolating indicates the leaseholder does not
+	// satisfy any lease preference applied.
+	leasePreferencesViolating
+	// leasePreferencesLessPreferred indicates the leaseholder satisfies _some_
+	// preference, however not the most preferred.
+	leasePreferencesLessPreferred
+	// leasePreferencesOK indicates the lease satisfies the first
+	// preference, or no lease preferences are applied.
+	leasePreferencesOK
+)
+
+// LeaseViolatesPreferences checks if this replica owns the lease and if it
+// violates the lease preferences defined in the span config. If no preferences
+// are defined then it will return false and consider it to be in conformance.
 func (r *Replica) LeaseViolatesPreferences(ctx context.Context) bool {
-	storeDesc, err := r.store.Descriptor(ctx, true /* useCached */)
-	if err != nil {
-		log.Infof(ctx, "Unable to load the descriptor %v: cannot check if lease violates preference", err)
-		return false
+	storeID := r.store.StoreID()
+	now := r.Clock().NowAsClockTimestamp()
+	r.mu.RLock()
+	leaseStatus := r.leaseStatusAtRLocked(ctx, now)
+	preferences := r.mu.conf.LeasePreferences
+	r.mu.RUnlock()
+
+	storeAttrs := r.store.Attrs()
+	nodeAttrs := r.store.nodeDesc.Attrs
+	nodeLocality := r.store.nodeDesc.Locality
+	preferenceStatus := makeLeasePreferenceStatus(
+		leaseStatus, storeID, storeAttrs, nodeAttrs, nodeLocality, preferences)
+
+	return preferenceStatus == leasePreferencesViolating
+}
+
+func makeLeasePreferenceStatus(
+	leaseStatus kvserverpb.LeaseStatus,
+	storeID roachpb.StoreID,
+	storeAttrs, nodeAttrs roachpb.Attributes,
+	nodeLocality roachpb.Locality,
+	preferences []roachpb.LeasePreference,
+) leasePreferencesStatus {
+	if !leaseStatus.IsValid() || !leaseStatus.Lease.OwnedBy(storeID) {
+		// We can't determine if the lease preferences are being conformed to or
+		// not, as the store either doesn't own the lease, or doesn't own a valid
+		// lease.
+		return leasePreferencesUnknown
 	}
-	conf := r.SpanConfig()
-	if len(conf.LeasePreferences) == 0 {
-		return false
+	if len(preferences) == 0 {
+		return leasePreferencesOK
 	}
-	for _, preference := range conf.LeasePreferences {
-		if constraint.ConjunctionsCheck(*storeDesc, preference.Constraints) {
-			return false
+	for i, preference := range preferences {
+		if constraint.CheckConjunction(storeAttrs, nodeAttrs, nodeLocality, preference.Constraints) {
+			if i > 0 {
+				return leasePreferencesLessPreferred
+			}
+			return leasePreferencesOK
 		}
 	}
-	// We have at lease one preference set up, but we don't satisfy any.
-	return true
+	return leasePreferencesViolating
 }

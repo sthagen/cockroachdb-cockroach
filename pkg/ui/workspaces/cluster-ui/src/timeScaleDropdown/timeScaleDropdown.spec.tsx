@@ -26,7 +26,7 @@ import RangeSelect from "./rangeSelect";
 import { timeFormat as customMenuTimeFormat } from "../dateRangeMenu";
 import { assert } from "chai";
 import { TimeWindow, ArrowDirection, TimeScale } from "./timeScaleTypes";
-import { getAllByText, render } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 /**
@@ -285,8 +285,6 @@ describe("TimeScaleDropdown functions", function () {
 
   describe("formatRangeSelectSelected", () => {
     it("formatRangeSelectSelected must return title Past 10 Minutes", () => {
-      const _ = makeTimeScaleDropdown(state);
-
       const title = formatRangeSelectSelected(
         currentWindow,
         state.currentScale,
@@ -368,8 +366,8 @@ describe("TimeScaleDropdown functions", function () {
   it("generateDisabledArrows must return array with disabled buttons", () => {
     const arrows = generateDisabledArrows(currentWindow);
     const wrapper = makeTimeScaleDropdown(state);
-    assert.equal(wrapper.find(".controls-content ._action.disabled").length, 2);
-    assert.deepEqual(arrows, [ArrowDirection.CENTER, ArrowDirection.RIGHT]);
+    expect(wrapper.find(".controls-content ._action.disabled").length).toBe(1);
+    expect(arrows).toEqual([ArrowDirection.CENTER, ArrowDirection.RIGHT]);
   });
 
   it("generateDisabledArrows must render 3 active buttons and return empty array", () => {

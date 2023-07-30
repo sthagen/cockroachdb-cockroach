@@ -55,6 +55,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -292,7 +293,7 @@ func mergeWithData(t *testing.T, retries int64) {
 		return nil
 	}
 
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	serv := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue:    true,
@@ -1233,7 +1234,7 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testutils.RunTrueAndFalse(t, "rhsHasHigherGen", func(t *testing.T, rhsHasHigherGen bool) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
 					// Disable both splits and merges so that we're in full
@@ -2289,7 +2290,7 @@ func TestStoreRangeMergeConcurrentRequests(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	serv := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue:     true,
@@ -3893,7 +3894,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			tombstoneKey := keys.RangeTombstoneKey(rangeID)
 			tombstoneValue := &kvserverpb.RangeTombstone{NextReplicaID: math.MaxInt32}
 			if err := storage.MVCCBlindPutProto(
-				context.Background(), &sst, nil, tombstoneKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, tombstoneValue, nil,
+				context.Background(), &sst, tombstoneKey, hlc.Timestamp{}, tombstoneValue, storage.MVCCWriteOptions{},
 			); err != nil {
 				return err
 			}
@@ -4146,7 +4147,7 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 	}
 
 	manualClock := hlc.NewHybridManualClock()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	serv := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue:      true,
@@ -4525,7 +4526,14 @@ func TestMergeQueue(t *testing.T) {
 
 					clearRange(t, lhsStartKey, rhsEndKey)
 					setSplitObjective(secondSplitObjective)
-					verifyUnmergedSoon(t, store, lhsStartKey, rhsStartKey)
+					if !grunning.Supported() {
+						// CPU isn't a supported split objective when grunning isn't
+						// supported. Switching the dimension will have no effect, as the
+						// objective gets overridden in such cases to always be QPS.
+						verifyMergedSoon(t, store, lhsStartKey, rhsStartKey)
+					} else {
+						verifyUnmergedSoon(t, store, lhsStartKey, rhsStartKey)
+					}
 				})
 			}
 		}
@@ -5285,7 +5293,7 @@ func TestStoreMergeGCHint(t *testing.T) {
 	} {
 		t.Run(d.name, func(t *testing.T) {
 			ctx := context.Background()
-			serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+			serv := serverutils.StartServerOnly(t, base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						DisableMergeQueue: true,

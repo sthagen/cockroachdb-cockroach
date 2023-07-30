@@ -42,7 +42,7 @@ func TestAdminAPIStatementDiagnosticsBundle(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	query := "EXPLAIN ANALYZE (DEBUG) SELECT 'secret'"
 	_, err := db.Exec(query)
@@ -82,10 +82,10 @@ func TestCreateStatementDiagnosticsReport(t *testing.T) {
 	// all tests.
 	defer ccl.TestingEnableEnterprise()()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	req := &serverpb.CreateStatementDiagnosticsReportRequest{
 		StatementFingerprint: "INSERT INTO test VALUES (_)",
@@ -117,7 +117,7 @@ func TestCreateStatementDiagnosticsReportWithViewActivityOptions(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	db := sqlutils.MakeSQLRunner(sqlDB)
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	ctx := context.Background()
 	ie := ts.InternalExecutor().(*sql.InternalExecutor)
@@ -208,7 +208,7 @@ func TestStatementDiagnosticsCompleted(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	_, err := db.Exec("CREATE TABLE test (x int PRIMARY KEY)")
 	if err != nil {
@@ -256,7 +256,7 @@ func TestStatementDiagnosticsDoesNotReturnExpiredRequests(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	db := sqlutils.MakeSQLRunner(sqlDB)
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	statementFingerprint := "INSERT INTO test VALUES (_)"
 	expiresAfter := 5 * time.Millisecond

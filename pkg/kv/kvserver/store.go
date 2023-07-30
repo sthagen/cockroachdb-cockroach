@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
@@ -1224,8 +1223,6 @@ type StoreConfig struct {
 
 	// RangeLogWriter is used to write entries to the system.rangelog table.
 	RangeLogWriter RangeLogWriter
-
-	ExternalStorage *cloud.ExternalStorageAccessor
 }
 
 // logRangeAndNodeEventsEnabled is used to enable or disable logging range events
@@ -2546,12 +2543,10 @@ func (s *Store) WriteLastUpTimestamp(ctx context.Context, time hlc.Timestamp) er
 	return storage.MVCCPutProto(
 		ctx,
 		s.TODOEngine(), // TODO(sep-raft-log): probably state engine
-		nil,
 		keys.StoreLastUpKey(),
 		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
 		&time,
+		storage.MVCCWriteOptions{},
 	)
 }
 
@@ -2582,12 +2577,10 @@ func (s *Store) WriteHLCUpperBound(ctx context.Context, time int64) error {
 	if err := storage.MVCCPutProto(
 		ctx,
 		batch,
-		nil,
 		keys.StoreHLCUpperBoundKey(),
 		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
 		&ts,
+		storage.MVCCWriteOptions{},
 	); err != nil {
 		return err
 	}

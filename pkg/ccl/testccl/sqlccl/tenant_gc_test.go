@@ -48,7 +48,7 @@ func TestGCTenantRemovesSpanConfigs(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	ts, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
 		DefaultTestTenant: base.TestTenantProbabilistic,
 		Knobs: base.TestingKnobs{
 			SpanConfig: &spanconfig.TestingKnobs{
@@ -318,6 +318,7 @@ func TestGCTenantJobWaitsForProtectedTimestamps(t *testing.T) {
 		tenantStopper.Stop(ctx)
 
 		// Drop the record.
+		sqlDB.Exec(t, `ALTER TENANT [$1] STOP SERVICE`, tenID.ToUint64())
 		sqlDB.Exec(t, `DROP TENANT [$1]`, tenID.ToUint64())
 
 		sqlDB.CheckQueryResultsRetry(

@@ -12,13 +12,10 @@ package spanconfigtestcluster
 
 import (
 	"context"
-	gosql "database/sql"
-	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigreconciler"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqltranslator"
@@ -59,7 +56,7 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) *
 	testServer := h.tc.Server(0)
 	tenantState := &Tenant{t: h.t}
 	if tenID == roachpb.SystemTenantID {
-		tenantState.TestTenantInterface = testServer
+		tenantState.ApplicationLayerInterface = testServer
 		tenantState.db = sqlutils.MakeSQLRunner(h.tc.ServerConn(0))
 		tenantState.cleanup = func() {} // noop
 	} else {
@@ -77,18 +74,13 @@ func (h *Handle) InitializeTenant(ctx context.Context, tenID roachpb.TenantID) *
 			},
 		}
 		var err error
-		tenantState.TestTenantInterface, err = testServer.StartTenant(ctx, tenantArgs)
+		tenantState.ApplicationLayerInterface, err = testServer.StartTenant(ctx, tenantArgs)
 		require.NoError(h.t, err)
 
-		pgURL, cleanupPGUrl := sqlutils.PGUrl(h.t, tenantState.SQLAddr(), "Tenant", url.User(username.RootUser))
-		tenantSQLDB, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(h.t, err)
+		tenantSQLDB := tenantState.SQLConn(h.t, "")
 
 		tenantState.db = sqlutils.MakeSQLRunner(tenantSQLDB)
-		tenantState.cleanup = func() {
-			require.NoError(h.t, tenantSQLDB.Close())
-			cleanupPGUrl()
-		}
+		tenantState.cleanup = func() {}
 	}
 
 	var tenKnobs *spanconfig.TestingKnobs

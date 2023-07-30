@@ -129,7 +129,7 @@ func TestSessionFinishRollsBackTxn(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	{
 		pgURL, cleanup := sqlutils.PGUrl(
-			t, s.ServingSQLAddr(), "TestSessionFinishRollsBackTxn", url.User(username.RootUser))
+			t, s.AdvSQLAddr(), "TestSessionFinishRollsBackTxn", url.User(username.RootUser))
 		defer cleanup()
 		if err := aborter.Init(pgURL); err != nil {
 			t.Fatal(err)
@@ -154,7 +154,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v TEXT);
 		t.Run(state, func(t *testing.T) {
 			// Create a low-level lib/pq connection so we can close it at will.
 			pgURL, cleanupDB := sqlutils.PGUrl(
-				t, s.ServingSQLAddr(), state, url.User(username.RootUser))
+				t, s.AdvSQLAddr(), state, url.User(username.RootUser))
 			defer cleanupDB()
 			c, err := pq.Open(pgURL.String())
 			if err != nil {
@@ -474,14 +474,14 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	params, _ := tests.CreateTestServerParams()
 	params.Insecure = true
 
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	// Prepare a session with a custom application name.
 	pgURL := url.URL{
 		Scheme:   "postgres",
 		User:     url.User(username.RootUser),
-		Host:     s.ServingSQLAddr(),
+		Host:     s.AdvSQLAddr(),
 		RawQuery: "sslmode=disable&application_name=mytest",
 	}
 	rawSQL, err := gosql.Open("postgres", pgURL.String())
@@ -786,7 +786,7 @@ func TestRetriableErrorDuringUpgradedTransaction(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(context.Background())
-	codec := s.TenantOrServer().Codec()
+	codec := s.ApplicationLayer().Codec()
 
 	conn, err := sqlDB.Conn(context.Background())
 	require.NoError(t, err)
@@ -845,7 +845,7 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
-	codec := s.TenantOrServer().Codec()
+	codec := s.ApplicationLayer().Codec()
 
 	testDB := sqlutils.MakeSQLRunner(sqlDB)
 	testDB.Exec(t, "CREATE TABLE foo (i INT PRIMARY KEY)")
@@ -858,7 +858,7 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	// transaction state evolves appropriately.
 
 	// Use pgx so that we can introspect error codes returned from cockroach.
-	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "", url.User("root"))
+	pgURL, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "", url.User("root"))
 	defer cleanup()
 	conf, err := pgx.ParseConfig(pgURL.String())
 	require.NoError(t, err)
@@ -973,7 +973,7 @@ func TestUnqualifiedIntSizeRace(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Insecure: true,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -1013,7 +1013,7 @@ func TestTrimSuspendedPortals(t *testing.T) {
 	ctx := context.Background()
 
 	var stmtBuff *sql.StmtBuf
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				// get a handle to the statement buffer during the Bind phase
@@ -1192,7 +1192,7 @@ func TestTransactionDeadline(t *testing.T) {
 			SessionOverride: sessionOverrideKnob,
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		DefaultTestTenant: base.TestTenantAlwaysEnabled,
 		Knobs:             knobs,
 	})
@@ -1273,7 +1273,7 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// the session expiry should be ignored.
 		// Open a DB connection on the server and not the tenant to test that the session
 		// expiry is ignored outside of the multi-tenant environment.
-		dbConn := serverutils.OpenDBConn(t, s.ServingSQLAddr(), "" /* useDatabase */, false /* insecure */, s.Stopper())
+		dbConn := s.SystemLayer().SQLConn(t, "")
 		defer dbConn.Close()
 		// Set up a dummy database and table to write into for the test.
 		if _, err := dbConn.Exec(`CREATE DATABASE t1;
@@ -1563,7 +1563,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 	params := base.TestServerArgs{}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
-	dbConn := serverutils.OpenDBConn(t, s.ServingSQLAddr(), "", false /* insecure */, s.Stopper())
+	dbConn := s.ApplicationLayer().SQLConn(t, "")
 	defer dbConn.Close()
 
 	waitChannel := make(chan struct{})
@@ -1737,28 +1737,16 @@ func TestSessionTotalActiveTime(t *testing.T) {
 
 	ctx := context.Background()
 	params := base.TestServerArgs{}
-	s, mainDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, mainDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	_, err := mainDB.Exec(fmt.Sprintf("CREATE USER %s", username.TestUser))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	pgURL, cleanupDB := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "TestSessionTotalActiveTime", url.User(username.TestUser))
-	defer cleanupDB()
-	rawSQL, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer func() {
-		err := rawSQL.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	rawSQL := s.SQLConnForUser(t, username.TestUser, "")
 
 	getSessionWithTestUser := func() *serverpb.Session {
 		sessions := s.SQLServer().(*sql.Server).GetExecutorConfig().SessionRegistry.SerializeAll()

@@ -103,8 +103,7 @@ ALTER TENANT application START SERVICE SHARED`)
 				continue
 			}
 
-			sqlAddr := tc.Server(i).ServingSQLAddr()
-			db, err := serverutils.OpenDBConnE(sqlAddr, "cluster:application", false, tc.Stopper())
+			db, err := tc.Server(i).SystemLayer().SQLConnE("cluster:application")
 			if err != nil {
 				return err
 			}
@@ -135,7 +134,7 @@ func TestSharedProcessServerInheritsTempStorageLimit(t *testing.T) {
 	// Start a server with a custom temp storage limit.
 	ctx := context.Background()
 	st := cluster.MakeClusterSettings()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Settings:          st,
 		TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(st, specialSize),
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
@@ -194,8 +193,7 @@ func TestServerControllerHTTP(t *testing.T) {
 	t.Logf("connecting to the test tenant")
 
 	// Get a SQL connection to the test tenant.
-	sqlAddr := s.ServingSQLAddr()
-	db2, err := serverutils.OpenDBConnE(sqlAddr, "cluster:hello/defaultdb", false, s.Stopper())
+	db2, err := s.SystemLayer().SQLConnE("cluster:hello/defaultdb")
 	// Expect no error yet: the connection is opened lazily; an
 	// error here means the parameters were incorrect.
 	require.NoError(t, err)
@@ -337,7 +335,7 @@ func TestServerControllerDefaultHTTPTenant(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -381,7 +379,7 @@ func TestServerControllerBadHTTPCookies(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	client, err := s.GetUnauthenticatedHTTPClient()
@@ -440,10 +438,10 @@ func TestServerControllerMultiNodeTenantStartup(t *testing.T) {
 	// Pick a random node, try to run some SQL inside that tenant.
 	rng, _ := randutil.NewTestRand()
 	serverIdx := int(rng.Int31n(int32(numNodes)))
-	sqlAddr := tc.Server(serverIdx).ServingSQLAddr()
+	sqlAddr := tc.Server(serverIdx).AdvSQLAddr()
 	t.Logf("attempting to use tenant server on node %d (%s)", serverIdx, sqlAddr)
 	testutils.SucceedsSoon(t, func() error {
-		tenantDB, err := serverutils.OpenDBConnE(sqlAddr, "cluster:hello", false, tc.Stopper())
+		tenantDB, err := tc.Server(serverIdx).SystemLayer().SQLConnE("cluster:hello")
 		if err != nil {
 			t.Logf("error connecting to tenant server (will retry): %v", err)
 			return err
@@ -481,8 +479,6 @@ func TestServerStartStop(t *testing.T) {
 	})
 	defer s.Stopper().Stop(ctx)
 
-	sqlAddr := s.ServingSQLAddr()
-
 	// Create our own test tenant with a known name.
 	_, err := db.Exec("CREATE TENANT hello")
 	require.NoError(t, err)
@@ -493,7 +489,7 @@ func TestServerStartStop(t *testing.T) {
 
 	// Check the liveness.
 	testutils.SucceedsSoon(t, func() error {
-		db2, err := serverutils.OpenDBConnE(sqlAddr, "cluster:hello/defaultdb", false, s.Stopper())
+		db2, err := s.SystemLayer().SQLConnE("cluster:hello/defaultdb")
 		// Expect no error yet: the connection is opened lazily; an
 		// error here means the parameters were incorrect.
 		require.NoError(t, err)
@@ -517,7 +513,7 @@ func TestServerStartStop(t *testing.T) {
 
 	// Verify that the service is indeed stopped.
 	testutils.SucceedsSoon(t, func() error {
-		db2, err := serverutils.OpenDBConnE(sqlAddr, "cluster:hello/defaultdb", false, s.Stopper())
+		db2, err := s.SystemLayer().SQLConnE("cluster:hello/defaultdb")
 		// Expect no error yet: the connection is opened lazily; an
 		// error here means the parameters were incorrect.
 		require.NoError(t, err)
@@ -566,7 +562,7 @@ func TestServerControllerLoginLogout(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	client, err := s.GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
@@ -587,7 +583,7 @@ func TestServerControllerLoginLogout(t *testing.T) {
 	require.ElementsMatch(t, []string{"", ""}, cookieValues)
 
 	// Need a new server because the HTTP Client is memoized.
-	s2, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s2 := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s2.Stopper().Stop(ctx)
 
 	clientMT, err := s2.GetAuthenticatedHTTPClient(false, serverutils.MultiTenantSession)

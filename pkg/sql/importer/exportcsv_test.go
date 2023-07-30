@@ -68,11 +68,11 @@ func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, st
 			},
 		},
 	)
-	s := tc.TenantOrServer(0)
+	s := tc.ApplicationLayer(0)
 	tenantSettings := s.ClusterSettings()
 	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &tenantSettings.SV, true)
 	sql.SecondaryTenantScatterEnabled.Override(ctx, &tenantSettings.SV, true)
-	conn := serverutils.OpenDBConn(t, s.SQLAddr(), "defaultdb", false, tc.Stopper())
+	conn := s.SQLConn(t, "defaultdb")
 	db := sqlutils.MakeSQLRunner(conn)
 
 	wk := bank.FromRows(rows)
@@ -473,30 +473,21 @@ func TestExportPrivileges(t *testing.T) {
 	sqlDB.Exec(t, `CREATE USER testuser`)
 	sqlDB.Exec(t, `CREATE TABLE privs (a INT)`)
 
-	pgURL, cleanup := sqlutils.PGUrl(t, srv.ServingSQLAddr(),
-		"TestExportPrivileges-testuser", url.User("testuser"))
-	defer cleanup()
-	startTestUser := func() *gosql.DB {
-		testuser, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(t, err)
-		return testuser
-	}
-	testuser := startTestUser()
+	testuser := srv.ApplicationLayer().SQLConnForUser(t, "testuser", "")
 	_, err := testuser.Exec(`EXPORT INTO CSV 'nodelocal://1/privs' FROM TABLE privs`)
 	require.True(t, testutils.IsError(err, "testuser does not have SELECT privilege"))
 
 	dest := "nodelocal://1/privs_placeholder"
 	_, err = testuser.Exec(`EXPORT INTO CSV $1 FROM TABLE privs`, dest)
 	require.True(t, testutils.IsError(err, "testuser does not have SELECT privilege"))
-	testuser.Close()
+
+	// The below SELECT GRANT hangs if we leave the user conn open.
+	_ = testuser.Close()
 
 	// Grant SELECT privilege.
 	sqlDB.Exec(t, `GRANT SELECT ON TABLE privs TO testuser`)
 
-	// The above SELECT GRANT hangs if we leave the user conn open. Thus, we need
-	// to reinitialize it here.
-	testuser = startTestUser()
-	defer testuser.Close()
+	testuser = srv.ApplicationLayer().SQLConnForUser(t, "testuser", "")
 
 	_, err = testuser.Exec(`EXPORT INTO CSV 'nodelocal://1/privs' FROM TABLE privs`)
 	require.True(t, testutils.IsError(err,
@@ -674,8 +665,8 @@ func TestProcessorEncountersUncertaintyError(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	if tc.StartedDefaultTestTenant() {
-		sql.SecondaryTenantSplitAtEnabled.Override(ctx, &tc.Server(0).TenantOrServer().ClusterSettings().SV, true)
-		systemSqlDB := serverutils.OpenDBConn(t, tc.Server(0).SQLAddr(), "system", false, tc.Stopper())
+		sql.SecondaryTenantSplitAtEnabled.Override(ctx, &tc.Server(0).ApplicationLayer().ClusterSettings().SV, true)
+		systemSqlDB := tc.Server(0).SystemLayer().SQLConn(t, "system")
 		_, err := systemSqlDB.Exec(`ALTER TENANT [$1] GRANT CAPABILITY can_admin_relocate_range=true`, serverutils.TestTenantID().ToUint64())
 		require.NoError(t, err)
 		serverutils.WaitForTenantCapabilities(t, tc.Server(0), serverutils.TestTenantID(), map[tenantcapabilities.ID]string{
@@ -721,7 +712,7 @@ func TestProcessorEncountersUncertaintyError(t *testing.T) {
 		_, err := origDB0.Exec("SET CLUSTER SETTING sql.defaults.results_buffer.size = '0'")
 		require.NoError(t, err)
 		// Create a new connection that will use the new result buffer size.
-		defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.Server(0).ServingSQLAddr())
+		defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.ApplicationLayer(0).AdvSQLAddr())
 		defer cleanup()
 
 		atomic.StoreInt64(&trapRead, 1)
@@ -767,7 +758,7 @@ func TestProcessorEncountersUncertaintyError(t *testing.T) {
 		_, err := origDB0.Exec("SET CLUSTER SETTING sql.defaults.results_buffer.size = '524288'")
 		require.NoError(t, err)
 		// Create a new connection that will use the new results buffer size.
-		defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.Server(0).ServingSQLAddr())
+		defaultConn, cleanup := getPGXConnAndCleanupFunc(ctx, t, tc.ApplicationLayer(0).AdvSQLAddr())
 		defer cleanup()
 
 		// Reads are trapped but not blocked, so node 1 should immediately return a

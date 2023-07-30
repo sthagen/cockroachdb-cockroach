@@ -828,6 +828,13 @@ func TestLogic_fk(
 	runLogicTest(t, "fk")
 }
 
+func TestLogic_fk_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "fk_read_committed")
+}
+
 func TestLogic_float(
 	t *testing.T,
 ) {
@@ -1556,6 +1563,13 @@ func TestLogic_rand_ident(
 	runLogicTest(t, "rand_ident")
 }
 
+func TestLogic_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "read_committed")
+}
+
 func TestLogic_reassign_owned_by(
 	t *testing.T,
 ) {
@@ -1778,13 +1792,6 @@ func TestLogic_select_for_update(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "select_for_update")
-}
-
-func TestLogic_select_for_update_read_committed(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "select_for_update_read_committed")
 }
 
 func TestLogic_select_index(
@@ -2618,6 +2625,13 @@ func TestLogic_with(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "with")
+}
+
+func TestLogic_workload_indexrecs(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "workload_indexrecs")
 }
 
 func TestLogic_zero(

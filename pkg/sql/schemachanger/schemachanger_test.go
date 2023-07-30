@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -58,7 +57,6 @@ import (
 // schema changes operating on the same descriptors are performed serially.
 func TestConcurrentDeclarativeSchemaChanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 106732, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -99,9 +97,9 @@ func TestConcurrentDeclarativeSchemaChanges(t *testing.T) {
 	var params base.TestServerArgs
 	params.Knobs = base.TestingKnobs{
 		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
-			AfterWaitingForConcurrentSchemaChanges: func(stmts []string, wasBlocked bool) {
+			WhileWaitingForConcurrentSchemaChanges: func(stmts []string) {
 				for _, stmt := range stmts {
-					if wasBlocked && strings.Contains(stmt, "ALTER PRIMARY KEY") {
+					if strings.Contains(stmt, "ALTER PRIMARY KEY") {
 						alterPrimaryKeyBlockedCounter.Add(1)
 						return
 					}
@@ -126,7 +124,7 @@ func TestConcurrentDeclarativeSchemaChanges(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 	defer cancel()
-	codec := s.TenantOrServer().Codec()
+	codec := s.ApplicationLayer().Codec()
 
 	if _, err := sqlDB.Exec(`CREATE DATABASE t`); err != nil {
 		t.Fatal(err)
@@ -160,6 +158,14 @@ func TestConcurrentDeclarativeSchemaChanges(t *testing.T) {
 		}
 		wg.Done()
 	}()
+
+	// The ALTER PRIMARY KEY schema change must block.
+	testutils.SucceedsSoon(t, func() error {
+		if alterPrimaryKeyBlockedCounter.Load() == 0 {
+			return errors.New("waiting for concurrent schema change to block")
+		}
+		return nil
+	})
 
 	// Unblock the create index job.
 	continueNotif <- struct{}{}
@@ -254,7 +260,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		s, sqlDB, kvDB := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(ctx)
 		getTableDescriptor = func() catalog.TableDescriptor {
-			return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.TenantOrServer().Codec(), "db", "t")
+			return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.ApplicationLayer().Codec(), "db", "t")
 		}
 
 		tdb := sqlutils.MakeSQLRunner(sqlDB)
@@ -394,7 +400,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		s, sqlDB, kvDB := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(ctx)
 		getTableDescriptor = func() catalog.TableDescriptor {
-			return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.TenantOrServer().Codec(), "db", "t")
+			return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.ApplicationLayer().Codec(), "db", "t")
 		}
 
 		tdb := sqlutils.MakeSQLRunner(sqlDB)
@@ -694,7 +700,7 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 		s, sqlDB, kvDB := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(ctx)
 		getTableDescriptor = func() catalog.TableDescriptor {
-			return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.TenantOrServer().Codec(), "db", "t")
+			return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.ApplicationLayer().Codec(), "db", "t")
 		}
 
 		initialSchemaChange := func() error {
@@ -835,7 +841,7 @@ func TestSchemaChangerJobRunningStatus(t *testing.T) {
 
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
-	jr = s.TenantOrServer().JobRegistry().(*jobs.Registry)
+	jr = s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	tdb.Exec(t, `SET use_declarative_schema_changer = 'off'`)
@@ -979,7 +985,7 @@ func TestInsertDuringAddColumnNotWritingToCurrentPrimaryIndex(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	tenantID := serverutils.TestTenantID().ToUint64()
 	getTableDescriptor = func() catalog.TableDescriptor {
-		return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.TenantOrServer().Codec(), "db", "t")
+		return desctestutils.TestingGetPublicTableDescriptor(kvDB, s.ApplicationLayer().Codec(), "db", "t")
 	}
 
 	tdb := sqlutils.MakeSQLRunner(sqlDB)

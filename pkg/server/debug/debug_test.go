@@ -27,7 +27,7 @@ import (
 )
 
 // debugURL returns the root debug URL.
-func debugURL(s serverutils.TestTenantInterface) string {
+func debugURL(s serverutils.ApplicationLayerInterface) string {
 	return s.AdminURL().WithPath(debug.Endpoint).String()
 }
 
@@ -36,10 +36,10 @@ func debugURL(s serverutils.TestTenantInterface) string {
 func TestAdminDebugExpVar(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	jI, err := srvtestutils.GetJSON(ts, debugURL(ts)+"vars")
 	if err != nil {
@@ -59,10 +59,10 @@ func TestAdminDebugExpVar(t *testing.T) {
 func TestAdminDebugMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	jI, err := srvtestutils.GetJSON(ts, debugURL(ts)+"metrics")
 	if err != nil {
@@ -82,10 +82,10 @@ func TestAdminDebugMetrics(t *testing.T) {
 func TestAdminDebugPprof(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	body, err := srvtestutils.GetText(ts, debugURL(ts)+"pprof/block?debug=1")
 	if err != nil {
@@ -101,10 +101,10 @@ func TestAdminDebugPprof(t *testing.T) {
 func TestAdminDebugTrace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	tc := []struct {
 		segment, search string
@@ -128,9 +128,9 @@ func TestAdminDebugAuth(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	url := debugURL(ts)
 
@@ -182,9 +182,9 @@ func TestAdminDebugAuth(t *testing.T) {
 func TestAdminDebugRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	expURL := debugURL(ts)
 	origURL := expURL + "incorrect"

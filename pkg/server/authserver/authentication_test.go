@@ -90,7 +90,7 @@ func TestSSLEnforcement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		// This test is verifying the (unimplemented) authentication of SSL
 		// client certificates over HTTP endpoints. Web session authentication
 		// is disabled in order to avoid the need to authenticate the individual
@@ -206,7 +206,7 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	if util.RaceEnabled {
 		// The default bcrypt cost makes this test approximately 30s slower when the
@@ -323,7 +323,7 @@ func TestCreateSession(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	username := username.TestUserName()
 	if err := ts.CreateAuthUser(username, false /* isAdmin */); err != nil {
@@ -416,9 +416,9 @@ WHERE id = $1`
 func TestVerifySession(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	sessionUsername := username.TestUserName()
 	if err := ts.CreateAuthUser(sessionUsername, false /* isAdmin */); err != nil {
@@ -500,7 +500,7 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	const (
 		validUsername = "testuser"
@@ -588,12 +588,12 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 func TestLogoutClearsCookies(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(context.Background())
 
-	testFunc := func(ts serverutils.TestTenantInterface, expectTenantCookieInClearList bool) {
+	testFunc := func(ts serverutils.ApplicationLayerInterface, expectTenantCookieInClearList bool) {
 		// Log in.
 		authHTTPClient, _, err := ts.GetAuthenticatedHTTPClientAndCookie(
 			apiconstants.TestingUserName(), true, serverutils.SingleTenantSession,
@@ -636,7 +636,7 @@ func TestLogout(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	// Log in.
 	authHTTPClient, cookie, err := ts.GetAuthenticatedHTTPClientAndCookie(
@@ -714,9 +714,9 @@ func TestLogout(t *testing.T) {
 func TestAuthenticationMux(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	tsrv := s.TenantOrServer()
+	tsrv := s.ApplicationLayer()
 
 	// Both the normal and authenticated client will be used for each test.
 	normalClient, err := tsrv.GetUnauthenticatedHTTPClient()
@@ -800,10 +800,10 @@ func TestGRPCAuthentication(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 
 	// For each subsystem we pick a representative RPC. The idea is not to
 	// exhaustively test each RPC but to prevent server startup from being

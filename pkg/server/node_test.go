@@ -139,7 +139,7 @@ func TestBootstrapNewStore(t *testing.T) {
 
 	// Start server with persisted store so that it gets bootstrapped.
 	{
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{Path: path},
 			},
@@ -152,7 +152,7 @@ func TestBootstrapNewStore(t *testing.T) {
 		{InMemory: true},
 		{InMemory: true},
 	}
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: specs,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -221,8 +221,8 @@ func TestNodeJoin(t *testing.T) {
 	// Verify node1 sees node2 via gossip and vice versa.
 	node1Key := gossip.MakeNodeIDKey(s.Server(0).NodeID())
 	node2Key := gossip.MakeNodeIDKey(s.Server(1).NodeID())
-	server1Addr := s.Server(0).ServingRPCAddr()
-	server2Addr := s.Server(1).ServingRPCAddr()
+	server1Addr := s.Server(0).AdvRPCAddr()
+	server2Addr := s.Server(1).AdvRPCAddr()
 	testutils.SucceedsSoon(t, func() error {
 		var nodeDesc1 roachpb.NodeDescriptor
 		if err := s.Server(0).GossipI().(*gossip.Gossip).GetInfoProto(node2Key, &nodeDesc1); err != nil {
@@ -272,7 +272,7 @@ func TestCorruptedClusterID(t *testing.T) {
 		StoreID:   1,
 	}
 	if err := storage.MVCCPutProto(
-		ctx, e, nil /* ms */, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil /* txn */, &sIdent,
+		ctx, e, keys.StoreIdentKey(), hlc.Timestamp{}, &sIdent, storage.MVCCWriteOptions{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +595,7 @@ func TestStartNodeWithLocality(t *testing.T) {
 		args := base.TestServerArgs{
 			Locality: locality,
 		}
-		s, _, _ := serverutils.StartServer(t, args)
+		s := serverutils.StartServerOnly(t, args)
 		defer s.Stopper().Stop(ctx)
 
 		// Check that the locality is present both on the Node and was also
@@ -669,7 +669,7 @@ func TestNodeBatchRequestPProfLabels(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	observedProfileLabels := make(map[string]string)
-	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				TestingResponseFilter: func(ctx context.Context, ba *kvpb.BatchRequest, _ *kvpb.BatchResponse) *kvpb.Error {
@@ -732,7 +732,7 @@ func TestNodeBatchRequestMetricsInc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	srv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer srv.Stopper().Stop(context.Background())
 	ts := srv.(*TestServer)
 
@@ -840,7 +840,7 @@ func TestGetTenantWeights(t *testing.T) {
 		{InMemory: true},
 		{InMemory: true},
 	}
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: specs,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -938,8 +938,8 @@ func TestDiskStatsMap(t *testing.T) {
 	engineIDs := []roachpb.StoreID{10, 5}
 	for i := range engines {
 		ident := roachpb.StoreIdent{StoreID: engineIDs[i]}
-		require.NoError(t, storage.MVCCBlindPutProto(ctx, engines[i], nil, keys.StoreIdentKey(),
-			hlc.Timestamp{}, hlc.ClockTimestamp{}, &ident, nil))
+		require.NoError(t, storage.MVCCBlindPutProto(ctx, engines[i], keys.StoreIdentKey(),
+			hlc.Timestamp{}, &ident, storage.MVCCWriteOptions{}))
 	}
 	var dsm diskStatsMap
 	clusterProvisionedBW := int64(150)

@@ -1064,9 +1064,9 @@ func TestRegistryLifecycle(t *testing.T) {
 			rts.check(t, jobs.StatusSucceeded)
 
 			<-completeCh
-			checkTraceFiles(ctx, t, expectedNumFiles+1, j.ID(), rts.s)
+			checkTraceFiles(ctx, t, expectedNumFiles+2, j.ID(), rts.s)
 		}
-		pauseUnpauseJob(1)
+		pauseUnpauseJob(2)
 	})
 
 	t.Run("dump traces on fail", func(t *testing.T) {
@@ -1103,7 +1103,7 @@ func TestRegistryLifecycle(t *testing.T) {
 			checkTraceFiles(ctx, t, expectedNumFiles, j.ID(), rts.s)
 		}
 
-		runJobAndFail(1)
+		runJobAndFail(2)
 	})
 
 	t.Run("dump traces on cancel", func(t *testing.T) {
@@ -1126,7 +1126,7 @@ func TestRegistryLifecycle(t *testing.T) {
 		rts.sqlDB.Exec(t, "CANCEL JOB $1", j.ID())
 
 		<-completeCh
-		checkTraceFiles(rts.ctx, t, 1, j.ID(), rts.s)
+		checkTraceFiles(rts.ctx, t, 2, j.ID(), rts.s)
 
 		rts.mu.e.OnFailOrCancelStart = true
 		rts.check(t, jobs.StatusReverting)
@@ -1189,17 +1189,23 @@ func checkTraceFiles(
 ) {
 	t.Helper()
 
-	recordings := make([]jobspb.TraceData, 0)
-	execCfg := s.TenantOrServer().ExecutorConfig().(sql.ExecutorConfig)
+	recordings := make([][]byte, 0)
+	execCfg := s.ApplicationLayer().ExecutorConfig().(sql.ExecutorConfig)
 	edFiles, err := jobs.ListExecutionDetailFiles(ctx, execCfg.InternalDB, jobID)
 	require.NoError(t, err)
+	require.Len(t, edFiles, expectedNumFiles)
 
 	for _, f := range edFiles {
 		data, err := jobs.ReadExecutionDetailFile(ctx, f, execCfg.InternalDB, jobID)
 		require.NoError(t, err)
-		td := jobspb.TraceData{}
-		require.NoError(t, protoutil.Unmarshal(data, &td))
-		recordings = append(recordings, td)
+		// Trace files are dumped in `binpb` and `binpb.txt` format. The former
+		// should be unmarshal-able.
+		if strings.HasSuffix(f, "binpb") {
+			td := jobspb.TraceData{}
+			require.NoError(t, protoutil.Unmarshal(data, &td))
+			require.NotEmpty(t, td.CollectedSpans)
+		}
+		recordings = append(recordings, data)
 	}
 	if len(recordings) != expectedNumFiles {
 		t.Fatalf("expected %d entries but found %d", expectedNumFiles, len(recordings))
@@ -1221,7 +1227,7 @@ func TestJobLifecycle(t *testing.T) {
 	params.Knobs.JobsTestingKnobs = &jobs.TestingKnobs{DisableRegistryLifecycleManagent: true}
 	srv, sqlDB, _ := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(ctx)
-	s := srv.TenantOrServer()
+	s := srv.ApplicationLayer()
 
 	registry := s.JobRegistry().(*jobs.Registry)
 
@@ -1961,7 +1967,7 @@ func TestShowAutomaticJobs(t *testing.T) {
 	params.Knobs.UpgradeManager = &upgradebase.TestingKnobs{DontUseJobs: true}
 	s, rawSQLDB, _ := serverutils.StartServer(t, params)
 	ctx := context.Background()
-	r := s.TenantOrServer().JobRegistry().(*jobs.Registry)
+	r := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
 	defer s.Stopper().Stop(context.Background())
 
@@ -2109,7 +2115,7 @@ SELECT id, payload, progress FROM "".crdb_internal.system_jobs ORDER BY id DESC 
 	}
 
 	// Create 3 rows from the valid row, one of which is corrupted.
-	createJob(context.Background(), t, s.TenantOrServer().JobRegistry().(*jobs.Registry), jobID+1, payload, progress)
+	createJob(context.Background(), t, s.ApplicationLayer().JobRegistry().(*jobs.Registry), jobID+1, payload, progress)
 
 	// Create the second row with a corrupted progress field.
 	if _, err := sqlDB.Exec(`
@@ -2552,7 +2558,7 @@ func TestStartableJob(t *testing.T) {
 	defer jobs.ResetConstructors()()
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	jr := s.JobRegistry().(*jobs.Registry)
 	var resumeFunc atomic.Value
@@ -2747,7 +2753,7 @@ func TestStartableJobTxnRetry(t *testing.T) {
 	params.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: requestFilter,
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 	jr := s.JobRegistry().(*jobs.Registry)
 	jobs.RegisterConstructor(jobspb.TypeRestore, func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
@@ -2777,7 +2783,7 @@ func TestRegistryTestingNudgeAdoptionQueue(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 
@@ -3097,7 +3103,7 @@ func TestLoseLeaseDuringExecution(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Knobs: knobs})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{Knobs: knobs})
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 

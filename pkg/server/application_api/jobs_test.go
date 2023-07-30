@@ -417,13 +417,13 @@ func TestAdminAPIJobsDetails(t *testing.T) {
 func TestJobStatusResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ts, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer ts.Stopper().Stop(context.Background())
 
 	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := srvtestutils.NewRPCTestContext(context.Background(), ts.(*server.TestServer), rootConfig)
 
-	url := ts.ServingRPCAddr()
+	url := ts.AdvRPCAddr()
 	nodeID := ts.NodeID()
 	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
 	if err != nil {

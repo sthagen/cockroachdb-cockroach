@@ -471,6 +471,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		DB: NewInternalDB(
 			s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor,
 		),
+		ClusterID:      s.cfg.NodeInfo.LogicalClusterID,
 		SQLIDContainer: cfg.NodeInfo.NodeID,
 		JobRegistry:    s.cfg.JobRegistry,
 		Knobs:          cfg.SQLStatsTestingKnobs,
@@ -3433,21 +3434,6 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 	return ret
 }
 
-func kvTxnIsolationLevelToTree(level isolation.Level) tree.IsolationLevel {
-	var ret tree.IsolationLevel
-	switch level {
-	case isolation.Serializable:
-		ret = tree.SerializableIsolation
-	case isolation.ReadCommitted:
-		ret = tree.ReadCommittedIsolation
-	case isolation.Snapshot:
-		ret = tree.SnapshotIsolation
-	default:
-		log.Fatalf(context.Background(), "unknown isolation level: %s", level)
-	}
-	return ret
-}
-
 func txnPriorityToProto(mode tree.UserPriority) roachpb.UserPriority {
 	var pri roachpb.UserPriority
 	switch mode {
@@ -4003,7 +3989,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			Priority:              ex.state.priority.String(),
 			QualityOfService:      sessiondatapb.ToQoSLevelString(txn.AdmissionHeader().Priority),
 			LastAutoRetryReason:   autoRetryReasonStr,
-			IsolationLevel:        kvTxnIsolationLevelToTree(ex.state.isolationLevel).String(),
+			IsolationLevel:        tree.IsolationLevelFromKVTxnIsolationLevel(ex.state.isolationLevel).String(),
 		}
 	}
 

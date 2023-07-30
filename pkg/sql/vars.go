@@ -872,7 +872,7 @@ var varGen = map[string]sessionVar{
 	`enable_implicit_select_for_update`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_select_for_update`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("enabled_implicit_select_for_update", s)
+			b, err := paramparse.ParseBoolVar("enable_implicit_select_for_update", s)
 			if err != nil {
 				return err
 			}
@@ -1491,7 +1491,7 @@ var varGen = map[string]sessionVar{
 	// See https://github.com/postgres/postgres/blob/REL_10_STABLE/src/backend/utils/misc/guc.c#L3401-L3409
 	`transaction_isolation`: {
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
-			level := kvTxnIsolationLevelToTree(evalCtx.Txn.IsoLevel())
+			level := tree.IsolationLevelFromKVTxnIsolationLevel(evalCtx.Txn.IsoLevel())
 			return strings.ToLower(level.String()), nil
 		},
 		RuntimeSet: func(ctx context.Context, evalCtx *extendedEvalContext, local bool, s string) error {
@@ -2816,6 +2816,40 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseImprovedJoinElimination), nil
 		},
 		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`enable_implicit_fk_locking_for_serializable`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_fk_locking_for_serializable`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_implicit_fk_locking_for_serializable", s)
+			if err != nil {
+				return err
+			}
+			m.SetImplicitFKLockingForSerializable(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().ImplicitFKLockingForSerializable), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`enable_durable_locking_for_serializable`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_durable_locking_for_serializable`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_durable_locking_for_serializable", s)
+			if err != nil {
+				return err
+			}
+			m.SetDurableLockingForSerializable(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DurableLockingForSerializable), nil
+		},
+		GlobalDefault: globalFalse,
 	},
 }
 

@@ -57,7 +57,7 @@ func TestCopyLogging(t *testing.T) {
 			}
 
 			pgURL, cleanupGoDB, err := sqlutils.PGUrlE(
-				s.ServingSQLAddr(),
+				s.AdvSQLAddr(),
 				"StartServer", /* prefix */
 				url.User(username.RootUser),
 			)
@@ -70,9 +70,7 @@ func TestCopyLogging(t *testing.T) {
 
 			// We have to start a new connection every time to exercise all possible paths.
 			t.Run("success during COPY FROM", func(t *testing.T) {
-				db := serverutils.OpenDBConn(
-					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
-				require.NoError(t, err)
+				db := s.SQLConn(t, params.UseDatabase)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -104,8 +102,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error in statement", func(t *testing.T) {
-				db := serverutils.OpenDBConn(
-					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				db := s.SQLConn(t, params.UseDatabase)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -117,8 +114,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error during COPY FROM", func(t *testing.T) {
-				db := serverutils.OpenDBConn(
-					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				db := s.SQLConn(t, params.UseDatabase)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -134,8 +130,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error in statement during COPY FROM", func(t *testing.T) {
-				db := serverutils.OpenDBConn(
-					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				db := s.SQLConn(t, params.UseDatabase)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -147,8 +142,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error during insert phase of COPY FROM", func(t *testing.T) {
-				db := serverutils.OpenDBConn(
-					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				db := s.SQLConn(t, params.UseDatabase)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -177,8 +171,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("error during copy during COPY FROM", func(t *testing.T) {
-				db := serverutils.OpenDBConn(
-					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				db := s.SQLConn(t, params.UseDatabase)
 				txn, err := db.Begin()
 				require.NoError(t, err)
 				{
@@ -194,7 +187,7 @@ func TestCopyLogging(t *testing.T) {
 			})
 
 			t.Run("no privilege on table", func(t *testing.T) {
-				pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copy_test", url.User(username.TestUser))
+				pgURL, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copy_test", url.User(username.TestUser))
 				defer cleanup()
 				conn, err := pgx.Connect(ctx, pgURL.String())
 				require.NoError(t, err)

@@ -122,6 +122,7 @@ ORDER BY name ASC`)
 		assert.NoError(t, rows.Scan(&table))
 		tables = append(tables, table)
 	}
+	tables = append(tables, "crdb_internal.probe_ranges_1s_write_limit_100")
 	sort.Strings(tables)
 
 	var exp []string
@@ -298,6 +299,7 @@ create table defaultdb."../system"(x int);
 func TestUnavailableZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	skip.WithIssue(t, 107738, "flaky")
 	skip.UnderShort(t)
 	// Race builds make the servers so slow that they report spurious
 	// unavailability.
@@ -372,8 +374,8 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `postgresql://...`)
 	re = regexp.MustCompile(`(?m)SQL address: .*$`)
 	out = re.ReplaceAllString(out, `SQL address: ...`)
-	re = regexp.MustCompile(`(?m)log file:.*$`)
-	out = re.ReplaceAllString(out, `log file: ...`)
+	re = regexp.MustCompile(`(?m)^\[node \d+\] \[log file:.*$` + "\n")
+	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m)RPC connection to .*$`)
 	out = re.ReplaceAllString(out, `RPC connection to ...`)
 	re = regexp.MustCompile(`(?m)dial tcp .*$`)
@@ -532,7 +534,7 @@ func TestZipRetries(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{Insecure: true})
 	defer s.Stopper().Stop(context.Background())
 
 	dir, cleanupFn := testutils.TempDir(t)
@@ -555,7 +557,7 @@ func TestZipRetries(t *testing.T) {
 		sqlURL := url.URL{
 			Scheme:   "postgres",
 			User:     url.User(username.RootUser),
-			Host:     s.ServingSQLAddr(),
+			Host:     s.AdvSQLAddr(),
 			RawQuery: "sslmode=disable",
 		}
 		sqlConn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, sqlURL.String())

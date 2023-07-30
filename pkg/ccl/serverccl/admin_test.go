@@ -30,13 +30,13 @@ import (
 var adminPrefix = "/_admin/v1/"
 
 func getAdminJSONProto(
-	ts serverutils.TestTenantInterface, path string, response protoutil.Message,
+	ts serverutils.ApplicationLayerInterface, path string, response protoutil.Message,
 ) error {
 	return getAdminJSONProtoWithAdminOption(ts, path, response, true)
 }
 
 func getAdminJSONProtoWithAdminOption(
-	ts serverutils.TestTenantInterface, path string, response protoutil.Message, isAdmin bool,
+	ts serverutils.ApplicationLayerInterface, path string, response protoutil.Message, isAdmin bool,
 ) error {
 	return serverutils.GetJSONProtoWithAdminOption(ts, adminPrefix+path, response, isAdmin)
 }
@@ -63,7 +63,7 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	firstServer := testCluster.Server(0)
 
 	// Enable zone configs for secondary tenants.
-	systemSqlDb := serverutils.OpenDBConn(t, firstServer.SQLAddr(), "system", false, firstServer.Stopper())
+	systemSqlDb := firstServer.SystemLayer().SQLConn(t, "system")
 	_, err := systemSqlDb.Exec("ALTER TENANT ALL SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true")
 	require.NoError(t, err)
 
@@ -172,7 +172,7 @@ func TestListTenants(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
@@ -212,7 +212,7 @@ func TestTableAndDatabaseDetailsAndStats(t *testing.T) {
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	st := s.TenantOrServer()
+	st := s.ApplicationLayer()
 	_, err := db.Exec("CREATE TABLE test (id int)")
 	require.NoError(t, err)
 	_, err = db.Exec("INSERT INTO test VALUES (1)")

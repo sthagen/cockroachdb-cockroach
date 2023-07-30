@@ -51,7 +51,7 @@ func TestingReset() {
 // TestCLI wraps a test server and is used by tests to make assertions about the output of CLI commands.
 type TestCLI struct {
 	*server.TestServer
-	tenant      serverutils.TestTenantInterface
+	tenant      serverutils.ApplicationLayerInterface
 	certsDir    string
 	cleanupFunc func() error
 	prevStderr  *os.File
@@ -146,6 +146,8 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		}
 
 		args := base.TestServerArgs{
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+
 			Insecure:      params.Insecure,
 			SSLCertsDir:   c.certsDir,
 			StoreSpecs:    params.StoreSpecs,
@@ -163,14 +165,14 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		if params.NoNodelocal {
 			args.ExternalIODir = ""
 		}
-		s, err := serverutils.StartServerRaw(params.T, args)
+		s, err := serverutils.StartServerOnlyE(params.T, args)
 		if err != nil {
 			c.fail(err)
 		}
 		c.TestServer = s.(*server.TestServer)
 
-		log.Infof(context.Background(), "server started at %s", c.ServingRPCAddr())
-		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
+		log.Infof(context.Background(), "server started at %s", c.AdvRPCAddr())
+		log.Infof(context.Background(), "SQL listener at %s", c.AdvSQLAddr())
 	}
 
 	if params.TenantArgs != nil && params.SharedProcessTenantArgs != nil {
@@ -187,11 +189,17 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		if c.Insecure() {
 			params.TenantArgs.ForceInsecure = true
 		}
-		c.tenant, _ = serverutils.StartTenant(c.t, c.TestServer, *params.TenantArgs)
+		c.tenant, err = c.TestServer.StartTenant(context.Background(), *params.TenantArgs)
+		if err != nil {
+			c.fail(err)
+		}
 	}
 
 	if params.SharedProcessTenantArgs != nil {
-		c.tenant, _ = serverutils.StartSharedProcessTenant(c.t, c.TestServer, *params.SharedProcessTenantArgs)
+		c.tenant, _, err = c.TestServer.StartSharedProcessTenant(context.Background(), *params.SharedProcessTenantArgs)
+		if err != nil {
+			c.fail(err)
+		}
 		c.useSystemTenant = params.UseSystemTenant
 	}
 
@@ -222,17 +230,17 @@ func setCLIDefaultsForTests() {
 func (c *TestCLI) stopServer() {
 	if c.TestServer != nil {
 		log.Infof(context.Background(), "stopping server at %s / %s",
-			c.ServingRPCAddr(), c.ServingSQLAddr())
+			c.AdvRPCAddr(), c.AdvSQLAddr())
 		c.Stopper().Stop(context.Background())
 	}
 }
 
-// RestartServer stops and restarts the test server. The ServingRPCAddr() may
+// RestartServer stops and restarts the test server. The AdvRPCAddr() may
 // have changed after this method returns.
 func (c *TestCLI) RestartServer(params TestCLIParams) {
 	c.stopServer()
 	log.Info(context.Background(), "restarting server")
-	s, err := serverutils.StartServerRaw(params.T, base.TestServerArgs{
+	s, err := serverutils.StartServerOnlyE(params.T, base.TestServerArgs{
 		Insecure:    params.Insecure,
 		SSLCertsDir: c.certsDir,
 		StoreSpecs:  params.StoreSpecs,
@@ -242,7 +250,7 @@ func (c *TestCLI) RestartServer(params TestCLIParams) {
 	}
 	c.TestServer = s.(*server.TestServer)
 	log.Infof(context.Background(), "restarted server at %s / %s",
-		c.ServingRPCAddr(), c.ServingSQLAddr())
+		c.AdvRPCAddr(), c.AdvSQLAddr())
 	if params.TenantArgs != nil {
 		if c.Insecure() {
 			params.TenantArgs.ForceInsecure = true
@@ -357,14 +365,14 @@ func (c TestCLI) getRPCAddr() string {
 	if c.tenant != nil && !c.useSystemTenant {
 		return c.tenant.RPCAddr()
 	}
-	return c.ServingRPCAddr()
+	return c.AdvRPCAddr()
 }
 
 func (c TestCLI) getSQLAddr() string {
 	if c.tenant != nil {
 		return c.tenant.SQLAddr()
 	}
-	return c.ServingSQLAddr()
+	return c.AdvSQLAddr()
 }
 
 // RunWithArgs add args according to TestCLI cfg.

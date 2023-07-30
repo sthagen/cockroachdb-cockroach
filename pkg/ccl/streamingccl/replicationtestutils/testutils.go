@@ -100,7 +100,7 @@ type TenantStreamingClusters struct {
 	SrcSysServer    serverutils.TestServerInterface
 	SrcSysSQL       *sqlutils.SQLRunner
 	SrcTenantSQL    *sqlutils.SQLRunner
-	SrcTenantServer serverutils.TestTenantInterface
+	SrcTenantServer serverutils.ApplicationLayerInterface
 	SrcURL          url.URL
 	SrcCleanup      func()
 
@@ -150,11 +150,7 @@ func (c *TenantStreamingClusters) init() {
 func (c *TenantStreamingClusters) StartDestTenant(ctx context.Context) func() error {
 	c.DestSysSQL.Exec(c.T, `ALTER TENANT $1 START SERVICE SHARED`, c.Args.DestTenantName)
 
-	destTenantConn, err := serverutils.OpenDBConnE(
-		c.DestCluster.Server(0).SQLAddr(), "cluster:"+string(c.Args.DestTenantName)+"/",
-		false, /* insecure */
-		c.DestCluster.Server(0).Stopper())
-	require.NoError(c.T, err)
+	destTenantConn := c.DestCluster.Server(0).SystemLayer().SQLConn(c.T, "cluster:"+string(c.Args.DestTenantName)+"/defaultdb")
 
 	c.DestTenantConn = destTenantConn
 	c.DestTenantSQL = sqlutils.MakeSQLRunner(destTenantConn)
@@ -291,7 +287,7 @@ func startC2CTestCluster(
 	c := testcluster.StartTestCluster(t, numNodes, params)
 	c.Server(0).Clock().Now()
 	// TODO(casper): support adding splits when we have multiple nodes.
-	pgURL, cleanupSinkCert := sqlutils.PGUrl(t, c.Server(0).ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+	pgURL, cleanupSinkCert := sqlutils.PGUrl(t, c.Server(0).AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	return c, pgURL, func() {
 		c.Stopper().Stop(ctx)
 		cleanupSinkCert()
@@ -424,8 +420,11 @@ func requireReplicatedTime(targetTime hlc.Timestamp, progress *jobspb.Progress) 
 }
 
 func CreateScatteredTable(t *testing.T, c *TenantStreamingClusters, numNodes int) {
-	// Create a source table with multiple ranges spread across multiple nodes
-	numRanges := 10
+	// Create a source table with multiple ranges spread across multiple nodes. We
+	// need around 50 or more ranges because there are already over 50 system
+	// ranges, so if we write just a few ranges those might all be on a single
+	// server, which will cause the test to flake.
+	numRanges := 50
 	rowsPerRange := 20
 	c.SrcTenantSQL.Exec(t, "CREATE TABLE d.scattered (key INT PRIMARY KEY)")
 	c.SrcTenantSQL.Exec(t, "INSERT INTO d.scattered (key) SELECT * FROM generate_series(1, $1)",

@@ -454,7 +454,7 @@ func TestExportRequestWithCPULimitResumeSpans(t *testing.T) {
 
 	defer tc.Stopper().Stop(context.Background())
 
-	s := tc.TenantOrServer(0)
+	s := tc.ApplicationLayer(0)
 	sqlDB := tc.Conns[0]
 	db := sqlutils.MakeSQLRunner(sqlDB)
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
@@ -808,7 +808,7 @@ func TestRandomKeyAndTimestampExport(t *testing.T) {
 			valueSize := randutil.RandIntInRange(rnd, averageValueSize-100, averageValueSize+100)
 			value := roachpb.MakeValueFromBytes(randutil.RandBytes(rnd, valueSize))
 			value.InitChecksum(key)
-			if err := storage.MVCCPut(ctx, batch, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+			if err := storage.MVCCPut(ctx, batch, key, ts, value, storage.MVCCWriteOptions{}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -819,7 +819,7 @@ func TestRandomKeyAndTimestampExport(t *testing.T) {
 				ts = hlc.Timestamp{WallTime: int64(curWallTime), Logical: int32(curLogical)}
 				value = roachpb.MakeValueFromBytes(randutil.RandBytes(rnd, 200))
 				value.InitChecksum(key)
-				if err := storage.MVCCPut(ctx, batch, nil, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+				if err := storage.MVCCPut(ctx, batch, key, ts, value, storage.MVCCWriteOptions{}); err != nil {
 					t.Fatal(err)
 				}
 			}

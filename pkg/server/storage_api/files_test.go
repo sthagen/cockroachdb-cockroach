@@ -40,7 +40,7 @@ func TestStatusGetFiles(t *testing.T) {
 
 	storeSpec := base.StoreSpec{Path: tempDir}
 
-	tsI, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	tsI := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{
 			storeSpec,
 		},
@@ -51,7 +51,7 @@ func TestStatusGetFiles(t *testing.T) {
 	rootConfig := testutils.NewTestBaseContext(username.RootUserName())
 	rpcContext := srvtestutils.NewRPCTestContext(context.Background(), ts, rootConfig)
 
-	url := ts.ServingRPCAddr()
+	url := ts.AdvRPCAddr()
 	nodeID := ts.NodeID()
 	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(context.Background())
 	if err != nil {

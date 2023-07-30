@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -30,6 +31,7 @@ import (
 func TestTelemetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 	skip.UnderRace(t, "takes >1min under race")
 	skip.UnderDeadlock(t, "takes >1min under deadlock")
 
@@ -52,7 +54,7 @@ func TestTelemetryRecordCockroachShell(t *testing.T) {
 
 	pgUrl, cleanupFn := sqlutils.PGUrl(
 		t,
-		cluster.Server(0).ServingSQLAddr(),
+		cluster.Server(0).AdvSQLAddr(),
 		"TestTelemetryRecordCockroachShell",
 		url.User("root"),
 	)

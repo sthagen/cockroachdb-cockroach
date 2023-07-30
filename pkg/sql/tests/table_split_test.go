@@ -16,7 +16,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -30,9 +29,9 @@ func TestSplitAtTableBoundary(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.Background())
-	s := tc.TenantOrServer(0)
+	s := tc.ApplicationLayer(0)
 
-	runner := sqlutils.MakeSQLRunner(serverutils.OpenDBConn(t, s.SQLAddr(), "system", false, tc.Stopper()))
+	runner := sqlutils.MakeSQLRunner(s.SQLConn(t, "system"))
 	runner.Exec(t, `CREATE DATABASE test`)
 	runner.Exec(t, `CREATE TABLE test.t (k SERIAL PRIMARY KEY, v INT)`)
 

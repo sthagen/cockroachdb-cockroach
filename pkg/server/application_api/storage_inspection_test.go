@@ -125,8 +125,7 @@ func TestRangeCount(t *testing.T) {
 	}
 
 	getRangeCountFromFullSpan := func() int64 {
-		ts := s.(*server.TestServer)
-		stats, err := ts.TestingStatsForSpan(context.Background(), roachpb.Span{
+		stats, err := s.StatsForSpan(context.Background(), roachpb.Span{
 			Key:    keys.LocalMax,
 			EndKey: keys.MaxKey,
 		})
@@ -172,14 +171,13 @@ func TestStatsforSpanOnLocalMax(t *testing.T) {
 	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 	firstServer := testCluster.Server(0)
-	ts := firstServer.(*server.TestServer)
 
 	underTest := roachpb.Span{
 		Key:    keys.LocalMax,
 		EndKey: keys.SystemPrefix,
 	}
 
-	_, err := ts.TestingStatsForSpan(context.Background(), underTest)
+	_, err := firstServer.StatsForSpan(context.Background(), underTest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +453,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	ts := s.(*server.TestServer)
 
@@ -471,7 +469,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 		Spans:  []roachpb.Span{span},
 	}
 
-	url := ts.ServingRPCAddr()
+	url := ts.AdvRPCAddr()
 	nodeID := ts.NodeID()
 	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
 	if err != nil {

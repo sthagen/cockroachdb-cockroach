@@ -585,6 +585,38 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestStartServer", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`, _, _ :?= serverutils\.StartServer\(`,
+			"--",
+			"*_test.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'serverutils.StartServerOnly' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestSQLTelemetryDirectCount", func(t *testing.T) {
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(
@@ -917,6 +949,7 @@ func TestLint(t *testing.T) {
 			"--",
 			"*.go",
 			":!util/timeutil/context.go",
+			":!server/testserver_sqlconn.go",
 			// TODO(jordan): ban these too?
 			":!server/debug/**",
 			":!workload/**",
@@ -2025,6 +2058,41 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestColbuilderSimpleProject", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			// We prohibit usage of colexecbase.NewSimpleProjectOp outside of
+			// addProjection helper in colbuilder package.
+			`colexecbase\.NewSimpleProjectOp`,
+			"--",
+			"sql/colexec/colbuilder*",
+			":!sql/colexec/colbuilder/execplan_util.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use addProjection to prevent type schema corruption", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestGCAssert", func(t *testing.T) {
 		skip.UnderShort(t)
 
@@ -2194,7 +2262,6 @@ func TestLint(t *testing.T) {
 			":!ccl/changefeedccl/helpers_test.go",
 			":!ccl/changefeedccl/parquet_test.go",
 			":!ccl/changefeedccl/scheduled_changefeed_test.go",
-			":!ccl/changefeedccl/schemafeed/table_event_filter_datadriven_test.go",
 			":!ccl/importerccl/ccl_test.go",
 			":!ccl/kvccl/kvfollowerreadsccl/boundedstaleness_test.go",
 			":!ccl/kvccl/kvfollowerreadsccl/followerreads_test.go",
@@ -2228,7 +2295,6 @@ func TestLint(t *testing.T) {
 			":!server/application_api/insights_test.go",
 			":!server/application_api/jobs_test.go",
 			":!server/application_api/query_plan_test.go",
-			":!server/application_api/schema_inspection_test.go",
 			":!server/application_api/security_test.go",
 			":!server/application_api/zcfg_test.go",
 			":!server/grpc_gateway_test.go",
@@ -2242,7 +2308,6 @@ func TestLint(t *testing.T) {
 			":!sql/importer/read_import_mysql_test.go",
 			":!sql/schemachanger/sctest/test_server_factory.go",
 			":!sql/sqlinstance/instancestorage/instancecache_test.go",
-			":!sql/sqltestutils/telemetry.go",
 			":!sql/tests/server_params.go",
 			":!sql/ttl/ttljob/ttljob_test.go",
 			":!testutils/lint/lint_test.go",

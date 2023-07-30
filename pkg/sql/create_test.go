@@ -157,7 +157,7 @@ func TestParallelCreateTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Get the id descriptor generator count.
-	s := tc.Servers[0].TenantOrServer()
+	s := tc.Servers[0].ApplicationLayer()
 	idgen := descidgen.NewGenerator(s.ClusterSettings(), s.Codec(), s.DB())
 	descIDStart, err := idgen.PeekNextUniqueDescID(context.Background())
 	if err != nil {
@@ -212,7 +212,7 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 	}
 
 	// Get the id descriptor generator count.
-	s := tc.Servers[0].TenantOrServer()
+	s := tc.Servers[0].ApplicationLayer()
 	idgen := descidgen.NewGenerator(s.ClusterSettings(), s.Codec(), s.DB())
 	descIDStart, err := idgen.PeekNextUniqueDescID(context.Background())
 	if err != nil {
@@ -312,11 +312,13 @@ SELECT * FROM t.kv%d
 func TestCreateStatementType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
-	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+	// This test does not use s.SQLConn() because it cares about looking
+	// at the statement tags in responses.
+	pgURL, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	pgxConfig, err := pgx.ParseConfig(pgURL.String())
 	if err != nil {

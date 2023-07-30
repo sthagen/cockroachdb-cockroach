@@ -313,7 +313,7 @@ func TestCopyFromBinary(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
+		t, s.AdvSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
 	defer cleanupGoDB()
 	conn, err := pgx.Connect(ctx, pgURL.String())
 	if err != nil {
@@ -524,7 +524,7 @@ func TestCopyFromRetries(t *testing.T) {
 
 			// Use pgx instead of lib/pq as pgx doesn't require copy to be in a txn.
 			pgURL, cleanupGoDB := sqlutils.PGUrl(
-				t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
+				t, s.AdvSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
 			defer cleanupGoDB()
 			pgxConn, err := pgx.Connect(ctx, pgURL.String())
 			require.NoError(t, err)
@@ -684,7 +684,7 @@ func TestCopyInReleasesLeases(t *testing.T) {
 	tdb.Exec(t, `GRANT admin TO foo`)
 
 	userURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(t,
-		s.ServingSQLAddr(), t.Name(), url.UserPassword("foo", "testabc"),
+		s.AdvSQLAddr(), t.Name(), url.UserPassword("foo", "testabc"),
 		false /* withClientCerts */)
 	defer cleanupFn()
 	conn, err := sqltestutils.PGXConn(t, userURL)
@@ -721,10 +721,10 @@ func TestMessageSizeTooBig(t *testing.T) {
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 	defer cleanup()
 	var sqlConnCtx clisqlclient.Context
 	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
@@ -766,10 +766,10 @@ func TestCopyExceedsSQLMemory(t *testing.T) {
 					params := base.TestServerArgs{
 						SQLMemoryPoolSize: 10 << 20,
 					}
-					s, _, _ := serverutils.StartServer(t, params)
+					s := serverutils.StartServerOnly(t, params)
 					defer s.Stopper().Stop(ctx)
 
-					url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+					url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 					defer cleanup()
 					var sqlConnCtx clisqlclient.Context
 					conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())

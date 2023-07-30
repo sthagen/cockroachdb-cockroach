@@ -75,10 +75,8 @@ import (
 func TestSelfBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{})
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if s.RPCContext().StorageClusterID.Get() == uuid.Nil {
@@ -88,10 +86,9 @@ func TestSelfBootstrap(t *testing.T) {
 
 func TestPanicRecovery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
+	defer log.ScopeWithoutShowLogs(t).Close(t)
 
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{})
-	require.NoError(t, err)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
@@ -131,16 +128,13 @@ func TestHealthCheck(t *testing.T) {
 
 	cfg := zonepb.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
 				DefaultZoneConfigOverride: &cfg,
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer s.Stopper().Stop(context.Background())
 
 	ctx := context.Background()
@@ -218,7 +212,7 @@ func TestServerStartClock(t *testing.T) {
 			},
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	// Run a command so that we are sure to touch the timestamp cache. This is
@@ -246,7 +240,7 @@ func TestServerStartClock(t *testing.T) {
 func TestPlainHTTPServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		// The default context uses embedded certs.
 		Insecure: true,
 	})
@@ -292,7 +286,7 @@ func TestPlainHTTPServer(t *testing.T) {
 func TestSecureHTTPRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
@@ -343,7 +337,7 @@ func TestSecureHTTPRedirect(t *testing.T) {
 func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	client, err := s.GetAdminHTTPClient()
 	if err != nil {
@@ -421,14 +415,11 @@ func TestListenerFileCreation(t *testing.T) {
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{{
 			Path: dir,
 		}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer s.Stopper().Stop(context.Background())
 
 	files, err := filepath.Glob(filepath.Join(dir, "cockroach.*"))
@@ -438,9 +429,9 @@ func TestListenerFileCreation(t *testing.T) {
 
 	li := listenerInfo{
 		listenRPC:    s.RPCAddr(),
-		advertiseRPC: s.ServingRPCAddr(),
+		advertiseRPC: s.AdvRPCAddr(),
 		listenSQL:    s.SQLAddr(),
-		advertiseSQL: s.ServingSQLAddr(),
+		advertiseSQL: s.AdvSQLAddr(),
 		listenHTTP:   s.HTTPAddr(),
 	}
 	expectedFiles := li.Iter()
@@ -484,9 +475,8 @@ func TestClusterIDMismatch(t *testing.T) {
 			StoreID:   roachpb.StoreID(i + 1),
 		}
 		if err := storage.MVCCPutProto(
-			context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &sIdent,
+			context.Background(), e, keys.StoreIdentKey(), hlc.Timestamp{}, &sIdent, storage.MVCCWriteOptions{},
 		); err != nil {
-
 			t.Fatal(err)
 		}
 		engines[i] = e
@@ -756,7 +746,7 @@ func TestServeIndexHTML(t *testing.T) {
 	}
 
 	t.Run("Insecure mode", func(t *testing.T) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{
 			Insecure: true,
 		})
 		defer s.Stopper().Stop(ctx)
@@ -823,7 +813,7 @@ Binary built without web UI.
 	t.Run("Secure mode", func(t *testing.T) {
 		linkInFakeUI()
 		defer unlinkFakeUI()
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
 
@@ -906,7 +896,7 @@ Binary built without web UI.
 			ui.Assets = nil
 		}()
 
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
 
@@ -1064,8 +1054,7 @@ func TestSQLDecommissioned(t *testing.T) {
 		require.True(t, ok, "expected gRPC status error, got %T: %s", err, err)
 		require.Equal(t, codes.PermissionDenied, s.Code())
 
-		sqlClient, err := serverutils.OpenDBConnE(decomSrv.ServingSQLAddr(), "", true, tc.Stopper())
-		require.NoError(t, err)
+		sqlClient := decomSrv.SQLConn(t, "")
 
 		var result int
 		err = sqlClient.QueryRow("SELECT 1").Scan(&result)
@@ -1088,8 +1077,8 @@ func TestAssertEnginesEmpty(t *testing.T) {
 
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
-	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.DeprecatedStoreClusterVersionKey(),
-		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}))
+	require.NoError(t, storage.MVCCPutProto(ctx, eng, keys.DeprecatedStoreClusterVersionKey(),
+		hlc.Timestamp{}, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}, storage.MVCCWriteOptions{}))
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
 	batch := eng.NewBatch()
@@ -1208,7 +1197,7 @@ func TestSocketAutoNumbering(t *testing.T) {
 		Insecure:   true,
 		SocketFile: socketFile,
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 
 	_, expectedPort, err := addr.SplitHostPort(s.SQLAddr(), "")
@@ -1224,7 +1213,7 @@ func TestInternalSQL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	conf, err := pgx.ParseConfig("")

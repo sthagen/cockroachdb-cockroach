@@ -69,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -896,7 +897,7 @@ func TestBackupAndRestoreJobDescription(t *testing.T) {
 	resolvedAsOfCollectionURIs := getResolvedCollectionURIs(collections, asOf1)
 
 	sqlDB.CheckQueryResults(
-		t, "SELECT description FROM [SHOW JOBS] WHERE job_type='RESTORE'",
+		t, "SELECT description FROM [SHOW JOBS] WHERE job_type='RESTORE' ORDER BY created",
 		[][]string{
 			{fmt.Sprintf("RESTORE DATABASE data FROM ('%s', '%s', '%s')",
 				backups[0].(string), backups[1].(string), backups[2].(string))},
@@ -1005,7 +1006,7 @@ func backupAndRestore(
 ) {
 	conn := tc.Conns[0]
 	sqlDB := sqlutils.MakeSQLRunner(conn)
-	storageConn := tc.StorageClusterConn()
+	storageConn := tc.SystemLayer(0).SQLConn(t, "")
 	storageSQLDB := sqlutils.MakeSQLRunner(storageConn)
 	storageSQLDB.Exec(t, "SET DATABASE=defaultdb")
 	{
@@ -1812,7 +1813,7 @@ func TestBackupRestoreResume(t *testing.T) {
 	const numAccounts = 1000
 	tc, outerDB, dir, cleanupFn := backupRestoreTestSetupWithParams(t, multiNode, numAccounts, InitManualReplication, params)
 	defer cleanupFn()
-	srv := tc.TenantOrServer(0)
+	srv := tc.ApplicationLayer(0)
 	codec := keys.MakeSQLCodec(srv.RPCContext().TenantID)
 	clusterID := srv.RPCContext().LogicalClusterID.Get()
 	backupTableDesc := desctestutils.TestingGetPublicTableDescriptor(tc.Servers[0].DB(), codec, "data", "bank")
@@ -1895,7 +1896,7 @@ func TestBackupRestoreResume(t *testing.T) {
 		sqlDB.Exec(t, `BACKUP DATABASE DATA TO $1`, restoreDir)
 		sqlDB.Exec(t, `CREATE DATABASE restoredb`)
 		restoreDatabaseID := sqlutils.QueryDatabaseID(t, sqlDB.DB, "restoredb")
-		restoreTableID, err := tc.TenantOrServer(0).ExecutorConfig().(sql.ExecutorConfig).DescIDGenerator.GenerateUniqueDescID(ctx)
+		restoreTableID, err := tc.ApplicationLayer(0).ExecutorConfig().(sql.ExecutorConfig).DescIDGenerator.GenerateUniqueDescID(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -5440,7 +5441,7 @@ func TestBackupRestoreSequenceOwnership(t *testing.T) {
 	origDB.Exec(t, `BACKUP DATABASE d TO $1`, backupLoc)
 
 	getTableDescriptorFromTestCluster := func(tc *testcluster.TestCluster, database string, table string) catalog.TableDescriptor {
-		srv := tc.TenantOrServer(0)
+		srv := tc.ApplicationLayer(0)
 		return desctestutils.TestingGetPublicTableDescriptor(srv.DB(), srv.Codec(), database, table)
 	}
 
@@ -5843,7 +5844,7 @@ func TestBatchedInsertStats(t *testing.T) {
 	}}
 	server, db, _ := serverutils.StartServer(t, params)
 	defer server.Stopper().Stop(context.Background())
-	s := server.TenantOrServer()
+	s := server.ApplicationLayer()
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	ctx := context.Background()
 	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
@@ -6392,7 +6393,7 @@ func TestRestoreErrorPropagates(t *testing.T) {
 	runner := sqlutils.MakeSQLRunner(db)
 
 	jobsTableKey.Lock()
-	jobsTableKey.key = tc.TenantOrServer(0).Codec().TablePrefix(uint32(systemschema.JobsTable.GetID()))
+	jobsTableKey.key = tc.ApplicationLayer(0).Codec().TablePrefix(uint32(systemschema.JobsTable.GetID()))
 	jobsTableKey.Unlock()
 
 	runner.Exec(t, `SET CLUSTER SETTING jobs.metrics.interval.poll = '30s'`)
@@ -7066,7 +7067,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`, `true`, `tenant-10`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "10"}`,
 				},
 			},
@@ -7093,6 +7094,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreConn10 = nil
 
 		// Mark tenant as DROP.
+		restoreDB.Exec(t, `ALTER TENANT [10] STOP SERVICE`)
 		restoreDB.Exec(t, `DROP TENANT [10]`)
 		restoreDB.CheckQueryResults(t,
 			`select id, active, name, data_state, service_mode, crdb_internal.pb_to_json('cockroach.multitenant.ProtoInfo', info) from system.tenants`,
@@ -7141,14 +7143,19 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`, `true`, `tenant-10`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "10"}`,
 				},
 			},
 		)
 
+		tenantID := roachpb.MustMakeTenantID(10)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn10 = serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: tenantID},
 		)
 		defer restoreConn10.Close()
 		restoreTenant10 = sqlutils.MakeSQLRunner(restoreConn10)
@@ -7156,6 +7163,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreTenant10.CheckQueryResults(t, `select * from foo.bar`, tenant10.QueryStr(t, `select * from foo.bar`))
 		restoreTenant10.CheckQueryResults(t, `select * from foo.bar2`, tenant10.QueryStr(t, `select * from foo.bar2`))
 
+		restoreDB.Exec(t, `ALTER TENANT [10] STOP SERVICE`)
 		restoreDB.Exec(t, `DROP TENANT [10]`)
 		// Wait for tenant GC job to complete.
 		restoreDB.CheckQueryResultsRetry(
@@ -7187,7 +7195,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`, `true`, `tenant-10`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "10"}`,
 				},
 			},
@@ -7227,14 +7235,19 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`, `true`, `tenant-10`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "10"}`,
 				},
 			},
 		)
 
+		tenantID := roachpb.MustMakeTenantID(10)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn10 := serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: tenantID},
 		)
 		defer restoreConn10.Close()
 		restoreTenant10 := sqlutils.MakeSQLRunner(restoreConn10)
@@ -7284,26 +7297,31 @@ func TestBackupRestoreTenant(t *testing.T) {
 				{
 					`10`, `true`, `tenant-10`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "10"}`,
 				},
 				{
 					`11`, `true`, `tenant-11`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "11"}`,
 				},
 				{
 					`20`, `true`, `tenant-20`,
 					strconv.Itoa(int(mtinfopb.DataStateReady)),
-					strconv.Itoa(int(mtinfopb.ServiceModeNone)),
+					strconv.Itoa(int(mtinfopb.ServiceModeExternal)),
 					`{"capabilities": {"canUseNodelocalStorage": true}, "deprecatedId": "20"}`,
 				},
 			},
 		)
 
+		tenantID := roachpb.MustMakeTenantID(10)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn10 := serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: tenantID},
 		)
 		defer restoreConn10.Close()
 		restoreTenant10 := sqlutils.MakeSQLRunner(restoreConn10)
@@ -7315,8 +7333,13 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreTenant10.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.read_payload_cost_per_mebibyte`, [][]string{{"123"}})
 		restoreTenant10.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.write_payload_cost_per_mebibyte`, [][]string{{"456"}})
 
+		tenantID = roachpb.MustMakeTenantID(11)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn11 := serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(11)},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: tenantID},
 		)
 		defer restoreConn11.Close()
 		restoreTenant11 := sqlutils.MakeSQLRunner(restoreConn11)
@@ -7326,9 +7349,16 @@ func TestBackupRestoreTenant(t *testing.T) {
 		// Check the all-tenant override.
 		restoreTenant11.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.read_payload_cost_per_mebibyte`, [][]string{{"123"}})
 
+		restoreDB.Exec(t, `ALTER TENANT [20] STOP SERVICE`)
 		restoreDB.Exec(t, `DROP TENANT [20] IMMEDIATE`)
 
-		restoreDB.Exec(t, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH virtual_cluster_name = 'tenant-20'`)
+		restoreDB.Exec(t, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH virtual_cluster = '20', virtual_cluster_name = 'tenant-20'`)
+
+		tenantID = roachpb.MustMakeTenantID(20)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn20 := serverutils.StartTenant(
 			t, restoreTC.Server(0), base.TestTenantArgs{TenantName: "tenant-20", DisableCreateTenant: true},
 		)
@@ -7341,6 +7371,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreTenant20.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.read_payload_cost_per_mebibyte`, [][]string{{"123"}})
 
 		// Remove tenant 11, then confirm restoring 11 over 10 fails.
+		restoreDB.Exec(t, `ALTER TENANT [11] STOP SERVICE`)
 		restoreDB.Exec(t, `DROP TENANT [11] IMMEDIATE`)
 		restoreDB.ExpectErr(t, `exists`, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH virtual_cluster_name = 'tenant-10'`)
 
@@ -7360,8 +7391,13 @@ func TestBackupRestoreTenant(t *testing.T) {
 
 		restoreDB.Exec(t, `RESTORE TENANT 10 FROM 'nodelocal://1/t10' AS OF SYSTEM TIME `+ts1)
 
+		tenantID := roachpb.MustMakeTenantID(10)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn10 := serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: tenantID},
 		)
 		defer restoreConn10.Close()
 		restoreTenant10 := sqlutils.MakeSQLRunner(restoreConn10)
@@ -7381,8 +7417,13 @@ func TestBackupRestoreTenant(t *testing.T) {
 
 		restoreDB.Exec(t, `RESTORE TENANT 20 FROM 'nodelocal://1/t20'`)
 
+		tenantID := roachpb.MustMakeTenantID(20)
+		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+			t.Fatal(err)
+		}
+
 		_, restoreConn20 := serverutils.StartTenant(
-			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(20)},
+			t, restoreTC.Server(0), base.TestTenantArgs{TenantID: tenantID},
 		)
 		defer restoreConn20.Close()
 		restoreTenant20 := sqlutils.MakeSQLRunner(restoreConn20)
@@ -7471,7 +7512,7 @@ func TestClientDisconnect(t *testing.T) {
 			// Make credentials for the new connection.
 			sqlDB.Exec(t, `CREATE USER testuser`)
 			sqlDB.Exec(t, `GRANT admin TO testuser`)
-			pgURL, cleanup := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(),
+			pgURL, cleanup := sqlutils.PGUrl(t, tc.ApplicationLayer(0).AdvSQLAddr(),
 				"TestClientDisconnect-testuser", url.User("testuser"))
 			defer cleanup()
 
@@ -8578,7 +8619,7 @@ func TestRestoreJobEventLogging(t *testing.T) {
 
 	var forceFailure bool
 	for i := range tc.Servers {
-		tc.TenantOrServer(i).JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
+		tc.ApplicationLayer(i).JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
 			jobspb.TypeRestore,
 			func(raw jobs.Resumer) jobs.Resumer {
 				r := raw.(*restoreResumer)
@@ -8691,7 +8732,7 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 	)
 	defer cleanupFn()
 	kvDB := tc.Server(0).DB()
-	codec := tc.TenantOrServer(0).ExecutorConfig().(sql.ExecutorConfig).Codec
+	codec := tc.ApplicationLayer(0).ExecutorConfig().(sql.ExecutorConfig).Codec
 
 	locationToDir := func(location string) string {
 		return strings.Replace(location, localFoo, filepath.Join(rawDir, "foo"), 1)
@@ -9769,7 +9810,7 @@ func TestBackupRestoreSystemUsers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	sqlDB, tempDir, cleanupFn := createEmptyCluster(t, singleNode)
+	_, sqlDB, tempDir, cleanupFn := backuptestutils.StartBackupRestoreTestCluster(t, singleNode)
 	_, sqlDBRestore, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{})
 	defer cleanupFn()
 	defer cleanupEmptyCluster()
@@ -10183,7 +10224,7 @@ func TestBackupNoOverwriteCheckpoint(t *testing.T) {
 
 	// List all the BACKUP-CHECKPOINTS in the progress directory and see
 	// if there are as many as we'd expect if none got overwritten.
-	execCfg := tc.TenantOrServer(0).ExecutorConfig().(sql.ExecutorConfig)
+	execCfg := tc.ApplicationLayer(0).ExecutorConfig().(sql.ExecutorConfig)
 	ctx := context.Background()
 	store, err := execCfg.DistSQLSrv.ExternalStorageFromURI(ctx, "userfile:///a", username.RootUserName())
 	require.NoError(t, err)
@@ -10412,7 +10453,7 @@ func TestBackupRestoreTelemetryEvents(t *testing.T) {
 
 	var forceFailure bool
 	for i := range tc.Servers {
-		tc.TenantOrServer(i).JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
+		tc.ApplicationLayer(i).JobRegistry().(*jobs.Registry).TestingWrapResumerConstructor(
 			jobspb.TypeRestore,
 			func(raw jobs.Resumer) jobs.Resumer {
 				r := raw.(*restoreResumer)

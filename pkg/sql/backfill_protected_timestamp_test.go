@@ -68,7 +68,7 @@ func TestValidationWithProtectedTS(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
-	ts := s.TenantOrServer()
+	ts := s.ApplicationLayer()
 	tenantSettings := ts.ClusterSettings()
 	protectedts.PollInterval.Override(ctx, &tenantSettings.SV, time.Millisecond)
 	r := sqlutils.MakeSQLRunner(db)
@@ -122,7 +122,7 @@ func TestValidationWithProtectedTS(t *testing.T) {
 	tableID := getTableID()
 	tableKey := ts.Codec().TablePrefix(tableID)
 
-	systemSqlDb := serverutils.OpenDBConn(t, s.SQLAddr(), "system", false, s.Stopper())
+	systemSqlDb := s.SystemLayer().SQLConn(t, "system")
 	grp := ctxgroup.WithContext(ctx)
 	grp.Go(func() error {
 		<-indexValidationQueryWait

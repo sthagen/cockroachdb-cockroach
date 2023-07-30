@@ -12,7 +12,6 @@ package application_api_test
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -23,9 +22,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
@@ -33,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -46,13 +44,13 @@ import (
 func TestAdminAPIDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Disable the default test tenant for now as this tests fails with
-		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	})
+
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
-	ts := s.(*server.TestServer)
+	ts := s.ApplicationLayer()
 
 	ac := ts.AmbientCtx()
 	ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
@@ -112,7 +110,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 			// Test databases endpoint.
 			var resp serverpb.DatabasesResponse
 			if err := srvtestutils.GetAdminJSONProtoWithAdminOption(
-				s,
+				ts,
 				"databases",
 				&resp,
 				tc.isAdmin,
@@ -137,7 +135,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 			urlEscapeDbName := url.PathEscape(testDbName)
 
 			if err := srvtestutils.GetAdminJSONProtoWithAdminOption(
-				s,
+				ts,
 				"databases/"+urlEscapeDbName,
 				&details,
 				tc.isAdmin,
@@ -179,7 +177,7 @@ func TestAdminAPIDatabases(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			databaseID, err := ts.TestingQueryDatabaseID(ctx, username.RootUserName(), testDbName)
+			databaseID, err := ts.QueryDatabaseID(ctx, username.RootUserName(), testDbName)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -193,15 +191,16 @@ func TestAdminAPIDatabases(t *testing.T) {
 func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Disable the default test tenant for now as this tests fails with
-		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	})
+
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
+	ts := s.ApplicationLayer()
 
 	const errPattern = "database.+does not exist"
-	if err := srvtestutils.GetAdminJSONProto(s, "databases/i_do_not_exist", nil); !testutils.IsError(err, errPattern) {
+	if err := srvtestutils.GetAdminJSONProto(ts, "databases/i_do_not_exist", nil); !testutils.IsError(err, errPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
 }
@@ -209,17 +208,18 @@ func TestAdminAPIDatabaseDoesNotExist(t *testing.T) {
 func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Disable the default test tenant for now as this tests fails with
-		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	})
+
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
+	ts := s.ApplicationLayer()
 
 	const fakedb = "system;DROP DATABASE system;"
 	const path = "databases/" + fakedb
 	const errPattern = `target database or schema does not exist`
-	if err := srvtestutils.GetAdminJSONProto(s, path, nil); !testutils.IsError(err, errPattern) {
+	if err := srvtestutils.GetAdminJSONProto(ts, path, nil); !testutils.IsError(err, errPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
 }
@@ -227,23 +227,24 @@ func TestAdminAPIDatabaseSQLInjection(t *testing.T) {
 func TestAdminAPITableDoesNotExist(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Disable the default test tenant for now as this tests fails with
-		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	})
+
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
+	ts := s.ApplicationLayer()
 
 	const fakename = "i_do_not_exist"
 	const badDBPath = "databases/" + fakename + "/tables/foo"
 	const dbErrPattern = `relation \\"` + fakename + `.foo\\" does not exist`
-	if err := srvtestutils.GetAdminJSONProto(s, badDBPath, nil); !testutils.IsError(err, dbErrPattern) {
+	if err := srvtestutils.GetAdminJSONProto(ts, badDBPath, nil); !testutils.IsError(err, dbErrPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, dbErrPattern)
 	}
 
 	const badTablePath = "databases/system/tables/" + fakename
 	const tableErrPattern = `relation \\"system.` + fakename + `\\" does not exist`
-	if err := srvtestutils.GetAdminJSONProto(s, badTablePath, nil); !testutils.IsError(err, tableErrPattern) {
+	if err := srvtestutils.GetAdminJSONProto(ts, badTablePath, nil); !testutils.IsError(err, tableErrPattern) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, tableErrPattern)
 	}
 }
@@ -251,17 +252,18 @@ func TestAdminAPITableDoesNotExist(t *testing.T) {
 func TestAdminAPITableSQLInjection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Disable the default test tenant for now as this tests fails with
-		// it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	})
+
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
+	ts := s.ApplicationLayer()
 
 	const fakeTable = "users;DROP DATABASE system;"
 	const path = "databases/system/tables/" + fakeTable
 	const errPattern = `relation \"system.` + fakeTable + `\" does not exist`
-	if err := srvtestutils.GetAdminJSONProto(s, path, nil); !testutils.IsError(err, regexp.QuoteMeta(errPattern)) {
+	if err := srvtestutils.GetAdminJSONProto(ts, path, nil); !testutils.IsError(err, regexp.QuoteMeta(errPattern)) {
 		t.Fatalf("unexpected error: %v\nexpected: %s", err, errPattern)
 	}
 }
@@ -269,6 +271,11 @@ func TestAdminAPITableSQLInjection(t *testing.T) {
 func TestAdminAPITableDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
+	const schemaName = "testschema"
 
 	for _, tc := range []struct {
 		name, dbName, tblName, pkName string
@@ -279,17 +286,12 @@ func TestAdminAPITableDetails(t *testing.T) {
 		{name: "upper", dbName: "TEST", tblName: `"TBL"`, pkName: "TBL_pkey"}, // Regression test for issue #14056
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-				// Disable the default test tenant for now as this tests fails
-				// with it enabled. Tracked with #81590.
-				DefaultTestTenant: base.TODOTestTenantDisabled,
-			})
+			s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 			defer s.Stopper().Stop(context.Background())
-			ts := s.(*server.TestServer)
+			ts := s.ApplicationLayer()
 
 			escDBName := tree.NameStringP(&tc.dbName)
 			tblName := tc.tblName
-			schemaName := "testschema"
 
 			ac := ts.AmbientCtx()
 			ctx, span := ac.AnnotateCtxWithSpan(context.Background(), "test")
@@ -303,7 +305,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 
 			setupQueries := []string{
 				fmt.Sprintf("CREATE DATABASE %s", escDBName),
-				fmt.Sprintf("CREATE SCHEMA %s", schemaName),
+				fmt.Sprintf("CREATE SCHEMA %s.%s", escDBName, schemaName),
 				fmt.Sprintf(`CREATE TABLE %s.%s (%s)`, escDBName, tblName, tableSchema),
 				"CREATE USER readonly",
 				"CREATE USER app",
@@ -311,16 +313,9 @@ func TestAdminAPITableDetails(t *testing.T) {
 				fmt.Sprintf("GRANT SELECT,UPDATE,DELETE ON %s.%s TO app", escDBName, tblName),
 				fmt.Sprintf("CREATE STATISTICS test_stats FROM %s.%s", escDBName, tblName),
 			}
-			pgURL, cleanupGoDB := sqlutils.PGUrl(
-				t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
-			defer cleanupGoDB()
-			pgURL.Path = tc.dbName
-			db, err := gosql.Open("postgres", pgURL.String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
+			db := ts.SQLConn(t, tc.dbName)
 			for _, q := range setupQueries {
+				t.Logf("executing: %v", q)
 				if _, err := db.Exec(q); err != nil {
 					t.Fatal(err)
 				}
@@ -329,7 +324,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			// Perform API call.
 			var resp serverpb.TableDetailsResponse
 			url := fmt.Sprintf("databases/%s/tables/%s", tc.dbName, tblName)
-			if err := srvtestutils.GetAdminJSONProto(s, url, &resp); err != nil {
+			if err := srvtestutils.GetAdminJSONProto(ts, url, &resp); err != nil {
 				t.Fatal(err)
 			}
 
@@ -433,7 +428,7 @@ func TestAdminAPITableDetails(t *testing.T) {
 			}
 
 			// Verify Descriptor ID.
-			tableID, err := ts.TestingQueryTableID(ctx, username.RootUserName(), tc.dbName, tc.tblName)
+			tableID, err := ts.QueryTableID(ctx, username.RootUserName(), tc.dbName, tc.tblName)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -448,11 +443,14 @@ func TestAdminAPIDatabaseDetails(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
 	const numServers = 3
 	tc := testcluster.StartTestCluster(t, numServers, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.Background())
 
-	db := tc.ServerConn(0)
+	db := tc.ApplicationLayer(0).SQLConn(t, "")
 
 	_, err := db.Exec("CREATE DATABASE test")
 	require.NoError(t, err)
@@ -467,14 +465,14 @@ func TestAdminAPIDatabaseDetails(t *testing.T) {
 
 	// Flush all stores here so that we can read the ApproximateDiskBytes field without waiting for a flush.
 	for i := 0; i < numServers; i++ {
-		s := tc.Server(i)
+		s := tc.Server(i).StorageLayer()
 		err = s.GetStores().(*kvserver.Stores).VisitStores(func(store *kvserver.Store) error {
 			return store.TODOEngine().Flush()
 		})
 		require.NoError(t, err)
 	}
 
-	s := tc.Server(0)
+	s := tc.Server(0).ApplicationLayer()
 
 	var resp serverpb.DatabaseDetailsResponse
 	require.NoError(t, serverutils.GetJSONProto(s, "/_admin/v1/databases/test", &resp))
@@ -507,6 +505,9 @@ func TestAdminAPITableStats(t *testing.T) {
 	skip.UnderStress(t, "flaky under stress #107156")
 	skip.UnderRace(t, "flaky under race #107156")
 
+	// Until this can be put in main_test.go.
+	defer ccl.TestingEnableEnterprise()()
+
 	const nodeCount = 3
 	tc := testcluster.StartTestCluster(t, nodeCount, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationAuto,
@@ -517,10 +518,11 @@ func TestAdminAPITableStats(t *testing.T) {
 		},
 	})
 	defer tc.Stopper().Stop(context.Background())
-	server0 := tc.Server(0)
+
+	server0 := tc.Server(0).ApplicationLayer()
 
 	// Create clients (SQL, HTTP) connected to server 0.
-	db := tc.ServerConn(0)
+	db := server0.SQLConn(t, "")
 
 	client, err := server0.GetAdminHTTPClient()
 	if err != nil {

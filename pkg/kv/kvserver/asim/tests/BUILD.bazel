@@ -5,6 +5,7 @@ go_test(
     srcs = [
         "datadriven_simulation_test.go",
         "helpers_test.go",
+        "rand_test.go",
     ],
     args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
@@ -21,6 +22,7 @@ go_test(
         "//pkg/roachpb",
         "//pkg/spanconfig/spanconfigtestutils",
         "//pkg/testutils/datapathutils",
+        "//pkg/testutils/skip",
         "//pkg/util/log",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_guptarohit_asciigraph//:asciigraph",
@@ -30,15 +32,24 @@ go_test(
 
 go_library(
     name = "tests",
-    srcs = ["assert.go"],
+    srcs = [
+        "assert.go",
+        "default_settings.go",
+        "rand_framework.go",
+    ],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/tests",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvserver/asim",
+        "//pkg/kv/kvserver/asim/config",
+        "//pkg/kv/kvserver/asim/event",
+        "//pkg/kv/kvserver/asim/gen",
         "//pkg/kv/kvserver/asim/metrics",
+        "//pkg/kv/kvserver/asim/state",
         "//pkg/roachpb",
         "//pkg/spanconfig/spanconfigtestutils",
         "//pkg/util/log",
+        "@com_github_guptarohit_asciigraph//:asciigraph",
         "@com_github_montanaflynn_stats//:stats",
     ],
 )

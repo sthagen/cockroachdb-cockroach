@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
@@ -100,6 +101,22 @@ type runnerResult struct {
 	err    error
 }
 
+type runnerDialErr struct {
+	err error
+}
+
+func (e *runnerDialErr) Error() string {
+	return e.err.Error()
+}
+
+func (e *runnerDialErr) Cause() error {
+	return e.err
+}
+
+func isDialErr(err error) bool {
+	return errors.HasType(err, (*runnerDialErr)(nil))
+}
+
 // run executes the request. An error, if encountered, is both sent on the
 // result channel and returned.
 func (req runnerRequest) run() error {
@@ -111,6 +128,9 @@ func (req runnerRequest) run() error {
 
 	conn, err := req.podNodeDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
 	if err != nil {
+		// Mark this error as special runnerDialErr so that we could retry this
+		// distributed query as local.
+		err = &runnerDialErr{err: err}
 		res.err = err
 		return err
 	}
@@ -688,14 +708,8 @@ func (dsp *DistSQLPlanner) Run(
 	localState.Txn = txn
 	localState.LocalProcs = plan.LocalProcessors
 	localState.LocalVectorSources = plan.LocalVectorSources
-	// If we have access to a planner and are currently being used to plan
-	// statements in a user transaction, then take the descs.Collection to resolve
-	// types with during flow execution. This is necessary to do in the case of
-	// a transaction that has already created or updated some types. If we do not
-	// use the local descs.Collection, we would attempt to acquire a lease on
-	// modified types when accessing them, which would error out.
-	if planCtx.planner != nil &&
-		(!planCtx.planner.isInternalPlanner || planCtx.usePlannerDescriptorsForLocalFlow) {
+	if planCtx.planner != nil {
+		// Note that the planner's collection will only be used for local plans.
 		localState.Collection = planCtx.planner.Descriptors()
 	}
 
@@ -1985,7 +1999,10 @@ func (dsp *DistSQLPlanner) PlanAndRun(
 			// cancellation has already occurred.
 			return
 		}
-		if !pgerror.IsSQLRetryableError(distributedErr) && !flowinfra.IsFlowRetryableError(distributedErr) {
+		if !sqlerrors.IsDistSQLRetryableError(distributedErr) &&
+			!pgerror.IsSQLRetryableError(distributedErr) &&
+			!flowinfra.IsFlowRetryableError(distributedErr) &&
+			!isDialErr(distributedErr) {
 			// Only re-run the query if we think there is a high chance of a
 			// successful local execution.
 			return

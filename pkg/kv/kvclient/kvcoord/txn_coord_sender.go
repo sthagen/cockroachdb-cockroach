@@ -47,7 +47,7 @@ const (
 	// txnRetryableError means that the transaction encountered a
 	// TransactionRetryWithProtoRefreshError, and calls to Send() fail in this
 	// state. It is possible to move back to txnPending by calling
-	// ClearTxnRetryableErr().
+	// ClearRetryableErr().
 	txnRetryableError
 
 	// txnError means that a batch encountered a non-retriable error. Further
@@ -697,7 +697,8 @@ func (tc *TxnCoordSender) maybeRejectIncompatibleRequest(
 func (tc *TxnCoordSender) maybeRejectClientLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) *kvpb.Error {
-	if ba != nil && ba.IsSingleAbortTxnRequest() && tc.mu.txn.Status != roachpb.COMMITTED {
+	rollback := ba != nil && ba.IsSingleAbortTxnRequest()
+	if rollback && tc.mu.txn.Status != roachpb.COMMITTED {
 		// As a special case, we allow rollbacks to be sent at any time. Any
 		// rollback attempt moves the TxnCoordSender state to txnFinalized, but higher
 		// layers are free to retry rollbacks if they want (and they do, for
@@ -721,8 +722,13 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 	case txnFinalized:
 		msg := redact.Sprintf("client already committed or rolled back the transaction. "+
 			"Trying to execute: %s", ba.Summary())
-		stack := string(debug.Stack())
-		log.Errorf(ctx, "%s. stack:\n%s", msg, stack)
+		if !rollback {
+			// If the client is trying to do anything other than rollback, it is
+			// unexpected for it to find the transaction already in a txnFinalized
+			// state. This may be a bug, so log a stack trace.
+			stack := string(debug.Stack())
+			log.Errorf(ctx, "%s. stack:\n%s", msg, stack)
+		}
 		reason := kvpb.TransactionStatusError_REASON_UNKNOWN
 		if tc.mu.txn.Status == roachpb.COMMITTED {
 			reason = kvpb.TransactionStatusError_REASON_TXN_COMMITTED
@@ -782,15 +788,6 @@ func (tc *TxnCoordSender) cleanupTxnLocked(ctx context.Context) {
 	}
 }
 
-// UpdateStateOnRemoteRetryableErr is part of the TxnSender interface.
-func (tc *TxnCoordSender) UpdateStateOnRemoteRetryableErr(
-	ctx context.Context, pErr *kvpb.Error,
-) *kvpb.Error {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	return kvpb.NewError(tc.handleRetryableErrLocked(ctx, pErr))
-}
-
 // handleRetryableErrLocked takes a retriable error and creates a
 // TransactionRetryWithProtoRefreshError containing the transaction that needs
 // to be used by the next attempt. It also handles various aspects of updating
@@ -798,9 +795,7 @@ func (tc *TxnCoordSender) UpdateStateOnRemoteRetryableErr(
 // not be usable afterwards (in case of TransactionAbortedError). The caller is
 // expected to check the ID of the resulting transaction. If the TxnCoordSender
 // can still be used, it will have been prepared for a new epoch.
-func (tc *TxnCoordSender) handleRetryableErrLocked(
-	ctx context.Context, pErr *kvpb.Error,
-) *kvpb.TransactionRetryWithProtoRefreshError {
+func (tc *TxnCoordSender) handleRetryableErrLocked(ctx context.Context, pErr *kvpb.Error) error {
 	// If the error is a transaction retry error, update metrics to
 	// reflect the reason for the restart. More details about the
 	// different error types are documented above on the metaRestart
@@ -836,7 +831,10 @@ func (tc *TxnCoordSender) handleRetryableErrLocked(
 		tc.metrics.RestartsUnknown.Inc()
 	}
 	errTxnID := pErr.GetTxn().ID
-	newTxn := kvpb.PrepareTransactionForRetry(ctx, pErr, tc.mu.userPriority, tc.clock)
+	newTxn, assertErr := kvpb.PrepareTransactionForRetry(pErr, tc.mu.userPriority, tc.clock)
+	if assertErr != nil {
+		return assertErr
+	}
 
 	// We'll pass a TransactionRetryWithProtoRefreshError up to the next layer.
 	retErr := kvpb.NewTransactionRetryWithProtoRefreshError(
@@ -1146,20 +1144,20 @@ func (tc *TxnCoordSender) RequiredFrontier() hlc.Timestamp {
 	return tc.mu.txn.RequiredFrontier()
 }
 
-// ManualRestart is part of the kv.TxnSender interface.
-func (tc *TxnCoordSender) ManualRestart(
-	ctx context.Context, pri roachpb.UserPriority, ts hlc.Timestamp, msg redact.RedactableString,
+// GenerateForcedRetryableErr is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) GenerateForcedRetryableErr(
+	ctx context.Context, ts hlc.Timestamp, msg redact.RedactableString,
 ) error {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tc.mu.txnState != txnPending && tc.mu.txnState != txnRetryableError {
-		return errors.AssertionFailedf("cannot manually restart, current state: %s", tc.mu.txnState)
+		return errors.AssertionFailedf("cannot generate retryable error, current state: %s", tc.mu.txnState)
 	}
 
 	// Invalidate any writes performed by any workers after the retry updated
 	// the txn's proto but before we synchronized (some of these writes might
 	// have been performed at the wrong epoch).
-	tc.mu.txn.Restart(pri, 0 /* upgradePriority */, ts)
+	tc.mu.txn.Restart(tc.mu.userPriority, 0 /* upgradePriority */, ts)
 
 	pErr := kvpb.NewTransactionRetryWithProtoRefreshError(
 		msg, tc.mu.txn.ID, tc.mu.txn)
@@ -1174,6 +1172,37 @@ func (tc *TxnCoordSender) ManualRestart(
 		reqInt.epochBumpedLocked()
 	}
 	return pErr
+}
+
+// UpdateStateOnRemoteRetryableErr is part of the TxnSender interface.
+func (tc *TxnCoordSender) UpdateStateOnRemoteRetryableErr(
+	ctx context.Context, pErr *kvpb.Error,
+) *kvpb.Error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return kvpb.NewError(tc.handleRetryableErrLocked(ctx, pErr))
+}
+
+// GetRetryableErr is part of the TxnSender interface.
+func (tc *TxnCoordSender) GetRetryableErr(
+	ctx context.Context,
+) *kvpb.TransactionRetryWithProtoRefreshError {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.mu.txnState == txnRetryableError {
+		return tc.mu.storedRetryableErr
+	}
+	return nil
+}
+
+// ClearRetryableErr is part of the TxnSender interface.
+func (tc *TxnCoordSender) ClearRetryableErr(ctx context.Context) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.mu.txnState == txnRetryableError {
+		tc.mu.storedRetryableErr = nil
+		tc.mu.txnState = txnPending
+	}
 }
 
 // IsSerializablePushAndRefreshNotPossible is part of the kv.TxnSender interface.
@@ -1472,28 +1501,6 @@ func (tc *TxnCoordSender) DeferCommitWait(ctx context.Context) func(context.Cont
 			return nil
 		}
 		return tc.maybeCommitWait(ctx, true /* deferred */)
-	}
-}
-
-// GetTxnRetryableErr is part of the TxnSender interface.
-func (tc *TxnCoordSender) GetTxnRetryableErr(
-	ctx context.Context,
-) *kvpb.TransactionRetryWithProtoRefreshError {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	if tc.mu.txnState == txnRetryableError {
-		return tc.mu.storedRetryableErr
-	}
-	return nil
-}
-
-// ClearTxnRetryableErr is part of the TxnSender interface.
-func (tc *TxnCoordSender) ClearTxnRetryableErr(ctx context.Context) {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	if tc.mu.txnState == txnRetryableError {
-		tc.mu.storedRetryableErr = nil
-		tc.mu.txnState = txnPending
 	}
 }
 

@@ -94,7 +94,7 @@ export const aggregateStatements = (
     if (!(key in statsKey)) {
       statsKey[key] = {
         aggregatedFingerprintID: s.statement_fingerprint_id?.toString(),
-        aggregatedFingerprintHexID: s.statement_fingerprint_id.toString(16),
+        aggregatedFingerprintHexID: s.statement_fingerprint_id?.toString(16),
         label: s.statement,
         summary: s.statement_summary,
         aggregatedTs: s.aggregated_ts,
@@ -199,8 +199,8 @@ export const filterTransactions = (
     })
     .filter(
       (t: Transaction) =>
-        t.stats_data.stats.service_lat.mean >= timeValue ||
-        timeValue === "empty",
+        timeValue === "empty" ||
+        t.stats_data.stats.service_lat.mean >= Number(timeValue),
     )
     .filter((t: Transaction) => {
       // The transaction must contain at least one value of the regions list

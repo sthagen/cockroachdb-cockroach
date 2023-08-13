@@ -33,12 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -139,7 +137,7 @@ func TestProxyProtocol(t *testing.T) {
 
 	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	pgs := ts.PGServer().(*pgwire.Server)
 	pgs.TestingEnableAuthLogging()
@@ -249,7 +247,7 @@ func TestPrivateEndpointsACL(t *testing.T) {
 	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 
 	// Create a default user.
@@ -265,22 +263,18 @@ func TestPrivateEndpointsACL(t *testing.T) {
 		Version:                 "001",
 		TenantID:                tenant10.ToUint64(),
 		ClusterName:             "my-tenant",
-		ConnectivityType:        tenant.ALLOW_ALL,
 		AllowedPrivateEndpoints: []string{"vpce-abc123"},
 	})
 	tds.CreateTenant(tenant20, &tenant.Tenant{
 		Version:                 "002",
 		TenantID:                tenant20.ToUint64(),
 		ClusterName:             "other-tenant",
-		ConnectivityType:        tenant.ALLOW_ALL,
 		AllowedPrivateEndpoints: []string{"vpce-some-other-vpc"},
 	})
 	tds.CreateTenant(tenant30, &tenant.Tenant{
-		Version:                 "003",
-		TenantID:                tenant30.ToUint64(),
-		ClusterName:             "public-tenant",
-		ConnectivityType:        tenant.ALLOW_PUBLIC_ONLY,
-		AllowedPrivateEndpoints: []string{},
+		Version:     "003",
+		TenantID:    tenant30.ToUint64(),
+		ClusterName: "public-tenant",
 	})
 	// All tenants map to the same pod.
 	for _, tenID := range []roachpb.TenantID{tenant10, tenant20, tenant30} {
@@ -352,7 +346,6 @@ func TestPrivateEndpointsACL(t *testing.T) {
 					Version:                 "010",
 					TenantID:                tenant10.ToUint64(),
 					ClusterName:             "my-tenant",
-					ConnectivityType:        tenant.ALLOW_ALL,
 					AllowedPrivateEndpoints: []string{},
 				})
 
@@ -438,22 +431,18 @@ func TestAllowedCIDRRangesACL(t *testing.T) {
 		Version:           "001",
 		TenantID:          tenant10.ToUint64(),
 		ClusterName:       "my-tenant",
-		ConnectivityType:  tenant.ALLOW_ALL,
 		AllowedCIDRRanges: []string{"127.0.0.1/32"},
 	})
 	tds.CreateTenant(tenant20, &tenant.Tenant{
 		Version:           "002",
 		TenantID:          tenant20.ToUint64(),
 		ClusterName:       "other-tenant",
-		ConnectivityType:  tenant.ALLOW_ALL,
 		AllowedCIDRRanges: []string{"10.0.0.8/32"},
 	})
 	tds.CreateTenant(tenant30, &tenant.Tenant{
-		Version:           "003",
-		TenantID:          tenant30.ToUint64(),
-		ClusterName:       "private-tenant",
-		ConnectivityType:  tenant.ALLOW_PRIVATE_ONLY,
-		AllowedCIDRRanges: []string{"0.0.0.0/0"},
+		Version:     "003",
+		TenantID:    tenant30.ToUint64(),
+		ClusterName: "private-tenant",
 	})
 	// All tenants map to the same pod.
 	for _, tenID := range []roachpb.TenantID{tenant10, tenant20, tenant30} {
@@ -485,7 +474,6 @@ func TestAllowedCIDRRangesACL(t *testing.T) {
 				Version:           "010",
 				TenantID:          tenant10.ToUint64(),
 				ClusterName:       "my-tenant",
-				ConnectivityType:  tenant.ALLOW_ALL,
 				AllowedCIDRRanges: []string{},
 			})
 
@@ -691,7 +679,7 @@ func TestProxyAgainstSecureCRDB(t *testing.T) {
 	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	pgs := ts.PGServer().(*pgwire.Server)
 	pgs.TestingEnableAuthLogging()
@@ -888,7 +876,7 @@ func TestProxyTLSClose(t *testing.T) {
 	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	pgs := ts.PGServer().(*pgwire.Server)
 	pgs.TestingEnableAuthLogging()
@@ -939,7 +927,7 @@ func TestProxyModifyRequestParams(t *testing.T) {
 	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	pgs := ts.PGServer().(*pgwire.Server)
 	pgs.TestingEnableAuthLogging()
@@ -997,7 +985,7 @@ func TestInsecureProxy(t *testing.T) {
 	sql, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	pgs := ts.PGServer().(*pgwire.Server)
 	pgs.TestingEnableAuthLogging()
@@ -1172,7 +1160,7 @@ func TestDenylistUpdate(t *testing.T) {
 	sql, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sql.Stopper().Stop(ctx)
 
-	ts := sql.(*server.TestServer).ApplicationLayer()
+	ts := sql.ApplicationLayer()
 	ts.
 		PGPreServer().(*pgwire.PreServeConnHandler).
 		TestingSetTrustClientProvidedRemoteAddr(true)
@@ -1932,16 +1920,17 @@ func TestConnectionMigration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start first SQL pod.
-	tenant1, tenantDB1 := serverutils.StartTenant(t, s, tests.CreateTestTenantParams(tenantID))
-	tenant1.(*server.TestTenant).PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
+	tenant1.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	defer tenant1.Stopper().Stop(ctx)
 	defer tenantDB1.Close()
 
 	// Start second SQL pod.
-	params2 := tests.CreateTestTenantParams(tenantID)
-	params2.DisableCreateTenant = true
-	tenant2, tenantDB2 := serverutils.StartTenant(t, s, params2)
-	tenant2.(*server.TestTenant).PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+	tenant2, tenantDB2 := serverutils.StartTenant(t, s, base.TestTenantArgs{
+		TenantID:            tenantID,
+		DisableCreateTenant: true,
+	})
+	tenant2.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 	defer tenant2.Stopper().Stop(ctx)
 	defer tenantDB2.Close()
 
@@ -2067,6 +2056,7 @@ func TestConnectionMigration(t *testing.T) {
 
 			// Now attempt a transfer concurrently with requests.
 			initSuccessCount := f.metrics.ConnMigrationSuccessCount.Count()
+			initErrorRecoverableCount := f.metrics.ConnMigrationErrorRecoverableCount.Count()
 			subCtx, cancel := context.WithCancel(tCtx)
 			defer cancel()
 
@@ -2106,7 +2096,7 @@ func TestConnectionMigration(t *testing.T) {
 
 			// Check metrics.
 			require.True(t, f.metrics.ConnMigrationSuccessCount.Count() > initSuccessCount+4)
-			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorRecoverableCount.Count())
+			require.Equal(t, initErrorRecoverableCount, f.metrics.ConnMigrationErrorRecoverableCount.Count())
 			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorFatalCount.Count())
 
 			validateMiscMetrics(t)
@@ -2116,6 +2106,7 @@ func TestConnectionMigration(t *testing.T) {
 		// transfers should not close the connection.
 		t.Run("failed_transfers_with_tx", func(t *testing.T) {
 			initSuccessCount := f.metrics.ConnMigrationSuccessCount.Count()
+			initErrorRecoverableCount := f.metrics.ConnMigrationErrorRecoverableCount.Count()
 			initAddr := queryAddr(tCtx, t, db)
 
 			err = crdb.ExecuteTx(tCtx, db, nil /* txopts */, func(tx *gosql.Tx) error {
@@ -2150,7 +2141,8 @@ func TestConnectionMigration(t *testing.T) {
 			// still be active.
 			require.Nil(t, f.ctx.Err())
 			require.Equal(t, initSuccessCount, f.metrics.ConnMigrationSuccessCount.Count())
-			require.Equal(t, int64(5), f.metrics.ConnMigrationErrorRecoverableCount.Count())
+			require.Equal(t, initErrorRecoverableCount+5,
+				f.metrics.ConnMigrationErrorRecoverableCount.Count())
 			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorFatalCount.Count())
 
 			// Once the transaction is closed, transfers should work.
@@ -2158,7 +2150,7 @@ func TestConnectionMigration(t *testing.T) {
 			require.NotEqual(t, initAddr, queryAddr(tCtx, t, db))
 			require.Nil(t, f.ctx.Err())
 			require.Equal(t, initSuccessCount+1, f.metrics.ConnMigrationSuccessCount.Count())
-			require.Equal(t, int64(5), f.metrics.ConnMigrationErrorRecoverableCount.Count())
+			require.True(t, f.metrics.ConnMigrationErrorRecoverableCount.Count() >= initErrorRecoverableCount+5)
 			require.Equal(t, int64(0), f.metrics.ConnMigrationErrorFatalCount.Count())
 
 			validateMiscMetrics(t)
@@ -2985,11 +2977,12 @@ func startTestTenantPodsWithStopper(
 
 	var tenants []serverutils.ApplicationLayerInterface
 	for i := 0; i < count; i++ {
-		params := tests.CreateTestTenantParams(tenantID)
-		params.TestingKnobs = knobs
-		params.Stopper = stopper
-		tenant, tenantDB := serverutils.StartTenant(t, ts, params)
-		tenant.(*server.TestTenant).PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
+		tenant, tenantDB := serverutils.StartTenant(t, ts, base.TestTenantArgs{
+			TenantID:     tenantID,
+			TestingKnobs: knobs,
+			Stopper:      stopper,
+		})
+		tenant.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
 
 		// Create a test user. We only need to do it once.
 		if i == 0 {

@@ -994,7 +994,9 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 			break
 		}
 
-		txn.PrepareForRetry(ctx)
+		if err := txn.PrepareForRetry(ctx); err != nil {
+			return err
+		}
 	}
 
 	return err
@@ -1002,7 +1004,7 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 
 // PrepareForRetry needs to be called before a retry to perform some
 // book-keeping and clear errors when possible.
-func (txn *Txn) PrepareForRetry(ctx context.Context) {
+func (txn *Txn) PrepareForRetry(ctx context.Context) error {
 	// Reset commit triggers. These must be reconfigured by the client during the
 	// next retry.
 	txn.commitTriggers = nil
@@ -1010,13 +1012,13 @@ func (txn *Txn) PrepareForRetry(ctx context.Context) {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
-	retryErr := txn.mu.sender.GetTxnRetryableErr(ctx)
+	retryErr := txn.mu.sender.GetRetryableErr(ctx)
 	if retryErr == nil {
-		return
+		return nil
 	}
 	if txn.typ != RootTxn {
-		panic(errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
-			retryErr, "PrepareForRetry() called on leaf txn"), ctx))
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "PrepareForRetry() called on leaf txn"), ctx)
 	}
 	log.VEventf(ctx, 2, "retrying transaction: %s because of a retryable error: %s",
 		txn.debugNameLocked(), retryErr)
@@ -1029,23 +1031,24 @@ func (txn *Txn) PrepareForRetry(ctx context.Context) {
 		// txn IDs. However, at no point can both the old and new incarnation of a
 		// transaction be active at the same time -- this would constitute a
 		// programming error.
-		log.Fatalf(
-			ctx,
-			"unexpected retryable error for old incarnation of the transaction %s; current incarnation %s",
-			retryErr.TxnID,
-			txn.mu.ID,
-		)
+		return errors.WithContextTags(
+			errors.NewAssertionErrorWithWrappedErrf(
+				retryErr,
+				"unexpected retryable error for old incarnation of the transaction %s; current incarnation %s",
+				retryErr.TxnID,
+				txn.mu.ID,
+			), ctx)
 	}
 
 	if !retryErr.PrevTxnAborted() {
 		// If the retryable error doesn't correspond to an aborted transaction,
 		// there's no need to switch out the transaction. We simply clear the
 		// retryable error and proceed.
-		txn.mu.sender.ClearTxnRetryableErr(ctx)
-		return
+		txn.mu.sender.ClearRetryableErr(ctx)
+		return nil
 	}
 
-	txn.handleTransactionAbortedErrorLocked(ctx, retryErr)
+	return txn.handleTransactionAbortedErrorLocked(ctx, retryErr)
 }
 
 // Send runs the specified calls synchronously in a single batch and
@@ -1354,10 +1357,11 @@ func (txn *Txn) UpdateStateOnRemoteRetryableErr(ctx context.Context, pErr *kvpb.
 // the current one with it.
 func (txn *Txn) handleTransactionAbortedErrorLocked(
 	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError,
-) {
+) error {
 	if !retryErr.PrevTxnAborted() {
 		// Sanity check we're dealing with a TransactionAbortedError.
-		log.Fatalf(ctx, "cannot replace root sender if txn not aborted: %v", retryErr)
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "cannot replace root sender if txn not aborted"), ctx)
 	}
 
 	// The transaction we had been using thus far has been aborted. The proto
@@ -1368,6 +1372,7 @@ func (txn *Txn) handleTransactionAbortedErrorLocked(
 	prevSteppingMode := txn.mu.sender.GetSteppingMode(ctx)
 	txn.mu.sender = txn.db.factory.RootTransactionalSender(newTxn, txn.mu.userPriority)
 	txn.mu.sender.ConfigureStepping(ctx, prevSteppingMode)
+	return nil
 }
 
 // SetFixedTimestamp makes the transaction run in an unusual way, at a "fixed
@@ -1393,24 +1398,22 @@ func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) error {
 	return txn.mu.sender.SetFixedTimestamp(ctx, ts)
 }
 
-// GenerateForcedRetryableError returns a TransactionRetryWithProtoRefreshError
+// GenerateForcedRetryableErr returns a TransactionRetryWithProtoRefreshError
 // that will cause the txn to be retried.
 //
 // The transaction's epoch is bumped, simulating to an extent what the
 // TxnCoordSender does on retriable errors. The transaction's timestamp is only
-// bumped to the extent that txn.ReadTimestamp is racheted up to txn.WriteTimestamp.
+// bumped to the extent that txn.ReadTimestamp is ratcheted up to txn.WriteTimestamp.
 // TODO(andrei): This method should take in an up-to-date timestamp, but
 // unfortunately its callers don't currently have that handy.
 //
 // As with other transaction retry errors, the caller must call PrepareForRetry
 // before continuing to use the transaction.
-func (txn *Txn) GenerateForcedRetryableError(
-	ctx context.Context, msg redact.RedactableString,
-) error {
+func (txn *Txn) GenerateForcedRetryableErr(ctx context.Context, msg redact.RedactableString) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	now := txn.db.clock.NowAsClockTimestamp()
-	return txn.mu.sender.ManualRestart(ctx, txn.mu.userPriority, now.ToTimestamp(), msg)
+	return txn.mu.sender.GenerateForcedRetryableErr(ctx, now.ToTimestamp(), msg)
 }
 
 // IsSerializablePushAndRefreshNotPossible returns true if the transaction is

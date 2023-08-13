@@ -2239,8 +2239,7 @@ func (r *restoreResumer) publishDescriptors(
 				jobsKnobs,
 				jobs.ScheduledJobTxn(txn),
 				user,
-				mutTable.GetID(),
-				mutTable.GetRowLevelTTL(),
+				mutTable,
 			)
 			if err != nil {
 				return err
@@ -2376,7 +2375,7 @@ func prefetchDescriptors(
 		if got[i].GetVersion() != expVersion[id] {
 			return nstree.Catalog{}, errors.Errorf(
 				"version mismatch for descriptor %d, expected version %d, got %v",
-				got[i].GetID(), got[i].GetVersion(), expVersion[id],
+				got[i].GetID(), expVersion[id], got[i].GetVersion(),
 			)
 		}
 		all.UpsertDescriptor(got[i])

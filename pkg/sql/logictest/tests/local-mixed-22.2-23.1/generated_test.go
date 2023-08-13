@@ -2067,6 +2067,13 @@ func TestLogic_udf_delete(
 	runLogicTest(t, "udf_delete")
 }
 
+func TestLogic_udf_fk(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_fk")
+}
+
 func TestLogic_udf_insert(
 	t *testing.T,
 ) {
@@ -2100,6 +2107,13 @@ func TestLogic_udf_plpgsql(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_plpgsql")
+}
+
+func TestLogic_udf_prepare(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_prepare")
 }
 
 func TestLogic_udf_privileges(

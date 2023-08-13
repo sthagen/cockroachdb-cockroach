@@ -39,7 +39,7 @@ func TestRunAllocatorSimulator(t *testing.T) {
 	sim.RunSim(ctx)
 }
 
-func TestAllocatorSimulatorDeterministic(t *testing.T) {
+func TestAsimDeterministic(t *testing.T) {
 	skip.WithIssue(t, 105904, "asim is non-deterministic")
 	settings := config.DefaultSimulationSettings()
 
@@ -47,9 +47,10 @@ func TestAllocatorSimulatorDeterministic(t *testing.T) {
 	duration := 15 * time.Minute
 	settings.TickInterval = 2 * time.Second
 
-	stores := 7
+	stores := 21
 	replsPerRange := 3
-	replicasPerStore := 100
+	replicasPerStore := 600
+
 	// NB: We want 100 replicas per store, so the number of ranges required
 	// will be 1/3 of the total replicas.
 	ranges := (replicasPerStore * stores) / replsPerRange

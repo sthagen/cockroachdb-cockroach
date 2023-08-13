@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -1250,7 +1249,7 @@ func TestEvalAddSSTable(t *testing.T) {
 						} else {
 							require.NotNil(t, result.Replicated.AddSSTable)
 							require.NoError(t, fs.WriteFile(engine, "sst", result.Replicated.AddSSTable.Data))
-							require.NoError(t, engine.IngestExternalFiles(ctx, []string{"sst"}))
+							require.NoError(t, engine.IngestLocalFiles(ctx, []string{"sst"}))
 						}
 
 						var expect kvs
@@ -1653,7 +1652,7 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, fs.WriteFile(engine, "sst", sst))
-	require.NoError(t, engine.IngestExternalFiles(ctx, []string{"sst"}))
+	require.NoError(t, engine.IngestLocalFiles(ctx, []string{"sst"}))
 
 	statsEvaled := statsBefore
 	statsEvaled.Add(*cArgs.Stats)
@@ -1924,15 +1923,14 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsClosedTS(t *testing.T) 
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	si, _, db := serverutils.StartServer(t, base.TestServerArgs{
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableCanAckBeforeApplication: true,
 			},
 		},
 	})
-	defer si.Stopper().Stop(ctx)
-	s := si.(*server.TestServer)
+	defer s.Stopper().Stop(ctx)
 
 	// Issue a write to trigger a closed timestamp.
 	require.NoError(t, db.Put(ctx, "someKey", "someValue"))

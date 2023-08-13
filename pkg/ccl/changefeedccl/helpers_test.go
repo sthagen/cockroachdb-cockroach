@@ -58,11 +58,17 @@ import (
 
 var testSinkFlushFrequency = 100 * time.Millisecond
 
-// disableDeclarativeSchemaChangesForTest tests that are disabled due to differences
-// in changefeed behaviour and are tracked by issue #80545.
-func disableDeclarativeSchemaChangesForTest(t testing.TB, sqlDB *sqlutils.SQLRunner) {
-	sqlDB.Exec(t, "SET use_declarative_schema_changer='off'")
-	sqlDB.Exec(t, "SET CLUSTER SETTING  sql.defaults.use_declarative_schema_changer='off'")
+// maybeDisableDeclarativeSchemaChangesForTest will disable the declarative
+// schema changer with a probability of 10% using the provided SQL DB
+// connection. This returns true if the declarative schema changer is disabled.
+func maybeDisableDeclarativeSchemaChangesForTest(t testing.TB, sqlDB *sqlutils.SQLRunner) bool {
+	disable := rand.Float32() < 0.1
+	if disable {
+		t.Log("using legacy schema changer")
+		sqlDB.Exec(t, "SET use_declarative_schema_changer='off'")
+		sqlDB.Exec(t, "SET CLUSTER SETTING  sql.defaults.use_declarative_schema_changer='off'")
+	}
+	return disable
 }
 
 func waitForSchemaChange(
@@ -796,7 +802,7 @@ func makeSystemServerWithOptions(
 			TestServer: TestServer{
 				DB:           systemDB,
 				Server:       systemServer,
-				TestingKnobs: systemServer.(*server.TestServer).Cfg.TestingKnobs,
+				TestingKnobs: *systemServer.SystemLayer().TestingKnobs(),
 				Codec:        keys.SystemSQLCodec,
 			},
 			SystemServer: systemServer,
@@ -822,7 +828,7 @@ func makeTenantServerWithOptions(
 			TestServer: TestServer{
 				DB:           tenantDB,
 				Server:       tenantServer,
-				TestingKnobs: tenantServer.(*server.TestTenant).Cfg.TestingKnobs,
+				TestingKnobs: *tenantServer.TestingKnobs(),
 				Codec:        keys.MakeSQLCodec(tenantID),
 			},
 			SystemDB:     systemDB,

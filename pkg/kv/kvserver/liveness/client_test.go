@@ -176,7 +176,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	tc.WaitForNodeLiveness(t)
 	log.Infof(ctx, "waiting done")
 
-	firstServer := tc.Server(0).(*server.TestServer)
+	firstServer := tc.Server(0)
 
 	liveNodeID := firstServer.NodeID()
 
@@ -203,10 +203,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 	log.Infof(ctx, "checking status map")
 
 	// See what comes up in the status.
-	admin, err := tc.GetAdminClient(ctx, t, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	admin := tc.GetAdminClient(t, 0)
 
 	type testCase struct {
 		nodeID         roachpb.NodeID

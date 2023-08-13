@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -122,7 +121,7 @@ func TestReplicateQueueRebalance(t *testing.T) {
 	countReplicas := func() []int {
 		counts := make([]int, len(tc.Servers))
 		for _, s := range tc.Servers {
-			err := s.Stores().VisitStores(func(s *kvserver.Store) error {
+			err := s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 				counts[s.StoreID()-1] += s.ReplicaCount()
 				return nil
 			})
@@ -281,7 +280,7 @@ func TestReplicateQueueRebalanceMultiStore(t *testing.T) {
 			countReplicas := func() (total int, perStore []int) {
 				perStore = make([]int, numStores)
 				for _, s := range tc.Servers {
-					err := s.Stores().VisitStores(func(s *kvserver.Store) error {
+					err := s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 						require.Zero(t, perStore[s.StoreID()-1])
 						perStore[s.StoreID()-1] = s.ReplicaCount()
 						total += s.ReplicaCount()
@@ -294,7 +293,7 @@ func TestReplicateQueueRebalanceMultiStore(t *testing.T) {
 			countLeases := func() (total int, perStore []int) {
 				perStore = make([]int, numStores)
 				for _, s := range tc.Servers {
-					err := s.Stores().VisitStores(func(s *kvserver.Store) error {
+					err := s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 						c, err := s.Capacity(ctx, false)
 						require.NoError(t, err)
 						leases := int(c.LeaseCount)
@@ -394,7 +393,7 @@ func TestReplicateQueueUpReplicateOddVoters(t *testing.T) {
 
 	tc.AddAndStartServer(t, base.TestServerArgs{})
 
-	if err := tc.Servers[0].Stores().VisitStores(func(s *kvserver.Store) error {
+	if err := tc.Servers[0].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		return s.ForceReplicationScanAndProcess()
 	}); err != nil {
 		t.Fatal(err)
@@ -408,7 +407,7 @@ func TestReplicateQueueUpReplicateOddVoters(t *testing.T) {
 	}
 
 	var store *kvserver.Store
-	_ = tc.Servers[0].Stores().VisitStores(func(s *kvserver.Store) error {
+	_ = tc.Servers[0].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		store = s
 		return nil
 	})
@@ -485,7 +484,7 @@ func TestReplicateQueueDownReplicate(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, s := range tc.Servers {
-		require.NoError(t, s.Stores().VisitStores(func(s *kvserver.Store) error {
+		require.NoError(t, s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 			require.NoError(t, s.ForceReplicationScanAndProcess())
 			return nil
 		}))
@@ -514,7 +513,7 @@ func scanAndGetNumNonVoters(
 ) (numNonVoters int) {
 	for _, s := range tc.Servers {
 		// Nudge internal queues to up/down-replicate our scratch range.
-		require.NoError(t, s.Stores().VisitStores(func(s *kvserver.Store) error {
+		require.NoError(t, s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 			require.NoError(t, s.ForceSplitScanAndProcess())
 			require.NoError(t, s.ForceReplicationScanAndProcess())
 			require.NoError(t, s.ForceRaftSnapshotQueueProcess())
@@ -860,10 +859,8 @@ func TestReplicateQueueTracingOnError(t *testing.T) {
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx))
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx+1))
 	adminSrv := tc.Server(decomNodeIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
-	_, err = adminClient.Decommission(
+	adminClient := adminSrv.GetAdminClient(t)
+	_, err := adminClient.Decommission(
 		ctx, &serverpb.DecommissionRequest{
 			NodeIDs:          []roachpb.NodeID{decomNodeID},
 			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
@@ -987,10 +984,8 @@ func TestReplicateQueueDecommissionPurgatoryError(t *testing.T) {
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx))
 	tc.AddVotersOrFatal(t, scratchKey, tc.Target(decomNodeIdx+1))
 	adminSrv := tc.Server(decomNodeIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
-	_, err = adminClient.Decommission(
+	adminClient := adminSrv.GetAdminClient(t)
+	_, err := adminClient.Decommission(
 		ctx, &serverpb.DecommissionRequest{
 			NodeIDs:          []roachpb.NodeID{decomNodeID},
 			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
@@ -1024,7 +1019,7 @@ func getLeaseholderStore(
 		return nil, err
 	}
 	leaseHolderSrv := tc.Servers[leaseHolder.NodeID-1]
-	store, err := leaseHolderSrv.Stores().GetStore(leaseHolder.StoreID)
+	store, err := leaseHolderSrv.GetStores().(*kvserver.Stores).GetStore(leaseHolder.StoreID)
 	if err != nil {
 		return nil, err
 	}
@@ -1407,7 +1402,7 @@ func getAggregateMetricCounts(
 ) (currentCount int64, currentVoterCount int64) {
 	for _, s := range tc.Servers {
 		if storeId, exists := voterMap[s.NodeID()]; exists {
-			store, err := s.Stores().GetStore(storeId)
+			store, err := s.GetStores().(*kvserver.Stores).GetStore(storeId)
 			if err != nil {
 				log.Errorf(ctx, "error finding store: %s", err)
 				continue
@@ -1728,7 +1723,7 @@ func filterRangeLog(
 
 func toggleReplicationQueues(tc *testcluster.TestCluster, active bool) {
 	for _, s := range tc.Servers {
-		_ = s.Stores().VisitStores(func(store *kvserver.Store) error {
+		_ = s.GetStores().(*kvserver.Stores).VisitStores(func(store *kvserver.Store) error {
 			store.SetReplicateQueueActive(active)
 			return nil
 		})
@@ -1737,7 +1732,7 @@ func toggleReplicationQueues(tc *testcluster.TestCluster, active bool) {
 
 func forceScanOnAllReplicationQueues(tc *testcluster.TestCluster) (err error) {
 	for _, s := range tc.Servers {
-		err = s.Stores().VisitStores(func(store *kvserver.Store) error {
+		err = s.GetStores().(*kvserver.Stores).VisitStores(func(store *kvserver.Store) error {
 			return store.ForceReplicationScanAndProcess()
 		})
 	}
@@ -1746,7 +1741,7 @@ func forceScanOnAllReplicationQueues(tc *testcluster.TestCluster) (err error) {
 
 func toggleSplitQueues(tc *testcluster.TestCluster, active bool) {
 	for _, s := range tc.Servers {
-		_ = s.Stores().VisitStores(func(store *kvserver.Store) error {
+		_ = s.GetStores().(*kvserver.Stores).VisitStores(func(store *kvserver.Store) error {
 			store.SetSplitQueueActive(active)
 			return nil
 		})
@@ -1834,7 +1829,7 @@ func TestLargeUnsplittableRangeReplicate(t *testing.T) {
 	forceProcess := func() {
 		// Speed up the queue processing.
 		for _, s := range tc.Servers {
-			err := s.Stores().VisitStores(func(store *kvserver.Store) error {
+			err := s.GetStores().(*kvserver.Stores).VisitStores(func(store *kvserver.Store) error {
 				return store.ForceReplicationScanAndProcess()
 			})
 			require.NoError(t, err)
@@ -1959,7 +1954,7 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 		rangeID, remoteNodeID, leaseHolderNodeID)
 	leaseHolderSrv := tc.Servers[leaseHolderNodeID-1]
 	leaseHolderStoreID := leaseHolderSrv.GetFirstStoreID()
-	leaseHolderStore, err := leaseHolderSrv.Stores().GetStore(leaseHolderStoreID)
+	leaseHolderStore, err := leaseHolderSrv.GetStores().(*kvserver.Stores).GetStore(leaseHolderStoreID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1967,7 +1962,7 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 	// Start delaying Raft messages to the remote node
 	remoteSrv := tc.Servers[remoteNodeID-1]
 	remoteStoreID := remoteSrv.GetFirstStoreID()
-	remoteStore, err := remoteSrv.Stores().GetStore(remoteStoreID)
+	remoteStore, err := remoteSrv.GetStores().(*kvserver.Stores).GetStore(remoteStoreID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2058,7 +2053,7 @@ func TestTransferLeaseToLaggingNode(t *testing.T) {
 			return nil
 		}
 		currentSrv := tc.Servers[leaseBefore.Replica.NodeID-1]
-		leaseStore, err := currentSrv.Stores().GetStore(currentSrv.GetFirstStoreID())
+		leaseStore, err := currentSrv.GetStores().(*kvserver.Stores).GetStore(currentSrv.GetFirstStoreID())
 		if err != nil {
 			return err
 		}
@@ -2089,8 +2084,6 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
 	lisReg := listenerutil.NewListenerRegistry()
 	defer lisReg.Close()
 
@@ -2109,7 +2102,7 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 				ScanMaxIdleTime:   time.Millisecond,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						StickyEngineRegistry:      stickyEngineRegistry,
+						StickyVFSRegistry:         server.NewStickyVFSRegistry(),
 						DefaultZoneConfigOverride: &zcfg,
 					},
 				},
@@ -2161,7 +2154,7 @@ func TestReplicateQueueAcquiresInvalidLeases(t *testing.T) {
 	forceProcess := func() {
 		// Speed up the queue processing.
 		for _, s := range tc.Servers {
-			err := s.Stores().VisitStores(func(store *kvserver.Store) error {
+			err := s.GetStores().(*kvserver.Stores).VisitStores(func(store *kvserver.Store) error {
 				return store.ForceReplicationScanAndProcess()
 			})
 			require.NoError(t, err)
@@ -2190,7 +2183,7 @@ func iterateOverAllStores(
 	t *testing.T, tc *testcluster.TestCluster, f func(*kvserver.Store) error,
 ) {
 	for _, server := range tc.Servers {
-		require.NoError(t, server.Stores().VisitStores(f))
+		require.NoError(t, server.GetStores().(*kvserver.Stores).VisitStores(f))
 	}
 }
 

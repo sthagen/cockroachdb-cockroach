@@ -64,25 +64,25 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stickyEngineRegistry := NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := NewStickyVFSRegistry()
 
 	serverArgs := base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 		StoreSpecs: []base.StoreSpec{
-			{InMemory: true, StickyInMemoryEngineID: "1"},
+			{InMemory: true, StickyVFSID: "1"},
 		},
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
-				StickyEngineRegistry: stickyEngineRegistry,
+				StickyVFSRegistry: stickyVFSRegistry,
 			},
 		},
 	}
 	var settingsCache []roachpb.KeyValue
-	testServer := serverutils.StartServerOnly(t, serverArgs)
-	closedts.TargetDuration.Override(ctx, &testServer.ClusterSettings().SV, 10*time.Millisecond)
-	closedts.SideTransportCloseInterval.Override(ctx, &testServer.ClusterSettings().SV, 10*time.Millisecond)
+	ts := serverutils.StartServerOnly(t, serverArgs)
+	closedts.TargetDuration.Override(ctx, &ts.ClusterSettings().SV, 10*time.Millisecond)
+	closedts.SideTransportCloseInterval.Override(ctx, &ts.ClusterSettings().SV, 10*time.Millisecond)
 	testutils.SucceedsSoon(t, func() error {
-		store, err := testServer.GetStores().(*kvserver.Stores).GetStore(1)
+		store, err := ts.GetStores().(*kvserver.Stores).GetStore(1)
 		if err != nil {
 			return err
 		}
@@ -96,30 +96,28 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 		settingsCache = settings
 		return nil
 	})
-	testServer.Stopper().Stop(context.Background())
+	ts.Stopper().Stop(context.Background())
 
-	ts, err := serverutils.NewServer(serverArgs)
+	s, err := serverutils.NewServer(serverArgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := ts.(*TestServer)
-	defer srv.Stopper().Stop(context.Background())
+	defer s.Stopper().Stop(context.Background())
 
-	s := srv.Server
 	var initServer *initServer
 	{
-		getDialOpts := s.rpcContext.GRPCDialOptions
+		getDialOpts := s.RPCContext().GRPCDialOptions
 
-		initConfig := newInitServerConfig(ctx, s.cfg, getDialOpts)
+		initConfig := newInitServerConfig(ctx, s.(*testServer).topLevelServer.cfg, getDialOpts)
 		inspectState, err := inspectEngines(
 			context.Background(),
-			s.engines,
-			s.cfg.Settings.Version.BinaryVersion(),
-			s.cfg.Settings.Version.BinaryMinSupportedVersion(),
+			s.Engines(),
+			s.ClusterSettings().Version.BinaryVersion(),
+			s.ClusterSettings().Version.BinaryMinSupportedVersion(),
 		)
 		require.NoError(t, err)
 
-		initServer = newInitServer(s.cfg.AmbientCtx, inspectState, initConfig)
+		initServer = newInitServer(s.AmbientCtx(), inspectState, initConfig)
 	}
 
 	// ServeAndWait should return immediately since the server is already initialized
@@ -128,8 +126,8 @@ func TestCachedSettingsServerRestart(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		state, initialBoot, err := initServer.ServeAndWait(
 			context.Background(),
-			s.stopper,
-			&s.cfg.Settings.SV,
+			s.Stopper(),
+			&s.ClusterSettings().SV,
 		)
 		if err != nil {
 			return err

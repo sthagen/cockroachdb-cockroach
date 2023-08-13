@@ -29,12 +29,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
-// httpTestServer is embedded in TestServer / TenantServer to
+// httpTestServer is embedded in testServer / TenantServer to
 // provide the HTTP API subset of ApplicationLayerInterface.
 type httpTestServer struct {
 	t struct {
 		// We need a sub-struct to avoid ambiguous overlap with the fields
-		// of *Server, which are also embedded in TestServer.
+		// of *Server, which are also embedded in testServer.
 		authentication authserver.Server
 		sqlServer      *SQLServer
 		tenantName     roachpb.TenantName
@@ -69,7 +69,7 @@ var _ http.RoundTripper = &tenantHeaderDecorator{}
 
 // AdminURL implements TestServerInterface.
 func (ts *httpTestServer) AdminURL() *serverutils.TestURL {
-	u := ts.t.sqlServer.execCfg.RPCContext.Config.AdminURL()
+	u := ts.t.sqlServer.cfg.Config.AdminURL()
 	if ts.t.tenantName != "" {
 		q := u.Query()
 		q.Add(ClusterNameParamInQueryURL, string(ts.t.tenantName))
@@ -156,7 +156,7 @@ func (ts *httpTestServer) GetAuthenticatedHTTPClientAndCookie(
 			if err != nil {
 				return err
 			}
-			url, err := url.Parse(ts.t.sqlServer.execCfg.RPCContext.Config.AdminURL().String())
+			url, err := url.Parse(ts.t.sqlServer.cfg.Config.AdminURL().String())
 			if err != nil {
 				return err
 			}

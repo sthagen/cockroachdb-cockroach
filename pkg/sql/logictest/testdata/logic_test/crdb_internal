@@ -64,6 +64,7 @@ crdb_internal  kv_inherited_role_members               table  admin  NULL  NULL
 crdb_internal  kv_node_liveness                        table  admin  NULL  NULL
 crdb_internal  kv_node_status                          table  admin  NULL  NULL
 crdb_internal  kv_repairable_catalog_corruptions       view   admin  NULL  NULL
+crdb_internal  kv_protected_ts_records                 table  admin  NULL  NULL
 crdb_internal  kv_store_status                         table  admin  NULL  NULL
 crdb_internal  kv_system_privileges                    view   admin  NULL  NULL
 crdb_internal  leases                                  table  admin  NULL  NULL
@@ -1113,10 +1114,10 @@ query ITTTT colnames
 SELECT * FROM "".crdb_internal.invalid_objects ORDER BY id
 ----
 id   database_name  schema_name  obj_name  error
-500  baddb          ·            ·         referenced descriptor not found
-501  system         badschema    ·         referenced descriptor not found
-502  system         public       badobj    referenced descriptor not found
-503  system         [404]        badobj    referenced descriptor not found
+500  baddb          ·            ·         referenced schema ID 500: referenced descriptor not found
+501  system         badschema    ·         referenced schema ID 501: referenced descriptor not found
+502  system         public       badobj    referenced schema ID 502: referenced descriptor not found
+503  system         [404]        badobj    referenced schema ID 503: referenced descriptor not found
 
 statement ok
 SELECT crdb_internal.unsafe_delete_namespace_entry(0, 0, 'baddb', 500, true);

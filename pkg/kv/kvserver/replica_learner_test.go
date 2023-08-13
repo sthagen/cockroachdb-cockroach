@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -773,7 +772,7 @@ func TestLearnerRaftConfState(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	verifyLearnerInRaftOnNodes := func(
-		key roachpb.Key, id roachpb.ReplicaID, servers []*server.TestServer,
+		key roachpb.Key, id roachpb.ReplicaID, servers []serverutils.TestServerInterface,
 	) {
 		t.Helper()
 		var repls []*kvserver.Replica
@@ -985,8 +984,7 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 		// effect on the outcome of this test.
 		const drainingServerIdx = 1
 		const drainingNodeID = drainingServerIdx + 1
-		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
-		require.NoError(t, err)
+		client := tc.GetAdminClient(t, drainingServerIdx)
 		drain(ctx, t, client, drainingNodeID)
 	}
 
@@ -1091,13 +1089,12 @@ func TestSnapshotsToDrainingNodes(t *testing.T) {
 			},
 		)
 		defer tc.Stopper().Stop(ctx)
-		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
-		require.NoError(t, err)
+		client := tc.GetAdminClient(t, drainingServerIdx)
 		drain(ctx, t, client, drainingNodeID)
 
 		// Now, we try to add a replica to it, we expect that to fail.
 		scratchKey := tc.ScratchRange(t)
-		_, err = tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
+		_, err := tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
 		require.Regexp(t, "store is draining", err)
 	})
 
@@ -2234,7 +2231,7 @@ func getExpectedSnapshotSizeBytes(
 	b := originStore.TODOEngine().NewWriteBatch()
 	defer b.Close()
 
-	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */
+	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true /* replicatedOnly */, rditer.ReplicatedSpansAll,
 		func(iter storage.EngineIterator, _ roachpb.Span, keyType storage.IterKeyType) error {
 			var err error
 			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {

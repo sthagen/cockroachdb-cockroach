@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -77,7 +76,7 @@ func TestPGWireDrainClient(t *testing.T) {
 	defer srv.Stopper().Stop(ctx)
 	tt := srv.ApplicationLayer()
 
-	host, port, err := net.SplitHostPort(srv.AdvSQLAddr())
+	host, port, err := net.SplitHostPort(tt.AdvSQLAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,9 +143,10 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{Insecure: true})
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{Insecure: true})
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	host, port, err := net.SplitHostPort(s.AdvSQLAddr())
 	if err != nil {
@@ -166,7 +166,7 @@ func TestPGWireDrainOngoingTxns(t *testing.T) {
 	}
 	defer db.Close()
 
-	pgServer := s.ApplicationLayer().PGServer().(*pgwire.Server)
+	pgServer := s.PGServer().(*pgwire.Server)
 
 	// Make sure that the server reports correctly the case in which a
 	// connection did not respond to cancellation in time.
@@ -424,9 +424,9 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SELECT $1 > 0", []preparedQueryTest{
 			baseTest.SetArgs(1).Results(true),
 			baseTest.SetArgs("1").Results(true),
-			baseTest.SetArgs(1.1).Error(`pq: error in argument for $1: could not parse "1.1" as type int: strconv.ParseInt: parsing "1.1": invalid syntax`).Results(true),
-			baseTest.SetArgs("1.0").Error(`pq: error in argument for $1: could not parse "1.0" as type int: strconv.ParseInt: parsing "1.0": invalid syntax`),
-			baseTest.SetArgs(true).Error(`pq: error in argument for $1: could not parse "true" as type int: strconv.ParseInt: parsing "true": invalid syntax`),
+			baseTest.SetArgs(1.1).Error(`error in argument for \$1: could not parse "1.1" as type int: strconv.ParseInt: parsing "1.1": invalid syntax`).Results(true),
+			baseTest.SetArgs("1.0").Error(`error in argument for \$1: could not parse "1.0" as type int: strconv.ParseInt: parsing "1.0": invalid syntax`),
+			baseTest.SetArgs(true).Error(`error in argument for \$1: could not parse "true" as type int: strconv.ParseInt: parsing "true": invalid syntax`),
 		}},
 		{"SELECT ($1) > 0", []preparedQueryTest{
 			baseTest.SetArgs(1).Results(true),
@@ -440,7 +440,7 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.SetArgs(true).Results(true),
 			baseTest.SetArgs(false).Results(false),
 			baseTest.SetArgs(1).Results(true),
-			baseTest.SetArgs("").Error(`pq: error in argument for $1: could not parse "" as type bool: strconv.ParseBool: parsing "": invalid syntax`),
+			baseTest.SetArgs("").Error(`error in argument for \$1: could not parse "" as type bool: strconv.ParseBool: parsing "": invalid syntax`),
 			// Make sure we can run another after a failure.
 			baseTest.SetArgs(true).Results(true),
 		}},
@@ -449,14 +449,12 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.SetArgs("true").Results(true),
 			baseTest.SetArgs("false").Results(false),
 			baseTest.SetArgs("1").Results(true),
-			baseTest.SetArgs(2).Error(`pq: error in argument for $1: could not parse "2" as type bool: strconv.ParseBool: parsing "2": invalid syntax`),
-			baseTest.SetArgs(3.1).Error(`pq: error in argument for $1: could not parse "3.1" as type bool: strconv.ParseBool: parsing "3.1": invalid syntax`),
-			baseTest.SetArgs("").Error(`pq: error in argument for $1: could not parse "" as type bool: strconv.ParseBool: parsing "": invalid syntax`),
+			baseTest.SetArgs(2).Error(`error in argument for \$1: could not parse "2" as type bool: strconv.ParseBool: parsing "2": invalid syntax`),
+			baseTest.SetArgs(3.1).Error(`error in argument for \$1: could not parse "3.1" as type bool: strconv.ParseBool: parsing "3.1": invalid syntax`),
+			baseTest.SetArgs("").Error(`error in argument for \$1: could not parse "" as type bool: strconv.ParseBool: parsing "": invalid syntax`),
 		}},
 		{"SELECT CASE 40+2 WHEN 42 THEN 51 ELSE $1::INT END", []preparedQueryTest{
-			baseTest.Error(
-				"pq: no value provided for placeholder: $1",
-			).PreparedError(
+			baseTest.Error(`no value provided for placeholder: \$1`).PreparedError(
 				wrongArgCountString(1, 0),
 			),
 		}},
@@ -465,14 +463,14 @@ func TestPGPreparedQuery(t *testing.T) {
 			baseTest.SetArgs("2", 1).Results(true),
 			baseTest.SetArgs(1, "2").Results(false),
 			baseTest.SetArgs("2", "1.0").Results(true),
-			baseTest.SetArgs("2.0", "1").Error(`pq: error in argument for $1: could not parse "2.0" as type int: strconv.ParseInt: parsing "2.0": invalid syntax`),
-			baseTest.SetArgs(2.1, 1).Error(`pq: error in argument for $1: could not parse "2.1" as type int: strconv.ParseInt: parsing "2.1": invalid syntax`),
+			baseTest.SetArgs("2.0", "1").Error(`error in argument for \$1: could not parse "2.0" as type int: strconv.ParseInt: parsing "2.0": invalid syntax`),
+			baseTest.SetArgs(2.1, 1).Error(`error in argument for \$1: could not parse "2.1" as type int: strconv.ParseInt: parsing "2.1": invalid syntax`),
 		}},
 		{"SELECT greatest($1, 0, $2), $2", []preparedQueryTest{
 			baseTest.SetArgs(1, -1).Results(1, -1),
 			baseTest.SetArgs(-1, 10).Results(10, 10),
 			baseTest.SetArgs("-2", "-1").Results(0, -1),
-			baseTest.SetArgs(1, 2.1).Error(`pq: error in argument for $2: could not parse "2.1" as type int: strconv.ParseInt: parsing "2.1": invalid syntax`),
+			baseTest.SetArgs(1, 2.1).Error(`error in argument for \$2: could not parse "2.1" as type int: strconv.ParseInt: parsing "2.1": invalid syntax`),
 		}},
 		{"SELECT $1::int, $1::float", []preparedQueryTest{
 			baseTest.SetArgs(1).Results(1, 1.0),
@@ -481,7 +479,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SELECT 3 + $1, $1 + $2", []preparedQueryTest{
 			baseTest.SetArgs("1", "2").Results(4, 3),
 			baseTest.SetArgs(3, "4").Results(6, 7),
-			baseTest.SetArgs(0, "a").Error(`pq: error in argument for $2: could not parse "a" as type int: strconv.ParseInt: parsing "a": invalid syntax`),
+			baseTest.SetArgs(0, "a").Error(`error in argument for \$2: could not parse "a" as type int: strconv.ParseInt: parsing "a": invalid syntax`),
 		}},
 		// Check for name resolution.
 		{"SELECT count(*)", []preparedQueryTest{
@@ -495,7 +493,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SELECT CASE 1 WHEN $1 THEN $2 ELSE 2 END", []preparedQueryTest{
 			baseTest.SetArgs(1, 3).Results(3),
 			baseTest.SetArgs(2, 3).Results(2),
-			baseTest.SetArgs(true, 0).Error(`pq: error in argument for $1: could not parse "true" as type int: strconv.ParseInt: parsing "true": invalid syntax`),
+			baseTest.SetArgs(true, 0).Error(`error in argument for \$1: could not parse "true" as type int: strconv.ParseInt: parsing "true": invalid syntax`),
 		}},
 		{"SELECT $1[2] LIKE 'b'", []preparedQueryTest{
 			baseTest.SetArgs(pq.Array([]string{"a", "b", "c"})).Results(true),
@@ -854,7 +852,7 @@ func TestPGPreparedQuery(t *testing.T) {
 						if prepared && test.preparedError != "" {
 							expectedErr = test.preparedError
 						}
-						if err.Error() != expectedErr {
+						if !testutils.IsError(err, expectedErr) {
 							t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, expectedErr, err)
 						}
 					}
@@ -1056,7 +1054,7 @@ func TestPGPreparedExec(t *testing.T) {
 			"INSERT INTO d.public.t VALUES ($1, $2, $3)",
 			[]preparedExecTest{
 				baseTest.SetArgs(1, "one", 2).RowsAffected(1),
-				baseTest.SetArgs("two", 2, 2).Error(`pq: error in argument for $1: could not parse "two" as type int: strconv.ParseInt: parsing "two": invalid syntax`),
+				baseTest.SetArgs("two", 2, 2).Error(`error in argument for \$1: could not parse "two" as type int: strconv.ParseInt: parsing "two": invalid syntax`),
 			},
 		},
 		{
@@ -1256,7 +1254,7 @@ func TestPGPreparedExec(t *testing.T) {
 				if result, err := execFunc(test.qargs...); err != nil {
 					if test.error == "" {
 						t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
-					} else if err.Error() != test.error {
+					} else if !testutils.IsError(err, test.error) {
 						t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, test.error, err)
 					}
 				} else {
@@ -1522,14 +1520,10 @@ func TestPGCommandTags(t *testing.T) {
 // checkSQLNetworkMetrics returns the server's pgwire bytesIn/bytesOut and an
 // error if the bytesIn/bytesOut don't satisfy the given minimums and maximums.
 func checkSQLNetworkMetrics(
-	srv serverutils.TestServerInterface, minBytesIn, minBytesOut, maxBytesIn, maxBytesOut int64,
+	srv serverutils.ApplicationLayerInterface, minBytesIn, minBytesOut, maxBytesIn, maxBytesOut int64,
 ) (int64, int64, error) {
-	if err := srv.WriteSummaries(); err != nil {
-		return -1, -1, err
-	}
-
-	bytesIn := srv.ApplicationLayer().MustGetSQLNetworkCounter(pgwire.MetaBytesIn.Name)
-	bytesOut := srv.ApplicationLayer().MustGetSQLNetworkCounter(pgwire.MetaBytesOut.Name)
+	bytesIn := srv.MustGetSQLNetworkCounter(pgwire.MetaBytesIn.Name)
+	bytesOut := srv.MustGetSQLNetworkCounter(pgwire.MetaBytesOut.Name)
 	if a, min := bytesIn, minBytesIn; a < min {
 		return bytesIn, bytesOut, errors.Errorf("bytesin %d < expected min %d", a, min)
 	}
@@ -1548,14 +1542,14 @@ func checkSQLNetworkMetrics(
 func TestSQLNetworkMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer ccl.TestingEnableEnterprise()()
 
-	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer srv.Stopper().Stop(context.Background())
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+	srv := s.ApplicationLayer()
 
 	// Setup pgwire client.
 	pgURL, cleanupFn := sqlutils.PGUrl(
-		t, srv.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(username.RootUser))
+		t, srv.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanupFn()
 
 	const minbytes = 10
@@ -1587,7 +1581,7 @@ func TestSQLNetworkMetrics(t *testing.T) {
 	// Verify connection counter.
 	expectConns := func(n int) {
 		testutils.SucceedsSoon(t, func() error {
-			if conns := srv.ApplicationLayer().MustGetSQLNetworkCounter(pgwire.MetaConns.Name); conns != int64(n) {
+			if conns := srv.MustGetSQLNetworkCounter(pgwire.MetaConns.Name); conns != int64(n) {
 				return errors.Errorf("connections %d != expected %d", conns, n)
 			}
 			return nil

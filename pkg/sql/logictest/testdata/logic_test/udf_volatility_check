@@ -5,7 +5,8 @@ statement ok
 CREATE TABLE t1(a INT PRIMARY KEY, b INT);
 CREATE TABLE t2(a INT PRIMARY KEY, b INT);
 
-# TODO(107369): These do not appear to error in postgres.
+# Note: postgres does not error in the following cases. CRDB provides stronger
+# protections against adding volatility to non-volatile functions.
 statement error pgcode 22023 pq: referencing relations is not allowed in immutable function
 CREATE FUNCTION f() RETURNS FLOAT LANGUAGE SQL IMMUTABLE AS $$ SELECT a FROM t1 $$;
 
@@ -100,5 +101,38 @@ ALTER FUNCTION f STABLE
 
 statement error pgcode 22023 pq: volatile statement not allowed in immutable function: SELECT random\(\)::INT8
 ALTER FUNCTION f IMMUTABLE
+
+subtest end
+
+subtest plpgsql_volatility
+
+statement error pgcode 22023 pq: referencing relations is not allowed in immutable function
+CREATE FUNCTION f() RETURNS FLOAT LANGUAGE PLpgSQL IMMUTABLE AS $$ BEGIN RETURN (SELECT a FROM t1); END $$;
+
+statement error pgcode 22023 pq: volatile statement not allowed in immutable function: BEGIN
+CREATE FUNCTION f() RETURNS FLOAT LANGUAGE PLpgSQL IMMUTABLE AS $$ BEGIN RETURN (SELECT random()); END $$;
+
+statement error pgcode 22023 pq: stable statement not allowed in immutable function: BEGIN
+CREATE FUNCTION f() RETURNS TIMESTAMP LANGUAGE PLpgSQL IMMUTABLE AS $$ BEGIN RETURN (SELECT statement_timestamp()); END $$;
+
+statement error pgcode 22023 pq: volatile statement not allowed in stable function: BEGIN
+CREATE FUNCTION f() RETURNS FLOAT LANGUAGE PLpgSQL STABLE AS $$ BEGIN RETURN (SELECT random()); END $$;
+
+statement error pgcode 22023 pq: volatile statement not allowed in immutable function: BEGIN
+CREATE FUNCTION f() RETURNS FLOAT LANGUAGE PLpgSQL IMMUTABLE AS $$ BEGIN RETURN (SELECT @1 FROM random()); END $$;
+
+statement error pgcode 22023 pq: volatile statement not allowed in immutable function: BEGIN
+CREATE FUNCTION f() RETURNS INT LANGUAGE PLpgSQL IMMUTABLE AS $$
+  BEGIN
+    RETURN (SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a + random()::INT);
+  END
+$$;
+
+statement error pgcode 22023 pq: volatile statement not allowed in immutable function: BEGIN
+CREATE FUNCTION f() RETURNS INT LANGUAGE PLpgSQL IMMUTABLE AS $$
+  BEGIN
+    RETURN (SELECT a FROM t1 WHERE b = 1 + random());
+  END
+$$;
 
 subtest end

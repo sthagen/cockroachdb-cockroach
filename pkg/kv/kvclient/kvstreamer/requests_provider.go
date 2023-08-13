@@ -244,8 +244,7 @@ func (b *requestsProviderBase) close() {
 }
 
 // outOfOrderRequestsProvider is a requestProvider that returns requests in an
-// arbitrary order (namely in the same order as the requests are enqueued and
-// added).
+// arbitrary order (namely in the LIFO order of requests being enqueued).
 type outOfOrderRequestsProvider struct {
 	*requestsProviderBase
 }
@@ -264,6 +263,9 @@ func (p *outOfOrderRequestsProvider) enqueue(requests []singleRangeBatch) {
 	if len(p.requests) > 0 {
 		panic(errors.AssertionFailedf("outOfOrderRequestsProvider has old requests in enqueue"))
 	}
+	if len(requests) == 0 {
+		panic(errors.AssertionFailedf("outOfOrderRequestsProvider enqueuing zero requests"))
+	}
 	p.requests = requests
 	p.hasWork.Signal()
 }
@@ -280,6 +282,8 @@ func (p *outOfOrderRequestsProvider) nextLocked() singleRangeBatch {
 	if len(p.requests) == 0 {
 		panic(errors.AssertionFailedf("nextLocked called when requestsProvider is empty"))
 	}
+	// Use the last request so that we could reuse its slot if resume request is
+	// added.
 	return p.requests[len(p.requests)-1]
 }
 
@@ -288,6 +292,8 @@ func (p *outOfOrderRequestsProvider) removeNextLocked() {
 	if len(p.requests) == 0 {
 		panic(errors.AssertionFailedf("removeNextLocked called when requestsProvider is empty"))
 	}
+	// Use the last request so that we could reuse its slot if resume request is
+	// added.
 	p.requests = p.requests[:len(p.requests)-1]
 }
 
@@ -387,6 +393,9 @@ func (p *inOrderRequestsProvider) enqueue(requests []singleRangeBatch) {
 	defer p.Unlock()
 	if len(p.requests) > 0 {
 		panic(errors.AssertionFailedf("inOrderRequestsProvider has old requests in enqueue"))
+	}
+	if len(requests) == 0 {
+		panic(errors.AssertionFailedf("inOrderRequestsProvider enqueuing zero requests"))
 	}
 	p.requests = requests
 	p.heapInit()

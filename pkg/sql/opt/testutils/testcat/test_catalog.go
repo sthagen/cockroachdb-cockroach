@@ -316,6 +316,11 @@ func (tc *Catalog) RoleExists(ctx context.Context, role username.SQLUsername) (b
 	return true, nil
 }
 
+// Optimizer is part of the cat.Catalog interface.
+func (tc *Catalog) Optimizer() interface{} {
+	return nil
+}
+
 func (tc *Catalog) resolveSchema(toResolve *cat.SchemaName) (cat.Schema, cat.SchemaName, error) {
 	if string(toResolve.CatalogName) != testDB {
 		return nil, cat.SchemaName{}, pgerror.Newf(pgcode.InvalidSchemaName,
@@ -924,6 +929,11 @@ func (tt *Table) HomeRegionColName() (colName string, ok bool) {
 // GetDatabaseID is part of the cat.Table interface.
 func (tt *Table) GetDatabaseID() descpb.ID {
 	return tt.DatabaseID
+}
+
+// IsHypothetical is part of the cat.Table interface.
+func (tt *Table) IsHypothetical() bool {
+	return false
 }
 
 // FindOrdinal returns the ordinal of the column with the given name.

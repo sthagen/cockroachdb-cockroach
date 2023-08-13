@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
@@ -487,6 +488,15 @@ func (oc *optCatalog) fullyQualifiedNameWithTxn(
 // RoleExists is part of the cat.Catalog interface.
 func (oc *optCatalog) RoleExists(ctx context.Context, role username.SQLUsername) (bool, error) {
 	return RoleExists(ctx, oc.planner.InternalSQLTxn(), role)
+}
+
+// Optimizer is part of the cat.Catalog interface.
+func (oc *optCatalog) Optimizer() interface{} {
+	if oc.planner == nil {
+		return nil
+	}
+	plannerInterface := eval.Planner(oc.planner)
+	return plannerInterface.Optimizer()
 }
 
 // dataSourceForDesc returns a data source wrapper for the given descriptor.
@@ -1357,6 +1367,11 @@ func (ot *optTable) HomeRegionColName() (colName string, ok bool) {
 // GetDatabaseID is part of the cat.Table interface.
 func (ot *optTable) GetDatabaseID() descpb.ID {
 	return ot.desc.GetParentID()
+}
+
+// IsHypothetical is part of the cat.Table interface.
+func (ot *optTable) IsHypothetical() bool {
+	return false
 }
 
 // lookupColumnOrdinal returns the ordinal of the column with the given ID. A
@@ -2346,6 +2361,11 @@ func (ot *optVirtualTable) HomeRegionColName() (colName string, ok bool) {
 // GetDatabaseID is part of the cat.Table interface.
 func (ot *optVirtualTable) GetDatabaseID() descpb.ID {
 	return 0
+}
+
+// IsHypothetical is part of the cat.Table interface.
+func (ot *optVirtualTable) IsHypothetical() bool {
+	return false
 }
 
 // CollectTypes is part of the cat.DataSource interface.

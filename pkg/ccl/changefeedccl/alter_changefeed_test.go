@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -50,7 +49,9 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+	ctx := context.Background()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -66,8 +67,6 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 			},
 		},
 	})
-	ctx := context.Background()
-	s := srv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
 
 	rootDB := sqlutils.MakeSQLRunner(db)
@@ -561,6 +560,11 @@ func TestAlterChangefeedErrors(t *testing.T) {
 			`pq: cannot specify both "initial_scan" and "no_initial_scan"`,
 			fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan, no_initial_scan`, feed.JobID()),
 		)
+
+		sqlDB.ExpectErr(t, "pq: changefeed ID must be an INT value: subqueries are not allowed in cdc",
+			"ALTER CHANGEFEED (SELECT 1) ADD bar")
+		sqlDB.ExpectErr(t, "pq: changefeed ID must be an INT value: could not parse \"two\" as type int",
+			"ALTER CHANGEFEED 'two' ADD bar")
 	}
 
 	cdcTest(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection)
@@ -1103,11 +1107,19 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rnd, _ := randutil.NewPseudoRand()
+	rnd, seed := randutil.NewPseudoRand()
+	t.Logf("random seed: %d", seed)
 
 	testFn := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		disableDeclarativeSchemaChangesForTest(t, sqlDB)
+		usingLegacySchemaChanger := maybeDisableDeclarativeSchemaChangesForTest(t, sqlDB)
+		// NB: For the `ALTER TABLE foo ADD COLUMN ... DEFAULT` schema change,
+		// the expected boundary is different depending on if we are using the
+		// legacy schema changer or not.
+		expectedBoundaryType := jobspb.ResolvedSpan_RESTART
+		if usingLegacySchemaChanger {
+			expectedBoundaryType = jobspb.ResolvedSpan_BACKFILL
+		}
 
 		knobs := s.TestingKnobs.
 			DistSQL.(*execinfra.TestingKnobs).
@@ -1182,10 +1194,9 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 				return true, nil
 			}
 
-			// A backfill begins when the backfill resolved event arrives, which has a
-			// timestamp such that all backfill spans have a timestamp of
-			// timestamp.Next()
-			if r.BoundaryType == jobspb.ResolvedSpan_BACKFILL {
+			// A backfill begins when the associated resolved event arrives, which has a
+			// timestamp such that all backfill spans have a timestamp of timestamp.Next().
+			if r.BoundaryType == expectedBoundaryType {
 				backfillTimestamp = r.Timestamp
 				return false, nil
 			}

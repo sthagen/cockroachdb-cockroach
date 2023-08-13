@@ -263,6 +263,14 @@ SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER _ -- literals removed
 SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER 123 -- identifiers removed
 
 parse
+SHOW PUBLIC CLUSTER SETTINGS FOR TENANT INTERVAL 'string' DAY TO HOUR
+----
+SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER ('string'::INTERVAL DAY TO HOUR) -- normalized!
+SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER ((('string')::INTERVAL DAY TO HOUR)) -- fully parenthesized
+SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER ('_'::INTERVAL DAY TO HOUR) -- literals removed
+SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER ('string'::INTERVAL DAY TO HOUR) -- identifiers removed
+
+parse
 SHOW CLUSTER SETTINGS FOR VIRTUAL CLUSTER (1+1)
 ----
 SHOW PUBLIC CLUSTER SETTINGS FOR VIRTUAL CLUSTER (1 + 1) -- normalized!
@@ -2051,3 +2059,19 @@ SHOW BACKUP 'family' IN ('string', 'placeholder', 'placeholder', 'placeholder', 
 SHOW BACKUP ('family') IN (('string'), ('placeholder'), ('placeholder'), ('placeholder'), ('string'), ('placeholder'), ('string'), ('placeholder')) WITH incremental_location = ('nullif'), privileges, debug_dump_metadata_sst -- fully parenthesized
 SHOW BACKUP '_' IN ('_', '_', '_', '_', '_', '_', '_', '_') WITH incremental_location = '_', privileges, debug_dump_metadata_sst -- literals removed
 SHOW BACKUP 'family' IN ('string', 'placeholder', 'placeholder', 'placeholder', 'string', 'placeholder', 'string', 'placeholder') WITH incremental_location = 'nullif', privileges, debug_dump_metadata_sst -- identifiers removed
+
+parse
+SHOW BACKUP 'abc' WITH SKIP SIZE
+----
+SHOW BACKUP 'abc' WITH skip size -- normalized!
+SHOW BACKUP ('abc') WITH skip size -- fully parenthesized
+SHOW BACKUP '_' WITH skip size -- literals removed
+SHOW BACKUP 'abc' WITH skip size -- identifiers removed
+
+parse
+SHOW BACKUP 'abc' WITH NOWAIT
+----
+SHOW BACKUP 'abc' WITH skip size -- normalized!
+SHOW BACKUP ('abc') WITH skip size -- fully parenthesized
+SHOW BACKUP '_' WITH skip size -- literals removed
+SHOW BACKUP 'abc' WITH skip size -- identifiers removed

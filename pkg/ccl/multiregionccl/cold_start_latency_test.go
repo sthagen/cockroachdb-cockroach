@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils/regionlatency"
@@ -78,8 +79,7 @@ func TestColdStartLatency(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		i := i
 		args := base.TestServerArgs{
-			DefaultTestTenant: base.TODOTestTenantDisabled,
-			Locality:          localities[i],
+			Locality: localities[i],
 		}
 		signalAfter[i] = make(chan struct{})
 		serverKnobs := &server.TestingKnobs{
@@ -119,6 +119,9 @@ func TestColdStartLatency(t *testing.T) {
 	tc := testcluster.NewTestCluster(t, numNodes, base.TestClusterArgs{
 		ParallelStart:     true,
 		ServerArgsPerNode: perServerArgs,
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+		},
 	})
 	go func() {
 		for _, c := range signalAfter {
@@ -288,7 +291,7 @@ SELECT checkpoint > extract(epoch from after)
 	// Wait for the configs to be applied.
 	testutils.SucceedsWithin(t, func() error {
 		for _, server := range tc.Servers {
-			reporter := server.Server.SpanConfigReporter()
+			reporter := server.SpanConfigReporter().(spanconfig.Reporter)
 			report, err := reporter.SpanConfigConformance(ctx, []roachpb.Span{
 				{Key: keys.TableDataMin, EndKey: keys.TenantTableDataMax},
 			})

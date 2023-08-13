@@ -130,7 +130,7 @@ type systemAdminServer struct {
 	*adminServer
 
 	nodeLiveness *liveness.NodeLiveness
-	server       *Server
+	server       *topLevelServer
 }
 
 // noteworthyAdminMemoryUsageBytes is the minimum size tracked by the
@@ -161,7 +161,7 @@ func newSystemAdminServer(
 	distSender *kvcoord.DistSender,
 	grpc *grpcServer,
 	drainServer *drainServer,
-	s *Server,
+	s *topLevelServer,
 ) *systemAdminServer {
 	adminServer := newAdminServer(
 		sqlServer,
@@ -2089,7 +2089,7 @@ func (s *adminServer) Cluster(
 	}, nil
 }
 
-// Health returns whether this sql tenant is ready to receive
+// Health returns whether this tenant server is ready to receive
 // traffic.
 //
 // See the docstring for HealthRequest for more details about
@@ -2109,11 +2109,24 @@ func (s *adminServer) Health(
 		return resp, nil
 	}
 
-	if !s.sqlServer.isReady.Get() {
-		return nil, grpcstatus.Errorf(codes.Unavailable, "node is not accepting SQL clients")
+	if err := s.checkReadinessForHealthCheck(ctx); err != nil {
+		return nil, err
 	}
 
 	return resp, nil
+}
+
+// checkReadinessForHealthCheck returns a gRPC error.
+func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
+	if err := s.grpc.health(ctx); err != nil {
+		return err
+	}
+
+	if !s.sqlServer.isReady.Get() {
+		return grpcstatus.Errorf(codes.Unavailable, "node is not accepting SQL clients")
+	}
+
+	return nil
 }
 
 // Health returns liveness for the node target of the request.
@@ -2143,18 +2156,8 @@ func (s *systemAdminServer) Health(
 
 // checkReadinessForHealthCheck returns a gRPC error.
 func (s *systemAdminServer) checkReadinessForHealthCheck(ctx context.Context) error {
-	serveMode := s.grpc.mode.get()
-	switch serveMode {
-	case modeInitializing:
-		return grpcstatus.Error(codes.Unavailable, "node is waiting for cluster initialization")
-	case modeDraining:
-		// grpc.mode is set to modeDraining when the Drain(DrainMode_CLIENT) has
-		// been called (client connections are to be drained).
-		return grpcstatus.Errorf(codes.Unavailable, "node is shutting down")
-	case modeOperational:
-		break
-	default:
-		return srverrors.ServerError(ctx, errors.Newf("unknown mode: %v", serveMode))
+	if err := s.grpc.health(ctx); err != nil {
+		return err
 	}
 
 	status := s.nodeLiveness.GetNodeVitalityFromCache(roachpb.NodeID(s.serverIterator.getID()))
@@ -3521,24 +3524,30 @@ func (rs resultScanner) ScanIndex(row tree.Datums, index int, dst interface{}) e
 		}
 
 	case *time.Time:
-		s, ok := src.(*tree.DTimestamp)
-		if !ok {
+		switch s := src.(type) {
+		case *tree.DTimestamp:
+			*d = s.Time
+		case *tree.DTimestampTZ:
+			*d = s.Time
+		default:
 			return errors.Errorf("source type assertion failed")
 		}
-		*d = s.Time
 
 	// Passing a **time.Time instead of a *time.Time means the source is allowed
 	// to be NULL, in which case nil is stored into *src.
 	case **time.Time:
-		s, ok := src.(*tree.DTimestamp)
-		if !ok {
-			if src != tree.DNull {
+		switch s := src.(type) {
+		case *tree.DTimestamp:
+			*d = &s.Time
+		case *tree.DTimestampTZ:
+			*d = &s.Time
+		default:
+			if src == tree.DNull {
+				*d = nil
+			} else {
 				return errors.Errorf("source type assertion failed")
 			}
-			*d = nil
-			break
 		}
-		*d = &s.Time
 
 	case *[]byte:
 		s, ok := src.(*tree.DBytes)

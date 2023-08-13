@@ -61,6 +61,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -588,12 +589,13 @@ var VectorizeClusterMode = settings.RegisterEnumSetting(
 	VectorizeClusterSettingName,
 	"default vectorize mode",
 	"on",
-	map[int64]string{
-		int64(sessiondatapb.VectorizeUnset):              "on",
-		int64(sessiondatapb.VectorizeOn):                 "on",
-		int64(sessiondatapb.VectorizeExperimentalAlways): "experimental_always",
-		int64(sessiondatapb.VectorizeOff):                "off",
-	},
+	func() map[int64]string {
+		m := make(map[int64]string, len(sessiondatapb.VectorizeExecMode_name))
+		for k := range sessiondatapb.VectorizeExecMode_name {
+			m[int64(k)] = sessiondatapb.VectorizeExecMode(k).String()
+		}
+		return m
+	}(),
 ).WithPublic()
 
 // DistSQLClusterExecMode controls the cluster default for when DistSQL is used.
@@ -738,8 +740,8 @@ var overrideAlterPrimaryRegionInSuperRegion = settings.RegisterBoolSetting(
 	false,
 ).WithPublic()
 
-var errNoTransactionInProgress = errors.New("there is no transaction in progress")
-var errTransactionInProgress = errors.New("there is already a transaction in progress")
+var errNoTransactionInProgress = pgerror.New(pgcode.NoActiveSQLTransaction, "there is no transaction in progress")
+var errTransactionInProgress = pgerror.New(pgcode.ActiveSQLTransaction, "there is already a transaction in progress")
 
 const sqlTxnName string = "sql txn"
 const metricsSampleInterval = 10 * time.Second
@@ -1319,6 +1321,10 @@ type ExecutorConfig struct {
 	// and per-role default settings.
 	SessionInitCache *sessioninit.Cache
 
+	// AuditConfig is the cluster's audit configuration. See the
+	// 'sql.log.user_audit' cluster setting to see how this is configured.
+	AuditConfig *auditlogging.AuditConfigLock
+
 	// ProtectedTimestampProvider encapsulates the protected timestamp subsystem.
 	ProtectedTimestampProvider protectedts.Provider
 
@@ -1376,6 +1382,10 @@ type ExecutorConfig struct {
 	// GetTableMetricsFunc is used to gather information about sstables that
 	// overlap with a key range for a specified node and store.
 	GetTableMetricsFunc eval.GetTableMetricsFunc
+
+	// ScanStorageInternalKeys is used to gather information about the types of
+	// keys (including snapshot pinned keys) at each level of a node store.
+	ScanStorageInternalKeysFunc eval.ScanStorageInternalKeysFunc
 
 	// TraceCollector is used to contact all live nodes in the cluster, and
 	// collect trace spans from their inflight node registries.
@@ -1788,6 +1798,8 @@ type StreamingTestingKnobs struct {
 	DistSQLRetryPolicy *retry.Options
 
 	AfterRetryIteration func(err error)
+
+	AfterResumerJobLoad func(err error) error
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -2151,6 +2163,7 @@ type SessionArgs struct {
 	User                        username.SQLUsername
 	IsSuperuser                 bool
 	IsSSL                       bool
+	ReplicationMode             sessiondatapb.ReplicationMode
 	SystemIdentity              username.SQLUsername
 	SessionDefaults             SessionDefaults
 	CustomOptionSessionDefaults SessionDefaults

@@ -1944,6 +1944,20 @@ func TestShowJobs(t *testing.T) {
 			// confirmed via the job_type field, which is dependent on the details
 			// field.
 			out.details = in.details
+			// All the timestamps won't compare with simple == due locality, so we
+			// check that they are the same instant with time.Equal ourselves.
+			if out.created.Equal(in.created) {
+				out.created = in.created
+			}
+			if out.started.Equal(in.started) {
+				out.started = in.started
+			}
+			if out.finished.Equal(in.finished) {
+				out.finished = in.finished
+			}
+			if out.modified.Equal(in.modified) {
+				out.modified = in.modified
+			}
 
 			if !reflect.DeepEqual(in, out) {
 				diff := strings.Join(pretty.Diff(in, out), "\n")
@@ -2836,14 +2850,14 @@ func TestStatusSafeFormatter(t *testing.T) {
 }
 
 type fakeMetrics struct {
-	n *metric.Counter
+	N *metric.Counter
 }
 
 func (fm fakeMetrics) MetricStruct() {}
 
 func makeFakeMetrics() fakeMetrics {
 	return fakeMetrics{
-		n: metric.NewCounter(metric.Metadata{
+		N: metric.NewCounter(metric.Metadata{
 			Name:        "fake.count",
 			Help:        "utterly fake metric",
 			Measurement: "N",
@@ -2887,7 +2901,7 @@ func TestMetrics(t *testing.T) {
 		func(j *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 			return jobs.FakeResumer{
 				OnResume: func(ctx context.Context) error {
-					defer fakeBackupMetrics.n.Inc(1)
+					defer fakeBackupMetrics.N.Inc(1)
 					return waitForErr(ctx)
 				},
 				FailOrCancel: func(ctx context.Context) error {
@@ -2940,7 +2954,7 @@ func TestMetrics(t *testing.T) {
 		require.Equal(t, int64(1), backupMetrics.CurrentlyRunning.Value())
 		errCh <- nil
 		int64EqSoon(t, backupMetrics.ResumeCompleted.Count, 1)
-		int64EqSoon(t, registry.MetricsStruct().JobSpecificMetrics[jobspb.TypeBackup].(fakeMetrics).n.Count, 1)
+		int64EqSoon(t, registry.MetricsStruct().JobSpecificMetrics[jobspb.TypeBackup].(fakeMetrics).N.Count, 1)
 
 	})
 	t.Run("restart, pause, resume, then success", func(t *testing.T) {
@@ -3647,4 +3661,30 @@ func TestJobTypeMetrics(t *testing.T) {
 
 	runner.Exec(t, "CANCEL JOB $1", cfJob.ID())
 	runner.Exec(t, "CANCEL JOB $1", importJob.ID())
+}
+
+func TestLoadJobProgress(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	r := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
+	defer s.Stopper().Stop(context.Background())
+
+	progress := &jobspb.Progress{
+		Details: jobspb.WrapProgressDetails(jobspb.ImportProgress{ReadProgress: []float32{7.1}}),
+	}
+	rec := jobs.Record{
+		JobID:    7,
+		Username: username.TestUserName(),
+		Details:  jobspb.ImportDetails{},
+		Progress: progress.UnwrapDetails(),
+	}
+	_, err := r.CreateJobWithTxn(ctx, rec, 7, nil)
+	require.NoError(t, err)
+
+	p, err := jobs.LoadJobProgress(ctx, s.InternalDB().(isql.DB), 7)
+	require.NoError(t, err)
+	require.Equal(t, []float32{7.1}, p.GetDetails().(*jobspb.Progress_Import).Import.ReadProgress)
 }

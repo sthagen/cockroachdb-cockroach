@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -306,13 +307,18 @@ type DistSenderMetrics struct {
 	InLeaseTransferBackoffs            *metric.Counter
 	RangeLookups                       *metric.Counter
 	SlowRPCs                           *metric.Gauge
-	RangefeedRanges                    *metric.Gauge
-	RangefeedCatchupRanges             *metric.Gauge
-	RangefeedErrorCatchup              *metric.Counter
-	RangefeedRestartRanges             *metric.Counter
-	RangefeedRestartStuck              *metric.Counter
 	MethodCounts                       [kvpb.NumMethods]*metric.Counter
 	ErrCounts                          [kvpb.NumErrors]*metric.Counter
+	DistSenderRangeFeedMetrics
+}
+
+// DistSenderRangeFeedMetrics is a set of rangefeed specific metrics.
+type DistSenderRangeFeedMetrics struct {
+	RangefeedRanges        *metric.Gauge
+	RangefeedCatchupRanges *metric.Gauge
+	RangefeedErrorCatchup  *metric.Counter
+	RangefeedRestartRanges *metric.Counter
+	RangefeedRestartStuck  *metric.Counter
 }
 
 func makeDistSenderMetrics() DistSenderMetrics {
@@ -334,11 +340,7 @@ func makeDistSenderMetrics() DistSenderMetrics {
 		InLeaseTransferBackoffs:            metric.NewCounter(metaDistSenderInLeaseTransferBackoffsCount),
 		RangeLookups:                       metric.NewCounter(metaDistSenderRangeLookups),
 		SlowRPCs:                           metric.NewGauge(metaDistSenderSlowRPCs),
-		RangefeedRanges:                    metric.NewGauge(metaDistSenderRangefeedTotalRanges),
-		RangefeedCatchupRanges:             metric.NewGauge(metaDistSenderRangefeedCatchupRanges),
-		RangefeedErrorCatchup:              metric.NewCounter(metaDistSenderRangefeedErrorCatchupRanges),
-		RangefeedRestartRanges:             metric.NewCounter(metaDistSenderRangefeedRestartRanges),
-		RangefeedRestartStuck:              metric.NewCounter(metaDistSenderRangefeedRestartStuck),
+		DistSenderRangeFeedMetrics:         makeDistSenderRangeFeedMetrics(),
 	}
 	for i := range m.MethodCounts {
 		method := kvpb.Method(i).String()
@@ -356,6 +358,19 @@ func makeDistSenderMetrics() DistSenderMetrics {
 	}
 	return m
 }
+
+func makeDistSenderRangeFeedMetrics() DistSenderRangeFeedMetrics {
+	return DistSenderRangeFeedMetrics{
+		RangefeedRanges:        metric.NewGauge(metaDistSenderRangefeedTotalRanges),
+		RangefeedCatchupRanges: metric.NewGauge(metaDistSenderRangefeedCatchupRanges),
+		RangefeedErrorCatchup:  metric.NewCounter(metaDistSenderRangefeedErrorCatchupRanges),
+		RangefeedRestartRanges: metric.NewCounter(metaDistSenderRangefeedRestartRanges),
+		RangefeedRestartStuck:  metric.NewCounter(metaDistSenderRangefeedRestartStuck),
+	}
+}
+
+// MetricStruct implements metrics.Struct interface.
+func (DistSenderRangeFeedMetrics) MetricStruct() {}
 
 // updateCrossLocalityMetricsOnReplicaAddressedBatchRequest updates
 // DistSenderMetrics for batch requests that have been divided and are currently
@@ -2657,6 +2672,40 @@ func (ds *DistSender) maybeIncrementErrCounters(br *kvpb.BatchResponse, err erro
 		}
 		ds.metrics.ErrCounts[typ].Inc(1)
 	}
+}
+
+// AllRangeSpans returns the list of all ranges that cover input spans along with the
+// nodeCountHint indicating the number of nodes that host those ranges.
+func (ds *DistSender) AllRangeSpans(
+	ctx context.Context, spans []roachpb.Span,
+) (_ []roachpb.Span, nodeCountHint int, _ error) {
+	ranges := make([]roachpb.Span, 0, len(spans))
+
+	it := MakeRangeIterator(ds)
+	var replicas util.FastIntMap
+
+	for i := range spans {
+		rSpan, err := keys.SpanAddr(spans[i])
+		if err != nil {
+			return nil, 0, err
+		}
+		for it.Seek(ctx, rSpan.Key, Ascending); ; it.Next(ctx) {
+			if !it.Valid() {
+				return nil, 0, it.Error()
+			}
+			ranges = append(ranges, roachpb.Span{
+				Key: it.Desc().StartKey.AsRawKey(), EndKey: it.Desc().EndKey.AsRawKey(),
+			})
+			for _, r := range it.Desc().InternalReplicas {
+				replicas.Set(int(r.NodeID), 0)
+			}
+			if !it.NeedAnother(rSpan) {
+				break
+			}
+		}
+	}
+
+	return ranges, replicas.Len(), nil
 }
 
 // skipStaleReplicas advances the transport until it's positioned on a replica

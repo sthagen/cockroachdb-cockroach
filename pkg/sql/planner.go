@@ -127,6 +127,7 @@ func (evalCtx *extendedEvalContext) copyFromExecCfg(execCfg *ExecutorConfig) {
 	evalCtx.CompactEngineSpan = execCfg.CompactEngineSpanFunc
 	evalCtx.SetCompactionConcurrency = execCfg.CompactionConcurrencyFunc
 	evalCtx.GetTableMetrics = execCfg.GetTableMetricsFunc
+	evalCtx.ScanStorageInternalKeys = execCfg.ScanStorageInternalKeysFunc
 	evalCtx.TestingKnobs = execCfg.EvalContextTestingKnobs
 	evalCtx.ClusterID = execCfg.NodeInfo.LogicalClusterID()
 	evalCtx.ClusterName = execCfg.RPCContext.ClusterName()
@@ -178,10 +179,6 @@ type planner struct {
 	// The internalSQLTxn may hold on to a stale txn reference and should
 	// never be accessed directly. Nothing explicitly resets this field.
 	internalSQLTxn internalTxn
-
-	// isInternalPlanner is set to true when this planner is not bound to
-	// a SQL session.
-	isInternalPlanner bool
 
 	atomic struct {
 		// innerPlansMustUseLeafTxn is set to 1 if the "outer" plan is using
@@ -399,7 +396,6 @@ func newInternalPlanner(
 	p.txn = txn
 	p.stmt = Statement{}
 	p.cancelChecker.Reset(ctx)
-	p.isInternalPlanner = true
 
 	p.semaCtx = tree.MakeSemaContext()
 	p.semaCtx.SearchPath = &sd.SearchPath
@@ -454,7 +450,6 @@ func newInternalPlanner(
 	p.extendedEvalCtx.ExecCfg = execCfg
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
-	p.extendedEvalCtx.Descs = params.collection
 
 	p.queryCacheSession.Init()
 	p.optPlanningCtx.init(p)
@@ -556,6 +551,22 @@ func internalExtendedEvalCtx(
 	return ret
 }
 
+// ExtendedEvalContextCopyAndReset returns a function that produces
+// extendedEvalContexts for parallel subquery, cascade, and check execution.
+func (p *planner) ExtendedEvalContextCopyAndReset() *extendedEvalContext {
+	evalCtx := p.ExtendedEvalContextCopy()
+	p.ExtendedEvalContextReset(evalCtx)
+	return evalCtx
+}
+
+// ExtendedEvalContextReset resets context fields so that the context may be
+// reused across subquery, cascade, and check execution.
+func (p *planner) ExtendedEvalContextReset(evalCtx *extendedEvalContext) {
+	evalCtx.Placeholders = &p.semaCtx.Placeholders
+	evalCtx.Annotations = &p.semaCtx.Annotations
+	evalCtx.SessionID = p.ExtendedEvalContext().SessionID
+}
+
 // SemaCtx provides access to the planner's SemaCtx.
 func (p *planner) SemaCtx() *tree.SemaContext {
 	return &p.semaCtx
@@ -614,7 +625,7 @@ func (p *planner) LeaseMgr() *lease.Manager {
 }
 
 func (p *planner) AuditConfig() *auditlogging.AuditConfigLock {
-	return p.execCfg.SessionInitCache.AuditConfig
+	return p.execCfg.AuditConfig
 }
 
 func (p *planner) Txn() *kv.Txn {
@@ -964,4 +975,9 @@ func (p *planner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) 
 	}
 	p.SemaCtx().Annotations = tree.MakeAnnotations(numAnnotations)
 	p.ExtendedEvalContext().Annotations = &p.SemaCtx().Annotations
+}
+
+// Optimizer is part of the eval.Planner interface.
+func (p *planner) Optimizer() interface{} {
+	return p.optPlanningCtx.Optimizer()
 }

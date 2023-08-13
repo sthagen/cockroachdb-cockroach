@@ -237,15 +237,15 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("CONCURRENTLY = ")
 		ctx.FormatNode(o.CheckConnectionConcurrency)
 	}
-	if o.CheckConnectionDuration != nil {
-		maybeAddSep()
-		ctx.WriteString("TIME = ")
-		ctx.FormatNode(o.CheckConnectionDuration)
-	}
 	if o.CheckConnectionTransferSize != nil {
 		maybeAddSep()
 		ctx.WriteString("TRANSFER = ")
 		ctx.FormatNode(o.CheckConnectionTransferSize)
+	}
+	if o.CheckConnectionDuration != nil {
+		maybeAddSep()
+		ctx.WriteString("TIME = ")
+		ctx.FormatNode(o.CheckConnectionDuration)
 	}
 }
 
@@ -1125,8 +1125,9 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 	ctx.WriteString("FOR TABLE ")
 	ctx.FormatNode(node.Table)
 	if len(node.Options) > 0 {
-		ctx.WriteString(" WITH ")
+		ctx.WriteString(" WITH OPTIONS (")
 		ctx.FormatNode(&node.Options)
+		ctx.WriteString(")")
 	}
 }
 
@@ -1322,6 +1323,7 @@ func (n *ShowSchedules) Format(ctx *FmtCtx) {
 type ShowDefaultPrivileges struct {
 	Roles       RoleSpecList
 	ForAllRoles bool
+	ForGrantee  bool
 	// If Schema is not specified, SHOW DEFAULT PRIVILEGES is being
 	// run on the current database.
 	Schema Name
@@ -1333,7 +1335,12 @@ var _ Statement = &ShowDefaultPrivileges{}
 func (n *ShowDefaultPrivileges) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW DEFAULT PRIVILEGES ")
 	if len(n.Roles) > 0 {
-		ctx.WriteString("FOR ROLE ")
+		if n.ForGrantee {
+			ctx.WriteString("FOR GRANTEE ")
+		} else {
+			ctx.WriteString("FOR ROLE ")
+		}
+
 		for i := range n.Roles {
 			if i > 0 {
 				ctx.WriteString(", ")

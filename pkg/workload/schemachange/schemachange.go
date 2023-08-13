@@ -22,8 +22,10 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -79,6 +81,7 @@ type schemaChange struct {
 	logFilePath                     string
 	logFile                         *os.File
 	dumpLogsOnce                    *sync.Once
+	declarativeStatementsEnabled    atomic.Bool
 	workers                         []*schemaChangeWorker
 	fkParentInvalidPct              int
 	fkChildInvalidPct               int
@@ -181,11 +184,6 @@ func (s *schemaChange) Ops(
 	if err != nil {
 		return workload.QueryLoad{}, err
 	}
-
-	err = adjustOpWeightsForCockroachVersion(ctx, pool, opWeights)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
 	ops := newDeck(rand.New(rand.NewSource(timeutil.Now().UnixNano())), opWeights...)
 	// A separate deck is constructed of only schema changes supported
 	// by the declarative schema changer. This deck has equal weights,
@@ -209,7 +207,6 @@ func (s *schemaChange) Ops(
 		}
 		artifactsLog = makeAtomicLog(s.logFile)
 	}
-
 	s.dumpLogsOnce = &sync.Once{}
 
 	for i := 0; i < s.connFlags.Concurrency; i++ {
@@ -267,8 +264,8 @@ func (s *schemaChange) Ops(
 // cluster.
 func (s *schemaChange) initSeqNum(
 	ctx context.Context, pool *workload.MultiConnPool,
-) (*int64, error) {
-	seqNum := new(int64)
+) (*atomic.Int64, error) {
+	var seqNum atomic.Int64
 
 	const q = `
 SELECT max(regexp_extract(name, '[0-9]+$')::INT8)
@@ -291,10 +288,10 @@ SELECT max(regexp_extract(name, '[0-9]+$')::INT8)
 		return nil, err
 	}
 	if max.Valid {
-		*seqNum = max.Int64 + 1
+		seqNum.Store(max.Int64 + 1)
 	}
 
-	return seqNum, nil
+	return &seqNum, nil
 }
 
 type schemaChangeWorker struct {
@@ -445,6 +442,21 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return errors.Wrap(err, "cannot get a connection and begin a txn")
+	}
+
+	// Enable extra schema changes, if they are available this moment.
+	if !w.workload.declarativeStatementsEnabled.Load() {
+		cannotEnableSchemaChanges, err := isClusterVersionLessThan(ctx, tx, clusterversion.ByKey(clusterversion.V23_2))
+		if err != nil {
+			return errors.Wrap(err, "cannot to get active")
+		}
+		if !cannotEnableSchemaChanges {
+			_, err = w.pool.Get().Exec(ctx, `SET CLUSTER SETTING sql.schema.force_declarative_statements="+CREATE SCHEMA, +CREATE SEQUENCE"`)
+			if err != nil {
+				return errors.Wrap(err, "cannot to enable extra schema changes")
+			}
+			w.workload.declarativeStatementsEnabled.Store(true)
+		}
 	}
 
 	// Release log entry locks if holding all.

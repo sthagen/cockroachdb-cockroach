@@ -101,7 +101,7 @@ func TestSavepoints(t *testing.T) {
 
 			case "retry":
 				epochBefore := txn.Epoch()
-				retryErr := txn.GenerateForcedRetryableError(ctx, "forced retry")
+				retryErr := txn.GenerateForcedRetryableErr(ctx, "forced retry")
 				epochAfter := txn.Epoch()
 				fmt.Fprintf(&buf, "synthetic error: %v\n", retryErr)
 				fmt.Fprintf(&buf, "epoch: %d -> %d\n", epochBefore, epochAfter)
@@ -127,7 +127,9 @@ func TestSavepoints(t *testing.T) {
 
 			case "reset":
 				prevID := txn.ID()
-				txn.PrepareForRetry(ctx)
+				if err := txn.PrepareForRetry(ctx); err != nil {
+					t.Fatal(err)
+				}
 				changed := "changed"
 				if prevID == txn.ID() {
 					changed = "not changed"

@@ -19,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -802,7 +802,7 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 	raftCfg.SetDefaults()
 	raftCfg.RaftHeartbeatIntervalTicks = 1
 	raftCfg.RaftElectionTimeoutTicks = 2
-	reg := server.NewStickyInMemEnginesRegistry()
+	reg := server.NewStickyVFSRegistry()
 	args := base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
@@ -810,15 +810,15 @@ func setupCircuitBreakerTest(t *testing.T) *circuitBreakerTest {
 			RaftConfig: raftCfg,
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					WallClock:            manualClock,
-					StickyEngineRegistry: reg,
+					WallClock:         manualClock,
+					StickyVFSRegistry: reg,
 				},
 				Store: storeKnobs,
 			},
 		},
 	}
 	tc := testcluster.StartTestCluster(t, 2, args)
-	tc.Stopper().AddCloser(stop.CloserFn(reg.CloseAllStickyInMemEngines))
+	tc.Stopper().AddCloser(stop.CloserFn(reg.CloseAllEngines))
 
 	_, err := tc.ServerConn(0).Exec(`SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '45s'`)
 	require.NoError(t, err)
@@ -906,7 +906,7 @@ func (cbt *circuitBreakerTest) ExpireAllLeasesAndN1LivenessRecord(
 		require.True(t, ok)
 
 		ts := hlc.Timestamp{WallTime: self.Expiration.WallTime}
-		require.NoError(t, srv.Stores().VisitStores(func(s *kvserver.Store) error {
+		require.NoError(t, srv.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 			s.VisitReplicas(func(replica *kvserver.Replica) (wantMore bool) {
 				lease, next := replica.GetLease()
 				if lease.Expiration != nil {
@@ -1007,10 +1007,10 @@ func (cbt *circuitBreakerTest) SendCtxTS(
 func (cbt *circuitBreakerTest) WriteDS(idx int) error {
 	cbt.t.Helper()
 	put := kvpb.NewPut(cbt.repls[idx].Desc().StartKey.AsRawKey(), roachpb.MakeValueFromString("hello"))
-	return cbt.sendViaDistSender(cbt.Servers[idx].DistSender(), put)
+	return cbt.sendViaDistSender(cbt.Servers[idx].DistSenderI().(kv.Sender), put)
 }
 
-func (cbt *circuitBreakerTest) sendViaDistSender(ds *kvcoord.DistSender, req kvpb.Request) error {
+func (cbt *circuitBreakerTest) sendViaDistSender(ds kv.Sender, req kvpb.Request) error {
 	cbt.t.Helper()
 	ba := &kvpb.BatchRequest{}
 	ba.Add(req)

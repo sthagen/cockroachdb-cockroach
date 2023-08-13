@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -697,7 +698,8 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// The test uses follower_read_timestamp().
 	defer utilccl.TestingEnableEnterprise()()
 
-	historicalQuery := `SELECT * FROM test AS OF SYSTEM TIME follower_read_timestamp() WHERE k=2`
+	var historicalQuery atomic.Value
+	historicalQuery.Store(`SELECT * FROM test AS OF SYSTEM TIME follower_read_timestamp() WHERE k=2`)
 	recCh := make(chan tracingpb.Recording, 1)
 
 	tc := testcluster.StartTestCluster(t, 4,
@@ -712,8 +714,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 			// Also, we're going to collect a trace of the test's final query.
 			ServerArgsPerNode: map[int]base.TestServerArgs{
 				3: {
-					DefaultTestTenant: base.TODOTestTenantDisabled,
-					UseDatabase:       "t",
+					UseDatabase: "t",
 					Knobs: base.TestingKnobs{
 						KVClient: &kvcoord.ClientTestingKnobs{
 							// Inhibit the checking of connection health done by the
@@ -732,7 +733,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 						},
 						SQLExecutor: &sql.ExecutorTestingKnobs{
 							WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
-								if stmt == historicalQuery {
+								if stmt == historicalQuery.Load().(string) {
 									recCh <- trace
 								}
 							},
@@ -786,7 +787,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// not be executed as a follower read since it attempts to use n2 which
 	// doesn't have a replica any more and then it tries n1 which returns an
 	// updated descriptor.
-	n4.Exec(t, historicalQuery)
+	n4.Exec(t, historicalQuery.Load().(string))
 	// As a sanity check, verify that this was not a follower read.
 	rec := <-recCh
 	require.False(t, kv.OnlyFollowerReads(rec), "query was served through follower reads: %s", rec)
@@ -803,7 +804,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// Make a note of the follower reads metric on n3. We'll check that it was
 	// incremented.
 	var followerReadsCountBefore int64
-	err := tc.Servers[2].Stores().VisitStores(func(s *kvserver.Store) error {
+	err := tc.Servers[2].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		followerReadsCountBefore = s.Metrics().FollowerReadsCount.Count()
 		return nil
 	})
@@ -812,7 +813,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// Run a historical query and assert that it's served from the follower (n3).
 	// n4 should attempt to route to n3 because we pretend n3 has a lower latency
 	// (see testing knob).
-	n4.Exec(t, historicalQuery)
+	n4.Exec(t, historicalQuery.Load().(string))
 	rec = <-recCh
 
 	// Look at the trace and check that we've served a follower read.
@@ -820,7 +821,7 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 
 	// Check that the follower read metric was incremented.
 	var followerReadsCountAfter int64
-	err = tc.Servers[2].Stores().VisitStores(func(s *kvserver.Store) error {
+	err = tc.Servers[2].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 		followerReadsCountAfter = s.Metrics().FollowerReadsCount.Count()
 		return nil
 	})
@@ -855,8 +856,8 @@ func TestFollowerReadsWithStaleDescriptor(t *testing.T) {
 	// the ReplicaInfo twice for the same range. This allows us to verify that
 	// the cached - in the spanResolverIterator - information is correctly
 	// preserved.
-	historicalQuery = `SELECT * FROM [SELECT * FROM test WHERE k=2 UNION ALL SELECT * FROM test WHERE k=3] AS OF SYSTEM TIME follower_read_timestamp()`
-	n4.Exec(t, historicalQuery)
+	historicalQuery.Store(`SELECT * FROM [SELECT * FROM test WHERE k=2 UNION ALL SELECT * FROM test WHERE k=3] AS OF SYSTEM TIME follower_read_timestamp()`)
+	n4.Exec(t, historicalQuery.Load().(string))
 	rec = <-recCh
 
 	// Sanity check that the plan was distributed.
@@ -899,13 +900,15 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 			}
 			localities[i] = locality
 			serverArgs[i] = base.TestServerArgs{
-				Locality:          localities[i],
-				DefaultTestTenant: base.TODOTestTenantDisabled, // we'll create one ourselves below.
+				Locality: localities[i],
 			}
 		}
 		tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
 			ReplicationMode:   base.ReplicationManual,
 			ServerArgsPerNode: serverArgs,
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TODOTestTenantDisabled, // we'll create one ourselves below.
+			},
 		})
 		ctx := context.Background()
 		defer tc.Stopper().Stop(ctx)
@@ -1025,7 +1028,7 @@ func TestSecondaryTenantFollowerReadsRouting(t *testing.T) {
 		getFollowerReadCounts := func() [numNodes]int64 {
 			var counts [numNodes]int64
 			for i := range tc.Servers {
-				err := tc.Servers[i].Stores().VisitStores(func(s *kvserver.Store) error {
+				err := tc.Servers[i].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
 					counts[i] = s.Metrics().FollowerReadsCount.Count()
 					return nil
 				})

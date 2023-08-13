@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -34,8 +33,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClusterStart(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tc := StartTestCluster(t, 3, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(context.Background())
+}
+
 func TestManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tc := StartTestCluster(t, 3,
 		base.TestClusterArgs{
@@ -100,12 +108,8 @@ func TestManualReplication(t *testing.T) {
 	}
 
 	// Transfer the lease to node 1.
-	leaseHolder, err := tc.FindRangeLeaseHolder(
-		tableRangeDesc,
-		&roachpb.ReplicationTarget{
-			NodeID:  tc.Servers[0].GetNode().Descriptor.NodeID,
-			StoreID: tc.Servers[0].GetFirstStoreID(),
-		})
+	target := tc.Target(0)
+	leaseHolder, err := tc.FindRangeLeaseHolder(tableRangeDesc, &target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,19 +126,15 @@ func TestManualReplication(t *testing.T) {
 	// Check that the lease holder has changed. We'll use the old lease holder as
 	// the hint, since it's guaranteed that the old lease holder has applied the
 	// new lease.
-	leaseHolder, err = tc.FindRangeLeaseHolder(
-		tableRangeDesc,
-		&roachpb.ReplicationTarget{
-			NodeID:  tc.Servers[0].GetNode().Descriptor.NodeID,
-			StoreID: tc.Servers[0].GetFirstStoreID(),
-		})
+	target = tc.Target(0)
+	leaseHolder, err = tc.FindRangeLeaseHolder(tableRangeDesc, &target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if leaseHolder.StoreID != tc.Servers[1].GetFirstStoreID() {
 		t.Fatalf("expected lease on server idx 1 (node: %d store: %d), but is on node: %+v",
-			tc.Servers[1].GetNode().Descriptor.NodeID,
-			tc.Servers[1].GetFirstStoreID(),
+			tc.Server(1).NodeID(),
+			tc.Server(1).GetFirstStoreID(),
 			leaseHolder)
 	}
 }
@@ -143,6 +143,7 @@ func TestManualReplication(t *testing.T) {
 // waiting for all of the stores to initialize.
 func TestBasicManualReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tc := StartTestCluster(t, 3, base.TestClusterArgs{ReplicationMode: base.ReplicationManual})
 	defer tc.Stopper().Stop(context.Background())
@@ -175,6 +176,7 @@ func TestBasicManualReplication(t *testing.T) {
 
 func TestBasicAutoReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	tc := StartTestCluster(t, 3, base.TestClusterArgs{ReplicationMode: base.ReplicationAuto})
 	defer tc.Stopper().Stop(context.Background())
@@ -183,6 +185,7 @@ func TestBasicAutoReplication(t *testing.T) {
 
 func TestStopServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Use insecure mode so our servers listen on util.IsolatedTestAddr
 	// and they fail cleanly instead of interfering with other tests.
@@ -209,22 +212,7 @@ func TestStopServer(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID:        roachpb.SystemTenantID,
-		Config:          server1.RPCContext().Config,
-		Clock:           server1.Clock().WallClock(),
-		ToleratedOffset: server1.Clock().ToleratedOffset(),
-		Stopper:         tc.Stopper(),
-		Settings:        server1.ClusterSettings(),
-
-		ClientOnly: true,
-	})
-	conn, err := rpcContext.GRPCDialNode(server1.AdvRPCAddr(), server1.NodeID(),
-		rpc.DefaultClass).Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	statusClient1 := serverpb.NewStatusClient(conn)
+	statusClient1 := server1.GetStatusClient(t)
 	var cancel func()
 	ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -273,9 +261,9 @@ func TestStopServer(t *testing.T) {
 
 func TestRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := server.NewStickyVFSRegistry()
 	lisReg := listenerutil.NewListenerRegistry()
 	defer lisReg.Close()
 
@@ -285,13 +273,13 @@ func TestRestart(t *testing.T) {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: "TestRestart" + strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: "TestRestart" + strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: stickyVFSRegistry,
 				},
 			},
 		}

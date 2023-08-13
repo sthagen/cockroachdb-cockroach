@@ -617,6 +617,41 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestServerCast", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`\*(testServer|testTenant)`,
+			"--",
+			"server/*_test.go",
+			":!server/server_special_test.go",
+			":!server/server_controller_test.go",
+			":!server/settings_cache_test.go",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use Go interfaces instead (see testutils/serverutils/api.go)", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestSQLTelemetryDirectCount", func(t *testing.T) {
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(
@@ -2302,13 +2337,14 @@ func TestLint(t *testing.T) {
 			":!server/storage_api/decommission_test.go",
 			":!server/storage_api/health_test.go",
 			":!server/storage_api/rangelog_test.go",
+			":!server/testserver.go",
 			":!sql/catalog/internal/catkv/catalog_reader_test.go",
 			":!sql/importer/import_processor_test.go",
 			":!sql/importer/import_stmt_test.go",
 			":!sql/importer/read_import_mysql_test.go",
 			":!sql/schemachanger/sctest/test_server_factory.go",
+			":!sql/server_params_test.go",
 			":!sql/sqlinstance/instancestorage/instancecache_test.go",
-			":!sql/tests/server_params.go",
 			":!sql/ttl/ttljob/ttljob_test.go",
 			":!testutils/lint/lint_test.go",
 			":!ts/server_test.go",

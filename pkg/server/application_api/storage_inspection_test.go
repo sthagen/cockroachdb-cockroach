@@ -20,8 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/rangetestutils"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -34,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -455,11 +452,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	ctx := context.Background()
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	ts := s.(*server.TestServer)
 
-	rpcStopper := stop.NewStopper()
-	defer rpcStopper.Stop(ctx)
-	rpcContext := srvtestutils.NewRPCTestContext(ctx, ts, ts.RPCContext().Config)
 	span := roachpb.Span{
 		Key:    roachpb.RKeyMin.AsRawKey(),
 		EndKey: roachpb.RKeyMax.AsRawKey(),
@@ -469,19 +462,13 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 		Spans:  []roachpb.Span{span},
 	}
 
-	url := ts.AdvRPCAddr()
-	nodeID := ts.NodeID()
-	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := serverpb.NewStatusClient(conn)
+	client := s.GetStatusClient(t)
 
 	response, err := client.SpanStats(ctx, &request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialRanges, err := ts.ExpectedInitialRangeCount()
+	initialRanges, err := s.ExpectedInitialRangeCount()
 	if err != nil {
 		t.Fatal(err)
 	}

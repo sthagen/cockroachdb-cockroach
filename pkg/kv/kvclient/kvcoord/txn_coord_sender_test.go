@@ -65,7 +65,7 @@ func createTestDBWithKnobs(
 	s := &localtestcluster.LocalTestCluster{
 		StoreTestingKnobs: knobs,
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), kvcoord.InitFactoryForLocalTestCluster)
+	s.Start(t, kvcoord.InitFactoryForLocalTestCluster)
 	return s
 }
 
@@ -267,7 +267,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 // can be idle and aborted by a heartbeat failure. This test verifies that in
 // those cases the state of the handle ends up as txnRetryableError.
 // This is important to verify because if the handle stays in txnPending then
-// GetTxnRetryableErr() returns nil, and PrepareForRetry() will not reset the
+// GetRetryableErr() returns nil, and PrepareForRetry() will not reset the
 // handle.
 func TestDB_PrepareForRetryAfterHeartbeatFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -336,7 +336,7 @@ func TestDB_PrepareForRetryAfterHeartbeatFailure(t *testing.T) {
 
 	// At this point the handle should be in state txnRetryableError - verify we
 	// can read the error.
-	pErr := tc.GetTxnRetryableErr(ctx)
+	pErr := tc.GetRetryableErr(ctx)
 	require.NotNil(t, pErr)
 	require.Equal(t, txn.ID(), pErr.TxnID)
 	// The transaction was aborted, therefore we should have a new transaction ID.
@@ -661,8 +661,8 @@ func TestTxnCoordSenderCleanupOnCommitAfterRestart(t *testing.T) {
 	}
 
 	// Restart the transaction with a new epoch.
-	require.Error(t, txn.Sender().ManualRestart(ctx, txn.UserPriority(), s.Clock.Now(), "force retry"))
-	txn.Sender().ClearTxnRetryableErr(ctx)
+	require.Error(t, txn.Sender().GenerateForcedRetryableErr(ctx, s.Clock.Now(), "force retry"))
+	txn.Sender().ClearRetryableErr(ctx)
 
 	// Now immediately commit.
 	require.NoError(t, txn.Commit(ctx))
@@ -912,7 +912,9 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			stopper.Stop(ctx)
 
 			if test.callPrepareForRetry {
-				txn.PrepareForRetry(ctx)
+				if err := txn.PrepareForRetry(ctx); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if test.name != "nil" && err == nil {
 				t.Fatalf("expected an error")
@@ -1183,7 +1185,7 @@ func setupMetricsTest(
 		DisableLivenessHeartbeat: true,
 		DontCreateSystemRanges:   true,
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), kvcoord.InitFactoryForLocalTestCluster)
+	s.Start(t, kvcoord.InitFactoryForLocalTestCluster)
 
 	metrics := kvcoord.MakeTxnMetrics(metric.TestSampleInterval)
 	s.DB.GetFactory().(*kvcoord.TxnCoordSenderFactory).TestingSetMetrics(metrics)
@@ -2771,16 +2773,16 @@ func TestTxnCoordSenderSetFixedTimestamp(t *testing.T) {
 			before: func(t *testing.T, txn *kv.Txn) {
 				_, err := txn.Get(ctx, "k")
 				require.NoError(t, err)
-				require.Error(t, txn.Sender().ManualRestart(ctx, txn.UserPriority(), txn.ReadTimestamp().Next(), "force retry"))
-				txn.Sender().ClearTxnRetryableErr(ctx)
+				require.Error(t, txn.Sender().GenerateForcedRetryableErr(ctx, txn.ReadTimestamp().Next(), "force retry"))
+				txn.Sender().ClearRetryableErr(ctx)
 			},
 		},
 		{
 			name: "write before, in prior epoch",
 			before: func(t *testing.T, txn *kv.Txn) {
 				require.NoError(t, txn.Put(ctx, "k", "v"))
-				require.Error(t, txn.Sender().ManualRestart(ctx, txn.UserPriority(), txn.ReadTimestamp().Next(), "force retry"))
-				txn.Sender().ClearTxnRetryableErr(ctx)
+				require.Error(t, txn.Sender().GenerateForcedRetryableErr(ctx, txn.ReadTimestamp().Next(), "force retry"))
+				txn.Sender().ClearRetryableErr(ctx)
 			},
 		},
 		{
@@ -2789,8 +2791,8 @@ func TestTxnCoordSenderSetFixedTimestamp(t *testing.T) {
 				_, err := txn.Get(ctx, "k")
 				require.NoError(t, err)
 				require.NoError(t, txn.Put(ctx, "k", "v"))
-				require.Error(t, txn.Sender().ManualRestart(ctx, txn.UserPriority(), txn.ReadTimestamp().Next(), "force retry"))
-				txn.Sender().ClearTxnRetryableErr(ctx)
+				require.Error(t, txn.Sender().GenerateForcedRetryableErr(ctx, txn.ReadTimestamp().Next(), "force retry"))
+				txn.Sender().ClearRetryableErr(ctx)
 			},
 		},
 	} {

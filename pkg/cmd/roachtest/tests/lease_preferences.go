@@ -188,7 +188,8 @@ func runLeasePreferences(
 				// dc=2: n3 n4
 				// ...
 				// dc=N: n2N-1 n2N
-				fmt.Sprintf("--locality=region=fake-region,zone=fake-zone,dc=%d", (node-1)/2+1))
+				fmt.Sprintf("--locality=region=fake-region,zone=fake-zone,dc=%d", (node-1)/2+1),
+				"--vmodule=replica_proposal=2,replicate_queue=3,replicate=3")
 			c.Start(ctx, t.L(), opts, settings, c.Node(node))
 
 		}
@@ -223,7 +224,7 @@ func runLeasePreferences(
 	checkLeasePreferenceConformance := func(ctx context.Context) {
 		result, err := waitForLeasePreferences(
 			ctx, t, c, spec.checkNodes, spec.waitForLessPreferred, stableDuration)
-		require.NoError(t, err)
+		require.NoError(t, err, result)
 		require.Truef(t, !result.violating(), "violating lease preferences %s", result)
 		if spec.waitForLessPreferred {
 			require.Truef(t, !result.lessPreferred(), "less preferred preferences %s", result)
@@ -250,6 +251,14 @@ func runLeasePreferences(
 	// Wait for under-replicated ranges before checking lease preference
 	// enforcement.
 	require.NoError(t, WaitForReplication(ctx, t, conn, spec.replFactor))
+
+	// Set a lease preference for the liveness range, to be on n5. This test
+	// would occasionally fail due to the liveness heartbeat failures, when the
+	// liveness lease is on a stopped node. This is not ideal behavior, #108512.
+	configureZone(t, ctx, conn, "RANGE liveness", zoneConfig{
+		replicas:  spec.replFactor,
+		leaseNode: 5,
+	})
 
 	t.L().Printf("setting lease preferences: %s", spec.preferences)
 	setLeasePreferences(ctx, spec.preferences)

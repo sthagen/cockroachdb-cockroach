@@ -158,12 +158,12 @@ func (b *baseStatusServer) getLocalSessions(
 		return nil, srverrors.ServerError(ctx, err)
 	}
 
-	hasViewActivityRedacted, err := b.privilegeChecker.HasRoleOption(ctx, sessionUser, roleoption.VIEWACTIVITYREDACTED)
+	hasViewActivityRedacted, err := b.privilegeChecker.HasPrivilegeOrRoleOption(ctx, sessionUser, privilege.VIEWACTIVITYREDACTED)
 	if err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 
-	hasViewActivity, err := b.privilegeChecker.HasRoleOption(ctx, sessionUser, roleoption.VIEWACTIVITY)
+	hasViewActivity, err := b.privilegeChecker.HasPrivilegeOrRoleOption(ctx, sessionUser, privilege.VIEWACTIVITY)
 	if err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
@@ -204,6 +204,11 @@ func (b *baseStatusServer) getLocalSessions(
 		}
 	}
 
+	// At this point, we have decided if we are going to show all sessions so we
+	// can set the username to the session user if it is undefined.
+	if reqUsername.Undefined() {
+		reqUsername = sessionUser
+	}
 	reqUserNameNormalized := reqUsername.Normalized()
 
 	userSessions := make([]serverpb.Session, 0, len(sessions)+len(closedSessions))
@@ -504,9 +509,16 @@ type StmtDiagnosticsRequester interface {
 	// tracing a query with the given fingerprint. Once this returns, calling
 	// stmtdiagnostics.ShouldCollectDiagnostics() on the current node will
 	// return true depending on the parameters below.
+	// - planGist, when set, indicates a particular plan that we want collect
+	//   diagnostics for. This can be useful when a single fingerprint can
+	//   result in multiple plans.
+	//  - There is a caveat to using this filtering: since the plan gist for a
+	//    running query is only available after the optimizer has done its part,
+	//    the trace will only include things after the optimizer is done.
+	//  - if antiPlanGist is true, then any plan not matching the gist will do.
 	// - samplingProbability controls how likely we are to try and collect a
-	//  diagnostics report for a given execution. The semantics with
-	//  minExecutionLatency are as follows:
+	//   diagnostics report for a given execution. The semantics with
+	//   minExecutionLatency are as follows:
 	//  - If samplingProbability is zero, we're always sampling. This is for
 	//    compatibility with pre-22.2 versions where this parameter was not
 	//    available.
@@ -524,6 +536,8 @@ type StmtDiagnosticsRequester interface {
 	InsertRequest(
 		ctx context.Context,
 		stmtFingerprint string,
+		planGist string,
+		antiPlanGist bool,
 		samplingProbability float64,
 		minExecutionLatency time.Duration,
 		expiresAfter time.Duration,
@@ -2809,8 +2823,9 @@ func (s *systemStatusServer) HotRangesV2(
 		response.ErrorsByNodeID[nodeID] = err.Error()
 	}
 
+	timeout := HotRangesRequestNodeTimeout.Get(&s.st.SV)
 	next, err := s.paginatedIterateNodes(
-		ctx, "hotRanges", size, start, requestedNodes, dialFn,
+		ctx, "hotRanges", size, start, requestedNodes, timeout, dialFn,
 		nodeFn, responseFn, errorFn)
 
 	if err != nil {
@@ -3087,12 +3102,14 @@ func (s *statusServer) iterateNodes(
 // and nodeError on every error result. It returns the next `limit` results
 // after `start`. If `requestedNodes` is specified and non-empty, iteration is
 // only done on that subset of nodes in addition to any nodes already in pagState.
+// If non-zero, nodeFn will run with a timeout specified by nodeFnTimeout.
 func (s *statusServer) paginatedIterateNodes(
 	ctx context.Context,
 	errorCtx string,
 	limit int,
 	pagState paginationState,
 	requestedNodes []roachpb.NodeID,
+	nodeFnTimeout time.Duration,
 	dialFn func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error),
 	nodeFn func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error),
 	responseFn func(nodeID roachpb.NodeID, resp interface{}),
@@ -3154,7 +3171,9 @@ func (s *statusServer) paginatedIterateNodes(
 				Sem:        sem,
 				WaitForSem: true,
 			},
-			func(ctx context.Context) { paginator.queryNode(ctx, nodeID, idx) },
+			func(ctx context.Context) {
+				paginator.queryNode(ctx, nodeID, idx, nodeFnTimeout)
+			},
 		); err != nil {
 			return pagState, err
 		}
@@ -3208,7 +3227,7 @@ func (s *statusServer) listSessionsHelper(
 	var err error
 	var pagState paginationState
 	if pagState, err = s.paginatedIterateNodes(
-		ctx, "session list", limit, start, nil, dialFn, nodeFn, responseFn, errorFn); err != nil {
+		ctx, "session list", limit, start, nil, noTimeout, dialFn, nodeFn, responseFn, errorFn); err != nil {
 		err := serverpb.ListSessionsError{Message: err.Error()}
 		response.Errors = append(response.Errors, err)
 	}

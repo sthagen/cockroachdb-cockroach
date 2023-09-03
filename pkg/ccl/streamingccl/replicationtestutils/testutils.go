@@ -130,8 +130,9 @@ func (c *TenantStreamingClusters) setupSrcTenant() {
 
 func (c *TenantStreamingClusters) init() {
 	c.SrcSysSQL.ExecMultiple(c.T, ConfigureClusterSettings(c.Args.SrcClusterSettings)...)
-	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.split_at.allow_for_secondary_tenant.enabled=true`, c.Args.SrcTenantName)
-	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.scatter.allow_for_secondary_tenant.enabled=true`, c.Args.SrcTenantName)
+	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.virtual_cluster.feature_access.manual_range_split.enabled=true`, c.Args.SrcTenantName)
+	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.virtual_cluster.feature_access.manual_range_scatter.enabled=true`, c.Args.SrcTenantName)
+	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled=true`, c.Args.SrcTenantName)
 	if c.Args.SrcInitFunc != nil {
 		c.Args.SrcInitFunc(c.T, c.SrcSysSQL, c.SrcTenantSQL)
 	}
@@ -158,6 +159,8 @@ func (c *TenantStreamingClusters) StartDestTenant(ctx context.Context) func() er
 		return c.DestTenantConn.Ping()
 	})
 	// TODO (msbutler): consider granting the new tenant some capabilities.
+	c.DestSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled=true`, c.Args.DestTenantName)
+
 	return func() error {
 		return destTenantConn.Close()
 	}
@@ -449,12 +452,14 @@ var defaultSrcClusterSetting = map[string]string{
 	`kv.rangefeed.enabled`:                `true`,
 	`kv.closed_timestamp.target_duration`: `'1s'`,
 	// Large timeout makes test to not fail with unexpected timeout failures.
-	`stream_replication.job_liveness_timeout`:            `'3m'`,
+	`stream_replication.job_liveness.timeout`:            `'3m'`,
 	`stream_replication.stream_liveness_track_frequency`: `'2s'`,
 	`stream_replication.min_checkpoint_frequency`:        `'1s'`,
 	// Make all AddSSTable operation to trigger AddSSTable events.
 	`kv.bulk_io_write.small_write_size`: `'1'`,
 	`jobs.registry.interval.adopt`:      `'1s'`,
+	// Speed up span reconciliation
+	`spanconfig.reconciliation_job.checkpoint_interval`: `'100ms'`,
 }
 
 var defaultDestClusterSetting = map[string]string{
@@ -463,6 +468,7 @@ var defaultDestClusterSetting = map[string]string{
 	`bulkio.stream_ingestion.minimum_flush_interval`:       `'10ms'`,
 	`bulkio.stream_ingestion.cutover_signal_poll_interval`: `'100ms'`,
 	`jobs.registry.interval.adopt`:                         `'1s'`,
+	`spanconfig.reconciliation_job.checkpoint_interval`:    `'100ms'`,
 }
 
 func ConfigureClusterSettings(setting map[string]string) []string {

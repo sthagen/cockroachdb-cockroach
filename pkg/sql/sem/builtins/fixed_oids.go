@@ -1215,7 +1215,7 @@ var builtinOidsArray = []string{
 	1234: `array_positions(array: anyenum[], elem: anyenum) -> int[]`,
 	1235: `array_positions(array: tuple[], elem: tuple) -> int[]`,
 	1236: `soundex(source: string) -> string`,
-	1237: `difference(source: string, target: string) -> string`,
+	1237: `difference(source: string, target: string) -> int`,
 	1238: `levenshtein(source: string, target: string) -> int`,
 	1239: `levenshtein(source: string, target: string, ins_cost: int, del_cost: int, sub_cost: int) -> int`,
 	1240: `json_remove_path(val: jsonb, path: string[]) -> jsonb`,
@@ -2440,6 +2440,19 @@ var builtinOidsArray = []string{
 	2469: `crdb_internal.is_system_table_key(raw_key: bytes) -> bool`,
 	2470: `crdb_internal.scan_storage_internal_keys(node_id: int, store_id: int, start_key: bytes, end_key: bytes) -> tuple{int AS level, int AS node_id, int AS store_id, int AS snapshot_pinned_keys, int AS snapshot_pinned_keys_bytes, int AS point_key_delete_count, int AS point_key_set_count, int AS range_delete_count, int AS range_key_set_count, int AS range_key_delete_count}`,
 	2471: `crdb_internal.scan_storage_internal_keys(node_id: int, store_id: int, start_key: bytes, end_key: bytes, mb_per_second: int4) -> tuple{int AS level, int AS node_id, int AS store_id, int AS snapshot_pinned_keys, int AS snapshot_pinned_keys_bytes, int AS point_key_delete_count, int AS point_key_set_count, int AS range_delete_count, int AS range_key_set_count, int AS range_key_delete_count}`,
+	2472: `bitmask_or(a: varbit, b: varbit) -> varbit`,
+	2473: `bitmask_or(a: string, b: string) -> varbit`,
+	2474: `bitmask_or(a: varbit, b: string) -> varbit`,
+	2475: `bitmask_or(a: string, b: varbit) -> varbit`,
+	2476: `bitmask_and(a: varbit, b: varbit) -> varbit`,
+	2477: `bitmask_and(a: string, b: string) -> varbit`,
+	2478: `bitmask_and(a: varbit, b: string) -> varbit`,
+	2479: `bitmask_and(a: string, b: varbit) -> varbit`,
+	2480: `bitmask_xor(a: varbit, b: varbit) -> varbit`,
+	2481: `bitmask_xor(a: string, b: string) -> varbit`,
+	2482: `bitmask_xor(a: varbit, b: string) -> varbit`,
+	2483: `bitmask_xor(a: string, b: varbit) -> varbit`,
+	2484: `oidvectortypes(vector: oidvector) -> string`,
 }
 
 var builtinOidsBySignature map[string]oid.Oid

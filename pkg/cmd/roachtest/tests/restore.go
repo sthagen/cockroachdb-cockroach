@@ -57,9 +57,8 @@ func registerRestoreNodeShutdown(r registry.Registry) {
 
 	makeRestoreStarter := func(ctx context.Context, t test.Test, c cluster.Cluster,
 		gatewayNode int, rd restoreDriver) jobStarter {
-		return func(c cluster.Cluster, t test.Test) (string, error) {
-			jobID, err := rd.runDetached(ctx, "DATABASE tpce", gatewayNode)
-			return fmt.Sprintf("%d", jobID), err
+		return func(c cluster.Cluster, t test.Test) (jobspb.JobID, error) {
+			return rd.runDetached(ctx, "DATABASE tpce", gatewayNode)
 		}
 	}
 
@@ -108,7 +107,7 @@ func registerRestore(r registry.Registry) {
 		PrometheusNameSpace, Subsystem: "restore", Name: "duration"}, []string{"test_name"})
 
 	withPauseSpecs := restoreSpecs{
-		hardware: makeHardwareSpecs(hardwareSpecs{}),
+		hardware: makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
 		backup: makeRestoringBackupSpecs(
 			backupSpecs{workload: tpceRestore{customers: 1000},
 				version: "v22.2.1"}),
@@ -135,8 +134,6 @@ func registerRestore(r registry.Registry) {
 			m := c.NewMonitor(ctx)
 			dul := roachtestutil.NewDiskUsageLogger(t, c)
 			m.Go(dul.Runner)
-			hc := roachtestutil.NewHealthChecker(t, c, c.All())
-			m.Go(hc.Runner)
 
 			jobIDCh := make(chan jobspb.JobID)
 			jobCompleteCh := make(chan struct{}, 1)
@@ -210,7 +207,6 @@ func registerRestore(r registry.Registry) {
 
 			m.Go(func(ctx context.Context) error {
 				defer dul.Done()
-				defer hc.Done()
 				defer close(jobCompleteCh)
 				defer close(jobIDCh)
 				t.Status(`running restore`)
@@ -268,7 +264,7 @@ func registerRestore(r registry.Registry) {
 
 	for _, sp := range []restoreSpecs{
 		{
-			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			hardware: makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
 			backup:   makeRestoringBackupSpecs(backupSpecs{}),
 			timeout:  1 * time.Hour,
 			tags:     registry.Tags("aws"),
@@ -290,7 +286,7 @@ func registerRestore(r registry.Registry) {
 		{
 			// Benchmarks if per node throughput remains constant if the number of
 			// nodes doubles relative to default.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 8}),
+			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 8, ebsThroughput: 250 /* MB/s */}),
 			backup:   makeRestoringBackupSpecs(backupSpecs{}),
 			timeout:  1 * time.Hour,
 			tags:     registry.Tags("aws"),
@@ -299,7 +295,7 @@ func registerRestore(r registry.Registry) {
 			// Benchmarks if per node throughput remains constant if the cluster
 			// is multi-region.
 			hardware: makeHardwareSpecs(hardwareSpecs{
-				nodes: 9,
+				nodes: 9, ebsThroughput: 250, /* MB/s */
 				zones: []string{"us-east-2b", "us-west-2b", "eu-west-1b"}}), // These zones are AWS-specific.
 			backup:  makeRestoringBackupSpecs(backupSpecs{cloud: spec.AWS}),
 			timeout: 90 * time.Minute,
@@ -308,7 +304,7 @@ func registerRestore(r registry.Registry) {
 		{
 			// Benchmarks if per node throughput doubles if the vcpu count doubles
 			// relative to default.
-			hardware: makeHardwareSpecs(hardwareSpecs{cpus: 16}),
+			hardware: makeHardwareSpecs(hardwareSpecs{cpus: 16, ebsThroughput: 250 /* MB/s */}),
 			backup:   makeRestoringBackupSpecs(backupSpecs{}),
 			timeout:  1 * time.Hour,
 			tags:     registry.Tags("aws"),
@@ -316,7 +312,7 @@ func registerRestore(r registry.Registry) {
 		{
 			// Ensures we can restore a 48 length incremental chain.
 			// Also benchmarks per node throughput for a long chain.
-			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			hardware: makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
 			backup:   makeRestoringBackupSpecs(backupSpecs{backupsIncluded: 48}),
 			timeout:  1 * time.Hour,
 			tags:     registry.Tags("aws"),
@@ -335,7 +331,8 @@ func registerRestore(r registry.Registry) {
 		},
 		{
 			// The weekly 32TB Restore test.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000}),
+			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000,
+				ebsThroughput: 250 /* MB/s */}),
 			backup: makeRestoringBackupSpecs(backupSpecs{
 				version:  "v22.2.1",
 				workload: tpceRestore{customers: 2000000}}),
@@ -351,7 +348,8 @@ func registerRestore(r registry.Registry) {
 			// spans. Together with having a 400 incremental chain, this
 			// regression tests against the OOMs that we've seen in previous
 			// versions.
-			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000}),
+			hardware: makeHardwareSpecs(hardwareSpecs{nodes: 15, cpus: 16, volumeSize: 5000,
+				ebsThroughput: 250 /* MB/s */}),
 			backup: makeRestoringBackupSpecs(backupSpecs{
 				version:          "v22.2.4",
 				workload:         tpceRestore{customers: 2000000},
@@ -380,7 +378,7 @@ func registerRestore(r registry.Registry) {
 		},
 		{
 			// A teeny weeny 15GB restore that could be used to bisect scale agnostic perf regressions.
-			hardware: makeHardwareSpecs(hardwareSpecs{}),
+			hardware: makeHardwareSpecs(hardwareSpecs{ebsThroughput: 250 /* MB/s */}),
 			backup: makeRestoringBackupSpecs(
 				backupSpecs{workload: tpceRestore{customers: 1000},
 					version: "v22.2.1"}),
@@ -414,12 +412,8 @@ func registerRestore(r registry.Registry) {
 				m := c.NewMonitor(ctx)
 				dul := roachtestutil.NewDiskUsageLogger(t, c)
 				m.Go(dul.Runner)
-				hc := roachtestutil.NewHealthChecker(t, c, c.All())
-				m.Go(hc.Runner)
-
 				m.Go(func(ctx context.Context) error {
 					defer dul.Done()
-					defer hc.Done()
 					t.Status(`running setup statements`)
 					db, err := rd.c.ConnE(ctx, rd.t.L(), rd.c.Node(1)[0])
 					if err != nil {
@@ -830,6 +824,13 @@ func (rd *restoreDriver) prepareCluster(ctx context.Context) {
 	rd.c.Put(ctx, rd.t.Cockroach(), "./cockroach")
 	rd.c.Start(ctx, rd.t.L(), option.DefaultStartOptsNoBackups(), install.MakeClusterSettings())
 	rd.getAOST(ctx)
+
+	if rand.Intn(2) == 0 {
+		rd.t.L().Printf("Running non-default makeSimpleImportSpans")
+		conn := rd.c.Conn(ctx, rd.t.L(), 1)
+		_, err := conn.ExecContext(ctx, "SET CLUSTER SETTING bulkio.restore.simple_import_spans.enabled = true")
+		require.NoError(rd.t, err)
+	}
 }
 
 // getAOST gets the AOST to use in the restore cmd.

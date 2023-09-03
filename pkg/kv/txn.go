@@ -389,22 +389,36 @@ func (txn *Txn) readTimestampLocked() hlc.Timestamp {
 	return txn.mu.sender.ReadTimestamp()
 }
 
-// CommitTimestamp returns the transaction's start timestamp.
-// The start timestamp can get pushed but the use of this
-// method will guarantee that if a timestamp push is needed
-// the commit will fail with a retryable error.
-func (txn *Txn) CommitTimestamp() hlc.Timestamp {
+// ReadTimestampFixed returns true if the read timestamp has been fixed
+// and cannot be pushed forward.
+func (txn *Txn) ReadTimestampFixed() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.ReadTimestampFixed()
+}
+
+// CommitTimestamp returns the transaction's commit timestamp.
+//
+// If the transaction is committed, the method returns the timestamp at
+// which the transaction performed all of its writes.
+//
+// If the transaction is aborted, the method returns an error.
+//
+// If the transaction is pending and running under serializable isolation,
+// the method returns the transaction's current provisional commit
+// timestamp. It also fixes the transaction's read timestamp to ensure
+// that the transaction cannot be pushed to a later timestamp and still
+// commit. It does so by disabling read refreshes. As a result, using this
+// method just once increases the likelihood that a retry error will
+// bubble up to a client.
+//
+// If the transaction is pending and running under a weak isolation level,
+// the method returns an error. Fixing the commit timestamp prematurely is
+// not supported for transactions running under weak isolation levels.
+func (txn *Txn) CommitTimestamp() (hlc.Timestamp, error) {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	return txn.mu.sender.CommitTimestamp()
-}
-
-// CommitTimestampFixed returns true if the commit timestamp has
-// been fixed to the start timestamp and cannot be pushed forward.
-func (txn *Txn) CommitTimestampFixed() bool {
-	txn.mu.Lock()
-	defer txn.mu.Unlock()
-	return txn.mu.sender.CommitTimestampFixed()
 }
 
 // ProvisionalCommitTimestamp returns the transaction's provisional
@@ -944,6 +958,11 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 		}
 		err = fn(ctx, txn)
 
+		// Optionally inject retryable errors for testing.
+		if err == nil && txn.TestingShouldRetry() {
+			err = txn.GenerateForcedRetryableErr(ctx, "injected retriable error")
+		}
+
 		// Commit on success, unless the txn has already been committed or rolled
 		// back by the closure. We allow that, as the closure might want to run 1PC
 		// transactions or might want to rollback on certain conditions.
@@ -971,7 +990,7 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 					log.Fatalf(ctx, "unexpected UnhandledRetryableError at the txn.exec() level: %s", err)
 				}
 			} else if t := (*kvpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &t) {
-				if txn.ID() != t.TxnID {
+				if txn.ID() != t.PrevTxnID {
 					// Make sure the retryable error is meant for this level by checking
 					// the transaction the error was generated for. If it's not, we
 					// terminate the "retryable" character of the error. We might get a
@@ -1020,35 +1039,91 @@ func (txn *Txn) PrepareForRetry(ctx context.Context) error {
 		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
 			retryErr, "PrepareForRetry() called on leaf txn"), ctx)
 	}
+	if err := txn.checkRetryErrorTxnIDLocked(ctx, retryErr); err != nil {
+		return err
+	}
+
 	log.VEventf(ctx, 2, "retrying transaction: %s because of a retryable error: %s",
 		txn.debugNameLocked(), retryErr)
 	txn.resetDeadlineLocked()
 
-	if txn.mu.ID != retryErr.TxnID {
-		// Sanity check that the retry error we're dealing with is for the current
-		// incarnation of the transaction. Aborted transactions may be retried
-		// transparently in certain cases and such incarnations come with new
-		// txn IDs. However, at no point can both the old and new incarnation of a
-		// transaction be active at the same time -- this would constitute a
-		// programming error.
-		return errors.WithContextTags(
-			errors.NewAssertionErrorWithWrappedErrf(
-				retryErr,
-				"unexpected retryable error for old incarnation of the transaction %s; current incarnation %s",
-				retryErr.TxnID,
-				txn.mu.ID,
-			), ctx)
+	if !retryErr.TxnMustRestartFromBeginning() {
+		// If the retry error does not require the transaction to restart from
+		// beginning, it will have also not caused the transaction to advance its
+		// epoch. The caller has decided that it does want to restart from the
+		// beginning, se we "promote" the partial retry error to a full retry by
+		// manually restarting the transaction.
+		const msg = "promoting partial retryable error to full transaction retry"
+		log.VEventf(ctx, 2, msg)
+		manualErr := txn.mu.sender.GenerateForcedRetryableErr(
+			ctx, retryErr.NextTransaction.WriteTimestamp, true /* mustRestart */, msg)
+		// Now replace retryErr with the error returned by ManualRestart.
+		if !errors.As(manualErr, &retryErr) {
+			return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+				manualErr, "unexpected non-retry error during manual restart"), ctx)
+		}
 	}
 
 	if !retryErr.PrevTxnAborted() {
 		// If the retryable error doesn't correspond to an aborted transaction,
 		// there's no need to switch out the transaction. We simply clear the
 		// retryable error and proceed.
-		txn.mu.sender.ClearRetryableErr(ctx)
-		return nil
+		return txn.mu.sender.ClearRetryableErr(ctx)
 	}
 
 	return txn.handleTransactionAbortedErrorLocked(ctx, retryErr)
+}
+
+// PrepareForPartialRetry is like PrepareForRetry, except that it expects the
+// retryable error to not require the transaction to restart from the beginning
+// (see TransactionRetryWithProtoRefreshError.TxnMustRestartFromBeginning). It
+// is called once a partial retryable error has been handled and the caller is
+// ready to continue using the transaction.
+func (txn *Txn) PrepareForPartialRetry(ctx context.Context) error {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+
+	retryErr := txn.mu.sender.GetRetryableErr(ctx)
+	if retryErr == nil {
+		return nil
+	}
+	if txn.typ != RootTxn {
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "PrepareForPartialRetry() called on leaf txn"), ctx)
+	}
+	if err := txn.checkRetryErrorTxnIDLocked(ctx, retryErr); err != nil {
+		return err
+	}
+	if retryErr.TxnMustRestartFromBeginning() {
+		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
+			retryErr, "unexpected retryable error that must restart from beginning"), ctx)
+	}
+
+	log.VEventf(ctx, 2, "partially retrying transaction: %s because of a retryable error: %s",
+		txn.debugNameLocked(), retryErr)
+
+	return txn.mu.sender.ClearRetryableErr(ctx)
+}
+
+func (txn *Txn) checkRetryErrorTxnIDLocked(
+	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError,
+) error {
+	if txn.mu.ID == retryErr.PrevTxnID {
+		return nil
+	}
+	// Sanity check that the retry error we're dealing with is for the current
+	// incarnation of the transaction. Aborted transactions may be retried
+	// transparently in certain cases and such incarnations come with new
+	// txn IDs. However, at no point can both the old and new incarnation of a
+	// transaction be active at the same time -- this would constitute a
+	// programming error.
+	return errors.WithContextTags(
+		errors.NewAssertionErrorWithWrappedErrf(
+			retryErr,
+			"unexpected retryable error for old incarnation of the transaction %s; current incarnation %s",
+			retryErr.PrevTxnID,
+			txn.mu.ID,
+		), ctx)
 }
 
 // Send runs the specified calls synchronously in a single batch and
@@ -1101,12 +1176,12 @@ func (txn *Txn) Send(
 	}
 
 	if retryErr, ok := pErr.GetDetail().(*kvpb.TransactionRetryWithProtoRefreshError); ok {
-		if requestTxnID != retryErr.TxnID {
+		if requestTxnID != retryErr.PrevTxnID {
 			// KV should not return errors for transactions other than the one that sent
 			// the request.
 			log.Fatalf(ctx, "retryable error for the wrong txn. "+
-				"requestTxnID: %s, retryErr.TxnID: %s. retryErr: %s",
-				requestTxnID, retryErr.TxnID, retryErr)
+				"requestTxnID: %s, retryErr.PrevTxnID: %s. retryErr: %s",
+				requestTxnID, retryErr.PrevTxnID, retryErr)
 		}
 	}
 	return br, pErr
@@ -1237,7 +1312,7 @@ func (txn *Txn) checkNegotiateAndSendPreconditions(
 	assert(ba.IsReadOnly(), "batch must be read-only")
 	assert(!ba.IsLocking(), "batch must not be locking")
 	assert(txn.typ == RootTxn, "txn must be root")
-	assert(!txn.CommitTimestampFixed(), "txn commit timestamp must not be fixed")
+	assert(!txn.ReadTimestampFixed(), "txn read timestamp must not be fixed")
 	return err
 }
 
@@ -1366,7 +1441,7 @@ func (txn *Txn) handleTransactionAbortedErrorLocked(
 
 	// The transaction we had been using thus far has been aborted. The proto
 	// inside the error has been prepared for use by the next transaction attempt.
-	newTxn := &retryErr.Transaction
+	newTxn := &retryErr.NextTransaction
 	txn.mu.ID = newTxn.ID
 	// Create a new txn sender. We need to preserve the stepping mode, if any.
 	prevSteppingMode := txn.mu.sender.GetSteppingMode(ctx)
@@ -1413,7 +1488,21 @@ func (txn *Txn) GenerateForcedRetryableErr(ctx context.Context, msg redact.Redac
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 	now := txn.db.clock.NowAsClockTimestamp()
-	return txn.mu.sender.GenerateForcedRetryableErr(ctx, now.ToTimestamp(), msg)
+	return txn.mu.sender.GenerateForcedRetryableErr(ctx, now.ToTimestamp(), false /* mustRestart */, msg)
+}
+
+// RandomTxnRetryProbability is the probability that a transaction will inject a
+// retryable error when either the RandomTransactionRetryFilter testing filter
+// is installed or the COCKROACH_FORCE_RANDOM_TXN_RETRIES environment variable
+// is set.
+const RandomTxnRetryProbability = 0.1
+
+// TestingShouldRetry returns true if we should generate a random, retryable
+// error for this transaction.
+func (txn *Txn) TestingShouldRetry() bool {
+	txn.mu.Lock()
+	defer txn.mu.Unlock()
+	return txn.mu.sender.TestingShouldRetry()
 }
 
 // IsSerializablePushAndRefreshNotPossible returns true if the transaction is

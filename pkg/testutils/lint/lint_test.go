@@ -1336,7 +1336,7 @@ func TestLint(t *testing.T) {
 		}
 	})
 
-	t.Run("TestProtoMessage", func(t *testing.T) {
+	t.Run("", func(t *testing.T) {
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(
 			pkgDir,
@@ -1359,6 +1359,7 @@ func TestLint(t *testing.T) {
 			":!sql/pgwire/pgerror/severity.go",
 			":!sql/pgwire/pgerror/with_candidate_code.go",
 			":!sql/pgwire/pgwirebase/too_big_error.go",
+			":!sql/plpgsql/plpgsql_error.go",
 			":!sql/protoreflect/redact.go",
 			":!sql/colexecerror/error.go",
 			":!util/timeutil/timeout_error.go",
@@ -1408,6 +1409,7 @@ func TestLint(t *testing.T) {
 			":!sql/opt/optgen",
 			":!sql/colexec/execgen",
 			":!kv/kvpb/gen/main.go",
+			":!testutils/serverutils/fwgen/gen.go",
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -2317,10 +2319,6 @@ func TestLint(t *testing.T) {
 			":!ccl/streamingccl/streamingest/stream_ingestion_processor_test.go",
 			":!ccl/streamingccl/streamproducer/producer_job_test.go",
 			":!ccl/streamingccl/streamproducer/replication_stream_test.go",
-			":!ccl/testccl/sqlccl/run_control_test.go",
-			":!ccl/testccl/sqlccl/temp_table_clean_test.go",
-			":!ccl/testccl/sqlccl/tenant_gc_test.go",
-			":!ccl/testccl/sqlstatsccl/sql_stats_test.go",
 			":!ccl/workloadccl/allccl/all_test.go",
 			":!cli/democluster/demo_cluster.go",
 			":!cli/democluster/demo_cluster_test.go",
@@ -2338,13 +2336,11 @@ func TestLint(t *testing.T) {
 			":!server/storage_api/health_test.go",
 			":!server/storage_api/rangelog_test.go",
 			":!server/testserver.go",
-			":!sql/catalog/internal/catkv/catalog_reader_test.go",
 			":!sql/importer/import_processor_test.go",
 			":!sql/importer/import_stmt_test.go",
 			":!sql/importer/read_import_mysql_test.go",
 			":!sql/schemachanger/sctest/test_server_factory.go",
 			":!sql/server_params_test.go",
-			":!sql/sqlinstance/instancestorage/instancecache_test.go",
 			":!sql/ttl/ttljob/ttljob_test.go",
 			":!testutils/lint/lint_test.go",
 			":!ts/server_test.go",

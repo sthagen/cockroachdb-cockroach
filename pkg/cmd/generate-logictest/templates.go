@@ -172,6 +172,7 @@ import ({{ if .SqliteLogicTest }}
 	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"{{ if .Ccl }}
 	"github.com/cockroachdb/cockroach/pkg/ccl"{{ end }}
 	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
@@ -214,6 +215,11 @@ func TestMain(m *testing.M) {
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)
+
+	defer serverutils.TestingSetDefaultTenantSelectionOverride(
+		base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(76378),
+	)()
+
 	os.Exit(m.Run())
 }
 
@@ -268,12 +274,18 @@ go_test(
         "//pkg/sql/logictest:testdata",  # keep{{ end }}{{ if .ExecBuildLogicTest }}
         "//pkg/sql/opt/exec/execbuilder:testdata",  # keep{{ end }}
     ],
+    exec_properties = {{ if eq .TestRuleName "cockroach-go-testserver-upgrade-to-master" }}{
+        "dockerNetwork": "standard",
+        {{ else }}{
+        {{ end }}"Pool": "large",
+    },
     shard_count = {{ if gt .TestCount 48 }}48{{ else }}{{ .TestCount }}{{end}},
     tags = [{{ if .Ccl }}
         "ccl_test",{{ end }}
         "cpu:{{ if gt .NumCPU 4 }}4{{ else }}{{ .NumCPU }}{{ end }}",
     ],
     deps = [
+        "//pkg/base",
         "//pkg/build/bazel",{{ if .Ccl }}
         "//pkg/ccl",{{ end }}
         "//pkg/security/securityassets",

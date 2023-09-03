@@ -121,6 +121,11 @@ func distChangefeedFlow(
 		}
 	}
 
+	if knobs, ok := execCtx.ExecCfg().DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs); ok {
+		if knobs != nil && knobs.StartDistChangefeedInitialHighwater != nil {
+			knobs.StartDistChangefeedInitialHighwater(ctx, initialHighWater)
+		}
+	}
 	return startDistChangefeed(
 		ctx, execCtx, jobID, schemaTS, details, initialHighWater, localState, resultsCh)
 }
@@ -315,8 +320,9 @@ var enableBalancedRangeDistribution = settings.RegisterBoolSetting(
 	"changefeed.balance_range_distribution.enable",
 	"if enabled, the ranges are balanced equally among all nodes",
 	util.ConstantWithMetamorphicTestBool(
-		"changefeed.balance_range_distribution.enable", false),
-).WithPublic()
+		"changefeed.balance_range_distribution.enabled", false),
+	settings.WithName("changefeed.balance_range_distribution.enabled"),
+	settings.WithPublic)
 
 func makePlan(
 	execCtx sql.JobExecContext,

@@ -563,6 +563,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		admissionKnobs,
 	)
 	db.SQLKVResponseAdmissionQ = gcoords.Regular.GetWorkQueue(admission.SQLKVResponseWork)
+	db.AdmissionPacerFactory = gcoords.Elastic
+	db.SettingsValues = &cfg.Settings.SV
 	cbID := goschedstats.RegisterRunnableCountCallback(gcoords.Regular.CPULoad)
 	stopper.AddCloser(stop.CloserFn(func() {
 		goschedstats.UnregisterRunnableCountCallback(cbID)
@@ -842,6 +844,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		EagerLeaseAcquisitionLimiter: eagerLeaseAcquisitionLimiter,
 		KVMemoryMonitor:              kvMemoryMonitor,
 		RangefeedBudgetFactory:       rangeReedBudgetFactory,
+		SharedStorageEnabled:         cfg.SharedStorage != "",
 		SystemConfigProvider:         systemConfigWatcher,
 		SpanConfigSubscriber:         spanConfig.subscriber,
 		SpanConfigsDisabled:          cfg.SpanConfigsDisabled,
@@ -922,15 +925,6 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 	}
 	blobspb.RegisterBlobServer(grpcServer.Server, blobService)
 
-	{ // wire up admission control's scheduler latency listener
-		slcbID := schedulerlatency.RegisterCallback(
-			node.storeCfg.SchedulerLatencyListener.SchedulerLatency,
-		)
-		stopper.AddCloser(stop.CloserFn(func() {
-			schedulerlatency.UnregisterCallback(slcbID)
-		}))
-	}
-
 	replicationReporter := reports.NewReporter(
 		db, node.stores, storePool, st, nodeLiveness, internalExecutor, systemConfigWatcher,
 	)
@@ -976,6 +970,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 	}
 
 	// Instantiate the status API server.
+	var serverTestingKnobs *TestingKnobs
+	if cfg.TestingKnobs.Server != nil {
+		serverTestingKnobs = cfg.TestingKnobs.Server.(*TestingKnobs)
+	}
+
 	sStatus := newSystemStatusServer(
 		cfg.AmbientCtx,
 		st,
@@ -998,6 +997,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		clock,
 		rangestats.NewFetcher(db),
 		node,
+		serverTestingKnobs,
 	)
 
 	keyVisualizerServer := &KeyVisualizerServer{
@@ -1784,6 +1784,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// Start measuring the Go scheduler latency.
 	if err := schedulerlatency.StartSampler(
 		workersCtx, s.st, s.stopper, s.registry, base.DefaultMetricsSampleInterval,
+		// Wire up admission control's scheduler latency listener.
+		s.node.storeCfg.SchedulerLatencyListener,
 	); err != nil {
 		return err
 	}

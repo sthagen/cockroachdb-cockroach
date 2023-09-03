@@ -12,12 +12,16 @@ go_test(
         "//c-deps:libgeos",  # keep
         "//pkg/ccl/logictestccl:testdata",  # keep
     ],
+    exec_properties = {
+        "Pool": "large",
+    },
     shard_count = 6,
     tags = [
         "ccl_test",
         "cpu:1",
     ],
     deps = [
+        "//pkg/base",
         "//pkg/build/bazel",
         "//pkg/ccl",
         "//pkg/security/securityassets",

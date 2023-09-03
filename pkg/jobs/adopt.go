@@ -82,14 +82,10 @@ func (r *Registry) maybeDumpTrace(resumerCtx context.Context, resumer Resumer, j
 		return
 	}
 
-	resumerTraceFilename := fmt.Sprintf("resumer-trace-n%s.%s.binpb",
+	resumerTraceFilename := fmt.Sprintf("%s/resumer-trace/%s",
 		r.ID().String(), timeutil.Now().Format("20060102_150405.00"))
 	td := jobspb.TraceData{CollectedSpans: sp.GetConfiguredRecording()}
-	b, err := protoutil.Marshal(&td)
-	if err != nil {
-		return
-	}
-	if err := WriteExecutionDetailFile(dumpCtx, resumerTraceFilename, b, r.db, jobID); err != nil {
+	if err := WriteProtobinExecutionDetailFile(dumpCtx, resumerTraceFilename, &td, r.db, jobID); err != nil {
 		log.Warning(dumpCtx, "failed to write trace on resumer trace file")
 		return
 	}
@@ -331,15 +327,7 @@ func (r *Registry) resumeJob(
 				return err
 			}
 			if !exists {
-				// 23.1.3 could finalize an upgrade but leave some jobs behind with rows
-				// not copied to info table. If we get here, try backfilling the info
-				// table for this job in the txn and proceed if it succeeds.
-				fixedPayload, err := infoStorage.BackfillLegacyPayload(ctx)
-				if err != nil {
-					return errors.Wrap(err, "job payload not found in system.job_info")
-				}
-				log.Infof(ctx, "fixed missing payload info for job %d", jobID)
-				payloadBytes = fixedPayload
+				return errors.Wrap(&JobNotFoundError{jobID: jobID}, "job payload not found in system.job_info")
 			}
 			if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
 				return err
@@ -350,12 +338,7 @@ func (r *Registry) resumeJob(
 				return err
 			}
 			if !exists {
-				fixedProgress, err := infoStorage.BackfillLegacyProgress(ctx)
-				if err != nil {
-					return errors.Wrap(err, "job progress not found in system.job_info")
-				}
-				log.Infof(ctx, "fixed missing progress info for job %d", jobID)
-				progressBytes = fixedProgress
+				return errors.Wrap(&JobNotFoundError{jobID: jobID}, "job progress not found in system.job_info")
 			}
 			return protoutil.Unmarshal(progressBytes, progress)
 		}); err != nil {
@@ -388,7 +371,7 @@ func (r *Registry) resumeJob(
 	if opts, ok := getRegisterOptions(payload.Type()); ok && opts.disableTenantCostControl {
 		resumeCtx = multitenant.WithTenantCostControlExemption(resumeCtx)
 	}
-	if alreadyAdopted := r.addAdoptedJob(jobID, s, cancel); alreadyAdopted {
+	if alreadyAdopted := r.addAdoptedJob(jobID, s, cancel, resumer); alreadyAdopted {
 		// Not needing the context after all. Avoid leaking resources.
 		cancel()
 		return nil
@@ -418,7 +401,7 @@ func (r *Registry) resumeJob(
 // false, it means that the job is already registered as running and should not
 // be run again.
 func (r *Registry) addAdoptedJob(
-	jobID jobspb.JobID, session sqlliveness.Session, cancel context.CancelFunc,
+	jobID jobspb.JobID, session sqlliveness.Session, cancel context.CancelFunc, resumer Resumer,
 ) (alreadyAdopted bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -431,6 +414,7 @@ func (r *Registry) addAdoptedJob(
 		session: session,
 		cancel:  cancel,
 		isIdle:  false,
+		resumer: resumer,
 	}
 	return false
 }

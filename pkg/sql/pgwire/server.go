@@ -74,19 +74,21 @@ var connResultsBufferSize = settings.RegisterByteSizeSetting(
 		"Updating the setting only affects new connections. "+
 		"Setting to 0 disables any buffering.",
 	16<<10, // 16 KiB
-).WithPublic()
+	settings.WithPublic)
 
 var logConnAuth = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	sql.ConnAuditingClusterSettingName,
 	"if set, log SQL client connect and disconnect events (note: may hinder performance on loaded nodes)",
-	false).WithPublic()
+	false,
+	settings.WithPublic)
 
 var logSessionAuth = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	sql.AuthAuditingClusterSettingName,
 	"if set, log SQL session login/disconnection events (note: may hinder performance on loaded nodes)",
-	false).WithPublic()
+	false,
+	settings.WithPublic)
 
 const (
 	// ErrSSLRequired is returned when a client attempts to connect to a
@@ -111,7 +113,7 @@ var (
 	}
 	MetaNewConns = metric.Metadata{
 		Name:        "sql.new_conns",
-		Help:        "Counter of the number of SQL connections created",
+		Help:        "Number of SQL connections created",
 		Measurement: "Connections",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -147,19 +149,19 @@ var (
 	}
 	MetaPGWireCancelTotal = metric.Metadata{
 		Name:        "sql.pgwire_cancel.total",
-		Help:        "Counter of the number of pgwire query cancel requests",
+		Help:        "Number of pgwire query cancel requests",
 		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaPGWireCancelIgnored = metric.Metadata{
 		Name:        "sql.pgwire_cancel.ignored",
-		Help:        "Counter of the number of pgwire query cancel requests that were ignored due to rate limiting",
+		Help:        "Number of pgwire query cancel requests that were ignored due to rate limiting",
 		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaPGWireCancelSuccessful = metric.Metadata{
 		Name:        "sql.pgwire_cancel.successful",
-		Help:        "Counter of the number of pgwire query cancel requests that were successful",
+		Help:        "Number of pgwire query cancel requests that were successful",
 		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}

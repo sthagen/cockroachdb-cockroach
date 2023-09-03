@@ -21,8 +21,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
-	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -868,6 +868,16 @@ func (ex *connExecutor) execStmtInOpenState(
 			)
 			return makeErrEvent(err)
 		}
+		if _, ok := s.Statement.(*tree.ExplainAnalyze); ok {
+			// Prohibit the explicit PREPARE ... AS EXPLAIN ANALYZE since we
+			// won't be able to execute the prepared statement. This is also in
+			// line with Postgres.
+			err := pgerror.Newf(
+				pgcode.Syntax,
+				"EXPLAIN ANALYZE can only be used as a top-level statement",
+			)
+			return makeErrEvent(err)
+		}
 		var typeHints tree.PlaceholderTypes
 		// We take max(len(s.Types), stmt.NumPlaceHolders) as the length of types.
 		numParams := len(s.Types)
@@ -1012,8 +1022,8 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmtCtx = ctx
 	}
 
-	var rollbackSP *tree.RollbackToSavepoint
-	var r *tree.ReleaseSavepoint
+	var rollbackHomeRegionSavepoint *tree.RollbackToSavepoint
+	var releaseHomeRegionSavepoint *tree.ReleaseSavepoint
 	enforceHomeRegion := p.EnforceHomeRegion()
 	_, isSelectStmt := stmt.AST.(*tree.Select)
 	// TODO(sql-sessions): ensure this is not broken for pausable portals.
@@ -1024,14 +1034,9 @@ func (ex *connExecutor) execStmtInOpenState(
 		// historical timestamp (so that the locality-optimized ops used for error
 		// reporting can run locally and not incur latency). This is currently only
 		// supported for SELECT statements.
-		var b strings.Builder
-		b.WriteString("enforce_home_region_sp")
 		// Add some unprintable ASCII characters to the name of the savepoint to
 		// decrease the likelihood of collision with a user-created savepoint.
-		b.WriteRune(rune(0x11))
-		b.WriteRune(rune(0x12))
-		b.WriteRune(rune(0x13))
-		enforceHomeRegionSavepointName := tree.Name(b.String())
+		const enforceHomeRegionSavepointName = "enforce_home_region_sp\x11\x12\x13"
 		s := &tree.Savepoint{Name: enforceHomeRegionSavepointName}
 		var event fsm.Event
 		var eventPayload fsm.EventPayload
@@ -1039,19 +1044,33 @@ func (ex *connExecutor) execStmtInOpenState(
 			return event, eventPayload, err
 		}
 
-		r = &tree.ReleaseSavepoint{Savepoint: enforceHomeRegionSavepointName}
-		rollbackSP = &tree.RollbackToSavepoint{Savepoint: enforceHomeRegionSavepointName}
+		releaseHomeRegionSavepoint = &tree.ReleaseSavepoint{Savepoint: enforceHomeRegionSavepointName}
+		rollbackHomeRegionSavepoint = &tree.RollbackToSavepoint{Savepoint: enforceHomeRegionSavepointName}
 		defer func() {
 			// The default case is to roll back the internally-generated savepoint
 			// after every request. We only need it if a retryable "query has no home
 			// region" error occurs.
-			ex.execRelease(ctx, r, res)
+			ex.execRelease(ctx, releaseHomeRegionSavepoint, res)
 		}()
 	}
 
-	if err = ex.dispatchToExecutionEngine(stmtCtx, p, res); err != nil {
-		stmtThresholdSpan.Finish()
-		return nil, nil, err
+	if ex.state.mu.txn.IsoLevel() == isolation.ReadCommitted &&
+		!ex.implicitTxn() &&
+		ex.executorType != executorTypeInternal {
+		// If an internal executor query that is run as part of a larger statement
+		// throws a retryable error, that error should be returned up and retried by
+		// the statement's dispatchReadCommittedStmtToExecutionEngine retry loop.
+		// TODO(rafi): The above should be happening already, but find a way to
+		// test it.
+		if err := ex.dispatchReadCommittedStmtToExecutionEngine(stmtCtx, p, res); err != nil {
+			stmtThresholdSpan.Finish()
+			return nil, nil, err
+		}
+	} else {
+		if err := ex.dispatchToExecutionEngine(stmtCtx, p, res); err != nil {
+			stmtThresholdSpan.Finish()
+			return nil, nil, err
+		}
 	}
 
 	if stmtThresholdSpan != nil {
@@ -1082,14 +1101,14 @@ func (ex *connExecutor) execStmtInOpenState(
 			p.EvalContext().Locality = p.EvalContext().OriginalLocality
 		}
 		if execinfra.IsDynamicQueryHasNoHomeRegionError(err) {
-			if rollbackSP != nil {
+			if rollbackHomeRegionSavepoint != nil {
 				// A retryable "query has no home region" error has occurred.
 				// Roll back to the internal savepoint in preparation for the next
 				// planning and execution of this query with a different gateway region
 				// (as considered by the optimizer).
 				p.StmtNoConstantsWithHomeRegionEnforced = p.stmt.StmtNoConstants
 				event, eventPayload := ex.execRollbackToSavepointInOpenState(
-					ctx, rollbackSP, res,
+					ctx, rollbackHomeRegionSavepoint, res,
 				)
 				_, isTxnRestart := event.(eventTxnRestart)
 				rollbackToSavepointFailed := !isTxnRestart || eventPayload != nil
@@ -1310,12 +1329,11 @@ func (ex *connExecutor) commitSQLTransaction(
 	ex.extraTxnState.idleLatency += ex.statsCollector.PhaseTimes().
 		GetIdleLatency(ex.statsCollector.PreviousPhaseTimes())
 	if ex.sessionData().InjectRetryErrorsOnCommitEnabled && ast.StatementTag() == "COMMIT" {
-		if ex.planner.Txn().Epoch() < ex.state.lastEpoch+numTxnRetryErrors {
+		if ex.state.injectedTxnRetryCounter < numTxnRetryErrors {
 			retryErr := ex.state.mu.txn.GenerateForcedRetryableErr(
 				ctx, "injected by `inject_retry_errors_on_commit_enabled` session variable")
+			ex.state.injectedTxnRetryCounter++
 			return ex.makeErrEvent(retryErr, ast)
-		} else {
-			ex.state.lastEpoch = ex.planner.Txn().Epoch()
 		}
 	}
 	ex.phaseTimes.SetSessionPhaseTime(sessionphase.SessionStartTransactionCommit, timeutil.Now())
@@ -1494,6 +1512,80 @@ func (ex *connExecutor) rollbackSQLTransaction(
 	return eventTxnFinishAborted{}, nil
 }
 
+// Each statement in an explicit READ COMMITTED transaction has a SAVEPOINT.
+// This allows for TransactionRetry errors to be retried automatically. We don't
+// do this for implicit transactions because the conn_executor state machine
+// already has retry logic for implicit transactions. To avoid having to
+// implement the retry logic in the state machine, we use the KV savepoint API
+// directly.
+func (ex *connExecutor) dispatchReadCommittedStmtToExecutionEngine(
+	ctx context.Context, p *planner, res RestrictedCommandResult,
+) error {
+	readCommittedSavePointToken, err := ex.state.mu.txn.CreateSavepoint(ctx)
+	if err != nil {
+		return err
+	}
+
+	// TODO(rafi): Figure out observability for these retries. We might want to
+	// add a new field similar to ex.state.mu.autoRetryCounter.
+	maxRetries := int(ex.sessionData().MaxRetriesForReadCommitted)
+	for attemptNum := 0; ; attemptNum++ {
+		bufferPos := res.BufferedResultsLen()
+		if err = ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
+			return err
+		}
+		maybeRetriableErr := res.Err()
+		if maybeRetriableErr == nil {
+			// If there was no error, then we must release the savepoint and break.
+			if err := ex.state.mu.txn.ReleaseSavepoint(ctx, readCommittedSavePointToken); err != nil {
+				return err
+			}
+			break
+		}
+		// If the error does not allow for a partial retry, then stop. The error
+		// is already set on res.Err() and will be returned to the client.
+		var txnRetryErr *kvpb.TransactionRetryWithProtoRefreshError
+		if !errors.As(maybeRetriableErr, &txnRetryErr) || txnRetryErr.TxnMustRestartFromBeginning() {
+			break
+		}
+
+		// If we reached the maximum number of retries, then we must stop.
+		if attemptNum == maxRetries {
+			res.SetError(errors.Wrapf(
+				maybeRetriableErr,
+				"read committed retry limit exceeded; set by max_retries_for_read_committed=%d",
+				maxRetries,
+			))
+			break
+		}
+
+		// In order to retry the statement, we need to clear any results and
+		// errors that were buffered, rollback to the savepoint, then prepare the
+		// kv.txn for the partial txn retry.
+		if ableToClear := res.TruncateBufferedResults(bufferPos); !ableToClear {
+			// If the buffer exceeded the maximum size, then it might have been
+			// flushed and sent back to the client already. In that case, we can't
+			// retry the statement.
+			res.SetError(errors.Wrapf(
+				maybeRetriableErr,
+				"cannot automatically retry since some results were already sent to the client",
+			))
+			break
+		}
+		if knob := ex.server.cfg.TestingKnobs.OnReadCommittedStmtRetry; knob != nil {
+			knob(txnRetryErr)
+		}
+		res.SetError(nil)
+		if err := ex.state.mu.txn.RollbackToSavepoint(ctx, readCommittedSavePointToken); err != nil {
+			return err
+		}
+		if err := ex.state.mu.txn.PrepareForPartialRetry(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // dispatchToExecutionEngine executes the statement, writes the result to res
 // and returns an event for the connection's state machine.
 //
@@ -1528,7 +1620,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	// https://github.com/cockroachdb/cockroach/issues/99410
 	ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.PlannerStartLogicalPlan, timeutil.Now())
 
-	if multitenant.TenantRUEstimateEnabled.Get(ex.server.cfg.SV()) {
+	if execinfra.IncludeRUEstimateInExplainAnalyze.Get(ex.server.cfg.SV()) {
 		if server := ex.server.cfg.DistSQLSrv; server != nil {
 			// Begin measuring CPU usage for tenants. This is a no-op for non-tenants.
 			ex.cpuStatsCollector.StartCollection(ctx, server.TenantCostController)
@@ -1536,14 +1628,24 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	var err error
+
 	if ppInfo := getPausablePortalInfo(); ppInfo != nil {
 		if !ppInfo.dispatchToExecutionEngine.cleanup.isComplete {
 			err = ex.makeExecPlan(ctx, planner)
-			ppInfo.dispatchToExecutionEngine.planTop = planner.curPlan
-			ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(namedFunc{
-				fName: "close planTop",
-				f:     func() { ppInfo.dispatchToExecutionEngine.planTop.close(ctx) },
-			})
+			if flags := planner.curPlan.flags; err == nil && (flags.IsSet(planFlagContainsMutation) || flags.IsSet(planFlagIsDDL)) {
+				telemetry.Inc(sqltelemetry.NotReadOnlyStmtsTriedWithPausablePortals)
+				// We don't allow mutations in a pausable portal. Set it back to
+				// an un-pausable (normal) portal.
+				planner.pausablePortal.pauseInfo = nil
+				err = res.RevokePortalPausability()
+				defer planner.curPlan.close(ctx)
+			} else {
+				ppInfo.dispatchToExecutionEngine.planTop = planner.curPlan
+				ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(namedFunc{
+					fName: "close planTop",
+					f:     func() { ppInfo.dispatchToExecutionEngine.planTop.close(ctx) },
+				})
+			}
 		} else {
 			planner.curPlan = ppInfo.dispatchToExecutionEngine.planTop
 		}
@@ -1666,6 +1768,8 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 			// un-pausable (normal) portal.
 			// With pauseInfo is nil, no cleanup function will be added to the stack
 			// and all clean-up steps will be performed as for normal portals.
+			// TODO(harding): We may need to move resetting pauseInfo before we add
+			// the pausable portal cleanup step above.
 			planner.pausablePortal.pauseInfo = nil
 			// We need this so that the result consumption for this portal cannot be
 			// paused either.
@@ -1745,12 +1849,11 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		isSetOrShow := stmt.AST.StatementTag() == "SET" || stmt.AST.StatementTag() == "SHOW"
 		if ex.sessionData().InjectRetryErrorsEnabled && !isSetOrShow &&
 			planner.Txn().Sender().TxnStatus() == roachpb.PENDING {
-			if planner.Txn().Epoch() < ex.state.lastEpoch+numTxnRetryErrors {
+			if ex.state.injectedTxnRetryCounter < numTxnRetryErrors {
 				retryErr := planner.Txn().GenerateForcedRetryableErr(
 					ctx, "injected by `inject_retry_errors_enabled` session variable")
 				res.SetError(retryErr)
-			} else {
-				ex.state.lastEpoch = planner.Txn().Epoch()
+				ex.state.injectedTxnRetryCounter++
 			}
 		}
 	}
@@ -1861,7 +1964,7 @@ func populateQueryLevelStats(
 	} else {
 		// If this query is being run by a tenant, record the RUs consumed by CPU
 		// usage and network egress to the client.
-		if multitenant.TenantRUEstimateEnabled.Get(cfg.SV()) && cfg.DistSQLSrv != nil {
+		if execinfra.IncludeRUEstimateInExplainAnalyze.Get(cfg.SV()) && cfg.DistSQLSrv != nil {
 			if costController := cfg.DistSQLSrv.TenantCostController; costController != nil {
 				if costCfg := costController.GetCostConfig(); costCfg != nil {
 					networkEgressRUEstimate := costCfg.PGWireEgressCost(topLevelStats.networkEgressEstimate)
@@ -2212,6 +2315,8 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	err error,
 ) {
 	now := ex.server.cfg.Clock.PhysicalTime()
+	p := &ex.planner
+	ex.resetPlanner(ctx, p, nil, now)
 	var modes tree.TransactionModes
 	if s != nil {
 		modes = s.Modes
@@ -2222,9 +2327,6 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 		return rwMode, now, nil, nil
 	}
 	ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
-	p := &ex.planner
-
-	ex.resetPlanner(ctx, p, nil, now)
 	asOf, err := p.EvalAsOfTimestamp(ctx, asOfClause)
 	if err != nil {
 		return 0, time.Time{}, nil, err

@@ -22,6 +22,7 @@ go_library(
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/util",
         "//pkg/util/admission",
         "//pkg/util/admission/admissionpb",
         "//pkg/util/bitmap",
@@ -45,6 +46,7 @@ go_test(
         "main_test.go",
         "requests_provider_test.go",
         "results_buffer_test.go",
+        "streamer_accounting_test.go",
         "streamer_disabled_test.go",
         "streamer_test.go",
     ],
@@ -52,6 +54,7 @@ go_test(
     embed = [":kvstreamer"],
     deps = [
         "//pkg/base",
+        "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvpb",

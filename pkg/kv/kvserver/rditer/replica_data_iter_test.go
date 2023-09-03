@@ -110,12 +110,12 @@ func createRangeData(
 	locks := []storage.LockTableKey{
 		{
 			Key:      keys.RangeDescriptorKey(desc.StartKey), // mark [1] above as intent
-			Strength: lock.Exclusive,
-			TxnUUID:  testTxnID.GetBytes(),
+			Strength: lock.Intent,
+			TxnUUID:  testTxnID,
 		}, {
 			Key:      desc.StartKey.AsRawKey(), // mark [2] above as intent
-			Strength: lock.Exclusive,
-			TxnUUID:  testTxnID.GetBytes(),
+			Strength: lock.Intent,
+			TxnUUID:  testTxnID,
 		},
 	}
 

@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -48,12 +49,12 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
-var minimumFlushInterval = settings.RegisterPublicDurationSettingWithExplicitUnit(
+var minimumFlushInterval = settings.RegisterDurationSettingWithExplicitUnit(
 	settings.TenantWritable,
 	"bulkio.stream_ingestion.minimum_flush_interval",
 	"the minimum timestamp between flushes; flushes may still occur if internal buffers fill up",
 	5*time.Second,
-	nil, /* validateFn */
+	settings.WithPublic,
 )
 
 var maxKVBufferSize = settings.RegisterByteSizeSetting(
@@ -84,7 +85,7 @@ var cutoverSignalPollInterval = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"bulkio.stream_ingestion.cutover_signal_poll_interval",
 	"the interval at which the stream ingestion job checks if it has been signaled to cutover",
-	30*time.Second,
+	10*time.Second,
 	settings.NonNegativeDuration,
 )
 
@@ -256,6 +257,11 @@ type streamIngestionProcessor struct {
 	metrics *Metrics
 
 	logBufferEvery log.EveryN
+
+	// Aggregator that aggregates StructuredEvents emitted in the
+	// backupDataProcessors' trace recording.
+	agg      *bulkutil.TracingAggregator
+	aggTimer *timeutil.Timer
 }
 
 // partitionEvent augments a normal event with the partition it came from.
@@ -323,6 +329,11 @@ func newStreamIngestionDataProcessor(
 			InputsToDrain: []execinfra.RowSource{},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				sip.close()
+				if sip.agg != nil {
+					meta := bulkutil.ConstructTracingAggregatorProducerMeta(ctx,
+						sip.flowCtx.NodeID.SQLInstanceID(), sip.flowCtx.ID, sip.agg)
+					return []execinfrapb.ProducerMetadata{*meta}
+				}
 				return nil
 			},
 		},
@@ -356,7 +367,15 @@ func newStreamIngestionDataProcessor(
 func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 	ctx = logtags.AddTag(ctx, "job", sip.spec.JobID)
 	log.Infof(ctx, "starting ingest proc")
-	ctx = sip.StartInternal(ctx, streamIngestionProcessorName)
+	sip.agg = bulkutil.TracingAggregatorForContext(ctx)
+	sip.aggTimer = timeutil.NewTimer()
+
+	// If the aggregator is nil, we do not want the timer to fire.
+	if sip.agg != nil {
+		sip.aggTimer.Reset(15 * time.Second)
+	}
+
+	ctx = sip.StartInternal(ctx, streamIngestionProcessorName, sip.agg)
 
 	sip.metrics = sip.flowCtx.Cfg.JobRegistry.MetricsStruct().StreamIngest.(*Metrics)
 
@@ -394,7 +413,8 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 			streamClient = sip.forceClientForTests
 			log.Infof(ctx, "using testing client")
 		} else {
-			streamClient, err = streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(addr), db)
+			streamClient, err = streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(addr), db,
+				streamclient.WithStreamID(streampb.StreamID(sip.spec.StreamID)))
 			if err != nil {
 				sip.MoveToDraining(errors.Wrapf(err, "creating client for partition spec %q from %q", token, addr))
 				return
@@ -469,6 +489,11 @@ func (sip *streamIngestionProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Pr
 			}
 			return row, nil
 		}
+	case <-sip.aggTimer.C:
+		sip.aggTimer.Read = true
+		sip.aggTimer.Reset(15 * time.Second)
+		return nil, bulkutil.ConstructTracingAggregatorProducerMeta(sip.Ctx(),
+			sip.flowCtx.NodeID.SQLInstanceID(), sip.flowCtx.ID, sip.agg)
 	case err := <-sip.errCh:
 		sip.MoveToDraining(err)
 		return nil, sip.DrainHelper()
@@ -532,6 +557,7 @@ func (sip *streamIngestionProcessor) close() {
 	if sip.maxFlushRateTimer != nil {
 		sip.maxFlushRateTimer.Stop()
 	}
+	sip.aggTimer.Stop()
 
 	sip.InternalClose()
 }

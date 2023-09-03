@@ -311,7 +311,7 @@ func TestReliableIntentCleanup(t *testing.T) {
 				},
 			},
 		}
-		tc := serverutils.StartNewTestCluster(t, 3, clusterArgs)
+		tc := serverutils.StartCluster(t, 3, clusterArgs)
 		defer tc.Stopper().Stop(ctx)
 
 		srv := tc.Server(0)
@@ -584,7 +584,7 @@ func TestReliableIntentCleanup(t *testing.T) {
 				} else {
 					t.Logf("retrying unexpected txn error: %v", err)
 					// Sanity check the retry error is meant for our transaction.
-					require.Equal(t, retryErr.TxnID, txn.ID())
+					require.Equal(t, retryErr.PrevTxnID, txn.ID())
 				}
 			}
 

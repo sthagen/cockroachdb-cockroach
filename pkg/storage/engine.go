@@ -398,8 +398,8 @@ type EngineIterator interface {
 // CloneContext is an opaque type encapsulating sufficient context to construct
 // a clone of an existing iterator.
 type CloneContext struct {
-	rawIter       pebbleiter.Iterator
-	statsReporter iterStatsReporter
+	rawIter pebbleiter.Iterator
+	engine  *Pebble
 }
 
 // IterOptions contains options used to create an {MVCC,Engine}Iterator.
@@ -593,12 +593,12 @@ type Reader interface {
 	//
 	// 4. Iterators on indexed batches see all batch writes as of their creation
 	//    time, but they satisfy ConsistentIterators for engine writes.
-	NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIterator
+	NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) (MVCCIterator, error)
 	// NewEngineIterator returns a new instance of an EngineIterator over this
 	// engine. The caller must invoke EngineIterator.Close() when finished
 	// with the iterator to free resources. The caller can change IterOptions
 	// after this function returns.
-	NewEngineIterator(opts IterOptions) EngineIterator
+	NewEngineIterator(opts IterOptions) (EngineIterator, error)
 	// ScanInternal allows a caller to inspect the underlying engine's InternalKeys
 	// using a visitor pattern, while also allowing for keys in shared files to be
 	// skipped if a visitor is provided for visitSharedFiles. Useful for
@@ -673,21 +673,6 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after it returns.
 	ClearUnversioned(key roachpb.Key, opts ClearOptions) error
-	// ClearIntent removes an intent from the db. Unlike ClearMVCC and
-	// ClearUnversioned, this is a higher-level method that may make changes in
-	// parts of the key space that are not only a function of the input, and may
-	// choose to use a single-clear under the covers. txnDidNotUpdateMeta allows
-	// for performance optimization when set to true, and has semantics defined in
-	// MVCCMetadata.TxnDidNotUpdateMeta (it can be conservatively set to false).
-	//
-	// It is safe to modify the contents of the arguments after it returns.
-	//
-	// TODO(sumeer): after the full transition to separated locks, measure the
-	// cost of a PutIntent implementation, where there is an existing intent,
-	// that does a <single-clear, put> pair. If there isn't a performance
-	// decrease, we can stop tracking txnDidNotUpdateMeta and still optimize
-	// ClearIntent by always doing single-clear.
-	ClearIntent(key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions) error
 	// ClearEngineKey removes the given point key from the engine. It does not
 	// affect range keys.  Note that clear actually removes entries from the
 	// storage engine. This is a general-purpose and low-level method that should
@@ -821,16 +806,6 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after Put returns.
 	PutUnversioned(key roachpb.Key, value []byte) error
-	// PutIntent puts an intent at the given key to the value provided. This is
-	// a higher-level method that may make changes in parts of the key space
-	// that are not only a function of the input key, and may explicitly clear
-	// the preceding intent. txnDidNotUpdateMeta defines what happened prior to
-	// this put, and allows for performance optimization when set to true, and
-	// has semantics defined in MVCCMetadata.TxnDidNotUpdateMeta (it can be
-	// conservatively set to false).
-	//
-	// It is safe to modify the contents of the arguments after Put returns.
-	PutIntent(ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID) error
 	// PutEngineKey sets the given key to the value provided. This is a
 	// general-purpose and low-level method that should be used sparingly,
 	// only when the other Put* methods are not applicable.
@@ -950,7 +925,8 @@ const (
 
 // Engine is the interface that wraps the core operations of a key/value store.
 type Engine interface {
-	ReadWriter
+	Reader
+	Writer
 	// Attrs returns the engine/store attributes.
 	Attrs() roachpb.Attributes
 	// Capacity returns capacity details for the engine's available storage.
@@ -1380,7 +1356,10 @@ func GetIntent(reader Reader, key roachpb.Key) (*roachpb.Intent, error) {
 	// used for queries.
 	lbKey, _ := keys.LockTableSingleKey(key, nil)
 
-	iter := reader.NewEngineIterator(IterOptions{Prefix: true, LowerBound: lbKey})
+	iter, err := reader.NewEngineIterator(IterOptions{Prefix: true, LowerBound: lbKey})
+	if err != nil {
+		return nil, err
+	}
 	defer iter.Close()
 
 	valid, err := iter.SeekEngineKeyGE(EngineKey{Key: lbKey})
@@ -1459,7 +1438,7 @@ func Scan(reader Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, err
 func ScanIntents(
 	ctx context.Context, reader Reader, start, end roachpb.Key, maxIntents int64, targetBytes int64,
 ) ([]roachpb.Intent, error) {
-	intents := []roachpb.Intent{}
+	var intents []roachpb.Intent
 
 	if bytes.Compare(start, end) >= 0 {
 		return intents, nil
@@ -1467,13 +1446,15 @@ func ScanIntents(
 
 	ltStart, _ := keys.LockTableSingleKey(start, nil)
 	ltEnd, _ := keys.LockTableSingleKey(end, nil)
-	iter := reader.NewEngineIterator(IterOptions{LowerBound: ltStart, UpperBound: ltEnd})
+	iter, err := reader.NewEngineIterator(IterOptions{LowerBound: ltStart, UpperBound: ltEnd})
+	if err != nil {
+		return nil, err
+	}
 	defer iter.Close()
 
 	var meta enginepb.MVCCMetadata
 	var intentBytes int64
 	var ok bool
-	var err error
 	for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: ltStart}); ok; ok, err = iter.NextEngineKey() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1544,17 +1525,19 @@ func ClearRangeWithHeuristic(
 	r Reader, w Writer, start, end roachpb.Key, pointKeyThreshold, rangeKeyThreshold int,
 ) error {
 	clearPointKeys := func(r Reader, w Writer, start, end roachpb.Key, threshold int) error {
-		iter := r.NewEngineIterator(IterOptions{
+		iter, err := r.NewEngineIterator(IterOptions{
 			KeyTypes:   IterKeyTypePointsOnly,
 			LowerBound: start,
 			UpperBound: end,
 		})
+		if err != nil {
+			return err
+		}
 		defer iter.Close()
 
 		// Scan, and drop a RANGEDEL if we reach the threshold. We tighten the span
 		// to the first encountered key, since we can cheaply do so.
 		var ok bool
-		var err error
 		var count int
 		var firstKey roachpb.Key
 		for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: start}); ok; ok, err = iter.NextEngineKey() {
@@ -1590,16 +1573,18 @@ func ClearRangeWithHeuristic(
 	}
 
 	clearRangeKeys := func(r Reader, w Writer, start, end roachpb.Key, threshold int) error {
-		iter := r.NewEngineIterator(IterOptions{
+		iter, err := r.NewEngineIterator(IterOptions{
 			KeyTypes:   IterKeyTypeRangesOnly,
 			LowerBound: start,
 			UpperBound: end,
 		})
+		if err != nil {
+			return err
+		}
 		defer iter.Close()
 
 		// Scan, and drop a RANGEKEYDEL if we reach the threshold.
 		var ok bool
-		var err error
 		var count int
 		var firstKey roachpb.Key
 		for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: start}); ok; ok, err = iter.NextEngineKey() {
@@ -1736,11 +1721,14 @@ func iterateOnReader(
 		return nil
 	}
 
-	it := reader.NewMVCCIterator(iterKind, IterOptions{
+	it, err := reader.NewMVCCIterator(iterKind, IterOptions{
 		KeyTypes:   keyTypes,
 		LowerBound: start,
 		UpperBound: end,
 	})
+	if err != nil {
+		return err
+	}
 	defer it.Close()
 
 	var rangeKeys MVCCRangeKeyStack // cached during iteration
@@ -1991,7 +1979,10 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 		ltEnd, _ := keys.LockTableSingleKey(end, nil)
 		opts.UpperBound = ltEnd
 	}
-	iter := reader.NewEngineIterator(opts)
+	iter, err := reader.NewEngineIterator(opts)
+	if err != nil {
+		return false, err
+	}
 	defer iter.Close()
 
 	var meta enginepb.MVCCMetadata

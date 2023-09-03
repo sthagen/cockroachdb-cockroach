@@ -27,6 +27,65 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
+// wrappableReader is used to implement a wrapped Reader. A wrapped Reader
+// should be used and immediately discarded. It maintains no state of its own
+// between calls.
+// Why do we not keep the wrapped reader as a member in the caller? Because
+// different methods on Reader can need different wrappings depending on what
+// they want to observe.
+//
+// TODO(sumeer): for allocation optimization we could expose a scratch space
+// struct that the caller keeps on behalf of the wrapped reader. But can only
+// do such an optimization when know that the wrappableReader will be used
+// with external synchronization that prevents preallocated buffers from being
+// modified concurrently. pebbleBatch.{MVCCGet,MVCCGetProto} have MVCCKey
+// serialization allocation optimizations which we can't do below. But those
+// are probably not performance sensitive, since the performance sensitive
+// code probably uses an MVCCIterator.
+type wrappableReader interface {
+	Reader
+}
+
+// wrapReader wraps the provided reader, to return an implementation of MVCCIterator
+// that supports MVCCKeyAndIntentsIterKind.
+func wrapReader(r wrappableReader) *intentInterleavingReader {
+	iiReader := intentInterleavingReaderPool.Get().(*intentInterleavingReader)
+	*iiReader = intentInterleavingReader{wrappableReader: r}
+	return iiReader
+}
+
+type intentInterleavingReader struct {
+	wrappableReader
+}
+
+var _ Reader = &intentInterleavingReader{}
+
+var intentInterleavingReaderPool = sync.Pool{
+	New: func() interface{} {
+		return &intentInterleavingReader{}
+	},
+}
+
+// NewMVCCIterator implements the Reader interface. The
+// intentInterleavingReader can be freed once this method returns.
+func (imr *intentInterleavingReader) NewMVCCIterator(
+	iterKind MVCCIterKind, opts IterOptions,
+) (MVCCIterator, error) {
+	if (!opts.MinTimestampHint.IsEmpty() || !opts.MaxTimestampHint.IsEmpty()) &&
+		iterKind == MVCCKeyAndIntentsIterKind {
+		panic("cannot ask for interleaved intents when specifying timestamp hints")
+	}
+	if iterKind == MVCCKeyIterKind || opts.KeyTypes == IterKeyTypeRangesOnly {
+		return imr.wrappableReader.NewMVCCIterator(MVCCKeyIterKind, opts)
+	}
+	return newIntentInterleavingIterator(imr.wrappableReader, opts)
+}
+
+func (imr *intentInterleavingReader) Free() {
+	*imr = intentInterleavingReader{}
+	intentInterleavingReaderPool.Put(imr)
+}
+
 type intentInterleavingIterConstraint int8
 
 const (
@@ -168,7 +227,7 @@ func isLocal(k roachpb.Key) bool {
 	return k.Compare(keys.LocalMax) < 0
 }
 
-func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator {
+func newIntentInterleavingIterator(reader Reader, opts IterOptions) (MVCCIterator, error) {
 	if !opts.MinTimestampHint.IsEmpty() || !opts.MaxTimestampHint.IsEmpty() {
 		panic("intentInterleavingIter must not be used with timestamp hints")
 	}
@@ -257,7 +316,11 @@ func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator
 	//
 	// Note that we can reuse intentKeyBuf, intentLimitKeyBuf after
 	// NewEngineIterator returns.
-	intentIter := reader.NewEngineIterator(intentOpts).(*pebbleIterator)
+	intentEngineIter, err := reader.NewEngineIterator(intentOpts)
+	if err != nil {
+		return nil, err
+	}
+	intentIter := intentEngineIter.(*pebbleIterator)
 
 	// The creation of these iterators can race with concurrent mutations, which
 	// may make them inconsistent with each other. So we clone here, to ensure
@@ -265,7 +328,11 @@ func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator
 	// and we use that when possible to save allocations).
 	var iter *pebbleIterator
 	if reader.ConsistentIterators() {
-		iter = maybeUnwrapUnsafeIter(reader.NewMVCCIterator(MVCCKeyIterKind, opts)).(*pebbleIterator)
+		mvccIter, err := reader.NewMVCCIterator(MVCCKeyIterKind, opts)
+		if err != nil {
+			return nil, err
+		}
+		iter = maybeUnwrapUnsafeIter(mvccIter).(*pebbleIterator)
 	} else {
 		iter = newPebbleIteratorByCloning(intentIter.CloneContext(), opts, StandardDurability)
 	}
@@ -279,7 +346,7 @@ func newIntentInterleavingIterator(reader Reader, opts IterOptions) MVCCIterator
 		intentKeyBuf:                         intentKeyBuf,
 		intentLimitKeyBuf:                    intentLimitKeyBuf,
 	}
-	return iiIter
+	return iiIter, nil
 }
 
 // TODO(sumeer): the limits generated below are tight for the current value of
@@ -542,8 +609,8 @@ func (i *intentInterleavingIter) SeekIntentGE(key roachpb.Key, txnUUID uuid.UUID
 	var engineKey EngineKey
 	engineKey, i.intentKeyBuf = LockTableKey{
 		Key:      key,
-		Strength: lock.Exclusive,
-		TxnUUID:  txnUUID[:],
+		Strength: lock.Intent,
+		TxnUUID:  txnUUID,
 	}.ToEngineKey(i.intentKeyBuf)
 	var limitKey roachpb.Key
 	if i.iterValid && !i.prefix {

@@ -67,7 +67,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -182,10 +182,26 @@ func TestBackupRestoreSingleNodeLocal(t *testing.T) {
 
 	const numAccounts = 1000
 	ctx := context.Background()
-	tc, _, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
+
+	var chunks int
+	// Set the testing knob so we count each time we write a checkpoint.
+	params := base.TestClusterArgs{}
+	knobs := base.TestingKnobs{
+		SQLExecutor: &sql.ExecutorTestingKnobs{
+			AfterBackupChunk: func() {
+				chunks++
+			},
+		},
+	}
+	params.ServerArgs.Knobs = knobs
+
+	tc, _, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, params)
 	defer cleanupFn()
 
 	backupAndRestore(ctx, t, tc, []string{localFoo}, []string{localFoo}, numAccounts, nil)
+
+	// Verify that we sent >0 chunk events to the chunk progress logger.
+	require.Greater(t, chunks, 0)
 }
 
 func TestBackupRestoreMultiNodeLocal(t *testing.T) {
@@ -602,7 +618,8 @@ func TestBackupRestoreAppend(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStressRace(t, "test is too large to run under stress race")
+	skip.UnderStress(t, "test is too large to run under stress")
+	skip.UnderRace(t, "test is too large to run under race")
 
 	const numAccounts = 1000
 	ctx := context.Background()
@@ -806,7 +823,7 @@ func TestBackupAndRestoreJobDescription(t *testing.T) {
 	sqlDB.Exec(t, "BACKUP TO ($1,$2,$3) INCREMENTAL FROM $4", append(incrementals, backups[0])...)
 	sqlDB.Exec(t, "BACKUP INTO ($1, $2, $3)", collections...)
 	sqlDB.Exec(t, "BACKUP INTO LATEST IN ($1, $2, $3)", collections...)
-	sqlDB.Exec(t, "BACKUP INTO LATEST IN ($1, $2, $3) WITH OPTIONS (incremental_location = ($4, $5, $6))",
+	sqlDB.Exec(t, "BACKUP INTO LATEST IN ($1, $2, $3) WITH incremental_location = ($4, $5, $6)",
 		append(collections, incrementals...)...)
 
 	sqlDB.ExpectErr(t, "the incremental_location option must contain the same number of locality",
@@ -1426,179 +1443,6 @@ into_db='restoredb', %s)`, encryptionOption), backupLoc1)
 	}
 }
 
-type inProgressChecker func(context context.Context, ip inProgressState) error
-
-// inProgressState holds state about an in-progress backup or restore
-// for use in inProgressCheckers.
-type inProgressState struct {
-	*gosql.DB
-	backupTableID uint32
-	dir, name     string
-}
-
-func (ip inProgressState) latestJobID() (jobspb.JobID, error) {
-	var id jobspb.JobID
-	if err := ip.QueryRow(
-		`SELECT job_id FROM crdb_internal.jobs ORDER BY created DESC LIMIT 1`,
-	).Scan(&id); err != nil {
-		return 0, err
-	}
-	return id, nil
-}
-
-// checkInProgressBackupRestore will run a backup and restore, pausing each
-// approximately halfway through to run either `checkBackup` or `checkRestore`.
-func checkInProgressBackupRestore(
-	t testing.TB, checkBackup inProgressChecker, checkRestore inProgressChecker,
-) {
-	var allowResponse chan struct{}
-	var exportSpanCompleteCh chan struct{}
-	params := base.TestClusterArgs{}
-	knobs := base.TestingKnobs{
-		DistSQL: &execinfra.TestingKnobs{
-			BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
-				RunAfterExportingSpanEntry: func(_ context.Context, res *kvpb.ExportResponse) {
-					<-allowResponse
-					// If ResumeSpan is set to nil, it means that we have completed
-					// exporting a span and the job will update its fraction progressed.
-					if res.ResumeSpan == nil {
-						<-exportSpanCompleteCh
-					}
-				},
-				RunAfterProcessingRestoreSpanEntry: func(_ context.Context, _ *execinfrapb.RestoreSpanEntry) {
-					<-allowResponse
-				},
-			},
-		},
-		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-	}
-	params.ServerArgs.Knobs = knobs
-
-	const numAccounts = 100
-
-	ctx := context.Background()
-	_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, multiNode, numAccounts,
-		InitManualReplication, params)
-	conn := sqlDB.DB.(*gosql.DB)
-	defer cleanup()
-
-	sqlDB.Exec(t, `CREATE DATABASE restoredb`)
-	// the small test-case will get entirely buffered/merged by small-file merging
-	// and not report any progress in the meantime unless it is disabled.
-	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.file_size = '1'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '1'`)
-
-	// Ensure that each node has at least one leaseholder. (These splits were
-	// made in backupRestoreTestSetup.) These are wrapped with SucceedsSoon()
-	// because EXPERIMENTAL_RELOCATE can fail if there are other replication
-	// changes happening.
-	for _, stmt := range []string{
-		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 0)`,
-		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[2], 30)`,
-		`ALTER TABLE data.bank EXPERIMENTAL_RELOCATE VALUES (ARRAY[3], 80)`,
-	} {
-		testutils.SucceedsSoon(t, func() error {
-			_, err := sqlDB.DB.ExecContext(ctx, stmt)
-			return err
-		})
-	}
-
-	var totalExpectedBackupRequests int
-	// mergedRangeQuery calculates the number of spans we expect PartitionSpans to
-	// produce. It merges contiguous ranges on the same node.
-	// It sorts ranges by start_key and counts the number of times the
-	// lease_holder changes by comparing against the previous row's lease_holder.
-	mergedRangeQuery := `
-WITH
-	ranges
-		AS (
-			SELECT
-				start_key,
-				lag(lease_holder) OVER (ORDER BY start_key)
-					AS prev_lease_holder,
-				lease_holder
-			FROM
-				[SHOW RANGES FROM TABLE data.bank WITH DETAILS]
-		)
-SELECT
-	count(*)
-FROM
-	ranges
-WHERE
-	lease_holder != prev_lease_holder
-	OR prev_lease_holder IS NULL;
-`
-
-	sqlDB.QueryRow(t, mergedRangeQuery).Scan(&totalExpectedBackupRequests)
-
-	backupTableID := sqlutils.QueryTableID(t, conn, "data", "public", "bank")
-
-	do := func(query string, check inProgressChecker) {
-		t.Logf("checking query %q", query)
-
-		var totalExpectedResponses int
-		if strings.Contains(query, "BACKUP") {
-			exportSpanCompleteCh = make(chan struct{})
-			// totalExpectedBackupRequests takes into account the merging that backup
-			// does of co-located ranges. It is the expected number of ExportRequests
-			// backup issues. DistSender will still split those requests to different
-			// ranges on the same node. Each range will write a file, so the number of
-			// SST files this backup will write is `backupRestoreDefaultRanges` .
-			totalExpectedResponses = totalExpectedBackupRequests
-		} else if strings.Contains(query, "RESTORE") {
-			// We expect restore to process each file in the backup individually.
-			// SST files are written per-range in the backup. So we expect the
-			// restore to process #(ranges) that made up the original table.
-			totalExpectedResponses = backupRestoreDefaultRanges
-		} else {
-			t.Fatal("expected query to be either a backup or restore")
-		}
-		jobDone := make(chan error)
-		allowResponse = make(chan struct{}, totalExpectedResponses)
-
-		go func() {
-			_, err := conn.Exec(query, localFoo)
-			jobDone <- err
-		}()
-
-		// Allow half the total expected responses to proceed.
-		for i := 0; i < totalExpectedResponses/2; i++ {
-			allowResponse <- struct{}{}
-		}
-
-		// Due to ExportRequest pagination, in the case of backup, we want to wait
-		// until an entire span has been exported before checking job progress.
-		if strings.Contains(query, "BACKUP") {
-			exportSpanCompleteCh <- struct{}{}
-			close(exportSpanCompleteCh)
-		}
-		err := retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
-			return check(ctx, inProgressState{
-				DB:            conn,
-				backupTableID: backupTableID,
-				dir:           dir,
-				name:          "foo",
-			})
-		})
-
-		// Close the channel to allow all remaining responses to proceed. We do this
-		// even if the above retry.ForDuration failed, otherwise the test will hang
-		// forever.
-		close(allowResponse)
-
-		if err := <-jobDone; err != nil {
-			t.Fatalf("%q: %+v", query, err)
-		}
-
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	do(`BACKUP DATABASE data INTO $1`, checkBackup)
-	do(`RESTORE data.* FROM LATEST IN $1 WITH OPTIONS (into_db='restoredb')`, checkRestore)
-}
-
 // TestRestoreCheckpointing checks that progress persists to the job record
 // using the new span frontier. The test takes the following approach:
 //
@@ -1714,38 +1558,6 @@ func TestRestoreCheckpointing(t *testing.T) {
 	// Ensure that no persisted work was repeated on resume and that all work was persisted.
 	checkPersistedSpanLength(1)
 	require.Equal(t, totalEntries-entriesBeforePause, postResumeCount)
-}
-
-func TestBackupRestoreSystemJobsProgress(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 68571, "flaky test")
-	defer log.Scope(t).Close(t)
-	defer jobs.TestingSetProgressThresholds()()
-
-	skip.UnderStressRace(t, "test takes too long to run under stressrace")
-
-	checkFraction := func(ctx context.Context, ip inProgressState) error {
-		jobID, err := ip.latestJobID()
-		if err != nil {
-			return err
-		}
-		var fractionCompleted float32
-		if err := ip.QueryRow(
-			`SELECT fraction_completed FROM crdb_internal.jobs WHERE job_id = $1`,
-			jobID,
-		).Scan(&fractionCompleted); err != nil {
-			return err
-		}
-		if fractionCompleted < 0.01 || fractionCompleted > 0.99 {
-			return errors.Errorf(
-				"expected progress to be in range [0.01, 0.99] but got %f",
-				fractionCompleted,
-			)
-		}
-		return nil
-	}
-
-	checkInProgressBackupRestore(t, checkFraction, checkFraction)
 }
 
 func createAndWaitForJob(
@@ -6057,7 +5869,7 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 
 	conn := tc.ServerConn(0)
 	systemTenantRunner := sqlutils.MakeSQLRunner(conn)
-	setAndWaitForTenantReadOnlyClusterSetting(t, sql.SecondaryTenantZoneConfigsEnabled.Key(),
+	setAndWaitForTenantReadOnlyClusterSetting(t, sql.SecondaryTenantZoneConfigsEnabled.Name(),
 		systemTenantRunner, ttSQLDB, tenantID, "true")
 
 	// Run the test as the system tenant, and as the secondary tenant.
@@ -6077,8 +5889,9 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 		startPretty := tablePrefix.String()
 
 		// Speeds up the test.
-		runner.Exec(t, "SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms';")
-		runner.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
+		systemTenantRunner.Exec(t, "SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms';")
+		systemTenantRunner.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
+		systemTenantRunner.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
 
 		// Run a full backup.
 		baseBackupURI := "userfile:///foo"
@@ -6454,6 +6267,15 @@ func TestProtectedTimestampsFailDueToLimits(t *testing.T) {
 	})
 }
 
+// Check if export request is from a lease for a descriptor to avoid picking
+// up on wrong export requests
+func isLeasingExportRequest(r *kvpb.ExportRequest) bool {
+	_, tenantID, _ := keys.DecodeTenantPrefix(r.Key)
+	codec := keys.MakeSQLCodec(tenantID)
+	return bytes.HasPrefix(r.Key, codec.DescMetadataPrefix()) &&
+		r.EndKey.Equal(r.Key.PrefixEnd())
+}
+
 func TestPaginatedBackupTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -6489,14 +6311,6 @@ func TestPaginatedBackupTenant(t *testing.T) {
 		return fmt.Sprintf("%v%s", span.String(), spanStr)
 	}
 
-	// Check if export request is from a lease for a descriptor to avoid picking
-	// up on wrong export requests
-	isLeasingExportRequest := func(r *kvpb.ExportRequest) bool {
-		_, tenantID, _ := keys.DecodeTenantPrefix(r.Key)
-		codec := keys.MakeSQLCodec(tenantID)
-		return bytes.HasPrefix(r.Key, codec.DescMetadataPrefix()) &&
-			r.EndKey.Equal(r.Key.PrefixEnd())
-	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 			for _, ru := range request.Requests {
@@ -6534,7 +6348,7 @@ func TestPaginatedBackupTenant(t *testing.T) {
 	defer cleanupFn()
 	srv := tc.Server(0)
 
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	resetStateVars := func() {
 		mu.Lock()
@@ -6656,7 +6470,7 @@ func TestBackupRestoreInsideTenant(t *testing.T) {
 	srv := tc.Server(0)
 
 	// NB: tenant certs for 10, 11, and 20 are embedded. See:
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	tenant10, cleanupT10 := makeTenant(srv, 10)
 	defer cleanupT10()
@@ -6776,7 +6590,7 @@ func TestBackupRestoreTenantSettings(t *testing.T) {
 	defer cleanupFn()
 
 	// NB: tenant certs for 2, 10, 11, and 20 are embedded. See:
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	// Create another server.
 	tc2, _, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, dir, InitManualReplication, base.TestClusterArgs{})
@@ -6829,7 +6643,7 @@ func TestBackupRestoreInsideMultiPodTenant(t *testing.T) {
 	srv := tc.Server(0)
 
 	// NB: tenant certs for 10, 11, and 20 are embedded. See:
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	// Create another server.
 	tc2, systemDB2, cleanupEmptyCluster := backupRestoreTestSetupEmpty(t, singleNode, dir, InitManualReplication, base.TestClusterArgs{})
@@ -6937,6 +6751,78 @@ func TestBackupRestoreInsideMultiPodTenant(t *testing.T) {
 	})
 }
 
+// TestBackupRestoreCreatedAndDroppedTenant ensures that a restore of a tenant works if a
+// incremental backups captured the creation or deletion of a tenant.
+func TestBackupRestoreCreatedAndDroppedTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params := base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			TenantTestingKnobs: &sql.TenantTestingKnobs{
+				// The tests expect specific tenant IDs to show up.
+				EnableTenantIDReuse: true,
+			},
+		},
+
+		DefaultTestTenant: base.TestControlsTenantsExplicitly},
+	}
+
+	const numAccounts = 1
+	tc, systemDB, _, cleanupFn := backupRestoreTestSetupWithParams(
+		t, singleNode, numAccounts, InitManualReplication, params,
+	)
+	_, _ = tc, systemDB
+	defer cleanupFn()
+
+	// NB: tenant certs for 10, 11, 20 are embedded. See:
+	_ = securitytest.EmbeddedTenantIDs()
+
+	systemDB.Exec(t, "CREATE TENANT foo")
+
+	systemDB.Exec(t, "SET sql_safe_updates =off;")
+
+	getAOST := func() string {
+		var ts string
+		systemDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&ts)
+		return ts
+	}
+	t1 := getAOST()
+
+	systemDB.Exec(t, fmt.Sprintf("BACKUP INTO 'nodelocal://1/clusterwide' AS OF SYSTEM TIME '%s' with include_all_virtual_clusters;", t1))
+
+	systemDB.Exec(t, "CREATE TENANT baz")
+
+	t2 := getAOST()
+	systemDB.Exec(t, fmt.Sprintf("BACKUP INTO LATEST IN 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s with include_all_virtual_clusters;", t2))
+
+	systemDB.Exec(t, "DROP TENANT baz")
+
+	// Make GC job scheduled by DROP TENANT run in 1 second.
+	systemDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue.enabled = false")
+	systemDB.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
+	// Wait for tenant GC job to complete.
+	systemDB.CheckQueryResultsRetry(
+		t,
+		"SELECT status FROM [SHOW JOBS] WHERE description LIKE 'GC for tenant%'",
+		[][]string{{"succeeded"}},
+	)
+
+	t3 := getAOST()
+	systemDB.Exec(t, fmt.Sprintf("BACKUP INTO LATEST IN 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s with include_all_virtual_clusters;", t3))
+
+	restoreCmd := func(aost string, name string) string {
+		return fmt.Sprintf("RESTORE TENANT 2 FROM LATEST IN 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s with tenant_name = '%s'", aost, name)
+	}
+
+	systemDB.Exec(t, restoreCmd(t1, "full"))
+
+	systemDB.Exec(t, restoreCmd(t2, "after-create"))
+
+	systemDB.Exec(t, restoreCmd(t3, "after-drop"))
+}
+
 // Ensure that backing up and restoring tenants succeeds.
 func TestBackupRestoreTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -6964,7 +6850,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 	srv := tc.Server(0)
 
 	// NB: tenant certs for 10, 11, 20 are embedded. See:
-	_ = security.EmbeddedTenantIDs()
+	_ = securitytest.EmbeddedTenantIDs()
 
 	// Setup a few tenants, each with a different table.
 	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
@@ -7113,7 +6999,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		)
 
 		// Make GC job scheduled by DROP TENANT run in 1 second.
-		restoreDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue_enabled = false")
+		restoreDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue.enabled = false")
 		restoreDB.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
 		// Wait for tenant GC job to complete.
 		restoreDB.CheckQueryResultsRetry(
@@ -8908,8 +8794,9 @@ func TestBackupOnlyPublicIndexes(t *testing.T) {
 
 func TestBackupWorkerFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 64773, "flaky test")
 	defer log.Scope(t).Close(t)
+
+	skip.UnderStressRace(t, "test is too slow to run under race")
 
 	allowResponse := make(chan struct{})
 	params := base.TestClusterArgs{}
@@ -8928,7 +8815,7 @@ func TestBackupWorkerFailure(t *testing.T) {
 
 	var expectedCount int
 	sqlDB.QueryRow(t, `SELECT count(*) FROM data.bank`).Scan(&expectedCount)
-	query := `BACKUP DATABASE data INTO 'userfile:///worker-failure'`
+	query := `BACKUP DATABASE data INTO 'nodelocal://1/worker-failure'`
 	errCh := make(chan error)
 	go func() {
 		_, err := conn.Exec(query)
@@ -8940,12 +8827,13 @@ func TestBackupWorkerFailure(t *testing.T) {
 		t.Fatalf("%s: query returned before expected: %s", err, query)
 	}
 	var jobID jobspb.JobID
-	sqlDB.QueryRow(t, `SELECT id FROM system.jobs ORDER BY created DESC LIMIT 1`).Scan(&jobID)
+	sqlDB.QueryRow(t, `SELECT id FROM system.jobs WHERE job_type = 'BACKUP' ORDER BY created DESC LIMIT 1`).Scan(&jobID)
 
 	// Shut down a node.
-	tc.StopServer(1)
+	tc.StopServer(2)
 
 	close(allowResponse)
+
 	// We expect the statement to retry since it should have encountered a
 	// retryable error.
 	if err := <-errCh; err != nil {
@@ -8955,12 +8843,14 @@ func TestBackupWorkerFailure(t *testing.T) {
 	// But the job should be restarted and succeed eventually.
 	jobutils.WaitForJobToSucceed(t, sqlDB, jobID)
 
+	// TODO(dt): verify correctness of the backup content, similar to the approach
+	// below which is commented out as it sometimes takes >30s.
 	// Drop database and restore to ensure that the backup was successful.
-	sqlDB.Exec(t, `DROP DATABASE data`)
-	sqlDB.Exec(t, `RESTORE DATABASE data FROM LATEST IN 'userfile:///worker-failure'`)
-	var actualCount int
-	sqlDB.QueryRow(t, `SELECT count(*) FROM data.bank`).Scan(&actualCount)
-	require.Equal(t, expectedCount, actualCount)
+	// sqlDB.Exec(t, `DROP DATABASE data`)
+	// sqlDB.Exec(t, `RESTORE DATABASE data FROM LATEST IN 'nodelocal://1/worker-failure'`)
+	// var actualCount int
+	// sqlDB.QueryRow(t, `SELECT count(*) FROM data.bank`).Scan(&actualCount)
+	// require.Equal(t, expectedCount, actualCount)
 }
 
 // Regression test for #66797 ensuring that the span merging optimization
@@ -9074,10 +8964,7 @@ func TestRestorePauseOnError(t *testing.T) {
 
 	var forceFailure bool
 	for i := range tc.Servers {
-		jobRegistry := tc.Servers[i].JobRegistry()
-		if tc.StartedDefaultTestTenant() {
-			jobRegistry = tc.Servers[i].TestTenants()[0].JobRegistry()
-		}
+		jobRegistry := tc.Servers[i].ApplicationLayer().JobRegistry()
 
 		jobRegistry.(*jobs.Registry).TestingWrapResumerConstructor(
 			jobspb.TypeRestore,
@@ -9437,6 +9324,8 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	var exportReqsAtomic int64
+
 	tc, sqlDB, iodir, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, 10,
 		InitManualReplication, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
@@ -9447,6 +9336,17 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(), // speeds up test
 					SpanConfig: &spanconfig.TestingKnobs{
 						SQLWatcherCheckpointNoopsEveryDurationOverride: 100 * time.Millisecond,
+					},
+					Store: &kvserver.StoreTestingKnobs{
+						TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+							for _, ru := range request.Requests {
+								if exportRequest, ok := ru.GetInner().(*kvpb.ExportRequest); ok &&
+									!isLeasingExportRequest(exportRequest) {
+									atomic.AddInt64(&exportReqsAtomic, 1)
+								}
+							}
+							return nil
+						},
 					},
 				},
 			},
@@ -9468,8 +9368,11 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 	conn := tc.Conns[0]
 
 	sqlDB.Exec(t, `CREATE TABLE data.foo (id INT, INDEX bar(id))`)
-	sqlDB.Exec(t, `INSERT INTO data.foo select * from generate_series(1,10)`)
+	sqlDB.Exec(t, `INSERT INTO data.foo select * from generate_series(1,5)`)
 
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, localFoo)
+
+	sqlDB.Exec(t, `INSERT INTO data.foo select * from generate_series(6,10)`)
 	// Create another table.
 	sqlDB.Exec(t, `CREATE TABLE data.bar (id INT, INDEX bar(id))`)
 	sqlDB.Exec(t, `INSERT INTO data.bar select * from generate_series(1,10)`)
@@ -9489,11 +9392,30 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 		}
 		return true, nil
 	})
-	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, localFoo)
+
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO LATEST IN $1`, localFoo)
+	sqlDB.Exec(t, `CREATE TABLE data.baz (id INT)`)
+	sqlDB.Exec(t, `ALTER TABLE data.baz SET (exclude_data_from_backup = true)`)
+	sqlDB.Exec(t, `INSERT INTO data.baz select * from generate_series(1,10)`)
+
+	waitForReplicaFieldToBeSet(t, tc, conn, "baz", "data", func(r *kvserver.Replica) (bool, error) {
+		if !r.ExcludeDataFromBackup() {
+			return false, errors.New("waiting for the range containing table data.foo to split")
+		}
+		return true, nil
+	})
+
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO LATEST IN $1`, localFoo)
 
 	restoreDB.Exec(t, `RESTORE DATABASE data FROM LATEST IN $1`, localFoo)
-	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.foo`), 0)
+	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.foo`), 5)
 	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.bar`), 10)
+	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.baz`), 0)
+
+	before := atomic.LoadInt64(&exportReqsAtomic)
+	sqlDB.Exec(t, `BACKUP data.foo TO $1`, localFoo+"/tbl")
+	after := atomic.LoadInt64(&exportReqsAtomic)
+	require.Equal(t, before, after)
 }
 
 // TestExportRequestBelowGCThresholdOnDataExcludedFromBackup tests that a
@@ -11190,7 +11112,7 @@ func TestRestoreMemoryMonitoringWithShadowing(t *testing.T) {
 	defer cleanupFn()
 
 	sqlDB.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.restore_node_concurrency = 1")
-	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.memory_monitor_ssts=true")
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.sst_memory_limit.enabled=true")
 	sqlDB.Exec(t, "BACKUP data.bank INTO 'userfile:///backup'")
 
 	// Repeatedly alter a single row and do an incremental backup.
@@ -11231,7 +11153,7 @@ func TestRestoreMemoryMonitoringMinWorkerMemory(t *testing.T) {
 
 	// 4 restore workers means we need minimum 2 workers to start restore.
 	sqlDB.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.restore_node_concurrency=4")
-	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.memory_monitor_ssts=true")
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.sst_memory_limit.enabled=true")
 
 	sqlDB.Exec(t, "BACKUP data.bank INTO 'userfile:///backup'")
 

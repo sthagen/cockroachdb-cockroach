@@ -1168,7 +1168,7 @@ func (t *Transaction) Restart(
 	// Reset all epoch-scoped state.
 	t.Sequence = 0
 	t.WriteTooOld = false
-	t.CommitTimestampFixed = false
+	t.ReadTimestampFixed = false
 	t.LockSpans = nil
 	t.InFlightWrites = nil
 	t.IgnoredSeqNums = nil
@@ -1216,15 +1216,16 @@ func (t *Transaction) BumpReadTimestamp(timestamp hlc.Timestamp) {
 // others) for the transaction. If t.ID is empty, then the transaction is
 // copied from o.
 func (t *Transaction) Update(o *Transaction) {
+	ctx := context.TODO()
 	if o == nil {
 		return
 	}
-	o.AssertInitialized(context.TODO())
+	o.AssertInitialized(ctx)
 	if t.ID == (uuid.UUID{}) {
 		*t = *o
 		return
 	} else if t.ID != o.ID {
-		log.Fatalf(context.Background(), "updating txn %s with different txn %s", t.String(), o.String())
+		log.Fatalf(ctx, "updating txn %s with different txn %s", t.String(), o.String())
 		return
 	}
 	if len(t.Key) == 0 {
@@ -1234,11 +1235,17 @@ func (t *Transaction) Update(o *Transaction) {
 
 	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
+		// Ensure that the transaction status makes sense. If the transaction
+		// has already been finalized, then it should remain finalized.
+		if !t.Status.IsFinalized() {
+			t.Status = o.Status
+		} else if t.Status == COMMITTED {
+			log.Warningf(ctx, "updating COMMITTED txn %s with txn at later epoch %s", t.String(), o.String())
+		}
 		// Replace all epoch-scoped state.
 		t.Epoch = o.Epoch
-		t.Status = o.Status
 		t.WriteTooOld = o.WriteTooOld
-		t.CommitTimestampFixed = o.CommitTimestampFixed
+		t.ReadTimestampFixed = o.ReadTimestampFixed
 		t.Sequence = o.Sequence
 		t.LockSpans = o.LockSpans
 		t.InFlightWrites = o.InFlightWrites
@@ -1254,7 +1261,7 @@ func (t *Transaction) Update(o *Transaction) {
 			}
 		case ABORTED:
 			if o.Status == COMMITTED {
-				log.Warningf(context.Background(), "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
+				log.Warningf(ctx, "updating ABORTED txn %s with COMMITTED txn %s", t.String(), o.String())
 			}
 		case COMMITTED:
 			// Nothing to do.
@@ -1264,7 +1271,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// If neither of the transactions has a bumped ReadTimestamp, then the
 			// WriteTooOld flag is cumulative.
 			t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
-			t.CommitTimestampFixed = t.CommitTimestampFixed || o.CommitTimestampFixed
+			t.ReadTimestampFixed = t.ReadTimestampFixed || o.ReadTimestampFixed
 		} else if t.ReadTimestamp.Less(o.ReadTimestamp) {
 			// If `o` has a higher ReadTimestamp (i.e. it's the result of a refresh,
 			// which refresh generally clears the WriteTooOld field), then it dictates
@@ -1272,7 +1279,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// concurrently with any requests whose response's WriteTooOld field
 			// matters.
 			t.WriteTooOld = o.WriteTooOld
-			t.CommitTimestampFixed = o.CommitTimestampFixed
+			t.ReadTimestampFixed = o.ReadTimestampFixed
 		}
 		// If t has a higher ReadTimestamp, than it gets to dictate the
 		// WriteTooOld field - so there's nothing to update.
@@ -1299,7 +1306,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// aborted.
 			t.Status = ABORTED
 		case COMMITTED:
-			log.Warningf(context.Background(), "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
+			log.Warningf(ctx, "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
 		}
 	}
 
@@ -1967,17 +1974,42 @@ func (l *Lease) Equal(that interface{}) bool {
 	return true
 }
 
-// MakeIntent makes an intent with the given txn and key.
-// This is suitable for use when constructing WriteIntentError.
-func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
-	var i Intent
-	i.Key = key
-	i.Txn = *txn
-	return i
+// MakeLock makes a lock with the given txn, key, and strength.
+// This is suitable for use when constructing LockConflictError.
+func MakeLock(txn *enginepb.TxnMeta, key Key, str lock.Strength) Lock {
+	var l Lock
+	l.Txn = *txn
+	l.Key = key
+	l.Strength = str
+	return l
 }
 
-// AsIntents takes a transaction and a slice of keys and
-// returns it as a slice of intents.
+// Intent is an intent-strength lock. The type is a specialization of Lock and
+// should be constructed using MakeIntent.
+type Intent Lock
+
+// MakeIntent makes an intent-strength lock with the given txn and key.
+func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
+	return Intent(MakeLock(txn, key, lock.Intent))
+}
+
+// AsLock casts an Intent to a Lock.
+func (i Intent) AsLock() Lock {
+	return Lock(i)
+}
+
+// AsLockPtr casts a *Intent to a *Lock.
+func (i *Intent) AsLockPtr() *Lock {
+	return (*Lock)(i)
+}
+
+// AsLocks casts a slice of Intents to a slice of Locks.
+func AsLocks(s []Intent) []Lock {
+	return *(*[]Lock)(unsafe.Pointer(&s))
+}
+
+// AsIntents takes a transaction and a slice of keys and returns it as a slice
+// of intent-strength locks.
 func AsIntents(txn *enginepb.TxnMeta, keys []Key) []Intent {
 	ret := make([]Intent, len(keys))
 	for i := range keys {

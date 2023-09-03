@@ -28,6 +28,7 @@ import {
 import * as H from "history";
 import moment from "moment-timezone";
 import { defaultFilters } from "src/queryFilter";
+import { indexUnusedDuration } from "src/util/constants";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabaseDetailsPageProps = {
@@ -35,6 +36,7 @@ const withLoadingIndicator: DatabaseDetailsPageProps = {
   loaded: false,
   lastError: undefined,
   showIndexRecommendations: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   name: randomName(),
   tables: [],
   viewMode: ViewMode.Tables,
@@ -68,6 +70,7 @@ const withoutData: DatabaseDetailsPageProps = {
   loaded: true,
   lastError: null,
   showIndexRecommendations: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   name: randomName(),
   tables: [],
   viewMode: ViewMode.Tables,
@@ -129,6 +132,7 @@ const withData: DatabaseDetailsPageProps = {
   loaded: true,
   lastError: null,
   showIndexRecommendations: true,
+  csIndexUnusedDuration: indexUnusedDuration,
   name: randomName(),
   tables: [createTable()],
   viewMode: ViewMode.Tables,

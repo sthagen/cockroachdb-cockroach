@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -284,8 +285,9 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.Tracer = tr
 	cfg.Settings = st
 	idsProvider := &idProvider{
-		clusterID: &base.ClusterIDContainer{},
-		serverID:  &base.NodeIDContainer{},
+		clusterID:  &base.ClusterIDContainer{},
+		serverID:   &base.NodeIDContainer{},
+		tenantName: roachpb.NewTenantNameContainer(""),
 	}
 	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 	cfg.idProvider = idsProvider
@@ -744,28 +746,6 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 
-		if spec.InMemory && spec.StickyVFSID != "" {
-			if cfg.TestingKnobs.Server == nil {
-				return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
-					"engine no server knobs available to get a registry. " +
-					"Please use Knobs.Server.StickyVFSRegistry to provide one.")
-			}
-			knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
-			if knobs.StickyVFSRegistry == nil {
-				return Engines{}, errors.Errorf("Could not create a sticky " +
-					"engine no registry available. Please use " +
-					"Knobs.Server.StickyVFSRegistry to provide one.")
-			}
-			eng, err := knobs.StickyVFSRegistry.Open(ctx, cfg, spec)
-			if err != nil {
-				return Engines{}, err
-			}
-			detail(redact.Sprintf("store %d: %+v", i, eng.Properties()))
-			engines = append(engines, eng)
-			continue
-		}
-
-		var location storage.Location
 		storageConfigOpts := []storage.ConfigOption{
 			storage.Attributes(spec.Attributes),
 			storage.EncryptionAtRest(spec.EncryptionOptions),
@@ -778,8 +758,25 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			storageConfigOpts = append(storageConfigOpts, opt)
 		}
 
+		var location storage.Location
 		if spec.InMemory {
-			location = storage.InMemory()
+			if spec.StickyVFSID == "" {
+				location = storage.InMemory()
+			} else {
+				if cfg.TestingKnobs.Server == nil {
+					return Engines{}, errors.AssertionFailedf("Could not create a sticky " +
+						"engine no server knobs available to get a registry. " +
+						"Please use Knobs.Server.StickyVFSRegistry to provide one.")
+				}
+				knobs := cfg.TestingKnobs.Server.(*TestingKnobs)
+				if knobs.StickyVFSRegistry == nil {
+					return Engines{}, errors.Errorf("Could not create a sticky " +
+						"engine no registry available. Please use " +
+						"Knobs.Server.StickyVFSRegistry to provide one.")
+				}
+				location = storage.MakeLocation("", knobs.StickyVFSRegistry.Get(spec.StickyVFSID))
+			}
+
 			var sizeInBytes = spec.Size.InBytes
 			if spec.Size.Percent > 0 {
 				sysMem, err := status.GetTotalMemory(ctx)
@@ -896,7 +893,8 @@ func (cfg *Config) InitNode(ctx context.Context) error {
 		cfg.GossipBootstrapAddresses = addresses
 	}
 
-	cfg.BaseConfig.idProvider.SetTenant(roachpb.SystemTenantID)
+	cfg.BaseConfig.idProvider.SetTenantID(roachpb.SystemTenantID)
+	cfg.BaseConfig.idProvider.SetTenantName(catconstants.SystemTenantName)
 
 	return nil
 }
@@ -1022,6 +1020,9 @@ type idProvider struct {
 	// tenantStr is the memoized representation of tenantID.
 	tenantStr atomic.Value
 
+	// tenantName is the tenant name container for this server.
+	tenantName *roachpb.TenantNameContainer
+
 	// serverID contains the node ID for KV nodes (when tenantID.IsSet() ==
 	// false), or the SQL instance ID for SQL-only servers (when
 	// tenantID.IsSet() == true).
@@ -1031,11 +1032,6 @@ type idProvider struct {
 }
 
 var _ serverident.ServerIdentificationPayload = (*idProvider)(nil)
-
-// TenantID is part of the serverident.ServerIdentificationPayload interface.
-func (s *idProvider) TenantID() interface{} {
-	return s.tenantID
-}
 
 // ServerIdentityString implements the serverident.ServerIdentificationPayload interface.
 func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKey) string {
@@ -1053,16 +1049,7 @@ func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKe
 		return cs
 
 	case serverident.IdentifyTenantID:
-		t := s.tenantStr.Load()
-		ts, ok := t.(string)
-		if !ok {
-			tid := s.tenantID
-			if tid.IsSet() {
-				ts = strconv.FormatUint(tid.ToUint64(), 10)
-				s.tenantStr.Store(ts)
-			}
-		}
-		return ts
+		return s.maybeMemoizeTenantID()
 
 	case serverident.IdentifyInstanceID:
 		// If tenantID is not set, this is a KV node and it has no SQL
@@ -1079,6 +1066,9 @@ func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKe
 			return ""
 		}
 		return s.maybeMemoizeServerID()
+
+	case serverident.IdentifyTenantName:
+		return string(s.tenantName.Get())
 	}
 
 	return ""
@@ -1090,7 +1080,7 @@ func (s *idProvider) ServerIdentityString(key serverident.ServerIdentificationKe
 // Note: this should not be called concurrently with logging which may
 // invoke the method from the serverident.ServerIdentificationPayload
 // interface.
-func (s *idProvider) SetTenant(tenantID roachpb.TenantID) {
+func (s *idProvider) SetTenantID(tenantID roachpb.TenantID) {
 	if !tenantID.IsSet() {
 		panic("programming error: invalid tenant ID")
 	}
@@ -1098,6 +1088,13 @@ func (s *idProvider) SetTenant(tenantID roachpb.TenantID) {
 		panic("programming error: provider already set for tenant server")
 	}
 	s.tenantID = tenantID
+}
+
+func (s *idProvider) SetTenantName(tenantName roachpb.TenantName) {
+	if s.tenantName.Get() != "" {
+		panic("programming error: tenant name already set")
+	}
+	s.tenantName.Set(tenantName)
 }
 
 // maybeMemoizeServerID saves the representation of serverID to
@@ -1113,4 +1110,19 @@ func (s *idProvider) maybeMemoizeServerID() string {
 		}
 	}
 	return sis
+}
+
+// maybeMemoizeTenantID saves the representation of tenantID to
+// tenantStr if the former is initialized.
+func (s *idProvider) maybeMemoizeTenantID() string {
+	t := s.tenantStr.Load()
+	ts, ok := t.(string)
+	if !ok {
+		tid := s.tenantID
+		if tid.IsSet() {
+			ts = strconv.FormatUint(tid.ToUint64(), 10)
+			s.tenantStr.Store(ts)
+		}
+	}
+	return ts
 }

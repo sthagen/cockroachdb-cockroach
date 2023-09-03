@@ -97,7 +97,7 @@ var maxNumNonAdminConnections = settings.RegisterIntSetting(
 		"(note: this will only limit future connection attempts and will not affect already established connections). "+
 		"Negative values result in unlimited number of connections. Superusers are not affected by this limit.",
 	-1, // Postgres defaults to 100, but we default to -1 to match our previous behavior of unlimited.
-).WithPublic()
+	settings.WithPublic)
 
 // Note(alyshan): This setting is not public. It is intended to be used by Cockroach Cloud to limit
 // connections to serverless clusters while still being able to connect from the Cockroach Cloud control plane.
@@ -889,7 +889,7 @@ func (s *Server) IncrementConnectionCount(
 			pgerror.New(pgcode.TooManyConnections, "sorry, too many clients already"),
 			"the maximum number of allowed connections is %d and can be modified using the %s config key",
 			maxNumConnectionsValue,
-			maxNumNonAdminConnections.Key(),
+			maxNumNonAdminConnections.Name(),
 		)
 	}
 	return decrementConnectionCount, nil
@@ -3849,6 +3849,7 @@ func (ex *connExecutor) txnStateTransitionsApplyWrapper(
 		ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
 			ex.Ctx(), &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 		)
+		ex.resetPlanner(ex.Ctx(), &ex.planner, nil, ex.server.cfg.Clock.PhysicalTime())
 	case txnRestart:
 		// In addition to resetting the extraTxnState, the restart event may
 		// also need to reset the sqlliveness.Session.

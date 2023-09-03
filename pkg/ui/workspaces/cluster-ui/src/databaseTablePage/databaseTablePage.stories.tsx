@@ -21,6 +21,7 @@ import {
 import { DatabaseTablePage, DatabaseTablePageProps } from "./databaseTablePage";
 import moment from "moment-timezone";
 import * as H from "history";
+import { indexUnusedDuration } from "src/util/constants";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabaseTablePageProps = {
@@ -30,6 +31,7 @@ const withLoadingIndicator: DatabaseTablePageProps = {
   schemaName: randomName(),
   indexUsageStatsEnabled: false,
   showIndexRecommendations: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   details: {
     loading: true,
     loaded: false,
@@ -76,6 +78,7 @@ const withData: DatabaseTablePageProps = {
   schemaName: randomName(),
   indexUsageStatsEnabled: true,
   showIndexRecommendations: true,
+  csIndexUnusedDuration: indexUnusedDuration,
   details: {
     loading: false,
     loaded: true,

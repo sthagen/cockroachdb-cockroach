@@ -63,6 +63,10 @@ func TestCollectInfoFromMultipleStores(t *testing.T) {
 	defer c.Cleanup()
 
 	tc := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// This logic is specific to the storage layer.
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {StoreSpecs: []base.StoreSpec{{Path: dir + "/store-1"}}},
 			1: {StoreSpecs: []base.StoreSpec{{Path: dir + "/store-2"}}},
@@ -112,6 +116,8 @@ func TestCollectInfoFromOnlineCluster(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{{InMemory: true}},
 			Insecure:   true,
+			// This logic is specific to the storage layer.
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
 		},
 	})
 	tc.Start(t)
@@ -180,6 +186,10 @@ func TestLossOfQuorumRecovery(t *testing.T) {
 	// mark on replicas on node 1 as designated survivors. After that, starting
 	// single node should succeed.
 	tcBefore := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// This logic is specific to the storage layer.
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {StoreSpecs: []base.StoreSpec{{Path: dir + "/store-1"}}},
 		},
@@ -242,6 +252,10 @@ func TestLossOfQuorumRecovery(t *testing.T) {
 		"apply plan was not executed on requested node")
 
 	tcAfter := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// This logic is specific to the storage layer.
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual,
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {StoreSpecs: []base.StoreSpec{{Path: dir + "/store-1"}}},
@@ -328,8 +342,15 @@ func TestStageVersionCheck(t *testing.T) {
 	})
 	defer c.Cleanup()
 
+	listenerReg := listenerutil.NewListenerRegistry()
+	defer listenerReg.Close()
+
 	storeReg := server.NewStickyVFSRegistry()
 	tc := testcluster.NewTestCluster(t, 4, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// This logic is specific to the storage layer.
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReplicationMode: base.ReplicationManual,
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {
@@ -343,6 +364,7 @@ func TestStageVersionCheck(t *testing.T) {
 				},
 			},
 		},
+		ReusableListenerReg: listenerReg,
 	})
 	tc.Start(t)
 	defer tc.Stopper().Stop(ctx)
@@ -377,9 +399,7 @@ func TestStageVersionCheck(t *testing.T) {
 	})
 	require.NoError(t, err, "force local must fix incorrect version")
 	// Check that stored plan has version matching cluster version.
-	fs, err := storeReg.Get(base.StoreSpec{InMemory: true, StickyVFSID: "1"})
-	require.NoError(t, err, "failed to get shared store fs")
-	ps := loqrecovery.NewPlanStore("", fs)
+	ps := loqrecovery.NewPlanStore("", storeReg.Get("1"))
 	p, ok, err := ps.LoadPlan()
 	require.NoError(t, err, "failed to read node 0 plan")
 	require.True(t, ok, "plan was not staged")
@@ -459,6 +479,10 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 		}
 	}
 	tc := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// This logic is specific to the storage layer.
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
 		ReusableListenerReg: listenerReg,
 		ServerArgsPerNode:   sa,
 	})

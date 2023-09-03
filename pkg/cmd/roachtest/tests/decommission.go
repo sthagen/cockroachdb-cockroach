@@ -164,7 +164,7 @@ func runDrainAndDecommission(
 		run(`SET CLUSTER SETTING kv.snapshot_rebalance.max_rate='2GiB'`)
 
 		// Wait for initial up-replication.
-		err := WaitForReplication(ctx, t, db, defaultReplicationFactor)
+		err := WaitForReplication(ctx, t, db, defaultReplicationFactor, atLeastReplicationFactor)
 		require.NoError(t, err)
 	}
 
@@ -349,13 +349,9 @@ func runDecommission(
 			db := c.Conn(ctx, t.L(), pinnedNode)
 			defer db.Close()
 
-			internalAddrs, err := c.InternalAddr(ctx, t.L(), c.Node(pinnedNode))
-			if err != nil {
-				return err
-			}
 			startOpts := option.DefaultStartSingleNodeOpts()
+			startOpts.RoachprodOpts.JoinTargets = []int{pinnedNode}
 			extraArgs := []string{
-				"--join", internalAddrs[0],
 				fmt.Sprintf("--attrs=node%d", node),
 			}
 			startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, extraArgs...)
@@ -1108,7 +1104,7 @@ func runDecommissionSlow(ctx context.Context, t test.Test, c cluster.Cluster) {
 		run(db, `SET CLUSTER SETTING kv.snapshot_rebalance.max_rate='2GiB'`)
 
 		// Wait for initial up-replication.
-		err := WaitForReplication(ctx, t, db, replicationFactor)
+		err := WaitForReplication(ctx, t, db, replicationFactor, atLeastReplicationFactor)
 		require.NoError(t, err)
 	}
 

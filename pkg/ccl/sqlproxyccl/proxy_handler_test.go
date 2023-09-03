@@ -571,7 +571,7 @@ func TestBackendDownRetry(t *testing.T) {
 		if callCount >= 3 {
 			directoryServer.DeleteTenant(roachpb.MustMakeTenantID(28))
 		}
-		return nil, withCode(errors.New("SQL pod is down"), codeBackendDown)
+		return nil, withCode(errors.New("SQL pod is down"), codeBackendDialFailed)
 	})()
 
 	// Valid connection, but no backend server running.
@@ -1004,8 +1004,16 @@ func TestInsecureProxy(t *testing.T) {
 	te.TestConnect(ctx, t, url, func(conn *pgx.Conn) {
 		require.NoError(t, runTestQuery(ctx, conn))
 	})
-	require.Equal(t, int64(1), s.metrics.AuthFailedCount.Count())
-	require.Equal(t, int64(1), s.metrics.SuccessfulConnCount.Count())
+	testutils.SucceedsSoon(t, func() error {
+		if s.metrics.AuthFailedCount.Count() != 1 ||
+			s.metrics.SuccessfulConnCount.Count() != 1 {
+			return errors.Newf("expected metrics to update, got: "+
+				"AuthFailedCount=%d, SuccessfulConnCount=%d",
+				s.metrics.AuthFailedCount.Count(), s.metrics.SuccessfulConnCount.Count(),
+			)
+		}
+		return nil
+	})
 	count, _ := s.metrics.ConnectionLatency.Total()
 	require.Equal(t, int64(1), count)
 }
@@ -1248,7 +1256,7 @@ func TestDenylistUpdate(t *testing.T) {
 		"Expected the connection to eventually fail",
 	)
 	require.Error(t, err)
-	require.Regexp(t, "closed|bad connection", err.Error())
+	require.Regexp(t, "(connection reset by peer|closed|bad connection)", err.Error())
 	require.Equal(t, int64(1), s.metrics.ExpiredClientConnCount.Count())
 }
 
@@ -1307,7 +1315,7 @@ func TestDirectoryConnect(t *testing.T) {
 			if countFailures >= 3 {
 				return nil, withCode(errors.New("backend disconnected"), codeBackendDisconnected)
 			}
-			return nil, withCode(errors.New("backend down"), codeBackendDown)
+			return nil, withCode(errors.New("backend down"), codeBackendDialFailed)
 		})()
 
 		// Ensure that Directory.ReportFailure is being called correctly.
@@ -1922,7 +1930,7 @@ func TestConnectionMigration(t *testing.T) {
 	// Start first SQL pod.
 	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
 	tenant1.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
-	defer tenant1.Stopper().Stop(ctx)
+	defer tenant1.AppStopper().Stop(ctx)
 	defer tenantDB1.Close()
 
 	// Start second SQL pod.
@@ -1931,7 +1939,7 @@ func TestConnectionMigration(t *testing.T) {
 		DisableCreateTenant: true,
 	})
 	tenant2.PGPreServer().(*pgwire.PreServeConnHandler).TestingSetTrustClientProvidedRemoteAddr(true)
-	defer tenant2.Stopper().Stop(ctx)
+	defer tenant2.AppStopper().Stop(ctx)
 	defer tenantDB2.Close()
 
 	_, err = tenantDB1.Exec("CREATE USER testuser WITH PASSWORD 'hunter2'")
@@ -2271,7 +2279,7 @@ func TestConnectionMigration(t *testing.T) {
 			t.Fatalf("require that pg_sleep query terminates")
 		case err = <-errCh:
 			require.Error(t, err)
-			require.Regexp(t, "(closed|bad connection)", err.Error())
+			require.Regexp(t, "(connection reset by peer|closed|bad connection)", err.Error())
 		}
 
 		require.EqualError(t, f.ctx.Err(), context.Canceled.Error())

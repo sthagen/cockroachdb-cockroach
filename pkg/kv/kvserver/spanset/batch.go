@@ -485,20 +485,28 @@ func (s spanSetReader) MVCCIterate(
 
 func (s spanSetReader) NewMVCCIterator(
 	iterKind storage.MVCCIterKind, opts storage.IterOptions,
-) storage.MVCCIterator {
-	if s.spansOnly {
-		return NewIterator(s.r.NewMVCCIterator(iterKind, opts), s.spans)
+) (storage.MVCCIterator, error) {
+	mvccIter, err := s.r.NewMVCCIterator(iterKind, opts)
+	if err != nil {
+		return nil, err
 	}
-	return NewIteratorAt(s.r.NewMVCCIterator(iterKind, opts), s.spans, s.ts)
+	if s.spansOnly {
+		return NewIterator(mvccIter, s.spans), nil
+	}
+	return NewIteratorAt(mvccIter, s.spans, s.ts), nil
 }
 
-func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) storage.EngineIterator {
+func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) (storage.EngineIterator, error) {
+	engineIter, err := s.r.NewEngineIterator(opts)
+	if err != nil {
+		return nil, err
+	}
 	return &EngineIterator{
-		i:         s.r.NewEngineIterator(opts),
+		i:         engineIter,
 		spans:     s.spans,
 		spansOnly: s.spansOnly,
 		ts:        s.ts,
-	}
+	}, nil
 }
 
 // ConsistentIterators implements the storage.Reader interface.
@@ -551,15 +559,6 @@ func (s spanSetWriter) ClearUnversioned(key roachpb.Key, opts storage.ClearOptio
 		return err
 	}
 	return s.w.ClearUnversioned(key, opts)
-}
-
-func (s spanSetWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts storage.ClearOptions,
-) error {
-	if err := s.checkAllowed(key); err != nil {
-		return err
-	}
-	return s.w.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, opts)
 }
 
 func (s spanSetWriter) ClearEngineKey(key storage.EngineKey, opts storage.ClearOptions) error {
@@ -693,15 +692,6 @@ func (s spanSetWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 		return err
 	}
 	return s.w.PutUnversioned(key, value)
-}
-
-func (s spanSetWriter) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	if err := s.checkAllowed(key); err != nil {
-		return err
-	}
-	return s.w.PutIntent(ctx, key, value, txnUUID)
 }
 
 func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {

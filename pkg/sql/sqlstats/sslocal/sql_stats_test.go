@@ -320,7 +320,7 @@ func TestNodeLocalInMemoryViewDoesNotReturnPersistedStats(t *testing.T) {
 
 	ctx := context.Background()
 
-	cluster := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{})
+	cluster := serverutils.StartCluster(t, 3 /* numNodes */, base.TestClusterArgs{})
 	defer cluster.Stopper().Stop(ctx)
 	server := cluster.Server(0 /* idx */).ApplicationLayer()
 
@@ -696,7 +696,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "enabled", func(t *testing.T, enabled bool) {
 		// Establish the cluster setting.
 		setting := sslocal.AssociateStmtWithTxnFingerprint
-		err := updater.Set(ctx, setting.Key(), settings.EncodedValue{
+		err := updater.Set(ctx, setting.InternalKey(), settings.EncodedValue{
 			Value: settings.EncodeBool(enabled),
 			Type:  setting.Typ(),
 		})

@@ -30,6 +30,7 @@ import {
 } from "src/redux/nodes";
 import {
   selectAutomaticStatsCollectionEnabled,
+  selectDropUnusedIndexDuration,
   selectIndexRecommendationsEnabled,
 } from "src/redux/clusterSettings";
 
@@ -76,7 +77,8 @@ export const mapStateToProps = (state: AdminUIState): DatabasesPageData => {
   return {
     loading: selectLoading(state),
     loaded: selectLoaded(state),
-    lastError: selectLastError(state),
+    requestError: selectLastError(state),
+    queryError: dbListResp?.error,
     databases: deriveDatabaseDetailsMemoized({
       dbListResp,
       databaseDetails,
@@ -92,13 +94,19 @@ export const mapStateToProps = (state: AdminUIState): DatabasesPageData => {
       selectAutomaticStatsCollectionEnabled(state),
     indexRecommendationsEnabled: selectIndexRecommendationsEnabled(state),
     showNodeRegionsColumn: selectIsMoreThanOneNode(state),
+    csIndexUnusedDuration: selectDropUnusedIndexDuration(state),
   };
 };
 
 export const mapDispatchToProps = {
   refreshSettings,
   refreshDatabases,
-  refreshDatabaseDetails,
+  refreshDatabaseDetails: (database: string, csIndexUnusedDuration: string) => {
+    return refreshDatabaseDetails({
+      database,
+      csIndexUnusedDuration,
+    });
+  },
   refreshNodes,
   onSortingChange: (
     _tableName: string,

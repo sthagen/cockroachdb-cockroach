@@ -183,13 +183,18 @@ func (ri *ReplicaMVCCDataIterator) tryCloseAndCreateIter() {
 		if ri.curIndex < 0 || ri.curIndex >= len(ri.spans) {
 			return
 		}
-		ri.it = ri.reader.NewMVCCIterator(
+		var err error
+		ri.it, err = ri.reader.NewMVCCIterator(
 			ri.IterKind,
 			storage.IterOptions{
 				LowerBound: ri.spans[ri.curIndex].Key,
 				UpperBound: ri.spans[ri.curIndex].EndKey,
 				KeyTypes:   ri.KeyTypes,
 			})
+		if err != nil {
+			ri.err = err
+			return
+		}
 		if ri.Reverse {
 			ri.it.SeekLT(storage.MakeMVCCMetadataKey(ri.spans[ri.curIndex].EndKey))
 		} else {
@@ -304,9 +309,10 @@ func (ri *ReplicaMVCCDataIterator) HasPointAndRange() (bool, bool) {
 
 // IterateReplicaKeySpans iterates over each of a range's key spans, and calls
 // the given visitor with an iterator over its data. Specifically, it iterates
-// over the spans returned by either makeAllKeySpans or MakeReplicatedKeySpans,
-// and for each one provides first a point key iterator and then a range key
-// iterator. This is the expected order for Raft snapshots.
+// over the spans returned by a Select() over all spans or replicated only spans
+// (with replicatedSpansFilter applied on replicated spans), and for each one
+// provides first a point key iterator and then a range key iterator. This is the
+// expected order for Raft snapshots.
 //
 // The iterator will be pre-seeked to the span, and is provided along with the
 // key span and key type (point or range). Iterators that have no data are
@@ -328,9 +334,11 @@ func IterateReplicaKeySpans(
 	var spans []roachpb.Span
 	if replicatedOnly {
 		spans = Select(desc.RangeID, SelectOpts{
-			ReplicatedSpansFilter: replicatedSpansFilter,
 			ReplicatedBySpan:      desc.RSpan(),
-			ReplicatedByRangeID:   true,
+			ReplicatedSpansFilter: replicatedSpansFilter,
+			// NB: We exclude ReplicatedByRangeID if replicatedSpansFilter is
+			// ReplicatedSpansUserOnly.
+			ReplicatedByRangeID: replicatedSpansFilter != ReplicatedSpansUserOnly,
 		})
 	} else {
 		spans = Select(desc.RangeID, SelectOpts{
@@ -344,11 +352,14 @@ func IterateReplicaKeySpans(
 	for _, span := range spans {
 		for _, keyType := range keyTypes {
 			err := func() error {
-				iter := reader.NewEngineIterator(storage.IterOptions{
+				iter, err := reader.NewEngineIterator(storage.IterOptions{
 					KeyTypes:   keyType,
 					LowerBound: span.Key,
 					UpperBound: span.EndKey,
 				})
+				if err != nil {
+					return err
+				}
 				defer iter.Close()
 				ok, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: span.Key})
 				if err == nil && ok {
@@ -432,11 +443,14 @@ func IterateMVCCReplicaKeySpans(
 	for _, span := range spans {
 		for _, keyType := range keyTypes {
 			err := func() error {
-				iter := reader.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+				iter, err := reader.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 					LowerBound: span.Key,
 					UpperBound: span.EndKey,
 					KeyTypes:   keyType,
 				})
+				if err != nil {
+					return err
+				}
 				defer iter.Close()
 				if options.Reverse {
 					iter.SeekLT(storage.MakeMVCCMetadataKey(span.EndKey))

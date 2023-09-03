@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v3"
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -55,7 +55,7 @@ func TestMrSystemDatabase(t *testing.T) {
 	tenantArgs := base.TestTenantArgs{
 		Settings: cs,
 		TenantID: id,
-		Locality: *cluster.Servers[0].Locality(),
+		Locality: cluster.Servers[0].Locality(),
 	}
 	_, tenantSQL := serverutils.StartTenant(t, cluster.Servers[0], tenantArgs)
 
@@ -218,6 +218,7 @@ func TestMrSystemDatabase(t *testing.T) {
 			{"TABLE system.public.descriptor"},
 			{"TABLE system.public.namespace"},
 			{"TABLE system.public.privileges"},
+			{"TABLE system.public.region_liveness"},
 			{"TABLE system.public.role_members"},
 			{"TABLE system.public.role_options"},
 			{"TABLE system.public.settings"},
@@ -273,7 +274,7 @@ func TestMultiRegionTenantRegions(t *testing.T) {
 			},
 		},
 	})
-	defer ten.Stopper().Stop(ctx)
+	defer ten.AppStopper().Stop(ctx)
 	defer tSQL.Close()
 	tenSQLDB := sqlutils.MakeSQLRunner(tSQL)
 

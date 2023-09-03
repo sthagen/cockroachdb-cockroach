@@ -75,7 +75,7 @@ var changeOwnPasswordEnabled = settings.RegisterBoolSetting(
 	"sql.auth.change_own_password.enabled",
 	"controls whether a user is allowed to change their own password, even if they have no other privileges",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // AlterRole represents a `ALTER ROLE ... [WITH] OPTION` statement.
 // Privileges: CREATEROLE privilege.
@@ -295,6 +295,7 @@ func (p *planner) AlterRoleSet(ctx context.Context, n *tree.AlterRoleSet) (planN
 		hasModify := false
 		hasSqlModify := false
 		hasCreateRole := false
+		// TODO(109258): Refactor this to use HasGlobalPrivilegeOrRoleOption.
 		// Check system privileges.
 		if ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User()); err != nil {
 			return nil, err

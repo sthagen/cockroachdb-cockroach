@@ -107,7 +107,7 @@ func TestAddSSTQPSStat(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 	})
 
@@ -219,7 +219,7 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 		ReplicationMode: base.ReplicationManual,
 	}
 	args.ServerArgs.Knobs.Store = &StoreTestingKnobs{DisableCanAckBeforeApplication: true}
-	tc := serverutils.StartNewTestCluster(t, 1, args)
+	tc := serverutils.StartCluster(t, 1, args)
 
 	const epsilonAllowed = 4
 
@@ -256,7 +256,7 @@ func TestWriteLoadStatsAccounting(t *testing.T) {
 	// Disable the consistency checker, to avoid interleaving requests
 	// artificially inflating measurement due to consistency checking.
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.consistency_check.interval = '0'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load_enabled = false`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load.enabled = false`)
 
 	for _, testCase := range testCases {
 		// This test can flake, where an errant request - not sent here
@@ -309,7 +309,7 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 	})
 
@@ -387,7 +387,7 @@ func TestReadLoadMetricAccounting(t *testing.T) {
 	// Disable the consistency checker, to avoid interleaving requests
 	// artificially inflating measurement due to consistency checking.
 	sqlDB.Exec(t, `SET CLUSTER SETTING server.consistency_check.interval = '0'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load_enabled = false`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load.enabled = false`)
 
 	for _, testCase := range testCases {
 		// This test can flake, where an errant request - not sent here

@@ -20,7 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationtestutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -29,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -104,6 +107,15 @@ func TestDataDriven(t *testing.T) {
 				d.Input = strings.ReplaceAll(d.Input, v, ds.vars[v])
 			}
 
+			// A few built-in replacements since we
+			// already have these IDs in many cases, we
+			// don't need to force the caller to get them
+			// again.
+			d.Input = strings.ReplaceAll(d.Input, "$_producerJobID", fmt.Sprintf("%d", ds.producerJobID))
+			d.Input = strings.ReplaceAll(d.Input, "$_ingestionJobID", fmt.Sprintf("%d", ds.ingestionJobID))
+			d.Expected = strings.ReplaceAll(d.Expected, "$_producerJobID", fmt.Sprintf("%d", ds.producerJobID))
+			d.Expected = strings.ReplaceAll(d.Expected, "$_ingestionJobID", fmt.Sprintf("%d", ds.ingestionJobID))
+
 			switch d.Cmd {
 			case "skip":
 				var issue int
@@ -121,7 +133,7 @@ func TestDataDriven(t *testing.T) {
 				})
 
 			case "start-replication-stream":
-				ds.producerJobID, ds.replicationJobID = ds.replicationClusters.StartStreamReplication(ctx)
+				ds.producerJobID, ds.ingestionJobID = ds.replicationClusters.StartStreamReplication(ctx)
 
 			case "wait-until-replicated-time":
 				var replicatedTimeTarget string
@@ -131,7 +143,7 @@ func TestDataDriven(t *testing.T) {
 					replicatedTimeTarget = varValue
 				}
 				ds.replicationClusters.WaitUntilReplicatedTime(stringToHLC(t, replicatedTimeTarget),
-					jobspb.JobID(ds.replicationJobID))
+					jobspb.JobID(ds.ingestionJobID))
 			case "start-replicated-tenant":
 				cleanupTenant := ds.replicationClusters.StartDestTenant(ctx)
 				ds.cleanupFns = append(ds.cleanupFns, cleanupTenant)
@@ -174,7 +186,7 @@ func TestDataDriven(t *testing.T) {
 				}
 				timestamp, _, err := tree.ParseDTimestamp(nil, cutoverTime, time.Microsecond)
 				require.NoError(t, err)
-				ds.replicationClusters.Cutover(ds.producerJobID, ds.replicationJobID, timestamp.Time, async)
+				ds.replicationClusters.Cutover(ds.producerJobID, ds.ingestionJobID, timestamp.Time, async)
 				return ""
 
 			case "exec-sql":
@@ -186,7 +198,9 @@ func TestDataDriven(t *testing.T) {
 			case "query-sql":
 				var as string
 				d.ScanArgs(t, "as", &as)
-
+				if d.HasArg("retry") {
+					ds.queryAsWithRetry(t, as, d.Input, d.Expected)
+				}
 				return ds.queryAs(t, as, d.Input)
 
 			case "compare-replication-results":
@@ -254,7 +268,7 @@ func TestDataDriven(t *testing.T) {
 					jobID = ds.producerJobID
 					runner = ds.replicationClusters.SrcSysSQL
 				} else if as == "destination-system" {
-					jobID = ds.replicationJobID
+					jobID = ds.ingestionJobID
 					runner = ds.replicationClusters.DestSysSQL
 				} else {
 					t.Fatalf("job cmd only works on consumer and producer jobs run on system tenant")
@@ -283,6 +297,44 @@ func TestDataDriven(t *testing.T) {
 					}
 				}
 				return ""
+			case "list-ttls":
+				var (
+					as string
+				)
+				d.ScanArgs(t, "as", &as)
+				var codec keys.SQLCodec
+				switch {
+				case strings.HasPrefix(as, "source"):
+					codec = keys.MakeSQLCodec(ds.replicationClusters.Args.SrcTenantID)
+				case strings.HasPrefix(as, "destination"):
+					codec = keys.MakeSQLCodec(ds.replicationClusters.Args.DestTenantID)
+				default:
+					t.Fatalf("%s does not begin with 'source' or 'destination'", as)
+				}
+
+				getTableID := func(arg string) uint32 {
+					var tableID string
+					d.ScanArgs(t, arg, &tableID)
+					varValue, ok := ds.vars[tableID]
+					if ok {
+						tableID = varValue
+					}
+					parsedID, err := strconv.Atoi(tableID)
+					if err != nil {
+						t.Fatalf("could not convert table ID %s", tableID)
+					}
+					return uint32(parsedID)
+				}
+
+				startKey := codec.TablePrefix(getTableID("min_table_id"))
+				endKey := codec.TablePrefix(getTableID("max_table_id"))
+
+				listQuery := fmt.Sprintf(
+					`SELECT crdb_internal.pb_to_json('cockroach.roachpb.SpanConfig', config)->'gcPolicy'->'ttlSeconds'
+FROM system.span_configurations
+WHERE start_key >= '\x%x' AND start_key <= '\x%x'
+ORDER BY start_key;`, startKey, endKey)
+				return ds.queryAsWithRetry(t, as, listQuery, d.Expected)
 
 			default:
 				t.Fatalf("unsupported instruction: %s", d.Cmd)
@@ -299,10 +351,11 @@ func stringToHLC(t *testing.T, timestamp string) hlc.Timestamp {
 }
 
 type datadrivenTestState struct {
-	producerJobID, replicationJobID int
-	replicationClusters             *replicationtestutils.TenantStreamingClusters
-	cleanupFns                      []func() error
-	vars                            map[string]string
+	producerJobID       int
+	ingestionJobID      int
+	replicationClusters *replicationtestutils.TenantStreamingClusters
+	cleanupFns          []func() error
+	vars                map[string]string
 }
 
 func (d *datadrivenTestState) cleanup(t *testing.T) {
@@ -330,6 +383,18 @@ func (d *datadrivenTestState) queryAs(t *testing.T, as, query string) string {
 
 	output, err := sqlutils.RowsToDataDrivenOutput(rows)
 	require.NoError(t, err)
+	return output
+}
+
+func (d *datadrivenTestState) queryAsWithRetry(t *testing.T, as, query, expected string) string {
+	var output string
+	testutils.SucceedsSoon(t, func() error {
+		output = d.queryAs(t, as, query)
+		if output != expected {
+			return errors.Newf("latest output: %s\n expected: %s", output, expected)
+		}
+		return nil
+	})
 	return output
 }
 

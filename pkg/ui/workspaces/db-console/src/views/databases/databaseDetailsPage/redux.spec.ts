@@ -22,7 +22,7 @@ import {
 } from "@cockroachlabs/cluster-ui";
 
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
-import { databaseNameAttr } from "src/util/constants";
+import { databaseNameAttr, indexUnusedDuration } from "src/util/constants";
 import * as fakeApi from "src/util/fakeApi";
 import { mapStateToProps, mapDispatchToProps } from "./redux";
 import moment from "moment-timezone";
@@ -108,11 +108,18 @@ class TestDriver {
   }
 
   async refreshDatabaseDetails() {
-    return this.actions.refreshDatabaseDetails(this.database);
+    return this.actions.refreshDatabaseDetails(
+      this.database,
+      indexUnusedDuration,
+    );
   }
 
   async refreshTableDetails(table: string) {
-    return this.actions.refreshTableDetails(this.database, table);
+    return this.actions.refreshTableDetails(
+      this.database,
+      table,
+      indexUnusedDuration,
+    );
   }
 
   private findTable(name: string) {
@@ -150,12 +157,16 @@ describe("Database Details Page", function () {
       sortSettingGrants: { ascending: true, columnTitle: "name" },
       tables: [],
       showIndexRecommendations: false,
+      csIndexUnusedDuration: indexUnusedDuration,
     });
   });
 
   it("makes a row for each table", async function () {
     fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
-      clusterUiApi.createDatabaseDetailsReq("things"),
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
       [
         // Id
         { rows: [] },
@@ -183,6 +194,7 @@ describe("Database Details Page", function () {
       isTenant: false,
       showNodeRegionsColumn: false,
       showIndexRecommendations: false,
+      csIndexUnusedDuration: indexUnusedDuration,
       viewMode: ViewMode.Tables,
       sortSettingTables: { ascending: true, columnTitle: "name" },
       sortSettingGrants: { ascending: true, columnTitle: "name" },
@@ -237,7 +249,10 @@ describe("Database Details Page", function () {
 
   it("loads table details", async function () {
     fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
-      clusterUiApi.createDatabaseDetailsReq("things"),
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
       [
         // Id
         { rows: [] },
@@ -255,7 +270,11 @@ describe("Database Details Page", function () {
     const mockStatsLastCreatedTimestamp = moment();
 
     fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
-      clusterUiApi.createTableDetailsReq("things", `"public"."foo"`),
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."foo"`,
+        indexUnusedDuration,
+      ),
       [
         // Table ID query
         { rows: [{ table_id: "1" }] },
@@ -306,7 +325,11 @@ describe("Database Details Page", function () {
     );
 
     fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
-      clusterUiApi.createTableDetailsReq("things", `"public"."bar"`),
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."bar"`,
+        indexUnusedDuration,
+      ),
       [
         // Table ID query
         { rows: [{ table_id: "2" }] },
@@ -404,7 +427,10 @@ describe("Database Details Page", function () {
 
   it("sorts roles meaningfully", async function () {
     fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
-      clusterUiApi.createDatabaseDetailsReq("things"),
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
       [
         // Id
         { rows: [] },
@@ -418,7 +444,11 @@ describe("Database Details Page", function () {
     );
 
     fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
-      clusterUiApi.createTableDetailsReq("things", `"public"."foo"`),
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."foo"`,
+        indexUnusedDuration,
+      ),
       [
         // Table ID query
         {},
@@ -451,7 +481,10 @@ describe("Database Details Page", function () {
 
   it("sorts grants meaningfully", async function () {
     fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
-      clusterUiApi.createDatabaseDetailsReq("things"),
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "things",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
       [
         // Id
         { rows: [] },
@@ -465,7 +498,11 @@ describe("Database Details Page", function () {
     );
 
     fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
-      clusterUiApi.createTableDetailsReq("things", `"public"."foo"`),
+      clusterUiApi.createTableDetailsReq(
+        "things",
+        `"public"."foo"`,
+        indexUnusedDuration,
+      ),
       [
         // Table ID query
         {},

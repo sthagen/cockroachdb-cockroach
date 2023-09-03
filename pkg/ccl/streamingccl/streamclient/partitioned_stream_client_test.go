@@ -59,48 +59,6 @@ func (f *subscriptionFeedSource) Error() error {
 // Close implements the streamingtest.FeedSource interface.
 func (f *subscriptionFeedSource) Close(ctx context.Context) {}
 
-func TestPartitionedSpanConfigReplicationClient(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	h, cleanup := replicationtestutils.NewReplicationHelper(t,
-		base.TestServerArgs{
-			DefaultTestTenant: base.TestControlsTenantsExplicitly,
-			Knobs: base.TestingKnobs{
-				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-			},
-		},
-	)
-
-	defer cleanup()
-
-	testTenantName := roachpb.TenantName("test-tenant")
-	tenant, cleanupTenant := h.CreateTenant(t, serverutils.TestTenantID(), testTenantName)
-	defer cleanupTenant()
-
-	ctx := context.Background()
-
-	maybeInlineURL := h.MaybeGenerateInlineURL(t)
-	client, err := streamclient.NewPartitionedStreamClient(ctx, maybeInlineURL)
-	require.NoError(t, err)
-	defer func() {
-		require.NoError(t, client.Close(ctx))
-	}()
-
-	streamID, topology, err := client.SetupSpanConfigsStream(ctx, testTenantName)
-	require.NoError(t, err)
-
-	require.NotEqual(t, 0, streamID)
-	require.Equal(t, 1, len(topology.Partitions))
-	require.Equal(t, tenant.ID, topology.SourceTenantID)
-
-	// Since a span config replication stream does not create a job, the HeartBeat
-	// call will deem the stream inactive.
-	status, err := client.Heartbeat(ctx, streamID, hlc.Timestamp{WallTime: timeutil.Now().UnixNano()})
-	require.NoError(t, err)
-	require.Equal(t, streampb.StreamReplicationStatus_STREAM_INACTIVE, status.StreamStatus)
-}
-
 func TestPartitionedStreamReplicationClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -125,7 +83,7 @@ func TestPartitionedStreamReplicationClient(t *testing.T) {
 	ctx := context.Background()
 	// Makes sure source cluster producer job does not time out within test timeout
 	h.SysSQL.Exec(t, `
-SET CLUSTER SETTING stream_replication.job_liveness_timeout = '500s';
+SET CLUSTER SETTING stream_replication.job_liveness.timeout = '500s';
 `)
 	tenant.SQL.Exec(t, `
 CREATE DATABASE d;

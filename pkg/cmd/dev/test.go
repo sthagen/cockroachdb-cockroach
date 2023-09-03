@@ -42,6 +42,15 @@ const (
 	showDiffFlag     = "show-diff"
 )
 
+// List of bazel integration tests that will fail when running `dev test pkg/...`
+var integrationTests = map[string]struct{ testName, commandToRun string }{
+	"pkg/acceptance":              {"acceptance_test", "dev acceptance"},
+	"pkg/compose":                 {"compose_test", "dev compose"},
+	"pkg/compose/compare/compare": {"compare_test", "dev compose"},
+	"pkg/testutils/docker":        {"docker_test", ""},
+	"pkg/testutils/lint":          {"lint_test", "dev lint"},
+}
+
 func makeTestCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Command {
 	// testCmd runs the specified cockroachdb tests.
 	testCmd := &cobra.Command{
@@ -88,6 +97,10 @@ pkg/kv/kvserver:kvserver_test) instead.`,
         Run a test repeatedly until at least N seconds have passed (useful if "dev test --stress" ends too quickly and you want to keep the test running for a while)
 
     dev test pkg/server -f=TestSpanStatsResponse -v --count=5 --vmodule='raft=1'
+        Run a specific test, multiple times, with increased logging verbosity
+
+    dev test pkg/server -- --test_env=COCKROACH_RANDOM_SEED=1234
+        Run a test with a specified seed by passing the --test_env flag directly to bazel
 `,
 		Args: cobra.MinimumNArgs(0),
 		RunE: runE,
@@ -106,7 +119,7 @@ pkg/kv/kvserver:kvserver_test) instead.`,
 	// visible.
 	testCmd.Flags().BoolP(vFlag, "v", false, "show testing process output")
 	testCmd.Flags().Bool(changedFlag, false, "automatically determine tests to run. This is done on a best-effort basis by asking git which files have changed. Only .go files and files in testdata/ directories are factored into this analysis.")
-	testCmd.Flags().Int(countFlag, 1, "run test the given number of times")
+	testCmd.Flags().Int(countFlag, 0, "run test the given number of times")
 	testCmd.Flags().BoolP(showLogsFlag, "", false, "show crdb logs in-line")
 	testCmd.Flags().Bool(stressFlag, false, "run tests under stress")
 	testCmd.Flags().Bool(raceFlag, false, "run tests using race builds")
@@ -198,6 +211,10 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		}
 	}
 
+	if stress && streamOutput {
+		return fmt.Errorf("cannot combine --%s and --%s", stressFlag, streamOutputFlag)
+	}
+
 	if rewrite {
 		ignoreCache = true
 		disableTestSharding = true
@@ -249,10 +266,21 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 		testTargets = append(testTargets, target)
 	}
 
-	args = append(args, testTargets...)
-	if ignoreCache {
-		args = append(args, "--nocache_test_results")
+	for _, target := range testTargets {
+		testTarget := strings.Split(target, ":")
+		integrationTest, ok := integrationTests[testTarget[0]]
+		if ok {
+			// If the test targets all tests in the package or the individual test, warn the user
+			if testTarget[1] == "all" || testTarget[1] == integrationTest.testName {
+				if integrationTest.commandToRun == "" {
+					return fmt.Errorf("%s:%s will fail since it is an integration test", testTarget[0], integrationTest.testName)
+				}
+				return fmt.Errorf("%s:%s will fail since it is an integration test. To run this test, run `%s`", testTarget[0], integrationTest.testName, integrationTest.commandToRun)
+			}
+		}
 	}
+
+	args = append(args, testTargets...)
 	args = append(args, "--test_env=GOTRACEBACK=all")
 
 	if rewrite {
@@ -305,7 +333,7 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	}
 
 	if stress {
-		if count == 1 {
+		if count == 0 {
 			// Default to 1000 unless a different count was provided.
 			count = 1000
 		}
@@ -331,7 +359,9 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	if showLogs {
 		args = append(args, "--test_arg", "-show-logs")
 	}
-	if count != 1 {
+	if count == 1 {
+		ignoreCache = true
+	} else if count != 0 {
 		args = append(args, fmt.Sprintf("--runs_per_test=%d", count))
 	}
 	if vModule != "" {
@@ -346,6 +376,10 @@ func (d *dev) test(cmd *cobra.Command, commandLine []string) error {
 	}
 	if disableTestSharding {
 		args = append(args, "--test_sharding_strategy=disabled")
+	}
+
+	if ignoreCache {
+		args = append(args, "--nocache_test_results")
 	}
 
 	if len(goTags) > 0 {

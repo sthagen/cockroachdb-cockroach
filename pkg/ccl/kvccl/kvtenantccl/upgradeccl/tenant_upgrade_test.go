@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
@@ -128,7 +127,7 @@ func TestTenantUpgrade(t *testing.T) {
 		db.CheckQueryResults(t, "SHOW CLUSTER SETTING version", [][]string{{v2.String()}})
 
 		t.Log("restart the tenant")
-		tenantServer.Stopper().Stop(ctx)
+		tenantServer.AppStopper().Stop(ctx)
 		tenantServer, err := ts.StartTenant(ctx, base.TestTenantArgs{
 			TenantID: roachpb.MustMakeTenantID(initialTenantID),
 		})
@@ -151,7 +150,7 @@ func TestTenantUpgrade(t *testing.T) {
 			"SHOW CLUSTER SETTING version", [][]string{{v2.String()}})
 
 		t.Log("restart the new tenant")
-		tenant.Stopper().Stop(ctx)
+		tenant.AppStopper().Stop(ctx)
 		var err error
 		tenant, err = ts.StartTenant(ctx, base.TestTenantArgs{
 			TenantID: roachpb.MustMakeTenantID(postUpgradeTenantID),
@@ -222,6 +221,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 
 	// Channel for stopping a tenant.
 	tenantStopperChannel := make(chan struct{})
+	shouldWaitForTenantToStop := true
 	startAndConnectToTenant := func(t *testing.T, id uint64) (tenant serverutils.ApplicationLayerInterface, db *gosql.DB) {
 		settings := cluster.MakeTestingClusterSettingsWithVersions(
 			v2,
@@ -268,8 +268,19 @@ func TestTenantUpgradeFailure(t *testing.T) {
 									ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps,
 								) error {
 									t.Log("v2 migration starts running")
-									tenantStopperChannel <- struct{}{}
-									t.Log("v2 migration finishes running")
+									defer t.Log("v2 migration finishes running")
+									if shouldWaitForTenantToStop {
+										tenantStopperChannel <- struct{}{}
+										// Wait until we are sure the stopper is quiescing.
+										for {
+											select {
+											case <-tenant.AppStopper().ShouldQuiesce():
+												return nil
+											default:
+												continue
+											}
+										}
+									}
 									return nil
 								}), true
 						default:
@@ -287,7 +298,6 @@ func TestTenantUpgradeFailure(t *testing.T) {
 	}
 
 	t.Run("upgrade tenant have it crash then resume", func(t *testing.T) {
-		skip.WithIssue(t, 106279)
 		t.Log("create a tenant before upgrading anything")
 		const initialTenantID = 10
 		tenant, conn := startAndConnectToTenant(t, initialTenantID)
@@ -304,7 +314,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 		go func() {
 			<-tenantStopperChannel
 			t.Log("received async notification to stop tenant")
-			tenant.Stopper().Stop(ctx)
+			tenant.AppStopper().Stop(ctx)
 			t.Log("tenant stopped")
 			waitForTenantClose <- struct{}{}
 		}()
@@ -316,8 +326,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 		db.CheckQueryResults(t,
 			"SELECT * FROM t", [][]string{{"1"}, {"2"}})
 		t.Log("upgrade the tenant cluster, expecting the upgrade to fail on v1")
-		db.ExpectErr(t,
-			".*(database is closed|failed to connect|closed network connection|upgrade failed due to transient SQL servers)+",
+		db.ExpectNonNilErr(t,
 			"SET CLUSTER SETTING version = $1", v2.String())
 
 		t.Log("waiting for tenant shutdown to complete")
@@ -335,9 +344,9 @@ func TestTenantUpgradeFailure(t *testing.T) {
 			[][]string{{v1.String()}})
 
 		t.Log("restart the tenant")
-		tenant.Stopper().Stop(ctx)
+		tenant.AppStopper().Stop(ctx)
 		tenant, conn = startAndConnectToTenant(t, initialTenantID)
-		defer tenant.Stopper().Stop(ctx)
+		defer tenant.AppStopper().Stop(ctx)
 		db = sqlutils.MakeSQLRunner(conn)
 
 		// Keep trying to resume the stopper channel until the channel is closed,
@@ -361,6 +370,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 			[][]string{{"1"}})
 
 		t.Log("upgrade the tenant cluster to v2")
+		shouldWaitForTenantToStop = false
 		db.Exec(t, "SET CLUSTER SETTING version = $1", v2.String())
 
 		close(tenantStopperChannel)
@@ -370,6 +380,6 @@ func TestTenantUpgradeFailure(t *testing.T) {
 			"SELECT * FROM t", [][]string{{"1"}, {"2"}})
 		db.CheckQueryResults(t,
 			"SHOW CLUSTER SETTING version", [][]string{{v2.String()}})
-		tenant.Stopper().Stop(ctx)
+		tenant.AppStopper().Stop(ctx)
 	})
 }

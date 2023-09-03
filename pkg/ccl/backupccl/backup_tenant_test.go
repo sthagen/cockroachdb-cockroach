@@ -78,7 +78,7 @@ func TestBackupTenantImportingTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Destroy the tenant, then restore it.
-	tSrv.Stopper().Stop(ctx)
+	tSrv.AppStopper().Stop(ctx)
 	if _, err := sqlDB.DB.ExecContext(ctx, "ALTER TENANT [10] STOP SERVICE; DROP TENANT [10] IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestBackupTenantImportingTable(t *testing.T) {
 
 // TestTenantBackupMultiRegionDatabases ensures secondary tenants restoring
 // MR databases respect the
-// sql.multi_region.allow_abstractions_for_secondary_tenants.enabled cluster
+// sql.virtual_cluster.feature_access.multiregion.enabled cluster
 // setting.
 func TestTenantBackupMultiRegionDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()

@@ -13,6 +13,7 @@ package application_api_test
 import (
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -44,13 +45,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// additionalTimeoutUnderStress is the additional timeout to use for the http
+// client if under stress.
+const additionalTimeoutUnderStress = 30 * time.Second
+
 func TestStatusAPICombinedTransactions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Stress() {
+		additionalTimeout = additionalTimeoutUnderStress
+	}
+
 	var params base.TestServerArgs
 	params.Knobs.SpanConfig = &spanconfig.TestingKnobs{ManagerDisableJobCreation: true} // TODO(irfansharif): #74919.
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: params,
 	})
 	ctx := context.Background()
@@ -125,7 +136,7 @@ func TestStatusAPICombinedTransactions(t *testing.T) {
 
 	// Hit query endpoint.
 	var resp serverpb.StatementsResponse
-	if err := srvtestutils.GetStatusJSONProto(firstServerProto, "combinedstmts", &resp); err != nil {
+	if err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, "combinedstmts", &resp, true, additionalTimeout); err != nil {
 		t.Fatal(err)
 	}
 
@@ -187,7 +198,7 @@ func TestStatusAPITransactions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	ctx := context.Background()
 	defer testCluster.Stopper().Stop(ctx)
 
@@ -322,10 +333,10 @@ func TestStatusAPITransactionStatementFingerprintIDsTruncation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 	testingApp := "testing"
 
@@ -380,11 +391,17 @@ func TestStatusAPIStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Stress() {
+		additionalTimeout = additionalTimeoutUnderStress
+	}
+
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
 	statsKnobs := sqlstats.CreateTestingKnobs()
 	statsKnobs.StubTimeNow = func() time.Time { return timeutil.Unix(aggregatedTs, 0) }
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				SQLStatsKnobs: statsKnobs,
@@ -396,7 +413,7 @@ func TestStatusAPIStatements(t *testing.T) {
 	})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []struct {
@@ -419,14 +436,14 @@ func TestStatusAPIStatements(t *testing.T) {
 
 	// Test that non-admin without VIEWACTIVITY privileges cannot access.
 	var resp serverpb.StatementsResponse
-	err := srvtestutils.GetStatusJSONProtoWithAdminOption(firstServerProto, "statements", &resp, false)
+	err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, "statements", &resp, false, additionalTimeout)
 	if !testutils.IsError(err, "status: 403") {
 		t.Fatalf("expected privilege error, got %v", err)
 	}
 
 	testPath := func(path string, expectedStmts []string) {
 		// Hit query endpoint.
-		if err := srvtestutils.GetStatusJSONProtoWithAdminOption(firstServerProto, path, &resp, false); err != nil {
+		if err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, path, &resp, false, additionalTimeout); err != nil {
 			t.Fatal(err)
 		}
 
@@ -487,15 +504,198 @@ func TestStatusAPIStatements(t *testing.T) {
 	testPath(fmt.Sprintf("statements?combined=true&start=%d", aggregatedTs+60), nil)
 }
 
+func TestStatusAPICombinedStatementsWithFullScans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Increase the timeout for the http client if under stress.
+	additionalTimeout := 0 * time.Second
+	if skip.Stress() {
+		additionalTimeout = additionalTimeoutUnderStress
+	}
+
+	// Aug 30 2021 19:50:00 GMT+0000
+	aggregatedTs := int64(1630353000)
+	oneMinAfterAggregatedTs := aggregatedTs + 60
+	statsKnobs := sqlstats.CreateTestingKnobs()
+	statsKnobs.StubTimeNow = func() time.Time { return timeutil.Unix(aggregatedTs, 0) }
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SQLStatsKnobs: statsKnobs,
+				SpanConfig: &spanconfig.TestingKnobs{
+					ManagerDisableJobCreation: true,
+				},
+			},
+		},
+	})
+	defer testCluster.Stopper().Stop(context.Background())
+
+	endpoint := fmt.Sprintf("combinedstmts?start=%d&end=%d", aggregatedTs-3600, oneMinAfterAggregatedTs)
+	findJobQuery := "SELECT status FROM [SHOW JOBS] WHERE statement = 'CREATE INDEX idx_age ON football.public.players (age) STORING (name)';"
+	testAppName := "TestCombinedStatementsWithFullScans"
+
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
+	sqlSB := testCluster.ServerConn(0)
+	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
+
+	var resp serverpb.StatementsResponse
+	// Test that non-admin without VIEWACTIVITY privileges cannot access.
+	err := srvtestutils.GetStatusJSONProtoWithAdminOption(firstServerProto, endpoint, &resp, false)
+	if !testutils.IsError(err, "status: 403") {
+		t.Fatalf("expected privilege error, got %v", err)
+	}
+
+	thirdServerSQL.Exec(t, fmt.Sprintf("GRANT SYSTEM VIEWACTIVITY TO %s", apiconstants.TestingUserNameNoAdmin().Normalized()))
+	thirdServerSQL.Exec(t, fmt.Sprintf(`SET application_name = '%s'`, testAppName))
+
+	type TestCases struct {
+		stmt      string
+		respQuery string
+		fullScan  bool
+		distSQL   bool
+		failed    bool
+		count     int
+	}
+
+	// These test statements are executed before the index is introduced.
+	statementsBeforeIndex := []TestCases{
+		{stmt: `CREATE DATABASE football`, respQuery: `CREATE DATABASE football`, fullScan: false, distSQL: false, failed: false, count: 1},
+		{stmt: `SET database = football`, respQuery: `SET database = football`, fullScan: false, distSQL: false, failed: false, count: 1},
+		{stmt: `CREATE TABLE players (id INT PRIMARY KEY, name TEXT, position TEXT, age INT,goals INT)`, respQuery: `CREATE TABLE players (id INT8 PRIMARY KEY, name STRING, "position" STRING, age INT8, goals INT8)`, fullScan: false, distSQL: false, failed: false, count: 1},
+		{stmt: `INSERT INTO players (id, name, position, age, goals) VALUES (1, 'Lionel Messi', 'Forward', 34, 672), (2, 'Cristiano Ronaldo', 'Forward', 36, 674)`, respQuery: `INSERT INTO players(id, name, "position", age, goals) VALUES (_, '_', __more1_10__), (__more1_10__)`, fullScan: false, distSQL: false, failed: false, count: 1},
+		{stmt: `SELECT avg(goals) FROM players`, respQuery: `SELECT avg(goals) FROM players`, fullScan: true, distSQL: true, failed: false, count: 1},
+		{stmt: `SELECT name FROM players WHERE age >= 32`, respQuery: `SELECT name FROM players WHERE age >= _`, fullScan: true, distSQL: true, failed: false, count: 1},
+	}
+
+	statementsCreateIndex := []TestCases{
+		// Drop the index, if it exists. Then, create the index.
+		{stmt: `DROP INDEX IF EXISTS idx_age`, respQuery: `DROP INDEX IF EXISTS idx_age`, fullScan: false, distSQL: false, failed: false, count: 1},
+		{stmt: `CREATE INDEX idx_age ON players (age) STORING (name)`, respQuery: `CREATE INDEX idx_age ON players (age) STORING (name)`, fullScan: false, distSQL: false, failed: false, count: 1},
+	}
+
+	// These test statements are executed after an index is created on the players table.
+	statementsAfterIndex := []TestCases{
+		// Since the index is created, the fullScan value should be false.
+		{stmt: `SELECT name FROM players WHERE age < 32`, respQuery: `SELECT name FROM players WHERE age < _`, fullScan: false, distSQL: false, failed: false, count: 1},
+		// Although the index is created, the fullScan value should be true because the previous query was not using the index. Its count should also be 2.
+		{stmt: `SELECT name FROM players WHERE age >= 32`, respQuery: `SELECT name FROM players WHERE age >= _`, fullScan: true, distSQL: true, failed: false, count: 2},
+	}
+
+	type ExpectedStatementData struct {
+		count    int
+		fullScan bool
+		distSQL  bool
+		failed   bool
+	}
+
+	// expectedStatementStatsMap maps the query response format to the associated
+	// expected statement statistics for verification.
+	expectedStatementStatsMap := make(map[string]ExpectedStatementData)
+
+	// Helper function to execute the statements and store the expected statement
+	executeStatements := func(statements []TestCases) {
+		// Clear the map at the start of each execution batch.
+		expectedStatementStatsMap = make(map[string]ExpectedStatementData)
+		for _, stmt := range statements {
+			thirdServerSQL.Exec(t, stmt.stmt)
+			expectedStatementStatsMap[stmt.respQuery] = ExpectedStatementData{
+				fullScan: stmt.fullScan,
+				distSQL:  stmt.distSQL,
+				failed:   stmt.failed,
+				count:    stmt.count,
+			}
+		}
+	}
+
+	// Helper function to convert a response into a JSON string representation.
+	responseToJSON := func(resp interface{}) string {
+		bytes, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(bytes)
+	}
+
+	// Helper function to verify the combined statement statistics response.
+	verifyCombinedStmtStats := func() {
+		err := srvtestutils.GetStatusJSONProtoWithAdminAndTimeoutOption(firstServerProto, endpoint, &resp, false, additionalTimeout)
+		require.NoError(t, err)
+
+		// actualResponseStatsMap maps the query response format to the actual
+		// statement statistics received from the server response.
+		actualResponseStatsMap := make(map[string]serverpb.StatementsResponse_CollectedStatementStatistics)
+		for _, respStatement := range resp.Statements {
+			// Skip failed statements: The test app may encounter transient 40001
+			// errors that are automatically retried. Thus, we only consider
+			// statements that were that were successfully executed by the test app
+			// to avoid counting such failures. If a statement that we expect to be
+			// successful is not found in the response, the test will fail later.
+			if respStatement.Key.KeyData.App == testAppName && !respStatement.Key.KeyData.Failed {
+				actualResponseStatsMap[respStatement.Key.KeyData.Query] = respStatement
+			}
+		}
+
+		for respQuery, expectedData := range expectedStatementStatsMap {
+			respStatement, exists := actualResponseStatsMap[respQuery]
+			require.True(t, exists, "Expected statement '%s' not found in response: %v", respQuery, responseToJSON(resp))
+
+			actualCount := respStatement.Stats.Count
+			actualFullScan := respStatement.Key.KeyData.FullScan
+			actualDistSQL := respStatement.Key.KeyData.DistSQL
+			actualFailed := respStatement.Key.KeyData.Failed
+
+			stmtJSONString := responseToJSON(respStatement)
+
+			require.Equal(t, expectedData.fullScan, actualFullScan, "failed for respStatement: %v", stmtJSONString)
+			require.Equal(t, expectedData.distSQL, actualDistSQL, "failed for respStatement: %v", stmtJSONString)
+			require.Equal(t, expectedData.failed, actualFailed, "failed for respStatement: %v", stmtJSONString)
+			require.Equal(t, expectedData.count, int(actualCount), "failed for respStatement: %v", stmtJSONString)
+		}
+	}
+
+	// Execute and verify the queries that will be executed before the index is created.
+	executeStatements(statementsBeforeIndex)
+	verifyCombinedStmtStats()
+
+	// Execute the queries that will create the index.
+	executeStatements(statementsCreateIndex)
+
+	// Wait for the job which creates the index to complete.
+	testutils.SucceedsWithin(t, func() error {
+		var status string
+		for {
+			row := sqlSB.QueryRow(findJobQuery)
+			err = row.Scan(&status)
+			if err != nil {
+				return err
+			}
+			if status == "succeeded" {
+				break
+			}
+			// sleep for a fraction of a second
+			time.Sleep(100 * time.Millisecond)
+		}
+		return nil
+	}, 3*time.Second)
+
+	// Execute and verify the queries that will be executed after the index is created.
+	executeStatements(statementsAfterIndex)
+	verifyCombinedStmtStats()
+}
+
 func TestStatusAPICombinedStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	// Resource-intensive test, times out under stress.
+	skip.UnderStressRace(t, "expensive tests")
 
 	// Aug 30 2021 19:50:00 GMT+0000
 	aggregatedTs := int64(1630353000)
 	statsKnobs := sqlstats.CreateTestingKnobs()
 	statsKnobs.StubTimeNow = func() time.Time { return timeutil.Unix(aggregatedTs, 0) }
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				SQLStatsKnobs: statsKnobs,
@@ -507,7 +707,7 @@ func TestStatusAPICombinedStatements(t *testing.T) {
 	})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []struct {
@@ -665,7 +865,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	aggregatedTs := int64(1630353000)
 	statsKnobs := sqlstats.CreateTestingKnobs()
 	statsKnobs.StubTimeNow = func() time.Time { return timeutil.Unix(aggregatedTs, 0) }
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				SQLStatsKnobs: statsKnobs,
@@ -677,7 +877,7 @@ func TestStatusAPIStatementDetails(t *testing.T) {
 	})
 	defer testCluster.Stopper().Stop(context.Background())
 
-	firstServerProto := testCluster.Server(0)
+	firstServerProto := testCluster.Server(0).ApplicationLayer()
 	thirdServerSQL := sqlutils.MakeSQLRunner(testCluster.ServerConn(2))
 
 	statements := []string{

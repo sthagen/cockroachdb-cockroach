@@ -31,8 +31,8 @@ const defaultWorkloadPort = 2112
 
 // Client is an interface allowing queries against Prometheus.
 type Client interface {
-	Query(ctx context.Context, query string, ts time.Time) (model.Value, promv1.Warnings, error)
-	QueryRange(ctx context.Context, query string, r promv1.Range) (model.Value, promv1.Warnings, error)
+	Query(ctx context.Context, query string, ts time.Time, opts ...promv1.Option) (model.Value, promv1.Warnings, error)
+	QueryRange(ctx context.Context, query string, r promv1.Range, opts ...promv1.Option) (model.Value, promv1.Warnings, error)
 }
 
 // ScrapeNode is a node to scrape from.
@@ -341,12 +341,13 @@ sudo systemd-run --unit prometheus --same-dir \
 			l.Stderr, cfg.PrometheusNode, "install grafana",
 			fmt.Sprintf(`
 sudo apt-get install -qqy apt-transport-https &&
-sudo apt-get install -qqy software-properties-common wget &&
+sudo apt-get install -qqy software-properties-common &&
 sudo apt-get install -y adduser libfontconfig1 &&
-wget https://dl.grafana.com/enterprise/release/grafana-enterprise_9.2.3_%s.deb -O grafana-enterprise_9.2.3_%s.deb &&
-sudo dpkg -i grafana-enterprise_9.2.3_%s.deb &&
+echo "Downloading https://dl.grafana.com/enterprise/release/grafana-enterprise_9.2.3_%[1]s.deb" &&
+curl https://dl.grafana.com/enterprise/release/grafana-enterprise_9.2.3_%[1]s.deb -sS -o grafana-enterprise_9.2.3_%[1]s.deb &&
+sudo dpkg -i grafana-enterprise_9.2.3_%[1]s.deb &&
 sudo mkdir -p /var/lib/grafana/dashboards`,
-				binArch, binArch, binArch)); err != nil {
+				binArch)); err != nil {
 			return nil, err
 		}
 

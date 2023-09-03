@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -36,10 +37,12 @@ func TestRoleMembersIDMigration10Users(t *testing.T) {
 	runTestRoleMembersIDMigration(t, 10)
 }
 
-func TestRoleMembersIDMigration1500Users(t *testing.T) {
+func TestRoleMembersIDMigration1200Users(t *testing.T) {
 	skip.UnderRace(t)
 	skip.UnderStress(t)
-	runTestRoleMembersIDMigration(t, 1500)
+	// Choosing a number larger than 1000 tests that the batching logic in
+	// this upgrade works correctly.
+	runTestRoleMembersIDMigration(t, 1200)
 }
 
 func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
@@ -49,6 +52,9 @@ func runTestRoleMembersIDMigration(t *testing.T, numUsers int) {
 	tc := testcluster.StartTestCluster(t, 1 /* nodes */, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
+				SQLEvalContext: &eval.TestingKnobs{
+					ForceProductionValues: true,
+				},
 				Server: &server.TestingKnobs{
 					BootstrapVersionKeyOverride:    clusterversion.V22_2,
 					DisableAutomaticVersionUpgrade: make(chan struct{}),

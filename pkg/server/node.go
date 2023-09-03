@@ -229,7 +229,8 @@ var (
 		"external.graphite.endpoint",
 		"if nonempty, push server metrics to the Graphite or Carbon server at the specified host:port",
 		"",
-	).WithPublic()
+		settings.WithPublic)
+
 	// graphiteInterval is how often metrics are pushed to Graphite, if enabled.
 	graphiteInterval = settings.RegisterDurationSetting(
 		settings.TenantWritable,
@@ -237,13 +238,15 @@ var (
 		"the interval at which metrics are pushed to Graphite (if enabled)",
 		10*time.Second,
 		settings.NonNegativeDurationWithMaximum(maxGraphiteInterval),
-	).WithPublic()
+		settings.WithPublic)
+
 	RedactServerTracesForSecondaryTenants = settings.RegisterBoolSetting(
 		settings.SystemOnly,
 		"server.secondary_tenants.redact_trace.enabled",
-		"controls if server side traces are redacted for tenant operations",
+		"if enabled, storage/KV trace results are redacted when returned to a virtual cluster",
 		true,
-	).WithPublic()
+		settings.WithName("trace.redact_at_virtual_cluster_boundary.enabled"),
+	)
 
 	slowRequestHistoricalStackThreshold = settings.RegisterDurationSetting(
 		settings.SystemOnly,
@@ -2312,7 +2315,7 @@ func (n *Node) getVersionSettingWithUpdateCh(
 	defer n.versionUpdateMu.Unlock()
 
 	setting := kvpb.TenantSetting{
-		Name: clusterversion.KeyVersionSetting,
+		InternalKey: clusterversion.KeyVersionSetting,
 		Value: settings.EncodedValue{
 			Type:  settings.VersionSettingValueType,
 			Value: n.versionUpdateMu.encodedVersion,

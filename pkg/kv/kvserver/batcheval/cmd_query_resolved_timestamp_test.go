@@ -228,8 +228,8 @@ func TestQueryResolvedTimestampErrors(t *testing.T) {
 
 	lockTableKey := storage.LockTableKey{
 		Key:      roachpb.Key("a"),
-		Strength: lock.Exclusive,
-		TxnUUID:  txnUUID.GetBytes(),
+		Strength: lock.Intent,
+		TxnUUID:  txnUUID,
 	}
 	engineKey, buf := lockTableKey.ToEngineKey(nil)
 

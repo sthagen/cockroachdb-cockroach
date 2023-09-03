@@ -12,7 +12,7 @@ go_library(
         "//pkg/base",
         "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security",
+        "//pkg/security/securitytest",
         "//pkg/server/serverpb",
         "//pkg/sql",
         "//pkg/sql/contention",
@@ -47,6 +47,7 @@ go_test(
     }),
     data = glob(["testdata/**"]),
     embed = [":serverccl"],
+    exec_properties = {"Pool": "large"},
     tags = ["ccl_test"],
     deps = [
         "//pkg/base",

@@ -13,11 +13,16 @@ go_test(
         "//pkg/cmd/cockroach-short",  # keep
         "//pkg/sql/logictest:testdata",  # keep
     ],
+    exec_properties = {
+        "dockerNetwork": "standard",
+        "Pool": "large",
+    },
     shard_count = 9,
     tags = [
         "cpu:2",
     ],
     deps = [
+        "//pkg/base",
         "//pkg/build/bazel",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",

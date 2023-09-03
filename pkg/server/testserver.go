@@ -52,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/deprecatedshowranges"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -65,7 +66,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	addrutil "github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
@@ -355,7 +355,7 @@ type testServer struct {
 	disableStartTenantError error
 }
 
-var _ serverutils.TestServerInterface = &testServer{}
+var _ serverutils.TestServerInterfaceRaw = &testServer{}
 
 // Node returns the Node as an interface{}.
 func (ts *testServer) Node() interface{} {
@@ -369,6 +369,11 @@ func (ts *testServer) NodeID() roachpb.NodeID {
 
 // Stopper returns the embedded server's Stopper.
 func (ts *testServer) Stopper() *stop.Stopper {
+	return ts.stopper
+}
+
+// AppStopper is part of serverutils.ApplicationLayerInterface.
+func (ts *testServer) AppStopper() *stop.Stopper {
 	return ts.stopper
 }
 
@@ -561,9 +566,9 @@ func (ts *testServer) TenantStatusServer() interface{} {
 	return ts.status
 }
 
-// TestTenants provides information to tenant(s) that _may_ have been created
-func (ts *testServer) TestTenants() []serverutils.ApplicationLayerInterface {
-	return ts.testTenants
+// TestTenant is part of serverutils.TenantControlInterface.
+func (ts *testServer) TestTenant() serverutils.ApplicationLayerInterface {
+	return ts.testTenants[0]
 }
 
 // maybeStartDefaultTestTenant might start a test tenant. This can then be used
@@ -586,19 +591,14 @@ func (ts *testServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 		return nil
 	}
 
-	clusterID := ts.sqlServer.execCfg.NodeInfo.LogicalClusterID
-	if err := base.CheckEnterpriseEnabled(ts.st, clusterID(), "SQL servers"); err != nil {
-		log.Shoutf(ctx, severity.WARNING, "test tenant requested by configuration, but code organization prevents start!\n%v", err)
-		// If not enterprise enabled, we won't be able to use SQL Servers so eat
-		// the error and return without creating/starting a SQL server.
-		//
-		// TODO(knz/yahor): Remove this - as we discussed this ought to work
-		// now even when not enterprise enabled.
-		ts.params.DefaultTestTenant = base.TODOTestTenantDisabled
-		return nil // nolint:returnerrcheck
+	tenantSettings := ts.params.Settings
+	if tenantSettings == nil {
+		tenantSettings = cluster.MakeTestingClusterSettings()
 	}
-
-	tempStorageConfig := base.DefaultTestTempStorageConfig(cluster.MakeTestingClusterSettings())
+	tempStorageConfig := ts.params.TempStorageConfig
+	if tempStorageConfig.Settings == nil {
+		tempStorageConfig = base.DefaultTestTempStorageConfig(tenantSettings)
+	}
 	params := base.TestTenantArgs{
 		// Currently, all the servers leverage the same tenant ID. We may
 		// want to change this down the road, for more elaborate testing.
@@ -613,7 +613,7 @@ func (ts *testServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 		SSLCertsDir:               ts.params.SSLCertsDir,
 		TestingKnobs:              ts.params.Knobs,
 		StartDiagnosticsReporting: ts.params.StartDiagnosticsReporting,
-		Settings:                  ts.params.Settings,
+		Settings:                  tenantSettings,
 	}
 
 	// Since we're creating a tenant, it doesn't make sense to pass through the
@@ -659,24 +659,19 @@ func (ts *testServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 	return nil
 }
 
-// Start starts the testServer by bootstrapping an in-memory store
-// (defaults to maximum of 100M). The server is started, launching the
-// node RPC server and all HTTP endpoints. Use the value of
-// testServer.AdvRPCAddr() after Start() for client connections.
-// Use testServer.Stopper().Stop() to shutdown the server after the test
-// completes.
-func (ts *testServer) Start(ctx context.Context) (retErr error) {
-	defer func() {
-		if retErr != nil {
-			// Use a separate context to avoid using an already-cancelled
-			// context in closers.
-			ts.Stopper().Stop(context.Background())
-		}
-	}()
+// PreStart calls the PreStart() method on the underlying server.
+// Call this before calling Start().
+// The caller is responsible for calling .Stopper().Stop() even
+// when PreStart() returns an error.
+func (ts *testServer) PreStart(ctx context.Context) error {
+	return ts.topLevelServer.PreStart(ctx)
+}
 
-	if err := ts.topLevelServer.PreStart(ctx); err != nil {
-		return err
-	}
+// Activate runs post-init server initialization and enables
+// clients to connect.
+// The caller is responsible for calling .Stopper().Stop() even
+// when PreStart() returns an error.
+func (ts *testServer) Activate(ctx context.Context) error {
 	if err := ts.topLevelServer.AcceptInternalClients(ctx); err != nil {
 		return err
 	}
@@ -687,6 +682,20 @@ func (ts *testServer) Start(ctx context.Context) (retErr error) {
 		return err
 	}
 
+	maybeRunVersionUpgrade := func(layer serverutils.ApplicationLayerInterface) error {
+		if v := ts.BinaryVersionOverride(); v != (roachpb.Version{}) {
+			ie := layer.InternalExecutor().(isql.Executor)
+			if _, err := ie.Exec(context.Background(), "set-cluster-version", nil, /* txn */
+				`SET CLUSTER SETTING version = $1`, v.String()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := maybeRunVersionUpgrade(ts); err != nil {
+		return err
+	}
+
 	// Let clients connect.
 	if err := ts.topLevelServer.AcceptClients(ctx); err != nil {
 		return err
@@ -694,6 +703,12 @@ func (ts *testServer) Start(ctx context.Context) (retErr error) {
 
 	if err := ts.maybeStartDefaultTestTenant(ctx); err != nil {
 		return err
+	}
+
+	if ts.StartedDefaultTestTenant() {
+		if err := maybeRunVersionUpgrade(ts.TestTenant()); err != nil {
+			return err
+		}
 	}
 
 	go func() {
@@ -713,6 +728,24 @@ func (ts *testServer) Start(ctx context.Context) (retErr error) {
 	return nil
 }
 
+// Start calls PreStart() and Activate().
+// For convenience, it also ensures .Stopper().Stop() has been
+// called if an error is returned.
+func (ts *testServer) Start(ctx context.Context) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			// Use a separate context to avoid using an already-cancelled
+			// context in closers.
+			ts.Stopper().Stop(context.Background())
+		}
+	}()
+
+	if err := ts.PreStart(ctx); err != nil {
+		return err
+	}
+	return ts.Activate(ctx)
+}
+
 // Stop is part of the serverutils.TestServerInterface.
 func (ts *testServer) Stop(ctx context.Context) {
 	ctx = ts.topLevelServer.AnnotateCtx(ctx)
@@ -730,6 +763,7 @@ type testTenant struct {
 	SQLCfg *SQLConfig
 	*httpTestServer
 	drain *drainServer
+	http  *httpServer
 
 	pgL *netutil.LoopbackListener
 
@@ -806,7 +840,7 @@ func (t *testTenant) SQLConnForUserE(userName string, dbName string) (*gosql.DB,
 	}
 	return openTestSQLConn(
 		userName, dbName, tenantName,
-		t.Stopper(),
+		t.AppStopper(),
 		t.pgL,
 		t.Cfg.SQLAdvertiseAddr,
 		t.Cfg.Insecure,
@@ -867,9 +901,25 @@ func (t *testTenant) DistSenderI() interface{} {
 	return t.sql.execCfg.DistSender
 }
 
+// NodeDescStoreI is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) NodeDescStoreI() interface{} {
+	return t.sql.execCfg.DistSQLPlanner.NodeDescStore()
+}
+
 // InternalDB is part of the serverutils.ApplicationLayerInterface.
 func (t *testTenant) InternalDB() interface{} {
 	return t.sql.internalDB
+}
+
+// Locality is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) Locality() roachpb.Locality {
+	return t.Cfg.Locality
+}
+
+// DistSQLPlanningNodeID is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) DistSQLPlanningNodeID() roachpb.NodeID {
+	// See comments on replicaoracle.Config.
+	return 0
 }
 
 // LeaseManager is part of the serverutils.ApplicationLayerInterface.
@@ -907,8 +957,8 @@ func (t *testTenant) ClusterSettings() *cluster.Settings {
 	return t.Cfg.Settings
 }
 
-// Stopper is part of the serverutils.ApplicationLayerInterface.
-func (t *testTenant) Stopper() *stop.Stopper {
+// AppStopper is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) AppStopper() *stop.Stopper {
 	return t.sql.stopper
 }
 
@@ -1035,7 +1085,11 @@ func (ts *testServer) StartSharedProcessTenant(
 	}
 
 	// Save the args for use if the server needs to be created.
-	ts.topLevelServer.serverController.testArgs[args.TenantName] = args
+	func() {
+		ts.topLevelServer.serverController.mu.Lock()
+		defer ts.topLevelServer.serverController.mu.Unlock()
+		ts.topLevelServer.serverController.mu.testArgs[args.TenantName] = args
+	}()
 
 	tenantRow, err := ts.InternalExecutor().(*sql.InternalExecutor).QueryRow(
 		ctx, "testserver-check-tenant-active", nil, /* txn */
@@ -1206,6 +1260,16 @@ func (t *testTenant) HTTPAuthServer() interface{} {
 	return t.t.authentication
 }
 
+// HTTPServer is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) HTTPServer() interface{} {
+	return t.http
+}
+
+// SQLLoopbackListener is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) SQLLoopbackListener() interface{} {
+	return t.pgL
+}
+
 func (ts *testServer) waitForTenantReadinessImpl(
 	ctx context.Context, tenantID roachpb.TenantID,
 ) error {
@@ -1356,18 +1420,6 @@ func (ts *testServer) StartTenant(
 	if st == nil {
 		st = cluster.MakeTestingClusterSettings()
 	}
-	// Verify that the settings object that was passed in has
-	// initialized the version setting. This is pretty much necessary
-	// for secondary tenants. See the comments at the beginning of
-	// `runStartSQL()` in cli/mt_start_sql.go and
-	// `makeSharedProcessTenantServerConfig()` in
-	// server_controller_new_server.go.
-	//
-	// The version is initialized in MakeTestingClusterSettings(). This
-	// assertion is there to prevent inadvertent changes to
-	// MakeTestingClusterSettings() and as a guardrail for tests that
-	// pass a custom params.Settings.
-	clusterversion.AssertInitialized(ctx, &st.SV)
 
 	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
 	// Remove in v23.2.
@@ -1378,7 +1430,7 @@ func (ts *testServer) StartTenant(
 
 	st.ExternalIODir = params.ExternalIODir
 	sqlCfg := makeTestSQLConfig(st, params.TenantID)
-	sqlCfg.TenantKVAddrs = []string{ts.AdvRPCAddr()}
+	sqlCfg.TenantLoopbackAddr = ts.AdvRPCAddr()
 	sqlCfg.ExternalIODirConfig = params.ExternalIODirConfig
 	if params.MemoryPoolSize != 0 {
 		sqlCfg.MemoryPoolSize = params.MemoryPoolSize
@@ -1539,6 +1591,7 @@ func (ts *testServer) StartTenant(
 		SQLCfg:         &sqlCfg,
 		pgPreServer:    sw.pgPreServer,
 		httpTestServer: hts,
+		http:           sw.http,
 		drain:          sw.drainServer,
 		pgL:            sw.loopbackPgL,
 	}, err
@@ -1670,9 +1723,14 @@ func (ts *testServer) MustGetSQLNetworkCounter(name string) int64 {
 	return mustGetSQLCounterForRegistry(reg, name)
 }
 
-// Locality is part of the serverutils.StorageLayerInterface.
-func (ts *testServer) Locality() *roachpb.Locality {
-	return &ts.cfg.Locality
+// Locality is part of the serverutils.ApplicationLayerInterface.
+func (ts *testServer) Locality() roachpb.Locality {
+	return ts.cfg.Locality
+}
+
+// DistSQLPlanningNodeID is part of the serverutils.ApplicationLayerInterface.
+func (ts *testServer) DistSQLPlanningNodeID() roachpb.NodeID {
+	return ts.NodeID()
 }
 
 // LeaseManager is part of the serverutils.ApplicationLayerInterface.
@@ -1698,6 +1756,11 @@ func (ts *testServer) GetNode() *Node {
 // DistSenderI is part of DistSenderInterface.
 func (ts *testServer) DistSenderI() interface{} {
 	return ts.distSender
+}
+
+// NodeDescStoreI is part of the serverutils.ApplicationLayerInterface.
+func (ts *testServer) NodeDescStoreI() interface{} {
+	return ts.sqlServer.execCfg.DistSQLPlanner.NodeDescStore()
 }
 
 // MigrationServer is part of the serverutils.ApplicationLayerInterface.
@@ -1930,29 +1993,6 @@ func (ts *testServer) StartedDefaultTestTenant() bool {
 	return len(ts.testTenants) > 0
 }
 
-// ApplicationLayer is part of the serverutils.TestServerInterface.
-func (ts *testServer) ApplicationLayer() serverutils.ApplicationLayerInterface {
-	if ts.StartedDefaultTestTenant() {
-		return ts.testTenants[0]
-	}
-	return ts
-}
-
-// StorageLayer is part of the serverutils.TestServerInterface.
-func (ts *testServer) StorageLayer() serverutils.StorageLayerInterface {
-	return ts
-}
-
-// TenantController is part of the serverutils.TestServerInterface.
-func (ts *testServer) TenantController() serverutils.TenantControlInterface {
-	return ts
-}
-
-// SystemLayer is part of the serverutils.TestServerInterface.
-func (ts *testServer) SystemLayer() serverutils.ApplicationLayerInterface {
-	return ts
-}
-
 // TracerI is part of the serverutils.ApplicationLayerInterface.
 func (ts *testServer) TracerI() interface{} {
 	return ts.Tracer()
@@ -1967,7 +2007,7 @@ func (ts *testServer) Tracer() *tracing.Tracer {
 func (ts *testServer) ForceTableGC(
 	ctx context.Context, database, table string, timestamp hlc.Timestamp,
 ) error {
-	return internalForceTableGC(ctx, ts.SystemLayer(), database, table, timestamp)
+	return internalForceTableGC(ctx, ts, database, table, timestamp)
 }
 
 func internalForceTableGC(
@@ -2143,6 +2183,21 @@ func (ts *testServer) HTTPAuthServer() interface{} {
 	return ts.t.authentication
 }
 
+// HTTPServer is part of the serverutils.ApplicationLayerInterface.
+func (ts *testServer) HTTPServer() interface{} {
+	return ts.topLevelServer.http
+}
+
+// SQLLoopbackListener is part of the serverutils.ApplicationLayerInterface.
+func (ts *testServer) SQLLoopbackListener() interface{} {
+	return ts.topLevelServer.loopbackPgL
+}
+
+// ServerController is part of the serverutils.TenantControlInterface.
+func (ts *testServer) ServerController() interface{} {
+	return ts.topLevelServer.serverController
+}
+
 type testServerFactoryImpl struct{}
 
 // TestServerFactory can be passed to serverutils.InitTestServerFactory
@@ -2176,7 +2231,8 @@ func (testServerFactoryImpl) PrepareRangeTestServer(srv interface{}) error {
 
 	// Make sure the range is spun up with an arbitrary read command. We do not
 	// expect a specific response.
-	if _, err := kvDB.Get(context.Background(), "a"); err != nil {
+	scratchKey := append(ts.ApplicationLayer().Codec().TenantPrefix(), roachpb.Key("a")...)
+	if _, err := kvDB.Get(context.Background(), scratchKey); err != nil {
 		return err
 	}
 
@@ -2290,15 +2346,17 @@ func TestingMakeLoggingContexts(
 ) (sysContext, appContext context.Context) {
 	ctxSysTenant := context.Background()
 	ctxSysTenant = context.WithValue(ctxSysTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
-		tenantID:  roachpb.SystemTenantID,
-		clusterID: &base.ClusterIDContainer{},
-		serverID:  &base.NodeIDContainer{},
+		tenantID:   roachpb.SystemTenantID,
+		clusterID:  &base.ClusterIDContainer{},
+		serverID:   &base.NodeIDContainer{},
+		tenantName: roachpb.NewTenantNameContainer("system"),
 	})
 	ctxAppTenant := context.Background()
 	ctxAppTenant = context.WithValue(ctxAppTenant, serverident.ServerIdentificationContextKey{}, &idProvider{
-		tenantID:  appTenantID,
-		clusterID: &base.ClusterIDContainer{},
-		serverID:  &base.NodeIDContainer{},
+		tenantID:   appTenantID,
+		clusterID:  &base.ClusterIDContainer{},
+		serverID:   &base.NodeIDContainer{},
+		tenantName: roachpb.NewTenantNameContainer(""),
 	})
 	return ctxSysTenant, ctxAppTenant
 }
@@ -2397,7 +2455,7 @@ func newClientRPCContext(
 	ctx = logtags.AddTag(ctx, "user", user)
 	ctx = logtags.AddTag(ctx, "nsql", s.SQLInstanceID())
 
-	stopper := s.Stopper()
+	stopper := s.AppStopper()
 	if ctx.Done() == nil {
 		// The RPCContext initialization wants a cancellable context,
 		// since that will be used to stop async goroutines. Help

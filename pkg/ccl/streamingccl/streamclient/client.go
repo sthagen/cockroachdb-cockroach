@@ -10,6 +10,7 @@ package streamclient
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
@@ -55,7 +56,7 @@ type Client interface {
 	// that apply to the passed in tenant, and returns the subscriptions the
 	// client can subscribe to. No protected timestamp or job is persisted to the
 	// source cluster.
-	SetupSpanConfigsStream(ctx context.Context, tenant roachpb.TenantName) (streampb.StreamID, Topology, error)
+	SetupSpanConfigsStream(ctx context.Context, tenant roachpb.TenantName) (Subscription, error)
 
 	// Dial checks if the source is able to be connected to for queries
 	Dial(ctx context.Context) error
@@ -148,7 +149,7 @@ type Subscription interface {
 
 // NewStreamClient creates a new stream client based on the stream address.
 func NewStreamClient(
-	ctx context.Context, streamAddress streamingccl.StreamAddress, db isql.DB,
+	ctx context.Context, streamAddress streamingccl.StreamAddress, db isql.DB, opts ...Option,
 ) (Client, error) {
 	var streamClient Client
 	streamURL, err := streamAddress.URL()
@@ -160,7 +161,10 @@ func NewStreamClient(
 	case "postgres", "postgresql":
 		// The canonical PostgreSQL URL scheme is "postgresql", however our
 		// own client commands also accept "postgres".
-		return NewPartitionedStreamClient(ctx, streamURL)
+		if processOptions(opts).forSpanConfigs {
+			return NewSpanConfigStreamClient(ctx, streamURL, opts...)
+		}
+		return NewPartitionedStreamClient(ctx, streamURL, opts...)
 	case "external":
 		if db == nil {
 			return nil, errors.AssertionFailedf("nil db handle can't be used to dereference external URI")
@@ -169,7 +173,7 @@ func NewStreamClient(
 		if err != nil {
 			return nil, err
 		}
-		return NewStreamClient(ctx, addr, db)
+		return NewStreamClient(ctx, addr, db, opts...)
 	case RandomGenScheme:
 		streamClient, err = newRandomStreamClient(streamURL)
 		if err != nil {
@@ -199,14 +203,16 @@ func lookupExternalConnection(
 
 // GetFirstActiveClient iterates through each provided stream address
 // and returns the first client it's able to successfully Dial.
-func GetFirstActiveClient(ctx context.Context, streamAddresses []string) (Client, error) {
+func GetFirstActiveClient(
+	ctx context.Context, streamAddresses []string, opts ...Option,
+) (Client, error) {
 	if len(streamAddresses) == 0 {
 		return nil, errors.Newf("failed to connect, no partition addresses")
 	}
 	var combinedError error = nil
 	for _, address := range streamAddresses {
 		streamAddress := streamingccl.StreamAddress(address)
-		client, err := NewStreamClient(ctx, streamAddress, nil)
+		client, err := NewStreamClient(ctx, streamAddress, nil, opts...)
 		if err == nil {
 			err = client.Dial(ctx)
 			if err == nil {
@@ -220,6 +226,46 @@ func GetFirstActiveClient(ctx context.Context, streamAddresses []string) (Client
 	}
 
 	return nil, errors.Wrap(combinedError, "failed to connect to any partition address")
+}
+
+type options struct {
+	streamID       streampb.StreamID
+	forSpanConfigs bool
+}
+
+func (o *options) appName() string {
+	const appNameBase = "repstream"
+	if o.streamID != 0 {
+		return fmt.Sprintf("%s job id=%d", appNameBase, o.streamID)
+	} else {
+		return appNameBase
+	}
+}
+
+// An Option configures some part of a Client.
+type Option func(*options)
+
+// WithStreamID sets the StreamID for the client. This only impacts
+// metadata such as the application_name on the SQL connection.
+func WithStreamID(id streampb.StreamID) Option {
+	return func(o *options) {
+		o.streamID = id
+	}
+}
+
+// ForSpanConfigs will create a client for replicating span configs.
+func ForSpanConfigs() Option {
+	return func(o *options) {
+		o.forSpanConfigs = true
+	}
+}
+
+func processOptions(opts []Option) *options {
+	ret := &options{}
+	for _, o := range opts {
+		o(ret)
+	}
+	return ret
 }
 
 /*

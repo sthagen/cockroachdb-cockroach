@@ -64,7 +64,7 @@ var featureFullBackupUserSubdir = settings.RegisterBoolSetting(
 	"when true, a backup command with a user specified subdirectory will create a full backup at"+
 		" the subdirectory if no backup already exists at that subdirectory",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // TODO(adityamaru): Move this to the soon to be `backupinfo` package.
 func containsManifest(ctx context.Context, exportStore cloud.ExternalStorage) (bool, error) {
@@ -197,7 +197,7 @@ func ResolveDest(
 						"Or, to take a full backup at a specific subdirectory, "+
 						"enable the deprecated syntax by switching the %q cluster setting to true; "+
 						"however, note this deprecated syntax will not be available in a future release.",
-						chosenSuffix, featureFullBackupUserSubdir.Key())
+						chosenSuffix, featureFullBackupUserSubdir.Name())
 			}
 		}
 		// There's no full backup in the resolved subdirectory; therefore, we're conducting a full backup.

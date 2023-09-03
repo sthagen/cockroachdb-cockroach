@@ -36,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/semenumpb"
@@ -47,7 +46,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam/tablestorageparam"
-	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -299,14 +297,14 @@ func (n *alterTableNode) startExec(params runParams) error {
 
 				activeVersion := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
 				if !activeVersion.IsActive(clusterversion.V23_2_PartiallyVisibleIndexes) &&
-					d.Invisibility > 0.0 && d.Invisibility < 1.0 {
+					d.Invisibility.Value > 0.0 && d.Invisibility.Value < 1.0 {
 					return unimplemented.New("partially visible indexes", "partially visible indexes are not yet supported")
 				}
 				idx := descpb.IndexDescriptor{
 					Name:             string(d.Name),
 					Unique:           true,
-					NotVisible:       d.Invisibility != 0.0,
-					Invisibility:     d.Invisibility,
+					NotVisible:       d.Invisibility.Value != 0.0,
+					Invisibility:     d.Invisibility.Value,
 					StoreColumnNames: d.Storing.ToStrings(),
 					CreatedAtNanos:   params.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
 				}
@@ -895,19 +893,13 @@ func (p *planner) setAuditMode(
 	}
 	if !hasAdmin {
 		// Check for system privilege first, otherwise fall back to role options.
-		hasModify, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User())
+		hasModify, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYCLUSTERSETTING)
 		if err != nil {
 			return false, err
 		}
 		if !hasModify {
-			hasModify, err = p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING)
-			if err != nil {
-				return false, err
-			}
-			if !hasModify {
-				return false, pgerror.Newf(pgcode.InsufficientPrivilege,
-					"only users with admin or %s system privilege are allowed to change audit settings on a table ", privilege.MODIFYCLUSTERSETTING.String())
-			}
+			return false, pgerror.Newf(pgcode.InsufficientPrivilege,
+				"only users with admin or %s system privilege are allowed to change audit settings on a table ", privilege.MODIFYCLUSTERSETTING.String())
 		}
 	}
 
@@ -1621,6 +1613,10 @@ func dropColumnImpl(
 			"cannot drop inaccessible column %q",
 			t.Column,
 		)
+	}
+
+	if err := params.p.disallowDroppingPrimaryIndexReferencedInUDFOrView(params.ctx, tableDesc); err != nil {
+		return nil, err
 	}
 
 	// If the dropped column uses a sequence, remove references to it from that sequence.

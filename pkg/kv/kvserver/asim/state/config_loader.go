@@ -12,12 +12,17 @@ package state
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"google.golang.org/protobuf/proto"
 )
 
-var ClusterOptions = [...]string{"single_region", "single_region_multi_store", "multi_region", "complex"}
+var SingleRegionClusterOptions = [...]string{"single_region", "single_region_multi_store"}
+var MultiRegionClusterOptions = [...]string{"multi_region", "complex"}
+var AllClusterOptions = [...]string{"single_region", "single_region_multi_store", "multi_region", "complex"}
 
 // TODO(kvoli): Add a loader/translator for the existing
 // []*roachpb.StoreDescriptor configurations in kvserver/*_test.go and
@@ -261,6 +266,27 @@ type ClusterInfo struct {
 	Regions        []Region
 }
 
+func (c ClusterInfo) String() (s string) {
+	buf := &strings.Builder{}
+	for i, r := range c.Regions {
+		buf.WriteString(fmt.Sprintf("\t\tregion:%s [", r.Name))
+		if len(r.Zones) == 0 {
+			panic(fmt.Sprintf("number of zones within region %s is zero", r.Name))
+		}
+		for j, z := range r.Zones {
+			buf.WriteString(fmt.Sprintf("zone=%s(nodes=%d,stores=%d)", z.Name, z.NodeCount, z.StoresPerNode))
+			if j != len(r.Zones)-1 {
+				buf.WriteString(", ")
+			}
+		}
+		buf.WriteString("]")
+		if i != len(c.Regions)-1 {
+			buf.WriteString("\n")
+		}
+	}
+	return buf.String()
+}
+
 type RangeInfo struct {
 	Descriptor  roachpb.RangeDescriptor
 	Config      *roachpb.SpanConfig
@@ -383,4 +409,89 @@ func LoadRangeInfo(s State, rangeInfos ...RangeInfo) {
 			}
 		}
 	}
+}
+
+func GetRegionSurvivalConfig(
+	regionOne string, regionTwo string, regionThree string,
+) zonepb.ZoneConfig {
+	zoneConfig := zonepb.DefaultZoneConfig()
+	zoneConfig.NumReplicas = proto.Int32(5)
+	zoneConfig.NumVoters = proto.Int32(5)
+	zoneConfig.LeasePreferences = []zonepb.LeasePreference{
+		{
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne}},
+		},
+	}
+	zoneConfig.Constraints = []zonepb.ConstraintsConjunction{
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionTwo},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionThree},
+			},
+		},
+	}
+	zoneConfig.VoterConstraints = []zonepb.ConstraintsConjunction{
+		{
+			NumReplicas: 2,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+			},
+		},
+	}
+	return zoneConfig
+}
+
+func GetZoneSurvivalConfig(
+	regionOne string, regionTwo string, regionThree string,
+) zonepb.ZoneConfig {
+	zoneConfig := zonepb.DefaultZoneConfig()
+	zoneConfig.NumReplicas = proto.Int32(5)
+	zoneConfig.NumVoters = proto.Int32(3)
+	zoneConfig.LeasePreferences = []zonepb.LeasePreference{{
+		Constraints: []zonepb.Constraint{
+			{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+		},
+	}}
+
+	zoneConfig.Constraints = []zonepb.ConstraintsConjunction{
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionTwo},
+			},
+		},
+		{
+			NumReplicas: 1,
+			Constraints: []zonepb.Constraint{
+				{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionThree},
+			},
+		},
+	}
+
+	zoneConfig.VoterConstraints = []zonepb.ConstraintsConjunction{{
+		Constraints: []zonepb.Constraint{
+			{Type: zonepb.Constraint_REQUIRED, Key: "region", Value: regionOne},
+		},
+	},
+	}
+	return zoneConfig
 }

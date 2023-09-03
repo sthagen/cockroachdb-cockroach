@@ -54,7 +54,7 @@ import (
 // Specifically, write intents (replicated, exclusive locks) are stored inline
 // in the MVCC keyspace, so they are not detectable until request evaluation
 // time. To accommodate this form of lock storage, the manager exposes a
-// HandleWriterIntentError method, which can be used in conjunction with a retry
+// HandleLockConflictError method, which can be used in conjunction with a retry
 // loop around evaluation to integrate external locks with the concurrency
 // manager structure. In the future, we intend to pull all locks, including
 // those associated with write intents, into the concurrency manager directly
@@ -87,12 +87,12 @@ import (
 //	|         +---------------------------------------------------+  |  |
 //	|         | [ lockTable ]                                     |  |  |
 //	|         | [    key1   ]    -------------+-----------------+ |  ^  |
-//	|         | [    key2   ]  /  lockState:  | lockWaitQueue:  |----<---<---<----+
+//	|         | [    key2   ]  /  keyLocks:   | lockWaitQueue:  |----<---<---<----+
 //	|         | [    key3   ]-{   - lock type | +-[a]<-[b]<-[c] | |  |  |         |
 //	|         | [    key4   ]  \  - txn  meta | |  (no latches) |-->-^  |         |
 //	|         | [    key5   ]    -------------+-|---------------+ |     |         |
 //	|         | [    ...    ]                   v                 |     |         ^
-//	|         +---------------------------------|-----------------+     |         | if lock found, HandleWriterIntentError()
+//	|         +---------------------------------|-----------------+     |         | if lock found, HandleLockConflictError()
 //	|                 |                         |                       |         |  - enter lockWaitQueue
 //	|                 |       +- may be remote -+--+                    |         |  - drop latches
 //	|                 |       |                    |                    |         |  - wait for lock update / release
@@ -212,7 +212,7 @@ type RequestSequencer interface {
 // typically involves preparing the request to be queued upon a retry. It is one
 // of the roles of Manager.
 type ContentionHandler interface {
-	// HandleWriterIntentError consumes a WriteIntentError by informing the
+	// HandleLockConflictError consumes a LockConflictError by informing the
 	// concurrency manager about the replicated write intent that was missing
 	// from its lock table which was found during request evaluation (while
 	// holding latches) under the provided lease sequence. After doing so, it
@@ -225,12 +225,12 @@ type ContentionHandler interface {
 	// Example usage: Txn A scans the lock table and does not see an intent on
 	// key K from txn B because the intent is not being tracked in the lock
 	// table. Txn A moves on to evaluation. While scanning, it notices the
-	// intent on key K. It throws a WriteIntentError which is consumed by this
+	// intent on key K. It throws a LockConflictError which is consumed by this
 	// method before txn A retries its scan. During the retry, txn A scans the
 	// lock table and observes the lock on key K, so it enters the lock's
 	// wait-queue and waits for it to be resolved.
-	HandleWriterIntentError(
-		context.Context, *Guard, roachpb.LeaseSequence, *kvpb.WriteIntentError,
+	HandleLockConflictError(
+		context.Context, *Guard, roachpb.LeaseSequence, *kvpb.LockConflictError,
 	) (*Guard, *Error)
 
 	// HandleTransactionPushError consumes a TransactionPushError thrown by a
@@ -402,7 +402,7 @@ type Request struct {
 	// level of quality-of-service under severe per-key contention. If set
 	// to a non-zero value and an existing lock wait-queue is already equal
 	// to or exceeding this length, the request will be rejected eagerly
-	// with a WriteIntentError instead of entering the queue and waiting.
+	// with a LockConflictError instead of entering the queue and waiting.
 	MaxLockWaitQueueLength int
 
 	// The poison.Policy to use for this Request.
@@ -529,7 +529,7 @@ type latchGuard interface{}
 //	+---------------------------------------------------+
 //	| [ lockTable ]                                     |
 //	| [    key1   ]    -------------+-----------------+ |
-//	| [    key2   ]  /  lockState:  | lockWaitQueue:  | |
+//	| [    key2   ]  /  keyLocks:   | lockWaitQueue:  | |
 //	| [    key3   ]-{   - lock type | <-[a]<-[b]<-[c] | |
 //	| [    key4   ]  \  - txn meta  |                 | |
 //	| [    key5   ]    -------------+-----------------+ |
@@ -637,8 +637,9 @@ type lockTable interface {
 	// true) or whether it was ignored because the lockTable is currently
 	// disabled (false).
 	AddDiscoveredLock(
-		intent *roachpb.Intent, seq roachpb.LeaseSequence, consultTxnStatusCache bool,
-		guard lockTableGuard) (bool, error)
+		foundLock *roachpb.Lock, seq roachpb.LeaseSequence,
+		consultTxnStatusCache bool, guard lockTableGuard,
+	) (bool, error)
 
 	// AcquireLock informs the lockTable that a new lock was acquired or an
 	// existing lock was updated.
@@ -773,23 +774,21 @@ type lockTableGuard interface {
 	// that conflict.
 	CheckOptimisticNoConflicts(*lockspanset.LockSpanSet) (ok bool)
 
-	// IsKeyLockedByConflictingTxn returns whether the specified key is claimed
-	// (see claimantTxn()) by a conflicting transaction in the lockTableGuard's
-	// snapshot of the lock table, given the caller's own desired locking
-	// strength. If so, true is returned. If the key is locked, the lock holder is
-	// also returned. Otherwise, if the key was claimed by a concurrent request
-	// still sequencing through the lock table, but the lock isn't held (yet), nil
-	// is also returned.
+	// IsKeyLockedByConflictingTxn returns whether the specified key is locked by
+	// a conflicting transaction in the lockTableGuard's snapshot of the lock
+	// table, given the caller's own desired locking strength. If so, true is
+	// returned and so is the lock holder. If the lock is held by the transaction
+	// itself, there's no conflict to speak of, so false is returned.
 	//
-	// If the lock has been claimed (held or otherwise) by the transaction itself,
-	// there's no conflict to speak of, so false is returned. In cases where the
-	// lock isn't held, but the lock has been claimed by the transaction itself,
-	// we do not make a distinction about which request claimed the key -- it
-	// could either be the request itself, or a different concurrent request from
-	// the same transaction; The specifics do not affect the caller.
 	// This method is used by requests in conjunction with the SkipLocked wait
 	// policy to determine which keys they should skip over during evaluation.
-	IsKeyLockedByConflictingTxn(roachpb.Key, lock.Strength) (bool, *enginepb.TxnMeta)
+	//
+	// If the supplied lock strength is locking (!= lock.None), then any queued
+	// locking requests that came before the lockTableGuard will also be checked
+	// for conflicts. This helps prevent a stream of locking SKIP LOCKED requests
+	// from starving out regular locking requests. In such cases, true is
+	// returned, but so is nil.
+	IsKeyLockedByConflictingTxn(roachpb.Key, lock.Strength) (bool, *enginepb.TxnMeta, error)
 }
 
 // lockTableWaiter is concerned with waiting in lock wait-queues for locks held
@@ -994,7 +993,7 @@ type txnWaitQueue interface {
 	//
 	// If the transaction is successfully pushed while this method is waiting,
 	// the first return value is a non-nil PushTxnResponse object.
-	MaybeWaitForPush(context.Context, *kvpb.PushTxnRequest) (*kvpb.PushTxnResponse, *Error)
+	MaybeWaitForPush(context.Context, *kvpb.PushTxnRequest, lock.WaitPolicy) (*kvpb.PushTxnResponse, *Error)
 
 	// MaybeWaitForQuery checks whether there is a queue already established for
 	// transaction being queried. If not, or if the QueryTxn request hasn't

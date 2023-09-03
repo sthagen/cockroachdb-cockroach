@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -42,6 +43,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/kvclientutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -142,6 +144,7 @@ type clusterCfg struct {
 	beforeVersion     string
 	testingKnobCfg    string
 	defaultTestTenant base.DefaultTestTenantOptions
+	randomTxnRetries  bool
 }
 
 func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
@@ -149,12 +152,19 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 	params.ServerArgs.ExternalIODirConfig = cfg.ioConf
 
 	params.ServerArgs.DefaultTestTenant = cfg.defaultTestTenant
+	var transactionRetryFilter func(roachpb.Transaction) bool
+	if cfg.randomTxnRetries {
+		transactionRetryFilter = kvclientutils.RandomTransactionRetryFilter()
+	}
 	params.ServerArgs.Knobs = base.TestingKnobs{
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		TenantTestingKnobs: &sql.TenantTestingKnobs{
 			// The tests in this package are particular about the tenant IDs
 			// they get in CREATE TENANT.
 			EnableTenantIDReuse: true,
+		},
+		KVClient: &kvcoord.ClientTestingKnobs{
+			TransactionRetryFilter: transactionRetryFilter,
 		},
 	}
 
@@ -175,6 +185,7 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 
 	closedts.TargetDuration.Override(context.Background(), &settings.SV, 10*time.Millisecond)
 	closedts.SideTransportCloseInterval.Override(context.Background(), &settings.SV, 10*time.Millisecond)
+	kvserver.RangeFeedRefreshInterval.Override(context.Background(), &settings.SV, 10*time.Millisecond)
 	sql.TempObjectWaitInterval.Override(context.Background(), &settings.SV, time.Millisecond)
 	params.ServerArgs.Settings = settings
 
@@ -513,6 +524,9 @@ func runTestDataDriven(t *testing.T, testFilePathFromWorkspace string) {
 				defaultTestTenant = base.TODOTestTenantDisabled
 			}
 
+			// TODO(ssd): Once TestServer starts up reliably enough:
+			// randomTxnRetries := !d.HasArg("disable-txn-retries")
+			randomTxnRetries := false
 			lastCreatedCluster = name
 			cfg := clusterCfg{
 				name:              name,
@@ -524,6 +538,7 @@ func runTestDataDriven(t *testing.T, testFilePathFromWorkspace string) {
 				beforeVersion:     beforeVersion,
 				testingKnobCfg:    testingKnobCfg,
 				defaultTestTenant: defaultTestTenant,
+				randomTxnRetries:  randomTxnRetries,
 			}
 			err := ds.addCluster(t, cfg)
 			if err != nil {
@@ -811,12 +826,9 @@ func runTestDataDriven(t *testing.T, testFilePathFromWorkspace string) {
 			return ""
 
 		case "create-dummy-system-table":
-			db := ds.firstNode[lastCreatedCluster].DB()
-			execCfg := ds.firstNode[lastCreatedCluster].ExecutorConfig().(sql.ExecutorConfig)
-			testTenants := ds.firstNode[lastCreatedCluster].TestTenants()
-			if len(testTenants) > 0 {
-				execCfg = testTenants[0].ExecutorConfig().(sql.ExecutorConfig)
-			}
+			al := ds.firstNode[lastCreatedCluster].ApplicationLayer()
+			db := al.DB()
+			execCfg := al.ExecutorConfig().(sql.ExecutorConfig)
 			codec := execCfg.Codec
 			dummyTable := systemschema.SettingsTable
 			err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {

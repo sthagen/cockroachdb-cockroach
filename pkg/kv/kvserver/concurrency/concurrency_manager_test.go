@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
@@ -69,8 +70,8 @@ import (
 // poison       req=<req-name>
 // finish       req=<req-name>
 //
-// handle-write-intent-error  req=<req-name> txn=<txn-name> key=<key> lease-seq=<seq>
-// handle-txn-push-error      req=<req-name> txn=<txn-name> key=<key>  TODO(nvanbenschoten): implement this
+// handle-lock-conflict-error  req=<req-name> txn=<txn-name> key=<key> lease-seq=<seq>
+// handle-txn-push-error       req=<req-name> txn=<txn-name> key=<key>  TODO(nvanbenschoten): implement this
 //
 // check-opt-no-conflicts            req=<req-name>
 // is-key-locked-by-conflicting-txn  req=<req-name> key=<key> strength=<strength>
@@ -99,6 +100,11 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t, "concurrency_manager"), func(t *testing.T, path string) {
 		c := newCluster()
+		if strings.HasSuffix(path, "_v23_1") {
+			v := clusterversion.ByKey(clusterversion.V23_1)
+			st := clustersettings.MakeTestingClusterSettingsWithVersions(v, v, true)
+			c = newClusterWithSettings(st)
+		}
 		c.enableTxnPushes()
 		m := concurrency.NewManager(c.makeConfig())
 		m.OnRangeLeaseUpdated(1, true /* isLeaseholder */) // enable
@@ -193,7 +199,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 
 				// Each kvpb.Request is provided on an indented line.
 				reqs, reqUnions := scanRequests(t, d, c)
-				latchSpans, lockSpans := c.collectSpans(t, txn, ts, reqs)
+				latchSpans, lockSpans := c.collectSpans(t, txn, ts, waitPolicy, reqs)
 
 				c.requestsByName[reqName] = concurrency.Request{
 					Txn:                    txn,
@@ -295,7 +301,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				})
 				return c.waitAndCollect(t, mon)
 
-			case "handle-write-intent-error":
+			case "handle-lock-conflict-error":
 				var reqName string
 				d.ScanArgs(t, "req", &reqName)
 				prev, ok := c.guardsByReqName[reqName]
@@ -306,17 +312,17 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				var leaseSeq int
 				d.ScanArgs(t, "lease-seq", &leaseSeq)
 
-				// Each roachpb.Intent is provided on an indented line.
-				var intents []roachpb.Intent
+				// Each roachpb.Lock is provided on an indented line.
+				var locks []roachpb.Lock
 				singleReqLines := strings.Split(d.Input, "\n")
 				for _, line := range singleReqLines {
 					var err error
 					d.Cmd, d.CmdArgs, err = datadriven.ParseLine(line)
 					if err != nil {
-						d.Fatalf(t, "error parsing single intent: %v", err)
+						d.Fatalf(t, "error parsing single lock: %v", err)
 					}
-					if d.Cmd != "intent" {
-						d.Fatalf(t, "expected \"intent\", found %s", d.Cmd)
+					if d.Cmd != "lock" {
+						d.Fatalf(t, "expected \"lock\", found %s", d.Cmd)
 					}
 
 					var txnName string
@@ -329,21 +335,21 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					var key string
 					d.ScanArgs(t, "key", &key)
 
-					intents = append(intents, roachpb.MakeIntent(&txn.TxnMeta, roachpb.Key(key)))
+					locks = append(locks, roachpb.MakeLock(&txn.TxnMeta, roachpb.Key(key), lock.Intent))
 				}
 
-				opName := fmt.Sprintf("handle write intent error %s", reqName)
+				opName := fmt.Sprintf("handle lock conflict error %s", reqName)
 				mon.runAsync(opName, func(ctx context.Context) {
 					seq := roachpb.LeaseSequence(leaseSeq)
-					wiErr := &kvpb.WriteIntentError{Intents: intents}
-					guard, err := m.HandleWriterIntentError(ctx, prev, seq, wiErr)
+					lcErr := &kvpb.LockConflictError{Locks: locks}
+					guard, err := m.HandleLockConflictError(ctx, prev, seq, lcErr)
 					if err != nil {
-						log.Eventf(ctx, "handled %v, returned error: %v", wiErr, err)
+						log.Eventf(ctx, "handled %v, returned error: %v", lcErr, err)
 						c.mu.Lock()
 						delete(c.guardsByReqName, reqName)
 						c.mu.Unlock()
 					} else {
-						log.Eventf(ctx, "handled %v, released latches", wiErr)
+						log.Eventf(ctx, "handled %v, released latches", lcErr)
 						c.mu.Lock()
 						c.guardsByReqName[reqName] = guard
 						c.mu.Unlock()
@@ -359,7 +365,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					d.Fatalf(t, "unknown request: %s", reqName)
 				}
 				reqs, _ := scanRequests(t, d, c)
-				latchSpans, lockSpans := c.collectSpans(t, g.Req.Txn, g.Req.Timestamp, reqs)
+				latchSpans, lockSpans := c.collectSpans(t, g.Req.Txn, g.Req.Timestamp, g.Req.WaitPolicy, reqs)
 				return fmt.Sprintf("no-conflicts: %t", g.CheckOptimisticNoConflicts(latchSpans, lockSpans))
 
 			case "is-key-locked-by-conflicting-txn":
@@ -372,7 +378,11 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				var key string
 				d.ScanArgs(t, "key", &key)
 				strength := concurrency.ScanLockStrength(t, d)
-				if ok, txn := g.IsKeyLockedByConflictingTxn(roachpb.Key(key), strength); ok {
+				ok, txn, err := g.IsKeyLockedByConflictingTxn(roachpb.Key(key), strength)
+				if err != nil {
+					return err.Error()
+				}
+				if ok {
 					holder := "<nil>"
 					if txn != nil {
 						holder = txn.ID.String()
@@ -683,11 +693,15 @@ type txnPush struct {
 }
 
 func newCluster() *cluster {
+	return newClusterWithSettings(clustersettings.MakeTestingClusterSettings())
+}
+
+func newClusterWithSettings(st *clustersettings.Settings) *cluster {
 	manual := timeutil.NewManualTime(timeutil.Unix(123, 0))
 	return &cluster{
 		nodeDesc:  &roachpb.NodeDescriptor{NodeID: 1},
 		rangeDesc: &roachpb.RangeDescriptor{RangeID: 1},
-		st:        clustersettings.MakeTestingClusterSettings(),
+		st:        st,
 		manual:    manual,
 		clock:     hlc.NewClockForTesting(manual),
 
@@ -781,8 +795,8 @@ func (c *cluster) PushTransaction(
 			pusheeTxn, _ = pusheeRecord.asTxn()
 			return pusheeTxn, nil
 		}
-		// If PUSH_TOUCH, return error instead of waiting.
-		if pushType == kvpb.PUSH_TOUCH {
+		// If PUSH_TOUCH or WaitPolicy_Error, return error instead of waiting.
+		if pushType == kvpb.PUSH_TOUCH || h.WaitPolicy == lock.WaitPolicy_Error {
 			log.Eventf(ctx, "pushee not abandoned")
 			err := kvpb.NewTransactionPushError(*pusheeTxn)
 			return nil, kvpb.NewError(err)
@@ -1028,10 +1042,10 @@ func (c *cluster) resetNamespace() {
 // collectSpans collects the declared spans for a set of requests.
 // Its logic mirrors that in Replica.collectSpans.
 func (c *cluster) collectSpans(
-	t *testing.T, txn *roachpb.Transaction, ts hlc.Timestamp, reqs []kvpb.Request,
+	t *testing.T, txn *roachpb.Transaction, ts hlc.Timestamp, wp lock.WaitPolicy, reqs []kvpb.Request,
 ) (latchSpans *spanset.SpanSet, lockSpans *lockspanset.LockSpanSet) {
 	latchSpans, lockSpans = &spanset.SpanSet{}, &lockspanset.LockSpanSet{}
-	h := kvpb.Header{Txn: txn, Timestamp: ts}
+	h := kvpb.Header{Txn: txn, Timestamp: ts, WaitPolicy: wp}
 	for _, req := range reqs {
 		if cmd, ok := batcheval.LookupCommand(req.Method()); ok {
 			cmd.DeclareKeys(c.rangeDesc, &h, req, latchSpans, lockSpans, 0)

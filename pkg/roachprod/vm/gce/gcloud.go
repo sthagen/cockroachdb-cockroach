@@ -36,12 +36,11 @@ import (
 )
 
 const (
-	defaultProject = "cockroach-ephemeral"
-	// ProviderName is gce.
+	defaultProject      = "cockroach-ephemeral"
 	ProviderName        = "gce"
-	DefaultImage        = "ubuntu-2004-focal-v20210603"
-	ARM64Image          = "ubuntu-2004-focal-arm64-v20230523"
-	FIPSImage           = "ubuntu-pro-fips-2004-focal-v20230302"
+	DefaultImage        = "ubuntu-2004-focal-v20230817"
+	ARM64Image          = "ubuntu-2004-focal-arm64-v20230817"
+	FIPSImage           = "ubuntu-pro-fips-2004-focal-v20230811"
 	defaultImageProject = "ubuntu-os-cloud"
 	FIPSImageProject    = "ubuntu-os-pro-cloud"
 )
@@ -55,7 +54,7 @@ func DefaultProject() string {
 }
 
 // projects for which a cron GC job exists.
-var projectsWithGC = []string{defaultProject, "andrei-jepsen"}
+var projectsWithGC = []string{defaultProject}
 
 // Denotes if this provider was successfully initialized.
 var initialized = false
@@ -238,8 +237,6 @@ func (jsonVM *jsonVM) toVM(
 		MachineType:            machineType,
 		Zone:                   zone,
 		Project:                project,
-		SQLPort:                config.DefaultSQLPort,
-		AdminUIPort:            config.DefaultAdminUIPort,
 		NonBootAttachedVolumes: volumes,
 		LocalDisks:             localDisks,
 	}
@@ -883,6 +880,54 @@ func (p *Provider) ConfigSSH(l *logger.Logger, zones []string) error {
 	return nil
 }
 
+func (p *Provider) editLabels(
+	l *logger.Logger, vms vm.List, labels map[string]string, remove bool,
+) error {
+	cmdArgs := []string{"compute", "instances"}
+	if remove {
+		cmdArgs = append(cmdArgs, "remove-labels")
+	} else {
+		cmdArgs = append(cmdArgs, "add-labels")
+	}
+
+	tagArgs := make([]string, 0, len(labels))
+	for key, value := range labels {
+		if remove {
+			tagArgs = append(tagArgs, key)
+		} else {
+			tagArgs = append(tagArgs, fmt.Sprintf("%s=%s", key, vm.SanitizeLabel(value)))
+		}
+	}
+	tagArgsString := strings.Join(tagArgs, ",")
+	commonArgs := []string{"--project", p.GetProject(), fmt.Sprintf("--labels=%s", tagArgsString)}
+
+	for _, v := range vms {
+		vmArgs := make([]string, len(cmdArgs))
+		copy(vmArgs, cmdArgs)
+
+		vmArgs = append(vmArgs, v.Name, "--zone", v.Zone)
+		vmArgs = append(vmArgs, commonArgs...)
+		cmd := exec.Command("gcloud", vmArgs...)
+		if b, err := cmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", vmArgs, string(b))
+		}
+	}
+	return nil
+}
+
+// AddLabels adds the given labels to the given VMs.
+func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	return p.editLabels(l, vms, labels, false /* remove */)
+}
+
+func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+	labelsMap := make(map[string]string, len(labels))
+	for _, label := range labels {
+		labelsMap[label] = ""
+	}
+	return p.editLabels(l, vms, labelsMap, true /* remove */)
+}
+
 // Create TODO(peter): document
 func (p *Provider) Create(
 	l *logger.Logger, names []string, opts vm.CreateOpts, vmProviderOpts vm.ProviderOpts,
@@ -1295,24 +1340,9 @@ func (p *Provider) Reset(l *logger.Logger, vms vm.List) error {
 
 // Extend TODO(peter): document
 func (p *Provider) Extend(l *logger.Logger, vms vm.List, lifetime time.Duration) error {
-	// The gcloud command only takes a single instance.  Unlike Delete() above, we have to
-	// perform the iteration here.
-	for _, v := range vms {
-		args := []string{"compute", "instances", "add-labels"}
-
-		args = append(args, "--project", v.Project)
-		args = append(args, "--zone", v.Zone)
-		args = append(args, "--labels", fmt.Sprintf("lifetime=%s", lifetime))
-		args = append(args, v.Name)
-
-		cmd := exec.Command("gcloud", args...)
-
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return errors.Wrapf(err, "Command: gcloud %s\nOutput: %s", args, output)
-		}
-	}
-	return nil
+	return p.AddLabels(l, vms, map[string]string{
+		"lifetime": lifetime.String(),
+	})
 }
 
 // FindActiveAccount TODO(peter): document

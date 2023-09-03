@@ -240,6 +240,7 @@ func TestPrepareExplain(t *testing.T) {
 		"EXPLAIN (TYPES) SELECT * FROM abc WHERE c=1",
 		"EXPLAIN (DISTSQL) SELECT * FROM abc WHERE c=1",
 		"EXPLAIN (VEC) SELECT * FROM abc WHERE c=1",
+		"EXPLAIN ANALYZE SELECT * FROM abc WHERE c=1",
 	}
 
 	for _, sql := range statements {
@@ -520,9 +521,10 @@ func TestExplainRedact(t *testing.T) {
 	t.Log("seed:", seed)
 
 	params, _ := createTestServerParams()
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-	defer sqlDB.Close()
+	srv, sqlDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
+	sql.SecondaryTenantScatterEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
 
 	query := func(sql string) (*gosql.Rows, error) {
 		return sqlDB.QueryContext(ctx, sql)

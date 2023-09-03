@@ -45,7 +45,7 @@ var ExportRequestTargetFileSize = settings.RegisterByteSizeSetting(
 		SSTTargetSizeSetting, MaxExportOverageSetting,
 	),
 	16<<20,
-).WithPublic()
+	settings.WithPublic)
 
 // MaxExportOverageSetting is the cluster setting name for the
 // ExportRequestMaxAllowedFileSizeOverage setting.
@@ -63,7 +63,7 @@ var ExportRequestMaxAllowedFileSizeOverage = settings.RegisterByteSizeSetting(
 		SSTTargetSizeSetting, MaxExportOverageSetting,
 	),
 	64<<20, /* 64 MiB */
-).WithPublic()
+	settings.WithPublic)
 
 func init() {
 	RegisterReadOnlyCommand(kvpb.Export, declareKeysExport, evalExport)
@@ -155,7 +155,7 @@ func evalExport(
 	}
 
 	var maxIntents uint64
-	if m := storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
+	if m := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV); m > 0 {
 		maxIntents = uint64(m)
 	}
 

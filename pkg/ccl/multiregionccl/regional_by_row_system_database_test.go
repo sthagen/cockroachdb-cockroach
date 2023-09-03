@@ -36,13 +36,13 @@ func TestRegionalByRowTablesInTheSystemDatabase(t *testing.T) {
 	sqlutils.MakeSQLRunner(sqlDB).Exec(t, `
 ALTER TENANT ALL
 SET CLUSTER SETTING
-sql.multi_region.allow_abstractions_for_secondary_tenants.enabled = true;`)
+sql.virtual_cluster.feature_access.multiregion.enabled = true;`)
 	tenant, tenantDB := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
 		TenantName:  "test",
 		TenantID:    serverutils.TestTenantID(),
 		UseDatabase: "defaultdb",
 	})
-	defer tenant.Stopper().Stop(ctx)
+	defer tenant.AppStopper().Stop(ctx)
 
 	tdb := sqlutils.MakeSQLRunner(tenantDB)
 	tdb.Exec(t, `ALTER DATABASE system SET PRIMARY REGION "us-east1";`)

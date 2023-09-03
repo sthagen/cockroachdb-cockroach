@@ -18,6 +18,7 @@ import {
 import * as matchers from "redux-saga-test-plan/matchers";
 import { expectSaga } from "redux-saga-test-plan";
 import {
+  DatabaseDetailsReqParams,
   DatabaseDetailsResponse,
   getDatabaseDetails,
   SqlApiResponse,
@@ -33,11 +34,13 @@ import {
   KeyedDatabaseDetailsState,
   reducer,
 } from "./databaseDetails.reducer";
+import { indexUnusedDuration } from "src/util/constants";
 
 describe("DatabaseDetails sagas", () => {
   const database = "test_db";
-  const requestAction: PayloadAction<string> = {
-    payload: database,
+  const csIndexUnusedDuration = indexUnusedDuration;
+  const requestAction: PayloadAction<DatabaseDetailsReqParams> = {
+    payload: { database, csIndexUnusedDuration },
     type: "request",
   };
   const databaseDetailsResponse: SqlApiResponse<DatabaseDetailsResponse> = {

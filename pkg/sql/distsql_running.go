@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -71,15 +70,7 @@ var settingDistSQLNumRunners = settings.RegisterIntSetting(
 	// The choice of the default multiple of 4 was made in order to get the
 	// original value of 16 on machines with 4 CPUs.
 	4*int64(runtime.GOMAXPROCS(0)), /* defaultValue */
-	func(v int64) error {
-		if v < 0 {
-			return errors.Errorf("cannot be set to a negative value: %d", v)
-		}
-		if v > distSQLNumRunnersMax {
-			return errors.Errorf("cannot be set to a value exceeding %d: %d", distSQLNumRunnersMax, v)
-		}
-		return nil
-	},
+	settings.IntInRange(0, distSQLNumRunnersMax),
 )
 
 // Somewhat arbitrary upper bound.
@@ -832,7 +823,7 @@ func (dsp *DistSQLPlanner) Run(
 	defer dsp.distSQLSrv.ServerConfig.Metrics.QueryStop()
 
 	recv.outputTypes = plan.GetResultTypes()
-	if multitenant.TenantRUEstimateEnabled.Get(&dsp.st.SV) &&
+	if execinfra.IncludeRUEstimateInExplainAnalyze.Get(&dsp.st.SV) &&
 		dsp.distSQLSrv.TenantCostController != nil && planCtx.planner != nil {
 		if instrumentation := planCtx.planner.curPlan.instrumentation; instrumentation != nil {
 			// Only collect the network egress estimate for a tenant that is running

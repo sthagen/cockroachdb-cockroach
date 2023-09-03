@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
@@ -50,7 +51,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
-	"golang.org/x/sys/unix"
 )
 
 // verifyClusterName ensures that the given name conforms to
@@ -224,24 +224,6 @@ func CachedClusters(l *logger.Logger, fn func(clusterName string, numVMs int)) {
 	}
 }
 
-// acquireFilesystemLock acquires a filesystem lock in order that concurrent
-// operations or roachprod processes that access shared system resources do
-// not conflict.
-func acquireFilesystemLock() (unlockFn func(), _ error) {
-	lockFile := os.ExpandEnv("$HOME/.roachprod/LOCK")
-	f, err := os.Create(lockFile)
-	if err != nil {
-		return nil, errors.Wrapf(err, "creating lock file %q", lockFile)
-	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		f.Close()
-		return nil, errors.Wrap(err, "acquiring lock on %q")
-	}
-	return func() {
-		f.Close()
-	}, nil
-}
-
 // Sync grabs an exclusive lock on the roachprod state and then proceeds to
 // read the current state from the cloud and write it out to disk. The locking
 // protects both the reading and the writing in order to prevent the hazard
@@ -251,7 +233,7 @@ func Sync(l *logger.Logger, options vm.ListOptions) (*cloud.Cloud, error) {
 	if !config.Quiet {
 		l.Printf("Syncing...")
 	}
-	unlock, err := acquireFilesystemLock()
+	unlock, err := lock.AcquireFilesystemLock(config.DefaultLockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -361,6 +343,14 @@ func List(
 	return filteredCloud, nil
 }
 
+// TruncateString truncates a string to maxLength and adds "..." to the end.
+func TruncateString(s string, maxLength int) string {
+	if len(s) > maxLength {
+		return s[:maxLength-3] + "..."
+	}
+	return s
+}
+
 // Run runs a command on the nodes in a cluster.
 func Run(
 	ctx context.Context,
@@ -386,11 +376,7 @@ func Run(
 	}
 
 	cmd := strings.TrimSpace(strings.Join(cmdArray, " "))
-	title := cmd
-	if len(title) > 30 {
-		title = title[:27] + "..."
-	}
-	return c.Run(ctx, l, stdout, stderr, c.Nodes, title, cmd, opts...)
+	return c.Run(ctx, l, stdout, stderr, c.Nodes, TruncateString(cmd, 30), cmd, opts...)
 }
 
 // RunWithDetails runs a command on the nodes in a cluster.
@@ -416,11 +402,7 @@ func RunWithDetails(
 	}
 
 	cmd := strings.TrimSpace(strings.Join(cmdArray, " "))
-	title := cmd
-	if len(title) > 30 {
-		title = title[:27] + "..."
-	}
-	return c.RunWithDetails(ctx, l, c.Nodes, title, cmd)
+	return c.RunWithDetails(ctx, l, c.Nodes, TruncateString(cmd, 30), cmd)
 }
 
 // SQL runs `cockroach sql` on a remote cluster. If a single node is passed,
@@ -437,6 +419,7 @@ func SQL(
 	clusterName string,
 	secure bool,
 	tenantName string,
+	tenantInstance int,
 	cmdArray []string,
 ) error {
 	if err := LoadClusters(); err != nil {
@@ -447,9 +430,9 @@ func SQL(
 		return err
 	}
 	if len(c.Nodes) == 1 {
-		return c.ExecOrInteractiveSQL(ctx, l, tenantName, cmdArray)
+		return c.ExecOrInteractiveSQL(ctx, l, tenantName, tenantInstance, cmdArray)
 	}
-	return c.ExecSQL(ctx, l, tenantName, cmdArray)
+	return c.ExecSQL(ctx, l, c.Nodes, tenantName, tenantInstance, cmdArray)
 }
 
 // IP gets the ip addresses of the nodes in a cluster.
@@ -587,7 +570,7 @@ func SetupSSH(ctx context.Context, l *logger.Logger, clusterName string) error {
 
 	// Configure SSH for machines in the zones we operate on.
 	if err := vm.ProvidersSequential(providers, func(p vm.Provider) error {
-		unlock, lockErr := acquireFilesystemLock()
+		unlock, lockErr := lock.AcquireFilesystemLock(config.DefaultLockPath)
 		if lockErr != nil {
 			return lockErr
 		}
@@ -683,6 +666,8 @@ func DefaultStartOpts() install.StartOpts {
 		ScheduleBackups:    false,
 		ScheduleBackupArgs: "",
 		InitTarget:         1,
+		SQLPort:            config.DefaultSQLPort,
+		AdminUIPort:        config.DefaultAdminUIPort,
 	}
 }
 
@@ -907,9 +892,10 @@ func Get(ctx context.Context, l *logger.Logger, clusterName, src, dest string) e
 }
 
 type PGURLOptions struct {
-	Secure     bool
-	External   bool
-	TenantName string
+	Secure         bool
+	External       bool
+	TenantName     string
+	TenantInstance int
 }
 
 // PgURL generates pgurls for the nodes in a cluster.
@@ -931,23 +917,24 @@ func PgURL(
 			ips[i] = c.VMs[nodes[i]-1].PublicIP
 		}
 	} else {
-		if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
-			node := nodes[i]
-			res := &install.RunResultDetails{Node: node}
-			res.Stdout, res.Err = c.GetInternalIP(node)
-			ips[i] = res.Stdout
-			return res, nil
-		}); err != nil {
-			return nil, err
+		for i := 0; i < len(nodes); i++ {
+			ip, err := c.GetInternalIP(nodes[i])
+			if err == nil {
+				ips[i] = ip
+			}
 		}
 	}
 
 	var urls []string
 	for i, ip := range ips {
+		desc, err := c.DiscoverService(nodes[i], opts.TenantName, install.ServiceTypeSQL, opts.TenantInstance)
+		if err != nil {
+			return nil, err
+		}
 		if ip == "" {
 			return nil, errors.Errorf("empty ip: %v", ips)
 		}
-		urls = append(urls, c.NodeURL(ip, c.NodePort(nodes[i]), opts.TenantName))
+		urls = append(urls, c.NodeURL(ip, desc.Port, opts.TenantName))
 	}
 	if len(urls) != len(nodes) {
 		return nil, errors.Errorf("have nodes %v, but urls %v from ips %v", nodes, urls, ips)
@@ -956,11 +943,13 @@ func PgURL(
 }
 
 type urlConfig struct {
-	path          string
-	usePublicIP   bool
-	openInBrowser bool
-	secure        bool
-	port          int
+	path           string
+	usePublicIP    bool
+	openInBrowser  bool
+	secure         bool
+	port           int
+	tenantName     string
+	tenantInstance int
 }
 
 func urlGenerator(
@@ -981,8 +970,13 @@ func urlGenerator(
 		if uConfig.usePublicIP {
 			host = c.VMs[node-1].PublicIP
 		}
-		if uConfig.port == 0 {
-			uConfig.port = c.NodeUIPort(node)
+		port := uConfig.port
+		if port == 0 {
+			desc, err := c.DiscoverService(node, uConfig.tenantName, install.ServiceTypeUI, uConfig.tenantInstance)
+			if err != nil {
+				return nil, err
+			}
+			port = desc.Port
 		}
 		scheme := "http"
 		if c.Secure {
@@ -991,7 +985,7 @@ func urlGenerator(
 		if !strings.HasPrefix(uConfig.path, "/") {
 			uConfig.path = "/" + uConfig.path
 		}
-		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, uConfig.port, uConfig.path)
+		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, port, uConfig.path)
 		urls = append(urls, url)
 		if uConfig.openInBrowser {
 			cmd := browserCmd(url)
@@ -1022,7 +1016,11 @@ func browserCmd(url string) *exec.Cmd {
 
 // AdminURL generates admin UI URLs for the nodes in a cluster.
 func AdminURL(
-	l *logger.Logger, clusterName, path string, usePublicIP, openInBrowser, secure bool,
+	l *logger.Logger,
+	clusterName, tenantName string,
+	tenantInstance int,
+	path string,
+	usePublicIP, openInBrowser, secure bool,
 ) ([]string, error) {
 	if err := LoadClusters(); err != nil {
 		return nil, err
@@ -1032,10 +1030,12 @@ func AdminURL(
 		return nil, err
 	}
 	uConfig := urlConfig{
-		path:          path,
-		usePublicIP:   usePublicIP,
-		openInBrowser: openInBrowser,
-		secure:        secure,
+		path:           path,
+		usePublicIP:    usePublicIP,
+		openInBrowser:  openInBrowser,
+		secure:         secure,
+		tenantName:     tenantName,
+		tenantInstance: tenantInstance,
 	}
 	return urlGenerator(c, l, c.TargetNodes(), uConfig)
 }
@@ -1080,12 +1080,13 @@ func Pprof(ctx context.Context, l *logger.Logger, clusterName string, opts Pprof
 
 	httpClient := httputil.NewClientWithTimeout(timeout)
 	startTime := timeutil.Now().Unix()
-	nodes := c.TargetNodes()
-	err = c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
-		node := nodes[i]
+	err = c.Parallel(ctx, l, c.TargetNodes(), func(ctx context.Context, node install.Node) (*install.RunResultDetails, error) {
 		res := &install.RunResultDetails{Node: node}
 		host := c.Host(node)
-		port := c.NodeUIPort(node)
+		port, err := c.NodeUIPort(node)
+		if err != nil {
+			return nil, err
+		}
 		scheme := "http"
 		if c.Secure {
 			scheme = "https"
@@ -1200,7 +1201,7 @@ func Destroy(
 		if err != nil {
 			return err
 		}
-		cld, err = cloud.ListCloud(l, vm.ListOptions{})
+		cld, err = cloud.ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true})
 		if err != nil {
 			return err
 		}
@@ -1230,7 +1231,7 @@ func Destroy(
 			}
 			if cld == nil {
 				var err error
-				cld, err = cloud.ListCloud(l, vm.ListOptions{})
+				cld, err = cloud.ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true})
 				if err != nil {
 					return err
 				}
@@ -1248,7 +1249,12 @@ func destroyCluster(cld *cloud.Cloud, l *logger.Logger, clusterName string) erro
 	if !ok {
 		return fmt.Errorf("cluster %s does not exist", clusterName)
 	}
-	l.Printf("Destroying cluster %s with %d nodes", clusterName, len(c.VMs))
+	if c.IsEmptyCluster() {
+		l.Printf("Destroying empty cluster %s with 0 nodes", clusterName)
+	} else {
+		l.Printf("Destroying cluster %s with %d nodes", clusterName, len(c.VMs))
+	}
+
 	return cloud.DestroyCluster(l, c)
 }
 
@@ -1277,7 +1283,7 @@ func (e *ClusterAlreadyExistsError) Error() string {
 }
 
 func cleanupFailedCreate(l *logger.Logger, clusterName string) error {
-	cld, err := cloud.ListCloud(l, vm.ListOptions{})
+	cld, err := cloud.ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true})
 	if err != nil {
 		return err
 	}
@@ -1288,6 +1294,34 @@ func cleanupFailedCreate(l *logger.Logger, clusterName string) error {
 		return nil
 	}
 	return cloud.DestroyCluster(l, c)
+}
+
+func AddLabels(l *logger.Logger, clusterName string, labels map[string]string) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+
+	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+		return p.AddLabels(l, vms, labels)
+	})
+}
+
+func RemoveLabels(l *logger.Logger, clusterName string, labels []string) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+
+	return vm.FanOut(c.VMs, func(p vm.Provider, vms vm.List) error {
+		return p.RemoveLabels(l, vms, labels)
+	})
 }
 
 // Create TODO
@@ -1312,7 +1346,7 @@ func Create(
 	if isLocal {
 		// To ensure that multiple processes don't create local clusters at
 		// the same time (causing port collisions), acquire the lock file.
-		unlockFn, err := acquireFilesystemLock()
+		unlockFn, err := lock.AcquireFilesystemLock(config.DefaultLockPath)
 		if err != nil {
 			return err
 		}
@@ -1379,7 +1413,7 @@ func GC(l *logger.Logger, dryrun bool) error {
 	if err := LoadClusters(); err != nil {
 		return err
 	}
-	cld, err := cloud.ListCloud(l, vm.ListOptions{})
+	cld, err := cloud.ListCloud(l, vm.ListOptions{IncludeEmptyClusters: true})
 	if err == nil {
 		// GCClusters depends on ListCloud so only call it if ListCloud runs without errors
 		err = cloud.GCClusters(l, cld, dryrun)
@@ -1613,14 +1647,23 @@ func CreateSnapshot(
 	if err := LoadClusters(); err != nil {
 		return nil, err
 	}
+
 	c, err := newCluster(l, clusterName)
 	if err != nil {
 		return nil, err
 	}
+
 	nodes := c.TargetNodes()
 	nodesStatus, err := c.Status(ctx, l)
+
 	if err != nil {
 		return nil, err
+	}
+
+	// 1-indexed node IDs.
+	statusByNodeID := make(map[int]install.NodeStatus)
+	for _, status := range nodesStatus {
+		statusByNodeID[status.NodeID] = status
 	}
 
 	// TODO(irfansharif): Add validation that we're using some released version,
@@ -1631,12 +1674,11 @@ func CreateSnapshot(
 		syncutil.Mutex
 		snapshots []vm.VolumeSnapshot
 	}{}
-	if err := c.Parallel(ctx, l, len(nodes), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
-		node := nodes[i]
+	if err := c.Parallel(ctx, l, nodes, func(ctx context.Context, node install.Node) (*install.RunResultDetails, error) {
 		res := &install.RunResultDetails{Node: node}
 
 		cVM := c.VMs[node-1]
-		crdbVersion := nodesStatus[i].Version
+		crdbVersion := statusByNodeID[int(node)].Version
 		if crdbVersion == "" {
 			crdbVersion = "unknown"
 		}
@@ -1751,11 +1793,10 @@ func ApplySnapshots(
 	}
 
 	// Detach and delete existing volumes. This is destructive.
-	if err := c.Parallel(ctx, l, len(c.TargetNodes()), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
-		node := c.TargetNodes()[i]
+	if err := c.Parallel(ctx, l, c.TargetNodes(), func(ctx context.Context, node install.Node) (*install.RunResultDetails, error) {
 		res := &install.RunResultDetails{Node: node}
 
-		cVM := &c.VMs[i]
+		cVM := &c.VMs[node-1]
 		if err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
 			volumes, err := provider.ListVolumes(l, cVM)
 			if err != nil {
@@ -1776,8 +1817,7 @@ func ApplySnapshots(
 		return err
 	}
 
-	return c.Parallel(ctx, l, len(c.TargetNodes()), func(ctx context.Context, i int) (*install.RunResultDetails, error) {
-		node := c.TargetNodes()[i]
+	return c.Parallel(ctx, l, c.TargetNodes(), func(ctx context.Context, node install.Node) (*install.RunResultDetails, error) {
 		res := &install.RunResultDetails{Node: node}
 
 		volumeOpts := opts // make a copy
@@ -1786,13 +1826,14 @@ func ApplySnapshots(
 			volumeOpts.Labels[k] = v
 		}
 
-		cVM := &c.VMs[i]
+		// TODO: same issue as above if the target nodes are not sequential starting from 1
+		cVM := &c.VMs[node-1]
 		if err := vm.ForProvider(cVM.Provider, func(provider vm.Provider) error {
 			volumeOpts.Zone = cVM.Zone
 			// NB: The "-1" signifies that it's the first attached non-boot volume.
 			// This is typical naming convention in GCE clusters.
 			volumeOpts.Name = fmt.Sprintf("%s-%04d-1", clusterName, node)
-			volumeOpts.SourceSnapshotID = snapshots[i].ID
+			volumeOpts.SourceSnapshotID = snapshots[node-1].ID
 
 			volumes, err := provider.ListVolumes(l, cVM)
 			if err != nil {
@@ -1927,12 +1968,14 @@ func sendCaptureCommand(
 ) error {
 	nodes := c.TargetNodes()
 	httpClient := httputil.NewClientWithTimeout(0 /* timeout: None */)
-	_, err := c.ParallelE(ctx, l, len(nodes),
-		func(ctx context.Context, i int) (*install.RunResultDetails, error) {
-			node := nodes[i]
+	_, _, err := c.ParallelE(ctx, l, nodes,
+		func(ctx context.Context, node install.Node) (*install.RunResultDetails, error) {
+			port, err := c.NodeUIPort(node)
+			if err != nil {
+				return nil, err
+			}
 			res := &install.RunResultDetails{Node: node}
 			host := c.Host(node)
-			port := c.NodeUIPort(node)
 			scheme := "http"
 			if c.Secure {
 				scheme = "https"

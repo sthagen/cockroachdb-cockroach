@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -37,9 +38,10 @@ import (
 var TargetPeriodSetting = settings.RegisterDurationSetting(
 	settings.TenantReadOnly,
 	"tenant_cost_control_period",
-	"target duration between token bucket requests from tenants (requires restart)",
+	"target duration between token bucket requests (requires restart)",
 	10*time.Second,
-	checkDurationInRange(5*time.Second, 120*time.Second),
+	settings.WithName("tenant_cost_control.token_request_period"),
+	settings.DurationInRange(5*time.Second, 120*time.Second),
 )
 
 // CPUUsageAllowance is exported for testing purposes.
@@ -50,26 +52,28 @@ var CPUUsageAllowance = settings.RegisterDurationSetting(
 		"doesn't contribute to consumption; for example, if it is set to 10ms, "+
 		"that corresponds to 1% of a CPU",
 	10*time.Millisecond,
-	checkDurationInRange(0, 1000*time.Millisecond),
+	settings.WithName("tenant_cost_control.cpu_usage_allowance"),
+	settings.DurationInRange(0, 1000*time.Millisecond),
 )
 
 // ExternalIORUAccountingMode controls whether external ingress and
 // egress bytes are included in RU calculations.
-var ExternalIORUAccountingMode = *settings.RegisterValidatedStringSetting(
+var ExternalIORUAccountingMode = *settings.RegisterStringSetting(
 	settings.TenantReadOnly,
 	"tenant_external_io_ru_accounting_mode",
 	"controls how external IO RU accounting behaves; allowed values are 'on' (external IO RUs are accounted for and callers wait for RUs), "+
 		"'nowait' (external IO RUs are accounted for but callers do not wait for RUs), "+
 		"and 'off' (no external IO RU accounting)",
 	"on",
-	func(_ *settings.Values, s string) error {
+	settings.WithName("tenant_cost_control.external_io.ru_accounting_mode"),
+	settings.WithValidateString(func(_ *settings.Values, s string) error {
 		switch s {
 		case "on", "off", "nowait":
 			return nil
 		default:
 			return errors.Errorf("invalid value %q, expected 'on', 'off', or 'nowait'", s)
 		}
-	},
+	}),
 )
 
 type externalIORUAccountingMode int64
@@ -97,19 +101,6 @@ func externalIORUAccountingModeFromString(s string) externalIORUAccountingMode {
 	default:
 		// Default to off given an unknown value.
 		return externalIORUAccountingOff
-	}
-}
-
-// checkDurationInRange returns a function used to validate duration cluster
-// settings. Because these values are currently settable by the tenant, we need
-// to restrict the allowed values to avoid possible sabotage of the cost control
-// mechanisms.
-func checkDurationInRange(min, max time.Duration) func(v time.Duration) error {
-	return func(v time.Duration) error {
-		if v < min || v > max {
-			return errors.Errorf("value %s out of range (%s, %s)", v, min, max)
-		}
-		return nil
 	}
 }
 
@@ -788,9 +779,9 @@ func (c *tenantSideCostController) OnResponseWait(
 
 	// Account for the cost of write requests and read responses.
 	costCfg := c.costCfg.Load()
-	writeRU := costCfg.RequestCost(req)
-	readRU := costCfg.ResponseCost(resp)
-	totalRU := writeRU + readRU
+	writeKVRU, writeNetworkRU := costCfg.RequestCost(req)
+	readKVRU, readNetworkRU := costCfg.ResponseCost(resp)
+	totalRU := writeKVRU + readKVRU + writeNetworkRU + readNetworkRU
 
 	// TODO(andyk): Consider breaking up huge acquisition requests into chunks
 	// that can be fulfilled separately and reported separately. This would make
@@ -800,7 +791,7 @@ func (c *tenantSideCostController) OnResponseWait(
 	}
 
 	// Record the number of RUs consumed by the IO request.
-	if multitenant.TenantRUEstimateEnabled.Get(&c.settings.SV) {
+	if execinfra.IncludeRUEstimateInExplainAnalyze.Get(&c.settings.SV) {
 		if sp := tracing.SpanFromContext(ctx); sp != nil &&
 			sp.RecordingType() != tracingpb.RecordingOff {
 			sp.RecordStructured(&kvpb.TenantConsumption{
@@ -816,14 +807,16 @@ func (c *tenantSideCostController) OnResponseWait(
 		c.mu.consumption.WriteBatches += uint64(req.WriteReplicas())
 		c.mu.consumption.WriteRequests += uint64(req.WriteReplicas() * req.WriteCount())
 		c.mu.consumption.WriteBytes += uint64(req.WriteReplicas() * req.WriteBytes())
-		c.mu.consumption.KVRU += float64(writeRU)
-		c.mu.consumption.RU += float64(writeRU)
+		c.mu.consumption.KVRU += float64(writeKVRU)
+		c.mu.consumption.RU += float64(writeKVRU + writeNetworkRU)
+		c.mu.consumption.CrossRegionNetworkRU += float64(writeNetworkRU)
 	} else if resp.IsRead() {
 		c.mu.consumption.ReadBatches++
 		c.mu.consumption.ReadRequests += uint64(resp.ReadCount())
 		c.mu.consumption.ReadBytes += uint64(resp.ReadBytes())
-		c.mu.consumption.KVRU += float64(readRU)
-		c.mu.consumption.RU += float64(readRU)
+		c.mu.consumption.KVRU += float64(readKVRU)
+		c.mu.consumption.RU += float64(readKVRU + readNetworkRU)
+		c.mu.consumption.CrossRegionNetworkRU += float64(readNetworkRU)
 	}
 
 	return nil

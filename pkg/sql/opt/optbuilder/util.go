@@ -35,7 +35,7 @@ var multipleModificationsOfTableEnabled = settings.RegisterBoolSetting(
 		"modified multiple times by a single statement (multiple INSERT subqueries without ON "+
 		"CONFLICT cannot cause corruption and are always allowed)",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // windowAggregateFrame() returns a frame that any aggregate built as a window
 // can use.
@@ -694,7 +694,9 @@ func resolveNumericColumnRefs(tab cat.Table, columns []tree.ColumnID) (ordinals 
 		cnt := tab.ColumnCount()
 		for ord < cnt {
 			col := tab.Column(ord)
-			if col.ColID() == cat.StableID(c) && col.Visibility() != cat.Inaccessible {
+			// NOTE: Inverted columns cannot be referenced.
+			if col.Kind() != cat.Inverted && col.ColID() == cat.StableID(c) &&
+				col.Visibility() != cat.Inaccessible {
 				break
 			}
 			ord++

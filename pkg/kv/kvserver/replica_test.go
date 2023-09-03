@@ -1828,7 +1828,9 @@ func TestOptimizePuts(t *testing.T) {
 		// Save the original slice, allowing us to assert that it doesn't
 		// change when it is passed to optimizePuts.
 		oldRequests := batch.Requests
-		batch.Requests = optimizePuts(tc.engine, batch.Requests, false)
+		var err error
+		batch.Requests, err = optimizePuts(tc.engine, batch.Requests, false)
+		require.NoError(t, err)
 		if !reflect.DeepEqual(goldenRequests, oldRequests) {
 			t.Fatalf("%d: optimizePuts mutated the original request slice: %s",
 				i, pretty.Diff(goldenRequests, oldRequests),
@@ -3117,7 +3119,10 @@ func TestReplicaTSCacheForwardsIntentTS(t *testing.T) {
 				if _, pErr := tc.SendWrappedWith(kvpb.Header{Txn: txnOld}, &pArgs); pErr != nil {
 					t.Fatal(pErr)
 				}
-				iter := tc.engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{Prefix: true})
+				iter, err := tc.engine.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{Prefix: true})
+				if err != nil {
+					t.Fatal(err)
+				}
 				defer iter.Close()
 				mvccKey := storage.MakeMVCCMetadataKey(key)
 				iter.SeekGE(mvccKey)
@@ -3144,7 +3149,7 @@ func TestConditionalPutUpdatesTSCacheOnError(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
-	cfg.TestingKnobs.DontPushOnWriteIntentError = true
+	cfg.TestingKnobs.DontPushOnLockConflictError = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	// Set clock to time 2s and do the conditional put.
@@ -3181,8 +3186,8 @@ func TestConditionalPutUpdatesTSCacheOnError(t *testing.T) {
 	t3 := makeTS(3*time.Second.Nanoseconds(), 0)
 	tc.manualClock.MustAdvanceTo(t3.GoTime())
 	_, pErr = tc.SendWrapped(&cpArgs1)
-	if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-		t.Errorf("expected WriteIntentError; got %v", pErr)
+	if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+		t.Errorf("expected LockConflictError; got %v", pErr)
 	}
 
 	// Abort the intent and try a transactional conditional put at
@@ -3228,7 +3233,7 @@ func TestInitPutUpdatesTSCacheOnError(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	cfg := TestStoreConfig(hlc.NewClockForTesting(tc.manualClock))
-	cfg.TestingKnobs.DontPushOnWriteIntentError = true
+	cfg.TestingKnobs.DontPushOnLockConflictError = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	// InitPut args to write "0". Should succeed.
@@ -3274,8 +3279,8 @@ func TestInitPutUpdatesTSCacheOnError(t *testing.T) {
 	t3 := makeTS(3*time.Second.Nanoseconds(), 0)
 	tc.manualClock.MustAdvanceTo(t3.GoTime())
 	_, pErr = tc.SendWrapped(&ipArgs2)
-	if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-		t.Errorf("expected WriteIntentError; got %v", pErr)
+	if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+		t.Errorf("expected LockConflictError; got %v", pErr)
 	}
 
 	// Abort the intent and try a transactional init put at a later
@@ -3370,7 +3375,7 @@ func TestReplicaNoTSCacheUpdateOnFailure(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	cfg := TestStoreConfig(nil)
-	cfg.TestingKnobs.DontPushOnWriteIntentError = true
+	cfg.TestingKnobs.DontPushOnLockConflictError = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	// Test for both read & write attempts.
@@ -3394,8 +3399,8 @@ func TestReplicaNoTSCacheUpdateOnFailure(t *testing.T) {
 		ts := tc.Clock().Now() // later timestamp
 
 		_, pErr = tc.SendWrappedWith(kvpb.Header{Timestamp: ts}, args)
-		if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-			t.Errorf("expected WriteIntentError; got %v", pErr)
+		if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+			t.Errorf("expected LockConflictError; got %v", pErr)
 		}
 
 		// Write the intent again -- should not have its timestamp upgraded!
@@ -4665,7 +4670,7 @@ func TestEndTxnRollbackAbortedTransaction(t *testing.T) {
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
 		cfg := TestStoreConfig(nil)
-		cfg.TestingKnobs.DontPushOnWriteIntentError = true
+		cfg.TestingKnobs.DontPushOnLockConflictError = true
 		tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 		key := []byte("a")
@@ -4696,8 +4701,8 @@ func TestEndTxnRollbackAbortedTransaction(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, pErr := tc.Sender().Send(ctx, ba)
-		if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-			t.Errorf("expected write intent error, but got %s", pErr)
+		if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+			t.Errorf("expected lock conflict error, but got %s", pErr)
 		}
 
 		if populateAbortSpan {
@@ -4849,7 +4854,7 @@ func TestBatchRetryCantCommitIntents(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	cfg := TestStoreConfig(nil)
-	cfg.TestingKnobs.DontPushOnWriteIntentError = true
+	cfg.TestingKnobs.DontPushOnLockConflictError = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	key := roachpb.Key("a")
@@ -4918,8 +4923,8 @@ func TestBatchRetryCantCommitIntents(t *testing.T) {
 	// Intent should have been created.
 	gArgs := getArgs(key)
 	_, pErr = tc.SendWrapped(&gArgs)
-	if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-		t.Errorf("expected WriteIntentError, got: %v", pErr)
+	if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+		t.Errorf("expected LockConflictError, got: %v", pErr)
 	}
 
 	// Heartbeat should fail with a TransactionAbortedError.
@@ -4938,8 +4943,8 @@ func TestBatchRetryCantCommitIntents(t *testing.T) {
 	// Expect that the txn left behind an intent on key A.
 	gArgs = getArgs(key)
 	_, pErr = tc.SendWrapped(&gArgs)
-	if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-		t.Errorf("expected WriteIntentError, got: %v", pErr)
+	if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+		t.Errorf("expected LockConflictError, got: %v", pErr)
 	}
 }
 
@@ -5060,7 +5065,7 @@ func TestEndTxnResolveOnlyLocalIntents(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	tc := testContext{}
 	tsc := TestStoreConfig(nil)
-	tsc.TestingKnobs.DontPushOnWriteIntentError = true
+	tsc.TestingKnobs.DontPushOnLockConflictError = true
 	key := roachpb.Key("a")
 	splitKey := roachpb.RKey(key).Next()
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
@@ -5089,8 +5094,8 @@ func TestEndTxnResolveOnlyLocalIntents(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, pErr := newRepl.Send(ctx, ba)
-		if _, ok := pErr.GetDetail().(*kvpb.WriteIntentError); !ok {
-			t.Errorf("expected write intent error, but got %s", pErr)
+		if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
+			t.Errorf("expected lock conflict error, but got %s", pErr)
 		}
 	}
 
@@ -6764,7 +6769,7 @@ func TestChangeReplicasDuplicateError(t *testing.T) {
 
 // TestReplicaDanglingMetaIntent creates a dangling intent on a meta2
 // record and verifies that RangeLookup scans behave
-// appropriately. Normally, the old value and a write intent error
+// appropriately. Normally, the old value and a lock conflict error
 // should be returned. If IgnoreIntents is specified, then a random
 // choice of old or new is returned with no error.
 // TODO(tschottdorf): add a test in which there is a dangling intent on a
@@ -6780,7 +6785,7 @@ func TestReplicaDanglingMetaIntent(t *testing.T) {
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
 		cfg := TestStoreConfig(nil)
-		cfg.TestingKnobs.DontPushOnWriteIntentError = true
+		cfg.TestingKnobs.DontPushOnLockConflictError = true
 		cfg.TestingKnobs.DisableCanAckBeforeApplication = true
 		tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
@@ -6817,7 +6822,7 @@ func TestReplicaDanglingMetaIntent(t *testing.T) {
 		}
 
 		// Now lookup the range; should get the value. Since the lookup is
-		// not consistent, there's no WriteIntentError. It should return both
+		// not consistent, there's no LockConflictError. It should return both
 		// the committed descriptor and the intent descriptor.
 		//
 		// Note that 'A' < 'a'.
@@ -6838,8 +6843,8 @@ func TestReplicaDanglingMetaIntent(t *testing.T) {
 
 		// Switch to consistent lookups, which should run into the intent.
 		_, _, err = kv.RangeLookup(ctx, tc.Sender(), newKey, kvpb.CONSISTENT, 0, reverse)
-		if !errors.HasType(err, (*kvpb.WriteIntentError)(nil)) {
-			t.Fatalf("expected WriteIntentError, not %s", err)
+		if !errors.HasType(err, (*kvpb.LockConflictError)(nil)) {
+			t.Fatalf("expected LockConflictError, not %s", err)
 		}
 	})
 }
@@ -8235,7 +8240,7 @@ func TestMVCCStatsGCCommutesWithWrites(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 	key := tc.ScratchRange(t)
 	store, err := tc.Server(0).GetStores().(*Stores).GetStore(tc.Server(0).GetFirstStoreID())
@@ -8467,7 +8472,7 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "followerRead", func(t *testing.T, followerRead bool) {
 		testutils.RunTrueAndFalse(t, "thresholdFirst", func(t *testing.T, thresholdFirst bool) {
 			ctx := context.Background()
-			tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+			tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 				ReplicationMode: base.ReplicationManual,
 				ServerArgs: base.TestServerArgs{
 					Knobs: base.TestingKnobs{
@@ -9199,9 +9204,8 @@ func TestCancelPendingCommands(t *testing.T) {
 		t.Fatalf("command finished earlier than expected with error %v", pErr)
 	default:
 	}
-	tc.repl.raftMu.Lock()
-	tc.repl.disconnectReplicationRaftMuLocked(ctx)
-	tc.repl.raftMu.Unlock()
+	require.NoError(t, tc.store.RemoveReplica(ctx, tc.repl, tc.repl.Desc().NextReplicaID,
+		RemoveOptions{DestroyData: true}))
 	pErr := <-errChan
 	if _, ok := pErr.GetDetail().(*kvpb.AmbiguousResultError); !ok {
 		t.Errorf("expected AmbiguousResultError, got %v", pErr)
@@ -13933,7 +13937,7 @@ func TestRangeSplitRacesWithRead(t *testing.T) {
 
 	testutils.RunTrueAndFalse(t, "followerRead", func(t *testing.T, followerRead bool) {
 		ctx := context.Background()
-		tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+		tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 		})
 		defer tc.Stopper().Stop(ctx)
@@ -14063,7 +14067,7 @@ func TestRangeSplitAndRHSRemovalRacesWithFollowerRead(t *testing.T) {
 	startSplit := make(chan struct{})
 	unblockRead := make(chan struct{})
 	scratchRangeID := roachpb.RangeID(-1)
-	tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			1: {

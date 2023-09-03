@@ -18,6 +18,7 @@ import { DatabasesPage, DatabasesPageProps } from "./databasesPage";
 
 import * as H from "history";
 import { defaultFilters } from "src/queryFilter";
+import { indexUnusedDuration } from "src/util/constants";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabasesPageProps = {
@@ -26,6 +27,7 @@ const withLoadingIndicator: DatabasesPageProps = {
   lastError: undefined,
   automaticStatsCollectionEnabled: true,
   indexRecommendationsEnabled: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   databases: [],
   sortSetting: {
     ascending: false,
@@ -54,6 +56,7 @@ const withoutData: DatabasesPageProps = {
   lastError: null,
   automaticStatsCollectionEnabled: true,
   indexRecommendationsEnabled: false,
+  csIndexUnusedDuration: indexUnusedDuration,
   databases: [],
   sortSetting: {
     ascending: false,
@@ -83,6 +86,7 @@ const withData: DatabasesPageProps = {
   showNodeRegionsColumn: true,
   automaticStatsCollectionEnabled: true,
   indexRecommendationsEnabled: true,
+  csIndexUnusedDuration: indexUnusedDuration,
   sortSetting: {
     ascending: false,
     columnTitle: "name",

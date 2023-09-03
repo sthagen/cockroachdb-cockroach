@@ -32,7 +32,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -88,6 +87,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/google/pprof/profile"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/prometheus/common/expfmt"
 	raft "go.etcd.io/raft/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -115,7 +115,7 @@ var (
 
 type metricMarshaler interface {
 	json.Marshaler
-	PrintAsText(io.Writer) error
+	PrintAsText(io.Writer, expfmt.Format) error
 	ScrapeIntoPrometheus(pm *metric.PrometheusExporter)
 }
 
@@ -500,6 +500,7 @@ type systemStatusServer struct {
 	spanConfigReporter spanconfig.Reporter
 	rangeStatsFetcher  *rangestats.Fetcher
 	node               *Node
+	knobs              *TestingKnobs
 }
 
 // StmtDiagnosticsRequester is the interface into *stmtdiagnostics.Registry
@@ -618,6 +619,7 @@ func newSystemStatusServer(
 	clock *hlc.Clock,
 	rangeStatsFetcher *rangestats.Fetcher,
 	node *Node,
+	knobs *TestingKnobs,
 ) *systemStatusServer {
 	server := newStatusServer(
 		ambient,
@@ -645,6 +647,7 @@ func newSystemStatusServer(
 		spanConfigReporter: spanConfigReporter,
 		rangeStatsFetcher:  rangeStatsFetcher,
 		node:               node,
+		knobs:              knobs,
 	}
 }
 
@@ -1234,7 +1237,7 @@ func (s *statusServer) LogFilesList(
 		}
 		return status.LogFilesList(ctx, req)
 	}
-	log.Flush()
+	log.FlushFiles()
 	logFiles, err := log.ListLogFiles()
 	if err != nil {
 		return nil, srverrors.ServerError(ctx, err)
@@ -1274,7 +1277,7 @@ func (s *statusServer) LogFile(
 	inputEditMode := log.SelectEditMode(req.Redact, log.KeepRedactable)
 
 	// Ensure that the latest log entries are available in files.
-	log.Flush()
+	log.FlushFiles()
 
 	// Read the logs.
 	reader, err := log.GetLogReader(req.File)
@@ -1404,7 +1407,7 @@ func (s *statusServer) Logs(
 	}
 
 	// Ensure that the latest log entries are available in files.
-	log.Flush()
+	log.FlushFiles()
 
 	// Read the logs.
 	entries, err := log.FetchEntriesFromFiles(
@@ -1635,7 +1638,9 @@ func (s *statusServer) fetchProfileFromAllNodes(
 	errorFn := func(nodeID roachpb.NodeID, err error) {
 		response.profDataByNodeID[nodeID] = &profData{err: err}
 	}
-	if err := s.iterateNodes(ctx, opName, dialFn, nodeFn, responseFn, errorFn); err != nil {
+	if err := s.iterateNodes(
+		ctx, opName, noTimeout, dialFn, nodeFn, responseFn, errorFn,
+	); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 	var data []byte
@@ -2053,7 +2058,13 @@ func (s *systemStatusServer) NetworkConnectivity(
 		response.ErrorsByNodeID[nodeID] = err.Error()
 	}
 
-	if err := s.iterateNodes(ctx, "network connectivity", dialFn, nodeFn, responseFn, errorFn); err != nil {
+	if err := s.iterateNodes(ctx, "network connectivity",
+		noTimeout,
+		dialFn,
+		nodeFn,
+		responseFn,
+		errorFn,
+	); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 
@@ -2191,8 +2202,9 @@ type varsHandler struct {
 func (h varsHandler) handleVars(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	w.Header().Set(httputil.ContentTypeHeader, httputil.PlaintextContentType)
-	err := h.metricSource.PrintAsText(w)
+	contentType := expfmt.Negotiate(r.Header)
+	w.Header().Set(httputil.ContentTypeHeader, string(contentType))
+	err := h.metricSource.PrintAsText(w, contentType)
 	if err != nil {
 		log.Errorf(ctx, "%v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2637,7 +2649,13 @@ func (s *systemStatusServer) HotRanges(
 		}
 	}
 
-	if err := s.iterateNodes(ctx, "hot ranges", dialFn, nodeFn, responseFn, errorFn); err != nil {
+	if err := s.iterateNodes(ctx, "hot ranges",
+		noTimeout,
+		dialFn,
+		nodeFn,
+		responseFn,
+		errorFn,
+	); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 
@@ -2990,7 +3008,9 @@ func (s *statusServer) Range(
 	}
 
 	if err := s.iterateNodes(
-		ctx, fmt.Sprintf("details about range %d", req.RangeId), dialFn, nodeFn, responseFn, errorFn,
+		ctx, fmt.Sprintf("details about range %d", req.RangeId), noTimeout,
+		dialFn,
+		nodeFn, responseFn, errorFn,
 	); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
@@ -3019,6 +3039,7 @@ func (s *statusServer) ListLocalSessions(
 func (s *statusServer) iterateNodes(
 	ctx context.Context,
 	errorCtx string,
+	nodeFnTimeout time.Duration,
 	dialFn func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error),
 	nodeFn func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error),
 	responseFn func(nodeID roachpb.NodeID, resp interface{}),
@@ -3053,7 +3074,18 @@ func (s *statusServer) iterateNodes(
 			return
 		}
 
-		res, err := nodeFn(ctx, client, nodeID)
+		var res interface{}
+		if nodeFnTimeout == noTimeout {
+			res, err = nodeFn(ctx, client, nodeID)
+		} else {
+			err = timeutil.RunWithTimeout(ctx, "iterate-nodes-fn",
+				nodeFnTimeout, func(ctx context.Context) error {
+					var _err error
+					res, _err = nodeFn(ctx, client, nodeID)
+					return _err
+				})
+		}
+
 		if err != nil {
 			err = errors.Wrapf(err, "error requesting %s from node %d (%s)",
 				errorCtx, nodeID, nodeStatuses[serverID(nodeID)])
@@ -3116,7 +3148,9 @@ func (s *statusServer) paginatedIterateNodes(
 	errorFn func(nodeID roachpb.NodeID, nodeFnError error),
 ) (next paginationState, err error) {
 	if limit == 0 {
-		return paginationState{}, s.iterateNodes(ctx, errorCtx, dialFn, nodeFn, responseFn, errorFn)
+		return paginationState{}, s.iterateNodes(ctx, errorCtx, noTimeout,
+			dialFn,
+			nodeFn, responseFn, errorFn)
 	}
 	nodeStatuses, err := s.serverIterator.getAllNodes(ctx)
 	if err != nil {
@@ -3462,7 +3496,9 @@ func (s *statusServer) ListContentionEvents(
 		response.Errors = append(response.Errors, errResponse)
 	}
 
-	if err := s.iterateNodes(ctx, "contention events list", dialFn, nodeFn, responseFn, errorFn); err != nil {
+	if err := s.iterateNodes(ctx, "contention events list", noTimeout,
+		dialFn, nodeFn,
+		responseFn, errorFn); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 	return &response, nil
@@ -3509,7 +3545,9 @@ func (s *statusServer) ListDistSQLFlows(
 		response.Errors = append(response.Errors, errResponse)
 	}
 
-	if err := s.iterateNodes(ctx, "distsql flows list", dialFn, nodeFn, responseFn, errorFn); err != nil {
+	if err := s.iterateNodes(ctx, "distsql flows list", noTimeout, dialFn,
+		nodeFn,
+		responseFn, errorFn); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 	return &response, nil
@@ -3569,7 +3607,9 @@ func (s *statusServer) ListExecutionInsights(
 		response.Errors = append(response.Errors, errors.EncodeError(ctx, err))
 	}
 
-	if err := s.iterateNodes(ctx, "execution insights list", dialFn, nodeFn, responseFn, errorFn); err != nil {
+	if err := s.iterateNodes(ctx, "execution insights list", noTimeout,
+		dialFn, nodeFn,
+		responseFn, errorFn); err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 	return &response, nil
@@ -3586,7 +3626,13 @@ func (s *statusServer) SpanStats(
 		// already returns a proper gRPC error status.
 		return nil, err
 	}
-	return s.sqlServer.tenantConnect.SpanStats(ctx, req)
+
+	if err := verifySpanStatsRequest(ctx, req, s.st.Version); err != nil {
+		return nil, err
+	}
+
+	batchSize := int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV))
+	return batchedSpanStats(ctx, req, s.sqlServer.tenantConnect.SpanStats, batchSize)
 }
 
 func (s *systemStatusServer) SpanStats(
@@ -3600,26 +3646,12 @@ func (s *systemStatusServer) SpanStats(
 		return nil, err
 	}
 
-	// If the cluster's active version is less than 23.1 return a mixed version error.
-	if !s.st.Version.IsActive(ctx, clusterversion.V23_1) {
-		return nil, errors.New(MixedVersionErr)
+	if err := verifySpanStatsRequest(ctx, req, s.st.Version); err != nil {
+		return nil, err
 	}
 
-	// If we receive a request using the old format.
-	if isLegacyRequest(req) {
-		// We want to force 23.1 callers to use the new format (e.g. Spans field).
-		if req.NodeID == "0" {
-			return nil, errors.New(UnexpectedLegacyRequest)
-		}
-		// We want to error if we receive a legacy request from a 22.2
-		// node (e.g. during a mixed-version fanout).
-		return nil, errors.New(MixedVersionErr)
-	}
-	if len(req.Spans) > int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV)) {
-		return nil, errors.Newf(exceedSpanLimitPlaceholder, len(req.Spans), int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV)))
-	}
-
-	return s.getSpanStatsInternal(ctx, req)
+	batchSize := int(roachpb.SpanStatsBatchLimit.Get(&s.st.SV))
+	return batchedSpanStats(ctx, req, s.getSpanStatsInternal, batchSize)
 }
 
 // Diagnostics returns an anonymized diagnostics report.
@@ -3929,6 +3961,7 @@ func (s *statusServer) TransactionContentionEvents(
 	}
 
 	if err := s.iterateNodes(ctx, "txn contention events for node",
+		noTimeout,
 		dialFn,
 		rpcCallFn,
 		func(nodeID roachpb.NodeID, nodeResp interface{}) {

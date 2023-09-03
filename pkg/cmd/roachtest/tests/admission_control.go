@@ -30,6 +30,7 @@ func registerAdmission(r registry.Registry) {
 
 	registerElasticControlForBackups(r)
 	registerElasticControlForCDC(r)
+	registerElasticControlForRowLevelTTL(r)
 	registerMultiStoreOverload(r)
 	registerMultiTenantFairness(r)
 	registerSnapshotOverload(r)
@@ -38,4 +39,6 @@ func registerAdmission(r registry.Registry) {
 	registerIndexOverload(r)
 	registerIndexBackfill(r)
 	registerDatabaseDrop(r)
+	registerIntentResolutionOverload(r)
+	registerElasticIO(r)
 }

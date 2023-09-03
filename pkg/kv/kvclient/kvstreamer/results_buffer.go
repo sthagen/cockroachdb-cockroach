@@ -52,8 +52,8 @@ type resultsBuffer interface {
 	get(context.Context) (_ []Result, allComplete bool, _ error)
 
 	// wait blocks until there is at least one Result available to be returned
-	// to the client or the passed-in context is canceled.
-	wait(context.Context) error
+	// to the client.
+	wait()
 
 	// releaseOne decrements the number of unreleased Results by one.
 	releaseOne()
@@ -96,7 +96,10 @@ type resultsBuffer interface {
 	// goroutine blocked in wait(), the goroutine is woken up.
 	//
 	// It is assumed that the budget's mutex is already being held.
-	doneAddingLocked(context.Context)
+	//
+	// doneAddingLocked returns the naumber of results that have been added but
+	// not yet returned to the client, and whether the client goroutine was woken.
+	doneAddingLocked(context.Context) (int, bool)
 
 	///////////////////////////////////////////////////////////////////////////
 	//                                                                       //
@@ -219,21 +222,18 @@ func (b *resultsBufferBase) accountForOverheadLocked(ctx context.Context, overhe
 	b.overheadAccountedFor = overheadMemUsage
 }
 
-// signal non-blockingly sends on hasResults channel.
-func (b *resultsBufferBase) signal() {
+// signal non-blockingly sends on hasResults channel and returns whether sent.
+func (b *resultsBufferBase) signal() bool {
 	select {
 	case b.hasResults <- struct{}{}:
+		return true
 	default:
+		return false
 	}
 }
 
-func (b *resultsBufferBase) wait(ctx context.Context) error {
-	select {
-	case <-b.hasResults:
-		return b.error()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func (b *resultsBufferBase) wait() {
+	<-b.hasResults
 }
 
 func (b *resultsBufferBase) numUnreleased() int {
@@ -305,9 +305,9 @@ func (b *outOfOrderResultsBuffer) addLocked(r Result) {
 
 const resultSize = int64(unsafe.Sizeof(Result{}))
 
-func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
+func (b *outOfOrderResultsBuffer) doneAddingLocked(ctx context.Context) (int, bool) {
 	b.accountForOverheadLocked(ctx, int64(cap(b.results))*resultSize)
-	b.signal()
+	return len(b.results), b.signal()
 }
 
 func (b *outOfOrderResultsBuffer) clearOverhead(ctx context.Context) {
@@ -511,13 +511,14 @@ func (b *inOrderResultsBuffer) addLocked(r Result) {
 
 const inOrderBufferedResultSize = int64(unsafe.Sizeof(inOrderBufferedResult{}))
 
-func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) {
+func (b *inOrderResultsBuffer) doneAddingLocked(ctx context.Context) (int, bool) {
 	overhead := int64(cap(b.buffered))*inOrderBufferedResultSize + // b.buffered
 		int64(cap(b.resultScratch))*resultSize // b.resultsScratch
 	b.accountForOverheadLocked(ctx, overhead)
 	if len(b.buffered) > 0 && b.buffered[0].Position == b.headOfLinePosition && b.buffered[0].subRequestIdx == b.headOfLineSubRequestIdx {
-		b.signal()
+		return len(b.buffered), b.signal()
 	}
+	return len(b.buffered), false
 }
 
 func (b *inOrderResultsBuffer) clearOverhead(ctx context.Context) {
@@ -701,19 +702,18 @@ type inOrderBufferedResult struct {
 // spill updates r to represent a result that has been spilled to disk and is
 // identified by the provided ordinal in the disk buffer.
 func (r *inOrderBufferedResult) spill(diskResultID int) {
-	isScanComplete := r.scanComplete
 	*r = inOrderBufferedResult{
 		Result: Result{
 			memoryTok:      r.memoryTok,
 			Position:       r.Position,
 			subRequestIdx:  r.subRequestIdx,
 			subRequestDone: r.subRequestDone,
+			scanComplete:   r.scanComplete,
 		},
 		addEpoch:     r.addEpoch,
 		onDisk:       true,
 		diskResultID: diskResultID,
 	}
-	r.scanComplete = isScanComplete
 }
 
 // get returns the Result, deserializing it from disk if necessary. toConsume

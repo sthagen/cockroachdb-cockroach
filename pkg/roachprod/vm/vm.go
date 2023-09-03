@@ -79,6 +79,12 @@ type VM struct {
 	Labels      map[string]string `json:"labels"`
 	// The provider-internal DNS name for the VM instance
 	DNS string `json:"dns"`
+
+	// PublicDNS is the public DNS name that can be used to connect to the VM.
+	PublicDNS string `json:"public_dns"`
+	// The DNS provider to use for DNS operations performed for this VM.
+	DNSProvider string `json:"dns_provider"`
+
 	// The name of the cloud provider that hosts the VM instance
 	Provider string `json:"provider"`
 	// The provider-specific id for the instance.  This may or may not be the same as Name, depending
@@ -99,16 +105,6 @@ type VM struct {
 	// cloud that supports project (i.e. GCE). Empty otherwise.
 	Project string `json:"project"`
 
-	// SQLPort is the port on which the cockroach process is listening for SQL
-	// connections.
-	// Usually config.DefaultSQLPort, except for local clusters.
-	SQLPort int `json:"sql_port"`
-
-	// AdminUIPort is the port on which the cockroach process is listening for
-	// HTTP traffic for the Admin UI.
-	// Usually config.DefaultAdminUIPort, except for local clusters.
-	AdminUIPort int `json:"adminui_port"`
-
 	// LocalClusterName is only set for VMs in a local cluster.
 	LocalClusterName string `json:"local_cluster_name,omitempty"`
 
@@ -121,6 +117,11 @@ type VM struct {
 	// CostPerHour is the estimated cost per hour of this VM, in US dollars. 0 if
 	//there is no estimate available.
 	CostPerHour float64
+
+	// EmptyCluster indicates that the VM does not exist. Azure allows for empty
+	// clusters, but roachprod does not allow VM-less clusters except when deleting them.
+	// A fake VM will be used in this scenario.
+	EmptyCluster bool
 }
 
 // Name generates the name for the i'th node in a cluster.
@@ -387,6 +388,7 @@ type VolumeCreateOpts struct {
 
 type ListOptions struct {
 	IncludeVolumes       bool
+	IncludeEmptyClusters bool
 	ComputeEstimatedCost bool
 }
 
@@ -406,6 +408,9 @@ type Provider interface {
 	FindActiveAccount(l *logger.Logger) (string, error)
 	List(l *logger.Logger, opts ListOptions) (List, error)
 	// The name of the Provider, which will also surface in the top-level Providers map.
+
+	AddLabels(l *logger.Logger, vms List, labels map[string]string) error
+	RemoveLabels(l *logger.Logger, vms List, labels []string) error
 	Name() string
 
 	// Active returns true if the provider is properly installed and capable of
@@ -642,4 +647,21 @@ func DNSSafeAccount(account string) string {
 		}
 	}
 	return strings.Map(safe, account)
+}
+
+// SanitizeLabel returns a version of the string that can be used as a label.
+func SanitizeLabel(label string) string {
+	// Replace any non-alphanumeric characters with hyphens
+	re := regexp.MustCompile("[^a-zA-Z0-9]+")
+	label = re.ReplaceAllString(label, "-")
+
+	// Remove any leading or trailing hyphens
+	label = strings.Trim(label, "-")
+
+	// Truncate the label to 63 characters (the maximum allowed by GCP)
+	if len(label) > 63 {
+		label = label[:63]
+	}
+
+	return label
 }

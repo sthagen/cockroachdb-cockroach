@@ -414,7 +414,7 @@ func TestMVCCHistories(t *testing.T) {
 				// output.
 				var buf redact.StringBuilder
 				e.results.buf = &buf
-				e.results.traceIntentWrites = trace
+				e.results.traceClearKey = trace
 
 				// We reset the stats such that they accumulate for all commands
 				// in a single test.
@@ -876,30 +876,29 @@ func cmdTxnUpdate(e *evalCtx) error {
 	return nil
 }
 
-type intentPrintingReadWriter struct {
+type clearKeyPrintingReadWriter struct {
 	storage.ReadWriter
 	buf *redact.StringBuilder
 }
 
-func (rw intentPrintingReadWriter) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
+func (rw clearKeyPrintingReadWriter) ClearEngineKey(
+	key storage.EngineKey, opts storage.ClearOptions,
 ) error {
-	rw.buf.Printf("called PutIntent(%v, _, %v)\n",
-		key, txnUUID)
-	return rw.ReadWriter.PutIntent(ctx, key, value, txnUUID)
+	rw.buf.Printf("called ClearEngineKey(%v)\n", key)
+	return rw.ReadWriter.ClearEngineKey(key, opts)
 }
 
-func (rw intentPrintingReadWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts storage.ClearOptions,
-) error {
-	rw.buf.Printf("called ClearIntent(%v, TDNUM(%t), %v)\n",
-		key, txnDidNotUpdateMeta, txnUUID)
-	return rw.ReadWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, opts)
+func (rw clearKeyPrintingReadWriter) SingleClearEngineKey(key storage.EngineKey) error {
+	rw.buf.Printf("called SingleClearEngineKey(%v)\n", key)
+	return rw.ReadWriter.SingleClearEngineKey(key)
 }
 
-func (e *evalCtx) tryWrapForIntentPrinting(rw storage.ReadWriter) storage.ReadWriter {
-	if e.results.traceIntentWrites {
-		return intentPrintingReadWriter{ReadWriter: rw, buf: e.results.buf}
+func (e *evalCtx) tryWrapForClearKeyPrinting(rw storage.ReadWriter) storage.ReadWriter {
+	if e.results.traceClearKey {
+		return clearKeyPrintingReadWriter{
+			ReadWriter: rw,
+			buf:        e.results.buf,
+		}
 	}
 	return rw
 }
@@ -967,7 +966,10 @@ func cmdCheckIntent(e *evalCtx) error {
 
 	return e.withReader(func(r storage.Reader) error {
 		var meta enginepb.MVCCMetadata
-		iter := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{Prefix: true})
+		iter, err := r.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{Prefix: true})
+		if err != nil {
+			return err
+		}
 		defer iter.Close()
 		iter.SeekGE(storage.MVCCKey{Key: key})
 		ok, err := iter.Valid()
@@ -1638,7 +1640,7 @@ func cmdScan(e *evalCtx) error {
 		// ascertain no result is populated in the intents when an error
 		// occurs.
 		for _, intent := range res.Intents {
-			e.results.buf.Printf("scan: intent %v {%s}\n", intent.Intent_SingleKeySpan.Key, intent.Txn)
+			e.results.buf.Printf("scan: intent %v {%s}\n", intent.Key, intent.Txn)
 		}
 		for _, val := range res.KVs {
 			e.results.buf.Printf("scan: %v -> %v @%v\n", val.Key, val.Value.PrettyPrint(), val.Value.Timestamp)
@@ -1713,7 +1715,10 @@ func cmdIterNew(e *evalCtx) error {
 	}
 
 	r := e.newReader()
-	iter := r.NewMVCCIterator(kind, opts)
+	iter, err := r.NewMVCCIterator(kind, opts)
+	if err != nil {
+		return err
+	}
 	iter = newMetamorphicIterator(e.t, e.metamorphicIterSeed(), iter).(storage.MVCCIterator)
 	if opts.Prefix != iter.IsPrefix() {
 		return errors.Errorf("prefix iterator returned IsPrefix=false")
@@ -1777,7 +1782,11 @@ func cmdIterNewIncremental(e *evalCtx) error {
 	}
 
 	r := e.newReader()
-	it := storage.SimpleMVCCIterator(storage.NewMVCCIncrementalIterator(r, opts))
+	mvccIter, err := storage.NewMVCCIncrementalIterator(r, opts)
+	if err != nil {
+		return err
+	}
+	it := storage.SimpleMVCCIterator(mvccIter)
 	// Can't metamorphically move the iterator around since when intents get aggregated
 	// or emitted we can't undo that later at the level of the metamorphic iterator.
 	if opts.IntentPolicy == storage.MVCCIncrementalIterIntentPolicyError {
@@ -1806,7 +1815,11 @@ func cmdIterNewReadAsOf(e *evalCtx) error {
 		opts.UpperBound = keys.MaxKey
 	}
 	r := e.newReader()
-	innerIter := newMetamorphicIterator(e.t, e.metamorphicIterSeed(), r.NewMVCCIterator(storage.MVCCKeyIterKind, opts))
+	mvccIter, err := r.NewMVCCIterator(storage.MVCCKeyIterKind, opts)
+	if err != nil {
+		return err
+	}
+	innerIter := newMetamorphicIterator(e.t, e.metamorphicIterSeed(), mvccIter)
 	iter := &iterWithCloser{innerIter, r.Close}
 	e.iter = storage.NewReadAsOfIterator(iter, asOf)
 	e.iterRangeKeys.Clear()
@@ -2153,9 +2166,9 @@ func formatStats(ms enginepb.MVCCStats, delta bool) string {
 // script.
 type evalCtx struct {
 	results struct {
-		buf               *redact.StringBuilder
-		txn               *roachpb.Transaction
-		traceIntentWrites bool
+		buf           *redact.StringBuilder
+		txn           *roachpb.Transaction
+		traceClearKey bool
 	}
 	ctx               context.Context
 	st                *cluster.Settings
@@ -2166,7 +2179,7 @@ type evalCtx struct {
 	t                 *testing.T
 	td                *datadriven.TestData
 	txns              map[string]*roachpb.Transaction
-	txnCounter        uint128.Uint128
+	txnCounter        uint32
 	locks             map[string]*roachpb.Transaction
 	ms                *enginepb.MVCCStats
 	sstWriter         *storage.SSTWriter
@@ -2176,12 +2189,11 @@ type evalCtx struct {
 
 func newEvalCtx(ctx context.Context, engine storage.Engine) *evalCtx {
 	return &evalCtx{
-		ctx:        ctx,
-		st:         cluster.MakeTestingClusterSettings(),
-		engine:     engine,
-		txns:       make(map[string]*roachpb.Transaction),
-		txnCounter: uint128.FromInts(0, 1),
-		locks:      make(map[string]*roachpb.Transaction),
+		ctx:    ctx,
+		st:     cluster.MakeTestingClusterSettings(),
+		engine: engine,
+		txns:   make(map[string]*roachpb.Transaction),
+		locks:  make(map[string]*roachpb.Transaction),
 	}
 }
 
@@ -2333,7 +2345,7 @@ func (e *evalCtx) withWriter(cmd string, fn func(_ storage.ReadWriter) error) er
 		defer batch.Close()
 		rw = batch
 	}
-	rw = e.tryWrapForIntentPrinting(rw)
+	rw = e.tryWrapForClearKeyPrinting(rw)
 	err := fn(rw)
 	if e.hasArg("batched") {
 		batchStatus := "non-empty"
@@ -2406,7 +2418,7 @@ func (e *evalCtx) newTxn(
 	}
 	txn := &roachpb.Transaction{
 		TxnMeta: enginepb.TxnMeta{
-			ID:             uuid.FromUint128(e.txnCounter),
+			ID:             e.newTxnID(),
 			Key:            []byte(key),
 			WriteTimestamp: ts,
 			Sequence:       0,
@@ -2416,9 +2428,16 @@ func (e *evalCtx) newTxn(
 		GlobalUncertaintyLimit: globalUncertaintyLimit,
 		Status:                 roachpb.PENDING,
 	}
-	e.txnCounter = e.txnCounter.Add(1)
 	e.txns[txnName] = txn
 	return txn, nil
+}
+
+func (e *evalCtx) newTxnID() uuid.UUID {
+	// Generate txn IDs in the upper 32 bits of the UUID so that differences are
+	// visible in UUID.Short formatting, which is used by TxnMeta.String.
+	e.txnCounter++
+	hi := uint64(e.txnCounter) << 32
+	return uuid.FromUint128(uint128.Uint128{Hi: hi})
 }
 
 func (e *evalCtx) sst() *storage.SSTWriter {
@@ -2475,18 +2494,18 @@ type mockLockTableView struct {
 
 func (lt *mockLockTableView) IsKeyLockedByConflictingTxn(
 	k roachpb.Key, s lock.Strength,
-) (bool, *enginepb.TxnMeta) {
+) (bool, *enginepb.TxnMeta, error) {
 	holder, ok := lt.locks[string(k)]
 	if !ok {
-		return false, nil
+		return false, nil, nil
 	}
 	if lt.txn != nil && lt.txn.ID == holder.ID {
-		return false, nil
+		return false, nil, nil
 	}
 	if s == lock.None && lt.ts.Less(holder.WriteTimestamp) {
-		return false, nil
+		return false, nil, nil
 	}
-	return true, &holder.TxnMeta
+	return true, &holder.TxnMeta, nil
 }
 
 func (e *evalCtx) visitWrappedIters(fn func(it storage.SimpleMVCCIterator) (done bool)) {

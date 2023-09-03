@@ -112,12 +112,12 @@ func ClearRange(
 	// txns. Otherwise, txn recovery would fail to find these intents and
 	// consider the txn incomplete, uncommitting it and its writes (even those
 	// outside of the cleared range).
-	maxIntents := storage.MaxIntentsPerWriteIntentError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
+	maxIntents := storage.MaxIntentsPerLockConflictError.Get(&cArgs.EvalCtx.ClusterSettings().SV)
 	intents, err := storage.ScanIntents(ctx, readWriter, from, to, maxIntents, 0)
 	if err != nil {
 		return result.Result{}, err
 	} else if len(intents) > 0 {
-		return result.Result{}, &kvpb.WriteIntentError{Intents: intents}
+		return result.Result{}, &kvpb.LockConflictError{Locks: roachpb.AsLocks(intents)}
 	}
 
 	// Before clearing, compute the delta in MVCCStats.
@@ -213,11 +213,14 @@ func computeStatsDelta(
 		if !entireRange {
 			leftPeekBound, rightPeekBound := rangeTombstonePeekBounds(
 				from, to, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey())
-			rkIter := readWriter.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
+			rkIter, err := readWriter.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{
 				KeyTypes:   storage.IterKeyTypeRangesOnly,
 				LowerBound: leftPeekBound,
 				UpperBound: rightPeekBound,
 			})
+			if err != nil {
+				return enginepb.MVCCStats{}, err
+			}
 			defer rkIter.Close()
 
 			if cmp, lhs, err := storage.PeekRangeKeysLeft(rkIter, from); err != nil {

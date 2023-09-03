@@ -155,7 +155,7 @@ var i1A = settings.RegisterIntSetting(settings.TenantWritable, "i.1", "desc", 0)
 var i2A = settings.RegisterIntSetting(settings.TenantWritable, "i.2", "desc", 5)
 var fA = settings.RegisterFloatSetting(settings.TenantReadOnly, "f", "desc", 5.4)
 var dA = settings.RegisterDurationSetting(settings.TenantWritable, "d", "desc", time.Second)
-var duA = settings.RegisterPublicDurationSettingWithExplicitUnit(settings.TenantWritable, "d_with_explicit_unit", "desc", time.Second, settings.NonNegativeDuration)
+var duA = settings.RegisterDurationSettingWithExplicitUnit(settings.TenantWritable, "d_with_explicit_unit", "desc", time.Second, settings.NonNegativeDuration, settings.WithPublic)
 var _ = settings.RegisterDurationSetting(settings.TenantWritable, "d_with_maximum", "desc", time.Second, settings.NonNegativeDurationWithMaximum(time.Hour))
 var eA = settings.RegisterEnumSetting(settings.SystemOnly, "e", "desc", "foo", map[int64]string{1: "foo", 2: "bar", 3: "baz"})
 var byteSize = settings.RegisterByteSizeSetting(settings.TenantWritable, "zzz", "desc", mb)
@@ -166,39 +166,32 @@ var mA = func() *settings.VersionSetting {
 }()
 
 func init() {
-	settings.RegisterBoolSetting(settings.SystemOnly, "sekretz", "desc", false).SetReportable(false)
-	settings.RegisterBoolSetting(settings.SystemOnly, "rezervedz", "desc", false).SetVisibility(settings.Reserved)
+	_ = settings.RegisterBoolSetting(settings.SystemOnly, "sekretz", "desc", false, settings.WithReportable(false))
+	_ = settings.RegisterBoolSetting(settings.SystemOnly, "rezervedz", "desc", false, settings.WithVisibility(settings.Reserved))
 }
 
-var strVal = settings.RegisterValidatedStringSetting(settings.SystemOnly,
-	"str.val", "desc", "", func(sv *settings.Values, v string) error {
+var strVal = settings.RegisterStringSetting(settings.SystemOnly,
+	"str.val", "desc", "", settings.WithValidateString(func(sv *settings.Values, v string) error {
 		for _, c := range v {
 			if !unicode.IsLetter(c) {
 				return errors.Errorf("not all runes of %s are letters: %c", v, c)
 			}
 		}
 		return nil
-	})
+	}))
 var dVal = settings.RegisterDurationSetting(settings.SystemOnly, "dVal", "desc", time.Second, settings.NonNegativeDuration)
 var fVal = settings.RegisterFloatSetting(settings.SystemOnly, "fVal", "desc", 5.4, settings.NonNegativeFloat)
 var byteSizeVal = settings.RegisterByteSizeSetting(settings.SystemOnly, "byteSize.Val", "desc", mb)
 var iVal = settings.RegisterIntSetting(settings.SystemOnly,
-	"i.Val", "desc", 0, func(v int64) error {
+	"i.Val", "desc", 0, settings.WithValidateInt(func(v int64) error {
 		if v < 0 {
 			return errors.Errorf("int cannot be negative")
 		}
 		return nil
-	})
-
-func TestNonNegativeDurationWithMinimum(t *testing.T) {
-	validator := settings.NonNegativeDurationWithMinimum(time.Minute)
-	require.NoError(t, validator(time.Minute))
-	require.NoError(t, validator(2*time.Minute))
-	require.Error(t, validator(59*time.Second))
-	require.Error(t, validator(-1*time.Second))
-}
+	}))
 
 func TestValidation(t *testing.T) {
+	defer settings.TestingSaveRegistry()()
 	ctx := context.Background()
 	sv := &settings.Values{}
 	sv.Init(ctx, settings.TestOpaque)
@@ -221,7 +214,8 @@ func TestValidation(t *testing.T) {
 
 func TestIntrospection(t *testing.T) {
 	require.Equal(t, "b", boolTA.Typ())
-	require.Equal(t, "bool.t", boolTA.Key())
+	require.Equal(t, settings.InternalKey("bool.t"), boolTA.InternalKey())
+	require.Equal(t, settings.SettingName("bool.t"), boolTA.Name())
 	require.Equal(t, "desc", boolTA.Description())
 	require.Equal(t, settings.Reserved, boolTA.Visibility())
 	require.Equal(t, settings.SystemOnly, boolTA.Class())
@@ -229,6 +223,7 @@ func TestIntrospection(t *testing.T) {
 }
 
 func TestCache(t *testing.T) {
+	defer settings.TestingSaveRegistry()()
 	ctx := context.Background()
 	sv := &settings.Values{}
 	sv.Init(ctx, settings.TestOpaque)
@@ -351,9 +346,9 @@ func TestCache(t *testing.T) {
 
 	t.Run("lookup-system", func(t *testing.T) {
 		for _, s := range []settings.Setting{i1A, iVal, fA, fVal, dA, dVal, eA, mA, duA} {
-			result, ok := settings.LookupForLocalAccess(s.Key(), settings.ForSystemTenant)
+			result, ok, _ := settings.LookupForLocalAccess(s.Name(), settings.ForSystemTenant)
 			if !ok {
-				t.Fatalf("lookup(%s) failed", s.Key())
+				t.Fatalf("lookup(%s) failed", s.Name())
 			}
 			if result != s {
 				t.Fatalf("expected %v, got %v", s, result)
@@ -362,9 +357,9 @@ func TestCache(t *testing.T) {
 	})
 	t.Run("lookup-tenant", func(t *testing.T) {
 		for _, s := range []settings.Setting{i1A, fA, dA, duA} {
-			result, ok := settings.LookupForLocalAccess(s.Key(), false /* forSystemTenant */)
+			result, ok, _ := settings.LookupForLocalAccess(s.Name(), false /* forSystemTenant */)
 			if !ok {
-				t.Fatalf("lookup(%s) failed", s.Key())
+				t.Fatalf("lookup(%s) failed", s.Name())
 			}
 			if result != s {
 				t.Fatalf("expected %v, got %v", s, result)
@@ -373,9 +368,9 @@ func TestCache(t *testing.T) {
 	})
 	t.Run("lookup-tenant-fail", func(t *testing.T) {
 		for _, s := range []settings.Setting{iVal, fVal, dVal, eA, mA} {
-			_, ok := settings.LookupForLocalAccess(s.Key(), false /* forSystemTenant */)
+			_, ok, _ := settings.LookupForLocalAccess(s.Name(), false /* forSystemTenant */)
 			if ok {
-				t.Fatalf("lookup(%s) should have failed", s.Key())
+				t.Fatalf("lookup(%s) should have failed", s.Name())
 			}
 		}
 	})
@@ -688,12 +683,12 @@ func TestCache(t *testing.T) {
 }
 
 func TestIsReportable(t *testing.T) {
-	if v, ok := settings.LookupForLocalAccess(
+	if v, ok, _ := settings.LookupForLocalAccess(
 		"bool.t", settings.ForSystemTenant,
 	); !ok || !settings.TestingIsReportable(v) {
 		t.Errorf("expected 'bool.t' to be marked as isReportable() = true")
 	}
-	if v, ok := settings.LookupForLocalAccess(
+	if v, ok, _ := settings.LookupForLocalAccess(
 		"sekretz", settings.ForSystemTenant,
 	); !ok || settings.TestingIsReportable(v) {
 		t.Errorf("expected 'sekretz' to be marked as isReportable() = false")
@@ -701,9 +696,10 @@ func TestIsReportable(t *testing.T) {
 }
 
 func TestOnChangeWithMaxSettings(t *testing.T) {
+	defer settings.TestingSaveRegistry()()
 	ctx := context.Background()
 	// Register MaxSettings settings to ensure that no errors occur.
-	maxName, err := batchRegisterSettings(t, t.Name(), settings.MaxSettings-settings.NumRegisteredSettings())
+	maxKey, maxName, err := batchRegisterSettings(t, t.Name(), settings.MaxSettings-settings.NumRegisteredSettings())
 	if err != nil {
 		t.Fatalf("expected no error to register %d settings, but get error: %v", settings.MaxSettings, err)
 	}
@@ -712,7 +708,7 @@ func TestOnChangeWithMaxSettings(t *testing.T) {
 	sv := &settings.Values{}
 	sv.Init(ctx, settings.TestOpaque)
 	var changes int
-	s, ok := settings.LookupForLocalAccess(maxName, settings.ForSystemTenant)
+	s, ok, _ := settings.LookupForLocalAccess(maxName, settings.ForSystemTenant)
 	if !ok {
 		t.Fatalf("expected lookup of %s to succeed", maxName)
 	}
@@ -723,7 +719,7 @@ func TestOnChangeWithMaxSettings(t *testing.T) {
 	intSetting.SetOnChange(sv, func(ctx context.Context) { changes++ })
 
 	u := settings.NewUpdater(sv)
-	if err := u.Set(ctx, maxName, v(settings.EncodeInt(9), "i")); err != nil {
+	if err := u.Set(ctx, maxKey, v(settings.EncodeInt(9), "i")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -736,7 +732,7 @@ func TestMaxSettingsPanics(t *testing.T) {
 	defer settings.TestingSaveRegistry()()
 
 	// Register too many settings which will cause a panic which is caught and converted to an error.
-	_, err := batchRegisterSettings(t, t.Name(),
+	_, _, err := batchRegisterSettings(t, t.Name(),
 		settings.MaxSettings-settings.NumRegisteredSettings()+1)
 	expectedErr := "too many settings; increase MaxSettings"
 	if !testutils.IsError(err, expectedErr) {
@@ -745,7 +741,9 @@ func TestMaxSettingsPanics(t *testing.T) {
 
 }
 
-func batchRegisterSettings(t *testing.T, keyPrefix string, count int) (name string, err error) {
+func batchRegisterSettings(
+	t *testing.T, keyPrefix string, count int,
+) (key settings.InternalKey, name settings.SettingName, err error) {
 	defer func() {
 		// Catch panic and convert it to an error.
 		if r := recover(); r != nil {
@@ -757,10 +755,11 @@ func batchRegisterSettings(t *testing.T, keyPrefix string, count int) (name stri
 		}
 	}()
 	for i := 0; i < count; i++ {
-		name = fmt.Sprintf("%s_%3d", keyPrefix, i)
-		settings.RegisterIntSetting(settings.SystemOnly, name, "desc", 0)
+		key = settings.InternalKey(fmt.Sprintf("%s_%3d", keyPrefix, i))
+		s := settings.RegisterIntSetting(settings.SystemOnly, key, "desc", 0)
+		name = s.Name()
 	}
-	return name, err
+	return key, name, err
 }
 
 var overrideBool = settings.RegisterBoolSetting(settings.SystemOnly, "override.bool", "desc", true)

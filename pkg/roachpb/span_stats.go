@@ -11,14 +11,14 @@
 package roachpb
 
 import (
-	"fmt"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 )
 
 // Put span statistics cluster settings here to avoid import cycle.
 
-const DefaultSpanStatsSpanLimit = 500
+const DefaultSpanStatsSpanLimit = 1000
 
 // SpanStatsBatchLimit registers the maximum number of spans allowed in a
 // span stats request payload.
@@ -28,6 +28,15 @@ var SpanStatsBatchLimit = settings.RegisterIntSetting(
 	"the maximum number of spans allowed in a request payload for span statistics",
 	DefaultSpanStatsSpanLimit,
 	settings.PositiveInt,
+)
+
+var SpanStatsNodeTimeout = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"server.span_stats.node.timeout",
+	"the duration allowed for a single node to return span stats data before"+
+		" the request is cancelled; if set to 0, there is no timeout",
+	time.Minute,
+	settings.NonNegativeDuration,
 )
 
 const defaultRangeStatsBatchLimit = 100
@@ -49,17 +58,5 @@ var RangeDescPageSize = settings.RegisterIntSetting(
 	"server.span_stats.range_desc_page_size",
 	"the page size when iterating through range descriptors",
 	100,
-	func(i int64) error {
-		if i < 5 || i > 25000 {
-			return fmt.Errorf("expected range_desc_page_size to be in range [5, 25000], got %d", i)
-		}
-		return nil
-	},
+	settings.IntInRange(5, 25000),
 )
-
-func (m *SpanStats) Add(other *SpanStats) {
-	m.TotalStats.Add(other.TotalStats)
-	m.ApproximateDiskBytes += other.ApproximateDiskBytes
-	m.RemoteFileBytes += other.RemoteFileBytes
-	m.ExternalFileBytes += other.ExternalFileBytes
-}

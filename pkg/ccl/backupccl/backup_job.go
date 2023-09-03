@@ -51,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -156,6 +157,23 @@ func backup(
 		}
 	}
 
+	// Add the spans for any tables that are excluded from backup to the set of
+	// already-completed spans, as there is nothing to do for them.
+	descs := iterFactory.NewDescIter(ctx)
+	defer descs.Close()
+	for ; ; descs.Next() {
+		if ok, err := descs.Valid(); err != nil {
+			return roachpb.RowCount{}, 0, err
+		} else if !ok {
+			break
+		}
+
+		if tbl, _, _, _, _ := descpb.GetDescriptors(descs.Value()); tbl != nil && tbl.ExcludeDataFromBackup {
+			prefix := execCtx.ExecCfg().Codec.TablePrefix(uint32(tbl.ID))
+			completedSpans = append(completedSpans, roachpb.Span{Key: prefix, EndKey: prefix.PrefixEnd()})
+		}
+	}
+
 	// Subtract out any completed spans.
 	spans := filterSpans(backupManifest.Spans, completedSpans)
 	introducedSpans := filterSpans(backupManifest.IntroducedSpans, completedIntroducedSpans)
@@ -215,7 +233,7 @@ func backup(
 			// Currently the granularity of backup progress is the % of spans
 			// exported. Would improve accuracy if we tracked the actual size of each
 			// file.
-			return progressLogger.Loop(ctx, requestFinishedCh)
+			return errors.Wrap(progressLogger.Loop(ctx, requestFinishedCh), "updating job progress")
 		}
 	}
 
@@ -263,6 +281,9 @@ func backup(
 			// Signal that an ExportRequest finished to update job progress.
 			for i := int32(0); i < progDetails.CompletedSpans; i++ {
 				requestFinishedCh <- struct{}{}
+				if execCtx.ExecCfg().TestingKnobs.AfterBackupChunk != nil {
+					execCtx.ExecCfg().TestingKnobs.AfterBackupChunk()
+				}
 			}
 
 			// Update the per-component progress maintained by the job profiler.
@@ -307,21 +328,41 @@ func backup(
 		}
 		return nil
 	}
+	tracingAggCh := make(chan *execinfrapb.TracingAggregatorEvents)
+	tracingAggLoop := func(ctx context.Context) error {
+		if err := bulk.AggregateTracingStats(ctx, job.ID(),
+			execCtx.ExecCfg().Settings, execCtx.ExecCfg().InternalDB, tracingAggCh); err != nil {
+			log.Warningf(ctx, "failed to aggregate tracing stats: %v", err)
+			// Even if we fail to aggregate tracing stats, we must continue draining
+			// the channel so that the sender in the DistSQLReceiver does not block
+			// and allows the backup to continue uninterrupted.
+			for range tracingAggCh {
+			}
+		}
+		return nil
+	}
 
-	resumerSpan.RecordStructured(&types.StringValue{Value: "starting DistSQL backup execution"})
 	runBackup := func(ctx context.Context) error {
-		return distBackup(
+		return errors.Wrapf(distBackup(
 			ctx,
 			execCtx,
 			planCtx,
 			dsp,
 			progCh,
+			tracingAggCh,
 			backupSpecs,
-		)
+		), "exporting %d ranges", errors.Safe(numTotalSpans))
 	}
 
-	if err := ctxgroup.GoAndWait(ctx, jobProgressLoop, checkpointLoop, storePerNodeProgressLoop, runBackup); err != nil {
-		return roachpb.RowCount{}, 0, errors.Wrapf(err, "exporting %d ranges", errors.Safe(numTotalSpans))
+	if err := ctxgroup.GoAndWait(
+		ctx,
+		jobProgressLoop,
+		checkpointLoop,
+		storePerNodeProgressLoop,
+		tracingAggLoop,
+		runBackup,
+	); err != nil {
+		return roachpb.RowCount{}, 0, err
 	}
 
 	backupID := uuid.MakeV4()

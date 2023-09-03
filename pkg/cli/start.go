@@ -729,7 +729,7 @@ func createAndStartServerAsync(
 
 	go func() {
 		// Ensure that the log files see the startup messages immediately.
-		defer log.Flush()
+		defer log.FlushAllSync()
 		// If anything goes dramatically wrong, use Go's panic/recover
 		// mechanism to intercept the panic and log the panic details to
 		// the error reporting server.
@@ -918,11 +918,15 @@ func waitForShutdown(
 	defer shutdownSpan.Finish()
 
 	stopWithoutDrain := make(chan struct{}) // closed if interrupted very early
+	msgDrain := redact.SafeString("initiating graceful shutdown of server")
 
 	select {
 	case shutdownRequest := <-shutdownC:
 		returnErr = shutdownRequest.ShutdownCause()
 		drain := shutdownRequest.TerminateUsingGracefulDrain()
+		if !drain {
+			msgDrain = "initiating hard shutdown of server"
+		}
 		startShutdownAsync(serverStatusMu, stopWithoutDrain, drain)
 
 	case sig := <-signalCh:
@@ -974,8 +978,7 @@ func waitForShutdown(
 	// stop. From this point on, we just have to wait until the server
 	// indicates it has stopped.
 
-	const msgDrain = "initiating graceful shutdown of server"
-	log.Ops.Info(shutdownCtx, msgDrain)
+	log.Ops.Infof(shutdownCtx, "%s", msgDrain)
 	if !startCtx.inBackground {
 		fmt.Fprintln(os.Stdout, msgDrain)
 	}
@@ -1494,7 +1497,7 @@ func reportReadinessExternally(ctx context.Context, cmd *cobra.Command, waitForI
 	// Ensure the configuration logging is written to disk in case a
 	// process is waiting for the sdnotify readiness to read important
 	// information from there.
-	log.Flush()
+	log.FlushAllSync()
 
 	// Signal readiness. This unblocks the process when running with
 	// --background or under systemd.

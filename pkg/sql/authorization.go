@@ -124,6 +124,14 @@ type AuthorizationAccessor interface {
 	// the role options table. Example: CREATEROLE instead of NOCREATEROLE.
 	// NOLOGIN instead of LOGIN.
 	HasRoleOption(ctx context.Context, roleOption roleoption.Option) (bool, error)
+
+	// HasGlobalPrivilegeOrRoleOption returns a bool representing whether the current user
+	// has a global privilege or the corresponding legacy role option.
+	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
+
+	// CheckGlobalPrivilegeOrRoleOption checks if the current user has a global privilege
+	// or the corresponding legacy role option, and returns an error if the user does not.
+	CheckGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) error
 }
 
 var _ AuthorizationAccessor = &planner{}
@@ -262,14 +270,32 @@ func (p *planner) CheckPrivilegeForUser(
 	privilegeKind privilege.Kind,
 	user username.SQLUsername,
 ) error {
-	ok, err := p.HasPrivilege(ctx, privilegeObject, privilegeKind, user)
+	hasPriv, err := p.HasPrivilege(ctx, privilegeObject, privilegeKind, user)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return insufficientPrivilegeError(user, privilegeKind, privilegeObject)
+	if hasPriv {
+		return nil
 	}
-	return nil
+	// Special case for system tables. The VIEWSYSTEMTABLE system privilege is
+	// equivalent to having SELECT on all system tables. This is because it is not
+	// possible to dynamically grant SELECT privileges system tables, but in the
+	// context of support escalations, we need to be able to grant the ability to
+	// view system tables without granting the entire admin role.
+	if d, ok := privilegeObject.(catalog.Descriptor); ok {
+		if catalog.IsSystemDescriptor(d) && privilegeKind == privilege.SELECT {
+			hasViewSystemTablePriv, err := p.HasPrivilege(
+				ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWSYSTEMTABLE, user,
+			)
+			if err != nil {
+				return err
+			}
+			if hasViewSystemTablePriv {
+				return nil
+			}
+		}
+	}
+	return insufficientPrivilegeError(user, privilegeKind, privilegeObject)
 }
 
 // CheckPrivilege implements the AuthorizationAccessor interface.
@@ -345,6 +371,13 @@ func (p *planner) CheckGrantOptionsForUser(
 func (p *planner) getOwnerOfPrivilegeObject(
 	ctx context.Context, privilegeObject privilege.Object,
 ) (username.SQLUsername, error) {
+	// Short-circuit for virtual tables, which are all owned by node. This allows
+	// us to avoid fetching the synthetic privileges for virtual tables in a
+	// thundering herd while populating a table like pg_class, which has a row for
+	// every table, including virtual tables.
+	if d, ok := privilegeObject.(catalog.TableDescriptor); ok && d.IsVirtualTable() {
+		return username.NodeUserName(), nil
+	}
 	privDesc, err := p.getPrivilegeDescriptor(ctx, privilegeObject)
 	if err != nil {
 		return username.SQLUsername{}, err
@@ -648,7 +681,7 @@ var useSingleQueryForRoleMembershipCache = settings.RegisterBoolSetting(
 	"sql.auth.resolve_membership_single_scan.enabled",
 	"determines whether to populate the role membership cache with a single scan",
 	defaultSingleQueryForRoleMembershipCache,
-).WithPublic()
+	settings.WithPublic)
 
 // resolveMemberOfWithAdminOption performs the actual recursive role membership lookup.
 func resolveMemberOfWithAdminOption(
@@ -783,6 +816,38 @@ func (p *planner) CheckRoleOption(ctx context.Context, roleOption roleoption.Opt
 			"user %s does not have %s privilege", p.User(), roleOption)
 	}
 
+	return nil
+}
+
+// HasGlobalPrivilegeOrRoleOption implements the AuthorizationAccessor interface.
+func (p *planner) HasGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind,
+) (bool, error) {
+	ok, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege, p.User())
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		return true, nil
+	}
+	if roleOption, ok := roleoption.ByName[privilege.String()]; ok {
+		return p.HasRoleOption(ctx, roleOption)
+	}
+	return false, nil
+}
+
+// CheckGlobalPrivilegeOrRoleOption implements the AuthorizationAccessor interface.
+func (p *planner) CheckGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind,
+) error {
+	ok, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"user %s does not have %s privilege", p.User(), privilege)
+	}
 	return nil
 }
 
@@ -979,31 +1044,11 @@ func (p *planner) HasViewActivityOrViewActivityRedactedRole(ctx context.Context)
 }
 
 func (p *planner) HasViewActivityRedacted(ctx context.Context) (bool, error) {
-	if hasViewRedacted, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITYREDACTED, p.User()); err != nil {
-		return false, err
-	} else if hasViewRedacted {
-		return true, nil
-	}
-	if hasViewRedacted, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITYREDACTED); err != nil {
-		return false, err
-	} else if hasViewRedacted {
-		return true, nil
-	}
-	return false, nil
+	return p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWACTIVITYREDACTED)
 }
 
 func (p *planner) HasViewActivity(ctx context.Context) (bool, error) {
-	if hasView, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWACTIVITY, p.User()); err != nil {
-		return false, err
-	} else if hasView {
-		return true, nil
-	}
-	if hasView, err := p.HasRoleOption(ctx, roleoption.VIEWACTIVITY); err != nil {
-		return false, err
-	} else if hasView {
-		return true, nil
-	}
-	return false, nil
+	return p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWACTIVITY)
 }
 
 func insufficientPrivilegeError(

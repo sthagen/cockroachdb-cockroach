@@ -47,7 +47,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/logtags"
@@ -72,7 +71,7 @@ var MaxSyncDuration = settings.RegisterDurationSetting(
 	"maximum duration for disk operations; any operations that take longer"+
 		" than this setting trigger a warning log entry or process crash",
 	maxSyncDurationDefault,
-).WithPublic()
+	settings.WithPublic)
 
 // MaxSyncDurationFatalOnExceeded governs whether disk stalls longer than
 // MaxSyncDuration fatal the Cockroach process. Defaults to true.
@@ -81,7 +80,7 @@ var MaxSyncDurationFatalOnExceeded = settings.RegisterBoolSetting(
 	"storage.max_sync_duration.fatal.enabled",
 	"if true, fatal the process when a disk operation exceeds storage.max_sync_duration",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // ValueBlocksEnabled controls whether older versions of MVCC keys in the same
 // sstable will have their values written to value blocks. This only affects
@@ -93,7 +92,8 @@ var ValueBlocksEnabled = settings.RegisterBoolSetting(
 	"storage.value_blocks.enabled",
 	"set to true to enable writing of value blocks in sstables",
 	util.ConstantWithMetamorphicTestBool(
-		"storage.value_blocks.enabled", true)).WithPublic()
+		"storage.value_blocks.enabled", true),
+	settings.WithPublic)
 
 // IngestAsFlushable controls whether ingested sstables that overlap the
 // memtable may be lazily ingested: written to the WAL and enqueued in the list
@@ -571,8 +571,9 @@ func DefaultPebbleOptions() *pebble.Options {
 	}
 
 	opts := &pebble.Options{
-		Comparer:                    EngineComparer,
-		FS:                          vfs.Default,
+		Comparer: EngineComparer,
+		FS:       vfs.Default,
+		// A value of 2 triggers a compaction when there is 1 sub-level.
 		L0CompactionThreshold:       2,
 		L0StopWritesThreshold:       1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
@@ -584,6 +585,7 @@ func DefaultPebbleOptions() *pebble.Options {
 		BlockPropertyCollectors:     PebbleBlockPropertyCollectors,
 		FormatMajorVersion:          MinimumSupportedFormatVersion,
 	}
+	opts.Experimental.L0CompactionConcurrency = l0SubLevelCompactionConcurrency
 	// Automatically flush 10s after the first range tombstone is added to a
 	// memtable. This ensures that we can reclaim space even when there's no
 	// activity on the database generating flushes.
@@ -805,8 +807,6 @@ type Pebble struct {
 	closer io.Closer
 	// onClose is a slice of functions to be invoked before the engine closes.
 	onClose []func(*Pebble)
-
-	wrappedIntentWriter intentDemuxWriter
 
 	storeIDPebbleLog *base.StoreIDContainer
 	replayer         *replay.WorkloadCollector
@@ -1151,7 +1151,6 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 
 	p.eventListener = &el
 	opts.EventListener = &el
-	p.wrappedIntentWriter = wrapIntentWriter(p)
 
 	// If both cfg.SharedStorage and cfg.RemoteStorageFactory are set, CRDB uses
 	// cfg.SharedStorage. Note that eventually we will enable using both at the
@@ -1282,10 +1281,32 @@ func (p *Pebble) async(fn func()) {
 	}()
 }
 
+// writePreventStartupFile creates a file that will prevent nodes from automatically restarting after
+// experiencing sstable corruption.
+func (p *Pebble) writePreventStartupFile(ctx context.Context, corruptionError error) {
+	auxDir := p.GetAuxiliaryDir()
+	path := base.PreventedStartupFile(auxDir)
+
+	preventStartupMsg := fmt.Sprintf(`ATTENTION:
+
+  this node is terminating because of sstable corruption. 
+	Corruption may be a consequence of a hardware error. 
+
+	Error: %s 
+
+  A file preventing this node from restarting was placed at: 
+  %s`, corruptionError.Error(), path)
+
+	if err := fs.WriteFile(p.unencryptedFS, path, []byte(preventStartupMsg)); err != nil {
+		log.Warningf(ctx, "%v", err)
+	}
+}
+
 func (p *Pebble) makeMetricEtcEventListener(ctx context.Context) pebble.EventListener {
 	return pebble.EventListener{
 		BackgroundError: func(err error) {
 			if errors.Is(err, pebble.ErrCorruption) {
+				p.writePreventStartupFile(ctx, err)
 				log.Fatalf(ctx, "local corruption detected: %v", err)
 			}
 		},
@@ -1462,21 +1483,27 @@ func (p *Pebble) MVCCIterate(
 }
 
 // NewMVCCIterator implements the Engine interface.
-func (p *Pebble) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIterator {
+func (p *Pebble) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) (MVCCIterator, error) {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		iter := r.NewMVCCIterator(iterKind, opts)
+		iter, err := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		return maybeWrapInUnsafeIter(iter)
+		if err != nil {
+			return nil, err
+		}
+		return maybeWrapInUnsafeIter(iter), nil
 	}
 
-	iter := newPebbleIterator(p.db, opts, StandardDurability, p)
-	return maybeWrapInUnsafeIter(iter)
+	iter, err := newPebbleIterator(p.db, opts, StandardDurability, p)
+	if err != nil {
+		return nil, err
+	}
+	return maybeWrapInUnsafeIter(iter), nil
 }
 
 // NewEngineIterator implements the Engine interface.
-func (p *Pebble) NewEngineIterator(opts IterOptions) EngineIterator {
+func (p *Pebble) NewEngineIterator(opts IterOptions) (EngineIterator, error) {
 	return newPebbleIterator(p.db, opts, StandardDurability, p)
 }
 
@@ -1536,14 +1563,6 @@ func (p *Pebble) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
 	return p.clear(MVCCKey{Key: key}, opts)
 }
 
-// ClearIntent implements the Engine interface.
-func (p *Pebble) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions,
-) error {
-	_, err := p.wrappedIntentWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, nil, opts)
-	return err
-}
-
 // ClearEngineKey implements the Engine interface.
 func (p *Pebble) ClearEngineKey(key EngineKey, opts ClearOptions) error {
 	if len(key.Key) == 0 {
@@ -1594,8 +1613,14 @@ func (p *Pebble) ClearRawRange(start, end roachpb.Key, pointKeys, rangeKeys bool
 
 // ClearMVCCRange implements the Engine interface.
 func (p *Pebble) ClearMVCCRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error {
-	_, err := p.wrappedIntentWriter.ClearMVCCRange(start, end, pointKeys, rangeKeys, nil)
-	return err
+	// Write all the tombstones in one batch.
+	batch := p.NewUnindexedBatch()
+	defer batch.Close()
+
+	if err := batch.ClearMVCCRange(start, end, pointKeys, rangeKeys); err != nil {
+		return err
+	}
+	return batch.Commit(true)
 }
 
 // ClearMVCCVersions implements the Engine interface.
@@ -1677,14 +1702,6 @@ func (p *Pebble) PutRawMVCC(key MVCCKey, value []byte) error {
 // PutUnversioned implements the Engine interface.
 func (p *Pebble) PutUnversioned(key roachpb.Key, value []byte) error {
 	return p.put(MVCCKey{Key: key}, value)
-}
-
-// PutIntent implements the Engine interface.
-func (p *Pebble) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	_, err := p.wrappedIntentWriter.PutIntent(ctx, key, value, txnUUID, nil)
-	return err
 }
 
 // PutEngineKey implements the Engine interface.
@@ -2427,7 +2444,9 @@ func (p *pebbleReadOnly) MVCCIterate(
 }
 
 // NewMVCCIterator implements the Engine interface.
-func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIterator {
+func (p *pebbleReadOnly) NewMVCCIterator(
+	iterKind MVCCIterKind, opts IterOptions,
+) (MVCCIterator, error) {
 	if p.closed {
 		panic("using a closed pebbleReadOnly")
 	}
@@ -2435,9 +2454,12 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		iter := r.NewMVCCIterator(iterKind, opts)
+		iter, err := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		return maybeWrapInUnsafeIter(iter)
+		if err != nil {
+			return nil, err
+		}
+		return maybeWrapInUnsafeIter(iter), nil
 	}
 
 	iter := &p.normalIter
@@ -2446,15 +2468,17 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 	}
 	if iter.inuse {
 		return newPebbleIteratorByCloning(CloneContext{
-			rawIter:       p.iter,
-			statsReporter: p.parent,
-		}, opts, p.durability)
+			rawIter: p.iter,
+			engine:  p.parent,
+		}, opts, p.durability), nil
 	}
 
 	if iter.iter != nil {
 		iter.setOptions(opts, p.durability)
 	} else {
-		iter.initReuseOrCreate(p.parent.db, p.iter, p.iterUsed, opts, p.durability, p.parent)
+		if err := iter.initReuseOrCreate(p.parent.db, p.iter, p.iterUsed, opts, p.durability, p.parent); err != nil {
+			return nil, err
+		}
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
@@ -2464,11 +2488,11 @@ func (p *pebbleReadOnly) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions
 	}
 
 	iter.inuse = true
-	return maybeWrapInUnsafeIter(iter)
+	return maybeWrapInUnsafeIter(iter), nil
 }
 
 // NewEngineIterator implements the Engine interface.
-func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
+func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) (EngineIterator, error) {
 	if p.closed {
 		panic("using a closed pebbleReadOnly")
 	}
@@ -2479,15 +2503,18 @@ func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
 	}
 	if iter.inuse {
 		return newPebbleIteratorByCloning(CloneContext{
-			rawIter:       p.iter,
-			statsReporter: p.parent,
-		}, opts, p.durability)
+			rawIter: p.iter,
+			engine:  p.parent,
+		}, opts, p.durability), nil
 	}
 
 	if iter.iter != nil {
 		iter.setOptions(opts, p.durability)
 	} else {
-		iter.initReuseOrCreate(p.parent.db, p.iter, p.iterUsed, opts, p.durability, p.parent)
+		err := iter.initReuseOrCreate(p.parent.db, p.iter, p.iterUsed, opts, p.durability, p.parent)
+		if err != nil {
+			return nil, err
+		}
 		if p.iter == nil {
 			// For future cloning.
 			p.iter = iter.iter
@@ -2497,7 +2524,7 @@ func (p *pebbleReadOnly) NewEngineIterator(opts IterOptions) EngineIterator {
 	}
 
 	iter.inuse = true
-	return iter
+	return iter, nil
 }
 
 // ConsistentIterators implements the Engine interface.
@@ -2512,7 +2539,11 @@ func (p *pebbleReadOnly) PinEngineStateForIterators() error {
 		if p.durability == GuaranteedDurability {
 			o = &pebble.IterOptions{OnlyReadGuaranteedDurable: true}
 		}
-		p.iter = pebbleiter.MaybeWrap(p.parent.db.NewIter(o))
+		iter, err := p.parent.db.NewIter(o)
+		if err != nil {
+			return err
+		}
+		p.iter = pebbleiter.MaybeWrap(iter)
 		// NB: p.iterUsed == false avoids cloning this in NewMVCCIterator(), since
 		// we've just created it.
 	}
@@ -2545,12 +2576,6 @@ func (p *pebbleReadOnly) ClearMVCC(key MVCCKey, opts ClearOptions) error {
 }
 
 func (p *pebbleReadOnly) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
-	panic("not implemented")
-}
-
-func (p *pebbleReadOnly) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions,
-) error {
 	panic("not implemented")
 }
 
@@ -2616,12 +2641,6 @@ func (p *pebbleReadOnly) PutUnversioned(key roachpb.Key, value []byte) error {
 	panic("not implemented")
 }
 
-func (p *pebbleReadOnly) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	panic("not implemented")
-}
-
 func (p *pebbleReadOnly) PutEngineKey(key EngineKey, value []byte) error {
 	panic("not implemented")
 }
@@ -2680,21 +2699,29 @@ func (p *pebbleSnapshot) MVCCIterate(
 }
 
 // NewMVCCIterator implements the Reader interface.
-func (p *pebbleSnapshot) NewMVCCIterator(iterKind MVCCIterKind, opts IterOptions) MVCCIterator {
+func (p *pebbleSnapshot) NewMVCCIterator(
+	iterKind MVCCIterKind, opts IterOptions,
+) (MVCCIterator, error) {
 	if iterKind == MVCCKeyAndIntentsIterKind {
 		r := wrapReader(p)
 		// Doing defer r.Free() does not inline.
-		iter := r.NewMVCCIterator(iterKind, opts)
+		iter, err := r.NewMVCCIterator(iterKind, opts)
 		r.Free()
-		return maybeWrapInUnsafeIter(iter)
+		if err != nil {
+			return nil, err
+		}
+		return maybeWrapInUnsafeIter(iter), nil
 	}
 
-	iter := MVCCIterator(newPebbleIterator(p.snapshot, opts, StandardDurability, p.parent))
-	return maybeWrapInUnsafeIter(iter)
+	iter, err := newPebbleIterator(p.snapshot, opts, StandardDurability, p.parent)
+	if err != nil {
+		return nil, err
+	}
+	return maybeWrapInUnsafeIter(MVCCIterator(iter)), nil
 }
 
 // NewEngineIterator implements the Reader interface.
-func (p pebbleSnapshot) NewEngineIterator(opts IterOptions) EngineIterator {
+func (p pebbleSnapshot) NewEngineIterator(opts IterOptions) (EngineIterator, error) {
 	return newPebbleIterator(p.snapshot, opts, StandardDurability, p.parent)
 }
 

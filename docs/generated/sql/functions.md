@@ -2685,6 +2685,30 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="bit_length"></a><code>bit_length(val: varbit) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the number of bits used to represent <code>val</code>.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_and"></a><code>bitmask_and(a: <a href="string.html">string</a>, b: <a href="string.html">string</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise AND value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_and"></a><code>bitmask_and(a: <a href="string.html">string</a>, b: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise AND value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_and"></a><code>bitmask_and(a: varbit, b: <a href="string.html">string</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise AND value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_and"></a><code>bitmask_and(a: varbit, b: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise AND value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_or"></a><code>bitmask_or(a: <a href="string.html">string</a>, b: <a href="string.html">string</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise OR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_or"></a><code>bitmask_or(a: <a href="string.html">string</a>, b: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise OR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_or"></a><code>bitmask_or(a: varbit, b: <a href="string.html">string</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise OR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_or"></a><code>bitmask_or(a: varbit, b: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise OR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_xor"></a><code>bitmask_xor(a: <a href="string.html">string</a>, b: <a href="string.html">string</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise XOR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_xor"></a><code>bitmask_xor(a: <a href="string.html">string</a>, b: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise XOR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_xor"></a><code>bitmask_xor(a: varbit, b: <a href="string.html">string</a>) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise XOR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="bitmask_xor"></a><code>bitmask_xor(a: varbit, b: varbit) &rarr; varbit</code></td><td><span class="funcdesc"><p>Calculates bitwise XOR value of unsigned bit arrays ‘a’ and ‘b’ that may have different lengths.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="btrim"></a><code>btrim(input: <a href="string.html">string</a>, trim_chars: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Removes any characters included in <code>trim_chars</code> from the beginning or end of <code>input</code> (applies recursively).</p>
 <p>For example, <code>btrim('doggie', 'eod')</code> returns <code>ggi</code>.</p>
 </span></td><td>Immutable</td></tr>
@@ -2715,7 +2739,7 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="decompress"></a><code>decompress(data: <a href="bytes.html">bytes</a>, codec: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decompress <code>data</code> with the specified <code>codec</code> (<code>gzip</code>, ‘lz4’, ‘snappy’, 'zstd).</p>
 </span></td><td>Immutable</td></tr>
-<tr><td><a name="difference"></a><code>difference(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Convert two strings to their Soundex codes and then reports the number of matching code positions.</p>
+<tr><td><a name="difference"></a><code>difference(source: <a href="string.html">string</a>, target: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Convert two strings to their Soundex codes and then reports the number of matching code positions.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="encode"></a><code>encode(data: <a href="bytes.html">bytes</a>, format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Encodes <code>data</code> using <code>format</code> (<code>hex</code> / <code>escape</code> / <code>base64</code>).</p>
 </span></td><td>Immutable</td></tr>
@@ -3278,6 +3302,8 @@ may increase either contention or retry errors, or both.</p>
 <tr><td><a name="obj_description"></a><code>obj_description(object_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a database object specified by its OID alone. This is deprecated since there is no guarantee that OIDs are unique across different system catalogs; therefore, the wrong comment might be returned.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="obj_description"></a><code>obj_description(object_oid: oid, catalog_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a database object specified by its OID and the name of the containing system catalog. For example, obj_description(123456, ‘pg_class’) would retrieve the comment for the table with OID 123456.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="oidvectortypes"></a><code>oidvectortypes(vector: oidvector) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Generates a comma seperated string of type names from an oidvector.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_backend_pid"></a><code>pg_backend_pid() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns a numerical ID attached to this session. This ID is part of the query cancellation key used by the wire protocol. This function was only added for compatibility, and unlike in Postgres, the returned value does not correspond to a real process ID.</p>
 </span></td><td>Stable</td></tr>

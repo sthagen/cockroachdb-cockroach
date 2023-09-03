@@ -10,7 +10,6 @@ package streamingest
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -30,11 +29,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 var replanThreshold = settings.RegisterFloatSetting(
@@ -77,19 +79,15 @@ func startDistIngestion(
 		heartbeatTimestamp = initialScanTimestamp
 	}
 
-	msg := fmt.Sprintf("resuming stream (producer job %d) from %s",
-		streamID, heartbeatTimestamp)
+	msg := redact.Sprintf("resuming stream (producer job %d) from %s", streamID, heartbeatTimestamp)
 	updateRunningStatus(ctx, ingestionJob, jobspb.InitializingReplication, msg)
 
-	client, err := connectToActiveClient(ctx, ingestionJob, execCtx.ExecCfg().InternalDB)
+	client, err := connectToActiveClient(ctx, ingestionJob, execCtx.ExecCfg().InternalDB,
+		streamclient.WithStreamID(streamID))
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := client.Close(ctx); err != nil {
-			log.Warningf(ctx, "stream ingestion client did not shut down properly: %s", err.Error())
-		}
-	}()
+	defer closeAndLog(ctx, client)
 	if err := waitUntilProducerActive(ctx, client, streamID, heartbeatTimestamp, ingestionJob.ID()); err != nil {
 		return err
 	}
@@ -97,9 +95,9 @@ func startDistIngestion(
 	log.Infof(ctx, "producer job %d is active, planning DistSQL flow", streamID)
 	dsp := execCtx.DistSQLPlanner()
 
-	planner := replicationFlowPlanner{}
-
-	initialPlan, planCtx, err := planner.makePlan(
+	planner, err := makeReplicationFlowPlanner(
+		ctx,
+		dsp,
 		execCtx,
 		ingestionJob.ID(),
 		details,
@@ -107,8 +105,7 @@ func startDistIngestion(
 		replicatedTime,
 		streamProgress.Checkpoint,
 		initialScanTimestamp,
-		dsp.GatewayID(),
-	)(ctx, dsp)
+		dsp.GatewayID())
 	if err != nil {
 		return err
 	}
@@ -126,7 +123,7 @@ func startDistIngestion(
 	if err != nil {
 		return errors.Wrap(err, "failed to update job progress")
 	}
-	jobsprofiler.StorePlanDiagram(ctx, execCtx.ExecCfg().DistSQLSrv.Stopper, initialPlan, execCtx.ExecCfg().InternalDB,
+	jobsprofiler.StorePlanDiagram(ctx, execCtx.ExecCfg().DistSQLSrv.Stopper, planner.initialPlan, execCtx.ExecCfg().InternalDB,
 		ingestionJob.ID())
 
 	replanOracle := sql.ReplanOnCustomFunc(
@@ -137,34 +134,63 @@ func startDistIngestion(
 	)
 
 	replanner, stopReplanner := sql.PhysicalPlanChangeChecker(ctx,
-		initialPlan,
-		planner.makePlan(
-			execCtx,
-			ingestionJob.ID(),
-			details,
-			client,
-			replicatedTime,
-			streamProgress.Checkpoint,
-			initialScanTimestamp,
-			dsp.GatewayID(),
-		),
+		planner.initialPlan,
+		planner.generatePlan,
 		execCtx,
 		replanOracle,
 		func() time.Duration { return replanFrequency.Get(execCtx.ExecCfg().SV()) },
 	)
 
+	tracingAggCh := make(chan *execinfrapb.TracingAggregatorEvents)
+	tracingAggLoop := func(ctx context.Context) error {
+		if err := bulk.AggregateTracingStats(ctx, ingestionJob.ID(),
+			execCtx.ExecCfg().Settings, execCtx.ExecCfg().InternalDB, tracingAggCh); err != nil {
+			log.Warningf(ctx, "failed to aggregate tracing stats: %v", err)
+			// Drain the channel if the loop to aggregate tracing stats has returned
+			// an error.
+			for range tracingAggCh {
+			}
+		}
+		return nil
+	}
+
+	spanConfigIngestStopper := make(chan struct{})
+	streamSpanConfigs := func(ctx context.Context) error {
+		if knobs := execCtx.ExecCfg().StreamingTestingKnobs; knobs != nil && knobs.SkipSpanConfigReplication {
+			return nil
+		}
+		sourceTenantID, err := planner.getSrcTenantID()
+		if err != nil {
+			return err
+		}
+		ingestor, err := makeSpanConfigIngestor(ctx, execCtx.ExecCfg(), ingestionJob, sourceTenantID, spanConfigIngestStopper)
+		if err != nil {
+			return err
+		}
+		return ingestor.ingestSpanConfigs(ctx, details.SourceTenantName)
+	}
+
 	execInitialPlan := func(ctx context.Context) error {
-		log.Infof(ctx, "starting to run DistSQL flow for stream ingestion job %d",
-			ingestionJob.ID())
-		defer stopReplanner()
+		defer func() {
+			stopReplanner()
+			close(tracingAggCh)
+			close(spanConfigIngestStopper)
+		}()
 		ctx = logtags.AddTag(ctx, "stream-ingest-distsql", nil)
+
+		metaFn := func(_ context.Context, meta *execinfrapb.ProducerMetadata) error {
+			if meta.AggregatorEvents != nil {
+				tracingAggCh <- meta.AggregatorEvents
+			}
+			return nil
+		}
 
 		rw := sql.NewRowResultWriter(nil /* rowContainer */)
 
 		var noTxn *kv.Txn
 		recv := sql.MakeDistSQLReceiver(
 			ctx,
-			rw,
+			sql.NewMetadataCallbackWriter(rw, metaFn),
 			tree.Rows,
 			nil, /* rangeCache */
 			noTxn,
@@ -175,29 +201,69 @@ func startDistIngestion(
 
 		// Copy the evalCtx, as dsp.Run() might change it.
 		evalCtxCopy := *execCtx.ExtendedEvalContext()
-		dsp.Run(ctx, planCtx, noTxn, initialPlan, recv, &evalCtxCopy, nil /* finishedSetupFn */)
+		dsp.Run(ctx, planner.initialPlanCtx, noTxn, planner.initialPlan, recv, &evalCtxCopy, nil /* finishedSetupFn */)
 		return rw.Err()
 	}
 
-	updateRunningStatus(ctx, ingestionJob, jobspb.Replicating,
-		"running the SQL flow for the stream ingestion job")
-	err = ctxgroup.GoAndWait(ctx, execInitialPlan, replanner)
+	updateRunningStatus(ctx, ingestionJob, jobspb.Replicating, "physical replication running")
+	err = ctxgroup.GoAndWait(ctx, execInitialPlan, replanner, tracingAggLoop, streamSpanConfigs)
 	if errors.Is(err, sql.ErrPlanChanged) {
 		execCtx.ExecCfg().JobRegistry.MetricsStruct().StreamIngest.(*Metrics).ReplanCount.Inc(1)
 	}
 	return err
 }
 
+// makeReplicationFlowPlanner creates a replicationFlowPlanner and the initial physical plan.
+func makeReplicationFlowPlanner(
+	ctx context.Context,
+	dsp *sql.DistSQLPlanner,
+	execCtx sql.JobExecContext,
+	ingestionJobID jobspb.JobID,
+	details jobspb.StreamIngestionDetails,
+	client streamclient.Client,
+	previousReplicatedTime hlc.Timestamp,
+	checkpoint jobspb.StreamIngestionCheckpoint,
+	initialScanTimestamp hlc.Timestamp,
+	gatewayID base.SQLInstanceID,
+) (replicationFlowPlanner, error) {
+
+	planner := replicationFlowPlanner{}
+	planner.generatePlan = planner.constructPlanGenerator(execCtx, ingestionJobID, details, client, previousReplicatedTime, checkpoint, initialScanTimestamp, gatewayID)
+
+	var err error
+	planner.initialPlan, planner.initialPlanCtx, err = planner.generatePlan(ctx, dsp)
+	return planner, err
+
+}
+
+// replicationFlowPlanner can generate c2c physical plans. To populate the
+// replicationFlowPlanner's state correctly, it must be constructed via
+// makeReplicationFlowPlanner.
 type replicationFlowPlanner struct {
-	// initial contains the stream addresses found during the replicationFlowPlanner's first makePlan call.
+	// generatePlan generates a c2c physical plan.
+	generatePlan func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error)
+
+	initialPlan *sql.PhysicalPlan
+
+	initialPlanCtx *sql.PlanningCtx
+
 	initialStreamAddresses []string
+
+	srcTenantID roachpb.TenantID
 }
 
 func (p *replicationFlowPlanner) containsInitialStreamAddresses() bool {
 	return len(p.initialStreamAddresses) > 0
 }
 
-func (p *replicationFlowPlanner) makePlan(
+func (p *replicationFlowPlanner) getSrcTenantID() (roachpb.TenantID, error) {
+	if p.srcTenantID.InternalValue == 0 {
+		return p.srcTenantID, errors.AssertionFailedf("makeReplicationFlowPlanner must be called before p.getSrcID")
+	}
+	return p.srcTenantID, nil
+}
+
+func (p *replicationFlowPlanner) constructPlanGenerator(
 	execCtx sql.JobExecContext,
 	ingestionJobID jobspb.JobID,
 	details jobspb.StreamIngestionDetails,
@@ -208,9 +274,7 @@ func (p *replicationFlowPlanner) makePlan(
 	gatewayID base.SQLInstanceID,
 ) func(context.Context, *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
 	return func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
-		log.Infof(ctx, "Generating DistSQL plan candidate for stream ingestion job %d",
-			ingestionJobID)
-
+		log.Infof(ctx, "generating DistSQL plan candidate")
 		streamID := streampb.StreamID(details.StreamID)
 		topology, err := client.Plan(ctx, streamID)
 		if err != nil {
@@ -219,6 +283,8 @@ func (p *replicationFlowPlanner) makePlan(
 		if !p.containsInitialStreamAddresses() {
 			p.initialStreamAddresses = topology.StreamAddresses()
 		}
+
+		p.srcTenantID = topology.SourceTenantID
 
 		planCtx, sqlInstanceIDs, err := dsp.SetupAllNodesPlanning(ctx, execCtx.ExtendedEvalContext(), execCtx.ExecCfg())
 		if err != nil {
@@ -250,9 +316,11 @@ func (p *replicationFlowPlanner) makePlan(
 
 		// Setup a one-stage plan with one proc per input spec.
 		corePlacement := make([]physicalplan.ProcessorCorePlacement, len(streamIngestionSpecs))
-		for i := range streamIngestionSpecs {
-			corePlacement[i].SQLInstanceID = sqlInstanceIDs[i]
-			corePlacement[i].Core.StreamIngestionData = streamIngestionSpecs[i]
+		i := 0
+		for instanceID := range streamIngestionSpecs {
+			corePlacement[i].SQLInstanceID = instanceID
+			corePlacement[i].Core.StreamIngestionData = streamIngestionSpecs[instanceID]
+			i++
 		}
 
 		p := planCtx.NewPhysicalPlan()
@@ -449,11 +517,14 @@ func constructStreamIngestionPlanSpecs(
 	streamID streampb.StreamID,
 	sourceTenantID roachpb.TenantID,
 	destinationTenantID roachpb.TenantID,
-) ([]*execinfrapb.StreamIngestionDataSpec, *execinfrapb.StreamIngestionFrontierSpec, error) {
+) (
+	map[base.SQLInstanceID]*execinfrapb.StreamIngestionDataSpec,
+	*execinfrapb.StreamIngestionFrontierSpec,
+	error,
+) {
 
-	streamIngestionSpecs := make([]*execinfrapb.StreamIngestionDataSpec, 0, len(destSQLInstances))
-	destSQLInstancesToIdx := make(map[base.SQLInstanceID]int, len(destSQLInstances))
-	for i, id := range destSQLInstances {
+	streamIngestionSpecs := make(map[base.SQLInstanceID]*execinfrapb.StreamIngestionDataSpec, len(destSQLInstances))
+	for _, id := range destSQLInstances {
 		spec := &execinfrapb.StreamIngestionDataSpec{
 			StreamID:                    uint64(streamID),
 			JobID:                       int64(jobID),
@@ -467,8 +538,7 @@ func constructStreamIngestionPlanSpecs(
 				NewID: destinationTenantID,
 			},
 		}
-		streamIngestionSpecs = append(streamIngestionSpecs, spec)
-		destSQLInstancesToIdx[id.GetInstanceID()] = i
+		streamIngestionSpecs[id.GetInstanceID()] = spec
 	}
 
 	trackedSpans := make([]roachpb.Span, 0)
@@ -487,19 +557,21 @@ func constructStreamIngestionPlanSpecs(
 		partition := candidate.partition
 		subscribingSQLInstances[partition.ID] = uint32(destID)
 
-		specIdx, ok := destSQLInstancesToIdx[destID]
-		if !ok {
-			return nil, nil, errors.AssertionFailedf(
-				"matched destination node id does not contain a stream ingestion spec")
-		}
-		streamIngestionSpecs[specIdx].PartitionSpecs[partition.ID] = execinfrapb.
-			StreamIngestionPartitionSpec{
+		partSpec := execinfrapb.StreamIngestionPartitionSpec{
 			PartitionID:       partition.ID,
 			SubscriptionToken: string(partition.SubscriptionToken),
 			Address:           string(partition.SrcAddr),
 			Spans:             partition.Spans,
 		}
+		streamIngestionSpecs[destID].PartitionSpecs[partition.ID] = partSpec
 		trackedSpans = append(trackedSpans, partition.Spans...)
+	}
+
+	// Remove any ingestion processors that haven't been assigned any work.
+	for key, spec := range streamIngestionSpecs {
+		if len(spec.PartitionSpecs) == 0 {
+			delete(streamIngestionSpecs, key)
+		}
 	}
 
 	// Create a spec for the StreamIngestionFrontier processor on the coordinator
@@ -515,4 +587,41 @@ func constructStreamIngestionPlanSpecs(
 	}
 
 	return streamIngestionSpecs, streamIngestionFrontierSpec, nil
+}
+
+// waitUntilProducerActive pings the producer job and waits until it
+// is active/running. It returns nil when the job is active.
+func waitUntilProducerActive(
+	ctx context.Context,
+	client streamclient.Client,
+	streamID streampb.StreamID,
+	heartbeatTimestamp hlc.Timestamp,
+	ingestionJobID jobspb.JobID,
+) error {
+	ro := retry.Options{
+		InitialBackoff: 1 * time.Second,
+		Multiplier:     2,
+		MaxBackoff:     5 * time.Second,
+		MaxRetries:     4,
+	}
+	// Make sure the producer job is active before start the stream replication.
+	var status streampb.StreamReplicationStatus
+	var err error
+	for r := retry.Start(ro); r.Next(); {
+		status, err = client.Heartbeat(ctx, streamID, heartbeatTimestamp)
+		if err != nil {
+			return errors.Wrapf(err, "failed to resume ingestion job %d due to producer job %d error",
+				ingestionJobID, streamID)
+		}
+		if status.StreamStatus != streampb.StreamReplicationStatus_UNKNOWN_STREAM_STATUS_RETRY {
+			break
+		}
+		log.Warningf(ctx, "producer job %d has status %s, retrying", streamID, status.StreamStatus)
+	}
+	if status.StreamStatus != streampb.StreamReplicationStatus_STREAM_ACTIVE {
+		return jobs.MarkAsPermanentJobError(errors.Errorf("failed to resume ingestion job %d "+
+			"as the producer job %d is not active and in status %s", ingestionJobID,
+			streamID, status.StreamStatus))
+	}
+	return nil
 }

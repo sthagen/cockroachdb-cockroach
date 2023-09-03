@@ -180,17 +180,15 @@ func jwtRunTest(t *testing.T, insecure bool) {
 		}
 		defer cleanup()
 
-		s, conn, _ := serverutils.StartServer(t,
+		srv, conn, _ := serverutils.StartServer(t,
 			base.TestServerArgs{
 				Insecure:   insecure,
 				SocketFile: maybeSocketFile,
 			})
-		defer s.Stopper().Stop(context.Background())
+		defer srv.Stopper().Stop(context.Background())
+		s := srv.ApplicationLayer()
 
 		sv := &s.ClusterSettings().SV
-		if len(s.TestTenants()) > 0 {
-			sv = &s.TestTenants()[0].ClusterSettings().SV
-		}
 
 		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf(`CREATE USER %s`, username.TestUser)); err != nil {
 			t.Fatal(err)
@@ -287,13 +285,13 @@ func jwtRunTest(t *testing.T, insecure bool) {
 					// We want the certs to be present in the filesystem for this test.
 					// However, certs are only generated for users "root" and "testuser" specifically.
 					sqlURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(
-						t, s.ApplicationLayer().AdvSQLAddr(), t.Name(), url.User(user),
+						t, s.AdvSQLAddr(), t.Name(), url.User(user),
 						forceCerts || user == username.RootUser || user == username.TestUser /* withClientCerts */)
 					defer cleanupFn()
 
 					var host, port string
 					if td.Cmd == "connect" {
-						host, port, err = net.SplitHostPort(s.ApplicationLayer().AdvSQLAddr())
+						host, port, err = net.SplitHostPort(s.AdvSQLAddr())
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -526,7 +524,7 @@ func TestClientAddrOverride(t *testing.T) {
 			t.Run("check-server-log-uses-override", func(t *testing.T) {
 				// Wait for the disconnection event in logs.
 				testutils.SucceedsSoon(t, func() error {
-					log.Flush()
+					log.FlushFiles()
 					entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, sessionTerminatedRe,
 						log.WithMarkedSensitiveData)
 					if err != nil {
@@ -539,7 +537,7 @@ func TestClientAddrOverride(t *testing.T) {
 				})
 
 				// Now we want to check that the logging tags are also updated.
-				log.Flush()
+				log.FlushFiles()
 				entries, err := log.FetchEntriesFromFiles(testStartTime.UnixNano(), math.MaxInt64, 10000, authLogFileRe,
 					log.WithMarkedSensitiveData)
 				if err != nil {

@@ -71,7 +71,13 @@ const (
 	MODIFYSQLCLUSTERSETTING  Kind = 28
 	REPLICATION              Kind = 29
 	MANAGETENANT             Kind = 30
+	VIEWSYSTEMTABLE          Kind = 31
+	largestKind                   = VIEWSYSTEMTABLE
 )
+
+var isDeprecatedKind = map[Kind]bool{
+	DEPRECATEDGRANT: true,
+}
 
 // Privilege represents a privilege parsed from an Access Privilege Inquiry
 // Function's privilege string argument.
@@ -136,7 +142,8 @@ var isDescriptorBacked = map[ObjectType]bool{
 
 // Predefined sets of privileges.
 var (
-	AllPrivileges         = List{ALL, CHANGEFEED, CONNECT, CREATE, DROP, SELECT, INSERT, DELETE, UPDATE, USAGE, ZONECONFIG, EXECUTE, BACKUP, RESTORE, EXTERNALIOIMPLICITACCESS, VIEWJOB}
+	// AllPrivileges is populated during init.
+	AllPrivileges         List
 	ReadData              = List{SELECT}
 	ReadWriteData         = List{SELECT, INSERT, DELETE, UPDATE}
 	ReadWriteSequenceData = List{SELECT, UPDATE, USAGE}
@@ -149,8 +156,12 @@ var (
 	// before v22.2 we treated Sequences the same as Tables. This is to avoid making
 	// certain privileges unavailable after upgrade migration.
 	// Note that "CREATE, CHANGEFEED, INSERT, DELETE, ZONECONFIG" are no-op privileges on sequences.
-	SequencePrivileges           = List{ALL, USAGE, SELECT, UPDATE, CREATE, CHANGEFEED, DROP, INSERT, DELETE, ZONECONFIG}
-	GlobalPrivileges             = List{ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED, VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS, VIEWJOB, MODIFYSQLCLUSTERSETTING, REPLICATION, MANAGETENANT}
+	SequencePrivileges = List{ALL, USAGE, SELECT, UPDATE, CREATE, CHANGEFEED, DROP, INSERT, DELETE, ZONECONFIG}
+	GlobalPrivileges   = List{
+		ALL, BACKUP, RESTORE, MODIFYCLUSTERSETTING, EXTERNALCONNECTION, VIEWACTIVITY, VIEWACTIVITYREDACTED,
+		VIEWCLUSTERSETTING, CANCELQUERY, NOSQLLOGIN, VIEWCLUSTERMETADATA, VIEWDEBUG, EXTERNALIOIMPLICITACCESS, VIEWJOB,
+		MODIFYSQLCLUSTERSETTING, REPLICATION, MANAGETENANT, VIEWSYSTEMTABLE,
+	}
 	VirtualTablePrivileges       = List{ALL, SELECT}
 	ExternalConnectionPrivileges = List{ALL, USAGE, DROP}
 )
@@ -196,6 +207,7 @@ var ByName = map[string]Kind{
 	"MODIFYSQLCLUSTERSETTING":  MODIFYSQLCLUSTERSETTING,
 	"REPLICATION":              REPLICATION,
 	"MANAGETENANT":             MANAGETENANT,
+	"VIEWSYSTEMTABLE":          VIEWSYSTEMTABLE,
 }
 
 // List is a list of privileges.
@@ -331,18 +343,38 @@ func PrivilegesFromBitFields(
 	return ret, nil
 }
 
+// Origin indicates the origin of the privileges being parsed in
+// ListFromStrings.
+type Origin bool
+
+const (
+	// OriginFromUserInput indicates that the privilege name came from user
+	// input and should be validated to make sure it refers to a real privilege.
+	OriginFromUserInput Origin = false
+
+	// OriginFromSystemTable indicates that the privilege name came from a
+	// system table and should be ignored if it does not refer to a real
+	// privilege.
+	OriginFromSystemTable Origin = true
+)
+
 // ListFromStrings takes a list of strings and attempts to build a list of Kind.
 // We convert each string to uppercase and search for it in the ByName map.
-// If an entry is not found in ByName, it is ignored.
-func ListFromStrings(strs []string) (List, error) {
+// If an entry is not found in ByName, it is either ignored or reports an error
+// depending on the purpose.
+func ListFromStrings(strs []string, origin Origin) (List, error) {
 	ret := make(List, len(strs))
 	for i, s := range strs {
 		k, ok := ByName[strings.ToUpper(s)]
 		if !ok {
-			// Ignore an unknown privilege name. This is so that it is possible to
-			// backport new privileges onto older release branches, without causing
-			// mixed-version compatibility issues.
-			continue
+			// Ignore an unknown privilege name if it came from a system table. This
+			// is so that it is possible to backport new privileges onto older release
+			// branches, without causing mixed-version compatibility issues.
+			if origin == OriginFromSystemTable {
+				continue
+			} else if origin == OriginFromUserInput {
+				return nil, errors.Errorf("not a valid privilege: %q", s)
+			}
 		}
 		ret[i] = k
 	}
@@ -463,4 +495,13 @@ type Object interface {
 	// GetName returns the name of the object. For example, the name of a
 	// table, schema or database.
 	GetName() string
+}
+
+func init() {
+	for kind := ALL; kind <= largestKind; kind++ {
+		if isDeprecatedKind[kind] {
+			continue
+		}
+		AllPrivileges = append(AllPrivileges, kind)
+	}
 }

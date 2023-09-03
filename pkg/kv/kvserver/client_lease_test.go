@@ -1054,7 +1054,8 @@ func TestLeasePreferencesDuringOutage(t *testing.T) {
 
 	srv, err := tc.FindMemberServer(newLeaseHolder.StoreID)
 	require.NoError(t, err)
-	region, ok := srv.Locality().Find("region")
+	loc := srv.Locality()
+	region, ok := loc.Find("region")
 	require.True(t, ok)
 	require.Equal(t, "us", region)
 	require.Equal(t, 3, len(repl.Desc().Replicas().Voters().VoterDescriptors()))
@@ -1062,7 +1063,8 @@ func TestLeasePreferencesDuringOutage(t *testing.T) {
 	for _, replDesc := range repl.Desc().Replicas().Voters().VoterDescriptors() {
 		serv, err := tc.FindMemberServer(replDesc.StoreID)
 		require.NoError(t, err)
-		dc, ok := serv.Locality().Find("dc")
+		memberLoc := serv.Locality()
+		dc, ok := memberLoc.Find("dc")
 		require.True(t, ok)
 		require.NotEqual(t, "sf", dc)
 	}
@@ -1481,7 +1483,7 @@ func TestLeaseTransfersUseExpirationLeasesAndBumpToEpochBasedOnes(t *testing.T) 
 	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
 	manualClock := hlc.NewHybridManualClock()
-	tci := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+	tci := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			Settings: st,
@@ -1552,7 +1554,7 @@ func TestLeaseUpgradeVersionGate(t *testing.T) {
 	)
 	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
-	tci := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+	tci := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			Settings: st,

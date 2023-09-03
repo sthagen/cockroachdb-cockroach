@@ -76,8 +76,6 @@ enforce_home_region                                        off
 enforce_home_region_follower_reads_enabled                 off
 escape_string_warning                                      on
 expect_and_ignore_not_visible_columns_in_copy              off
-experimental_distsql_planning                              off
-experimental_enable_auto_rehoming                          off
 experimental_enable_implicit_column_partitioning           off
 experimental_enable_temp_tables                            off
 experimental_enable_unique_without_index_constraints       off
@@ -85,7 +83,6 @@ experimental_hash_group_join_enabled                       off
 extra_float_digits                                         1
 force_savepoint_restart                                    off
 foreign_key_cascades_limit                                 10000
-idle_in_session_timeout                                    0
 idle_in_transaction_session_timeout                        0
 idle_session_timeout                                       0
 index_join_streamer_batch_size                             8.0 MiB
@@ -112,6 +109,7 @@ log_timezone                                               UTC
 max_connections                                            -1
 max_identifier_length                                      128
 max_index_keys                                             32
+max_retries_for_read_committed                             10
 node_id                                                    1
 null_ordered_last                                          off
 on_update_rehome_row_enabled                               on
@@ -144,12 +142,13 @@ serial_normalization                                       rowid
 server_encoding                                            UTF8
 server_version                                             13.0.0
 server_version_num                                         130000
-session_user                                               root
 show_primary_key_constraint_on_not_visible_columns         on
 sql_safe_updates                                           off
+ssl                                                        on
 standard_conforming_strings                                on
 statement_timeout                                          0
 streamer_enabled                                           on
+strict_ddl_atomicity                                       off
 stub_catalog_tables                                        on
 synchronize_seqscans                                       on
 synchronous_commit                                         on
@@ -300,6 +299,7 @@ public       privileges                       table     node   NULL
 public       protected_ts_meta                table     node   NULL
 public       protected_ts_records             table     node   NULL
 public       rangelog                         table     node   NULL
+public       region_liveness                  table     node   NULL
 public       replication_constraint_stats     table     node   NULL
 public       replication_critical_localities  table     node   NULL
 public       replication_stats                table     node   NULL
@@ -357,6 +357,7 @@ public       privileges                       table     node   NULL      ·
 public       protected_ts_meta                table     node   NULL      ·
 public       protected_ts_records             table     node   NULL      ·
 public       rangelog                         table     node   NULL      ·
+public       region_liveness                  table     node   NULL      ·
 public       replication_constraint_stats     table     node   NULL      ·
 public       replication_critical_localities  table     node   NULL      ·
 public       replication_stats                table     node   NULL      ·

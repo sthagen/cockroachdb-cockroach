@@ -31,12 +31,13 @@ import (
 // The degree of the inFlightWrites btree.
 const txnPipelinerBtreeDegree = 32
 
-// PipelinedWritesEnabled is the kv.transaction.write_pipelining_enabled cluster setting.
+// PipelinedWritesEnabled is the kv.transaction.write_pipelining.enabled cluster setting.
 var PipelinedWritesEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"kv.transaction.write_pipelining_enabled",
 	"if enabled, transactional writes are pipelined through Raft consensus",
 	true,
+	settings.WithName("kv.transaction.write_pipelining.enabled"),
 )
 var pipelinedWritesMaxBatchSize = settings.RegisterIntSetting(
 	settings.TenantWritable,
@@ -52,6 +53,7 @@ var pipelinedWritesMaxBatchSize = settings.RegisterIntSetting(
 	// hit the 1PC fast-path or should have batches which exceed this limit.
 	128,
 	settings.NonNegativeInt,
+	settings.WithName("kv.transaction.write_pipelining.max_batch_size"),
 )
 
 // TrackedWritesMaxSize is a byte threshold for the tracking of writes performed
@@ -82,7 +84,7 @@ var TrackedWritesMaxSize = settings.RegisterIntSetting(
 	"kv.transaction.max_intents_bytes",
 	"maximum number of bytes used to track locks in transactions",
 	1<<22, /* 4 MB */
-).WithPublic()
+	settings.WithPublic)
 
 // rejectTxnOverTrackedWritesBudget dictates what happens when a txn exceeds
 // kv.transaction.max_intents_bytes.
@@ -92,7 +94,7 @@ var rejectTxnOverTrackedWritesBudget = settings.RegisterBoolSetting(
 	"if set, transactions that exceed their lock tracking budget (kv.transaction.max_intents_bytes) "+
 		"are rejected instead of having their lock spans imprecisely compressed",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // txnPipeliner is a txnInterceptor that pipelines transactional writes by using
 // asynchronous consensus. The interceptor then tracks all writes that have been
@@ -656,8 +658,8 @@ func (tp *txnPipeliner) updateLockTrackingInner(
 		// locks, we ignore that request for the purposes of accounting for lock
 		// spans. This is important for transactions that only perform a single
 		// request and hit an unambiguous error like a ConditionFailedError, as it
-		// can allow them to avoid sending a rollback. It it also important for
-		// transactions that throw a WriteIntentError due to heavy contention on a
+		// can allow them to avoid sending a rollback. It is also important for
+		// transactions that throw a LockConflictError due to heavy contention on a
 		// certain key after either passing a Error wait policy or hitting a lock
 		// timeout / queue depth limit. In such cases, this optimization prevents
 		// these transactions from adding even more load to the contended key by

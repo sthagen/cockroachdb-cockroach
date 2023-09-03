@@ -86,7 +86,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
-	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/vtable"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
@@ -1411,7 +1410,8 @@ const crdbInternalKVProtectedTSTableQuery = `
 		    false /* emit defaults */,
 		    false /* include redaction marker */ 
 		          /* NB: redactions in the debug zip are handled elsewhere by marking columns as sensitive */
-		) as decoded_targets
+		) as decoded_targets,
+	    crdb_internal_mvcc_timestamp
 	FROM system.protected_ts_records
 `
 
@@ -1432,7 +1432,8 @@ CREATE TABLE crdb_internal.kv_protected_ts_records (
                                 -- This data can have different structures depending on the meta_type. 
    decoded_target 		JSON,   -- Decoded data from the target column above.
    internal_meta        JSON,   -- Additional metadata added by this virtual table (ex. job owner for job meta_type) 
-   num_ranges  			INT     -- Number of ranges protected by this PTS record.
+   num_ranges  			INT,     -- Number of ranges protected by this PTS record.
+   last_updated         DECIMAL -- crdb_internal_mvcc_timestamp of the row
 )`,
 	comment: `decoded protected timestamp metadata from system.protected_ts_records (KV scan). does not decode `,
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (err error) {
@@ -1475,7 +1476,7 @@ CREATE TABLE crdb_internal.kv_protected_ts_records (
 			return err
 		}
 
-		var id, ts, metaType, meta, numSpans, spans, verified, target, decodedTarget tree.Datum
+		var id, ts, metaType, meta, numSpans, spans, verified, target, decodedTarget, lastUpdated tree.Datum
 
 		for {
 			hasNext, err := it.Next(ctx)
@@ -1487,8 +1488,8 @@ CREATE TABLE crdb_internal.kv_protected_ts_records (
 			}
 
 			r := it.Cur()
-			id, ts, metaType, meta, numSpans, spans, verified, target, decodedTarget =
-				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
+			id, ts, metaType, meta, numSpans, spans, verified, target, decodedTarget, lastUpdated =
+				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]
 
 			metaTypeDatum, ok := metaType.(*tree.DString)
 			if !ok {
@@ -1577,7 +1578,7 @@ CREATE TABLE crdb_internal.kv_protected_ts_records (
 				}
 			}
 
-			if err := addRow(id, ts, metaType, meta, numSpans, spans, verified, target, decodedMeta, decodedTarget, internalMeta, numRanges); err != nil {
+			if err := addRow(id, ts, metaType, meta, numSpans, spans, verified, target, decodedMeta, decodedTarget, internalMeta, numRanges, lastUpdated); err != nil {
 				return err
 			}
 
@@ -2336,42 +2337,38 @@ CREATE TABLE crdb_internal.cluster_settings (
   public        BOOL NOT NULL, -- whether the setting is documented, which implies the user can expect support.
   description   STRING NOT NULL,
   default_value STRING NOT NULL,
-  origin        STRING NOT NULL -- the origin of the value: 'default' , 'override' or 'external-override'
+  origin        STRING NOT NULL, -- the origin of the value: 'default' , 'override' or 'external-override'
+  key           STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		hasSqlModify, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYSQLCLUSTERSETTING, p.User())
+		canViewAll, err := p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYCLUSTERSETTING)
 		if err != nil {
 			return err
 		}
-		hasModify, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.MODIFYCLUSTERSETTING, p.User())
-		if err != nil {
-			return err
-		}
-		hasView, err := p.HasPrivilege(ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.VIEWCLUSTERSETTING, p.User())
-		if err != nil {
-			return err
-		}
-		if !hasModify {
-			if hasModify, err = p.HasRoleOption(ctx, roleoption.MODIFYCLUSTERSETTING); err != nil {
+		if !canViewAll {
+			canViewAll, err = p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWCLUSTERSETTING)
+			if err != nil {
 				return err
 			}
 		}
-		if !hasView {
-			if hasView, err = p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING); err != nil {
+		canViewSqlOnly := false
+		if !canViewAll {
+			canViewSqlOnly, err = p.HasGlobalPrivilegeOrRoleOption(ctx, privilege.MODIFYSQLCLUSTERSETTING)
+			if err != nil {
 				return err
 			}
 		}
-		if !hasModify && !hasSqlModify && !hasView {
+		if !canViewAll && !canViewSqlOnly {
 			return pgerror.Newf(pgcode.InsufficientPrivilege,
 				"only users with %s, %s or %s system privileges are allowed to read "+
 					"crdb_internal.cluster_settings", privilege.MODIFYCLUSTERSETTING, privilege.MODIFYSQLCLUSTERSETTING, privilege.VIEWCLUSTERSETTING)
 		}
 		for _, k := range settings.Keys(p.ExecCfg().Codec.ForSystemTenant()) {
-			// If the user has specifically MODIFYSQLCLUSTERSETTING, hide non-sql.defaults settings.
-			if !hasModify && !hasView && hasSqlModify && !strings.HasPrefix(k, "sql.defaults") {
+			// If the user can only view sql.defaults settings, hide all other settings.
+			if canViewSqlOnly && !strings.HasPrefix(string(k), "sql.defaults") {
 				continue
 			}
-			setting, _ := settings.LookupForLocalAccess(k, p.ExecCfg().Codec.ForSystemTenant())
+			setting, _ := settings.LookupForLocalAccessByKey(k, p.ExecCfg().Codec.ForSystemTenant())
 			strVal := setting.String(&p.ExecCfg().Settings.SV)
 			isPublic := setting.Visibility() == settings.Public
 			desc := setting.Description()
@@ -2381,13 +2378,14 @@ CREATE TABLE crdb_internal.cluster_settings (
 			}
 			origin := setting.ValueOrigin(ctx, &p.ExecCfg().Settings.SV).String()
 			if err := addRow(
-				tree.NewDString(k),
+				tree.NewDString(string(setting.Name())),
 				tree.NewDString(strVal),
 				tree.NewDString(setting.Typ()),
 				tree.MakeDBool(tree.DBool(isPublic)),
 				tree.NewDString(desc),
 				tree.NewDString(defaultVal),
 				tree.NewDString(origin),
+				tree.NewDString(string(setting.InternalKey())),
 			); err != nil {
 				return err
 			}
@@ -7410,7 +7408,9 @@ CREATE VIEW crdb_internal.tenant_usage_details AS
     (j->>'sqlPodsCpuSeconds')::FLOAT8 AS total_sql_pod_seconds,
     (j->>'pgwireEgressBytes')::INT8 AS total_pgwire_egress_bytes,
     (j->>'externalIOIngressBytes')::INT8 AS total_external_io_ingress_bytes,
-    (j->>'externalIOEgressBytes')::INT8 AS total_external_io_egress_bytes
+    (j->>'externalIOIngressBytes')::INT8 AS total_external_io_ingress_bytes,
+    (j->>'kvRU')::FLOAT8 AS total_kv_ru,
+    (j->>'crossRegionNetworkRU')::FLOAT8 AS total_cross_region_network_ru
   FROM
     (
       SELECT
@@ -7433,6 +7433,8 @@ CREATE VIEW crdb_internal.tenant_usage_details AS
 		{Name: "total_pgwire_egress_bytes", Typ: types.Int},
 		{Name: "total_external_io_ingress_bytes", Typ: types.Int},
 		{Name: "total_external_io_egress_bytes", Typ: types.Int},
+		{Name: "total_kv_ru", Typ: types.Float},
+		{Name: "total_cross_region_network_ru", Typ: types.Float},
 	},
 }
 

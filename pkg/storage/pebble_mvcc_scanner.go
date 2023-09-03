@@ -980,7 +980,7 @@ func (p *pebbleMVCCScanner) getOne(ctx context.Context) (ok, added bool) {
 			// intents written by other transactions and seek to the next key.
 			// However, we return the intent separately if we have room; the caller
 			// may want to resolve it. Unlike below, this intent will not result in
-			// a WriteIntentError because MVCC{Scan,Get}Options.errOnIntents returns
+			// a LockConflictError because MVCC{Scan,Get}Options.errOnIntents returns
 			// false when skipLocked in enabled.
 			if p.maxIntents == 0 || int64(p.intents.Count()) < p.maxIntents {
 				if !p.addCurIntent(ctx) {
@@ -1004,7 +1004,7 @@ func (p *pebbleMVCCScanner) getOne(ctx context.Context) (ok, added bool) {
 		if !p.addCurIntent(ctx) {
 			return false, false
 		}
-		// Limit number of intents returned in write intent error.
+		// Limit number of intents returned in lock conflict error.
 		if p.maxIntents > 0 && int64(p.intents.Count()) >= p.maxIntents {
 			p.resumeReason = kvpb.RESUME_INTENT_LIMIT
 			return false, false
@@ -1809,7 +1809,12 @@ func (p *pebbleMVCCScanner) isKeyLockedByConflictingTxn(
 	if p.failOnMoreRecent {
 		strength = lock.Exclusive
 	}
-	if ok, txn := p.lockTable.IsKeyLockedByConflictingTxn(key, strength); ok {
+	ok, txn, err := p.lockTable.IsKeyLockedByConflictingTxn(key, strength)
+	if err != nil {
+		p.err = err
+		return false, false
+	}
+	if ok {
 		// The key is locked or reserved, so ignore it.
 		if txn != nil && (p.maxIntents == 0 || int64(p.intents.Count()) < p.maxIntents) {
 			// However, if the key is locked, we return the lock holder separately

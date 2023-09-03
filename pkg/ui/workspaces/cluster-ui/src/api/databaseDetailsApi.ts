@@ -9,6 +9,7 @@
 // licenses/APL.txt.
 
 import {
+  combineQueryErrors,
   createSqlExecutionRequest,
   executeInternalSql,
   formatApiResult,
@@ -17,6 +18,7 @@ import {
   SqlApiResponse,
   SqlExecutionErrorMessage,
   SqlExecutionRequest,
+  sqlResultsAreEmpty,
   SqlStatement,
   SqlTxnResult,
   txnResultIsEmpty,
@@ -26,12 +28,17 @@ import { Format, Identifier, QualifiedIdentifier } from "./safesql";
 import moment from "moment-timezone";
 import { fromHexString, withTimeout } from "./util";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
-import { getLogger } from "../util";
+import { getLogger, indexUnusedDuration } from "../util";
 
 const { ZoneConfig } = cockroach.config.zonepb;
 const { ZoneConfigurationLevel } = cockroach.server.serverpb;
 type ZoneConfigType = cockroach.config.zonepb.ZoneConfig;
 type ZoneConfigLevelType = cockroach.server.serverpb.ZoneConfigurationLevel;
+
+export type DatabaseDetailsReqParams = {
+  database: string;
+  csIndexUnusedDuration: string;
+};
 
 export type DatabaseDetailsResponse = {
   idResp: SqlApiQueryResponse<DatabaseIdRow>;
@@ -95,7 +102,7 @@ const getDatabaseId: DatabaseDetailsQuery<DatabaseIdRow> = {
     }
   },
   handleMaxSizeError: (_dbName, _response, _dbDetail) => {
-    return new Promise<boolean>(() => false);
+    return Promise.resolve(false);
   },
 };
 
@@ -133,12 +140,12 @@ const getDatabaseGrantsQuery: DatabaseDetailsQuery<DatabaseGrantsRow> = {
     }
   },
   handleMaxSizeError: (_dbName, _response, _dbDetail) => {
-    return new Promise<boolean>(() => false);
+    return Promise.resolve(false);
   },
 };
 
 // Database Tables
-type DatabaseTablesResponse = {
+export type DatabaseTablesResponse = {
   tables: string[];
 };
 
@@ -276,11 +283,11 @@ const getDatabaseZoneConfig: DatabaseDetailsQuery<DatabaseZoneConfigRow> = {
       }
     }
     if (txn_result.error) {
-      resp.idResp.error = txn_result.error;
+      resp.zoneConfigResp.error = txn_result.error;
     }
   },
   handleMaxSizeError: (_dbName, _response, _dbDetail) => {
-    return new Promise<boolean>(() => false);
+    return Promise.resolve(false);
   },
 };
 
@@ -291,7 +298,7 @@ type DatabaseDetailsStats = {
   indexStats: SqlApiQueryResponse<DatabaseIndexUsageStatsResponse>;
 };
 
-type DatabaseSpanStatsRow = {
+export type DatabaseSpanStatsRow = {
   approximate_disk_bytes: number;
   live_bytes: number;
   total_bytes: number;
@@ -333,7 +340,7 @@ const getDatabaseSpanStats: DatabaseDetailsQuery<DatabaseSpanStatsRow> = {
     }
   },
   handleMaxSizeError: (_dbName, _response, _dbDetail) => {
-    return new Promise<boolean>(() => false);
+    return Promise.resolve(false);
   },
 };
 
@@ -378,7 +385,7 @@ const getDatabaseReplicasAndRegions: DatabaseDetailsQuery<DatabaseReplicasRegion
       }
     },
     handleMaxSizeError: (_dbName, _response, _dbDetail) => {
-      return new Promise<boolean>(() => false);
+      return Promise.resolve(false);
     },
   };
 
@@ -387,24 +394,19 @@ type DatabaseIndexUsageStatsResponse = {
 };
 
 const getDatabaseIndexUsageStats: DatabaseDetailsQuery<IndexUsageStatistic> = {
-  createStmt: dbName => {
+  createStmt: (dbName: string, csIndexUnusedDuration: string) => {
+    csIndexUnusedDuration = csIndexUnusedDuration ?? indexUnusedDuration;
     return {
       sql: Format(
-        `WITH cs AS (
-          SELECT value 
-              FROM crdb_internal.cluster_settings 
-          WHERE variable = 'sql.index_recommendation.drop_unused_duration'
-          )
-          SELECT * FROM (SELECT
+        `SELECT * FROM (SELECT
                   ti.created_at,
                   us.last_read,
                   us.total_reads,
-                  cs.value as unused_threshold,
-                  cs.value::interval as interval_threshold,
+                  '${csIndexUnusedDuration}' as unused_threshold,
+                  '${csIndexUnusedDuration}'::interval as interval_threshold,
                   now() - COALESCE(us.last_read AT TIME ZONE 'UTC', COALESCE(ti.created_at, '0001-01-01')) as unused_interval
                   FROM %1.crdb_internal.index_usage_statistics AS us
                   JOIN %1.crdb_internal.table_indexes AS ti ON (us.index_id = ti.index_id AND us.table_id = ti.descriptor_id)
-                  CROSS JOIN cs
                  WHERE $1 != 'system' AND ti.is_unique IS false)
                WHERE unused_interval > interval_threshold
                ORDER BY total_reads DESC;`,
@@ -428,7 +430,7 @@ const getDatabaseIndexUsageStats: DatabaseDetailsQuery<IndexUsageStatistic> = {
     }
   },
   handleMaxSizeError: (_dbName, _response, _dbDetail) => {
-    return new Promise<boolean>(() => false);
+    return Promise.resolve(false);
   },
 };
 
@@ -442,7 +444,7 @@ export type DatabaseDetailsRow =
   | IndexUsageStatistic;
 
 type DatabaseDetailsQuery<RowType> = {
-  createStmt: (dbName: string) => SqlStatement;
+  createStmt: (dbName: string, csIndexUnusedDuration: string) => SqlStatement;
   addToDatabaseDetail: (
     response: SqlTxnResult<RowType>,
     dbDetail: DatabaseDetailsResponse,
@@ -464,63 +466,83 @@ const databaseDetailQueries: DatabaseDetailsQuery<DatabaseDetailsRow>[] = [
   getDatabaseSpanStats,
 ];
 
-export function createDatabaseDetailsReq(dbName: string): SqlExecutionRequest {
-  return createSqlExecutionRequest(
-    dbName,
-    databaseDetailQueries.map(query => query.createStmt(dbName)),
-  );
+export function createDatabaseDetailsReq(
+  params: DatabaseDetailsReqParams,
+): SqlExecutionRequest {
+  return {
+    ...createSqlExecutionRequest(
+      params.database,
+      databaseDetailQueries.map(query =>
+        query.createStmt(params.database, params.csIndexUnusedDuration),
+      ),
+    ),
+    separate_txns: true,
+  };
 }
 
 export async function getDatabaseDetails(
-  databaseName: string,
+  params: DatabaseDetailsReqParams,
   timeout?: moment.Duration,
 ): Promise<SqlApiResponse<DatabaseDetailsResponse>> {
-  return withTimeout(fetchDatabaseDetails(databaseName), timeout);
+  return withTimeout(fetchDatabaseDetails(params), timeout);
 }
 
 async function fetchDatabaseDetails(
-  databaseName: string,
+  params: DatabaseDetailsReqParams,
 ): Promise<SqlApiResponse<DatabaseDetailsResponse>> {
   const detailsResponse: DatabaseDetailsResponse = newDatabaseDetailsResponse();
-  const req: SqlExecutionRequest = createDatabaseDetailsReq(databaseName);
+  const req: SqlExecutionRequest = createDatabaseDetailsReq(params);
   const resp = await executeInternalSql<DatabaseDetailsRow>(req);
+  const errs: Error[] = [];
   resp.execution.txn_results.forEach(txn_result => {
-    if (txn_result.rows) {
-      const query: DatabaseDetailsQuery<DatabaseDetailsRow> =
-        databaseDetailQueries[txn_result.statement - 1];
-      query.addToDatabaseDetail(txn_result, detailsResponse);
+    if (txn_result.error) {
+      errs.push(txn_result.error);
     }
+    const query: DatabaseDetailsQuery<DatabaseDetailsRow> =
+      databaseDetailQueries[txn_result.statement - 1];
+    query.addToDatabaseDetail(txn_result, detailsResponse);
   });
   if (resp.error) {
-    if (resp.error.message.includes("max result size exceeded")) {
-      return fetchSeparatelyDatabaseDetails(databaseName);
+    if (isMaxSizeError(resp.error.message)) {
+      return fetchSeparatelyDatabaseDetails(params);
     }
     detailsResponse.error = resp.error;
   }
+
+  detailsResponse.error = combineQueryErrors(errs, detailsResponse.error);
   return formatApiResult<DatabaseDetailsResponse>(
     detailsResponse,
     detailsResponse.error,
-    "retrieving database details information",
+    `retrieving database details information for database '${params.database}'`,
+    false,
   );
 }
 
 async function fetchSeparatelyDatabaseDetails(
-  databaseName: string,
+  params: DatabaseDetailsReqParams,
 ): Promise<SqlApiResponse<DatabaseDetailsResponse>> {
   const detailsResponse: DatabaseDetailsResponse = newDatabaseDetailsResponse();
+  const errs: Error[] = [];
   for (const databaseDetailQuery of databaseDetailQueries) {
-    const req = createSqlExecutionRequest(databaseName, [
-      databaseDetailQuery.createStmt(databaseName),
+    const req = createSqlExecutionRequest(params.database, [
+      databaseDetailQuery.createStmt(
+        params.database,
+        params.csIndexUnusedDuration,
+      ),
     ]);
     const resp = await executeInternalSql<DatabaseDetailsRow>(req);
-    const txn_result = resp.execution.txn_results[0];
-    if (txn_result.rows) {
-      databaseDetailQuery.addToDatabaseDetail(txn_result, detailsResponse);
+    if (sqlResultsAreEmpty(resp)) {
+      continue;
     }
+    const txn_result = resp.execution.txn_results[0];
+    if (txn_result.error) {
+      errs.push(txn_result.error);
+    }
+    databaseDetailQuery.addToDatabaseDetail(txn_result, detailsResponse);
 
     if (resp.error) {
       const handleFailure = await databaseDetailQuery.handleMaxSizeError(
-        databaseName,
+        params.database,
         txn_result,
         detailsResponse,
       );
@@ -530,9 +552,11 @@ async function fetchSeparatelyDatabaseDetails(
     }
   }
 
+  detailsResponse.error = combineQueryErrors(errs, detailsResponse.error);
   return formatApiResult<DatabaseDetailsResponse>(
     detailsResponse,
     detailsResponse.error,
-    "retrieving database details information",
+    `retrieving database details information for database '${params.database}'`,
+    false,
   );
 }

@@ -22,6 +22,7 @@ import {
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
 import * as fakeApi from "src/util/fakeApi";
 import { mapDispatchToProps, mapStateToProps } from "./redux";
+import { indexUnusedDuration } from "src/util/constants";
 
 class TestDriver {
   private readonly actions: DatabasesPageActions;
@@ -39,8 +40,11 @@ class TestDriver {
     return this.actions.refreshDatabases();
   }
 
-  async refreshDatabaseDetails(database: string) {
-    return this.actions.refreshDatabaseDetails(database);
+  async refreshDatabaseDetails(
+    database: string,
+    csIndexUnusedDuration: string,
+  ) {
+    return this.actions.refreshDatabaseDetails(database, csIndexUnusedDuration);
   }
 
   async refreshNodes() {
@@ -91,7 +95,8 @@ describe("Databases Page", function () {
     driver.assertProperties({
       loading: false,
       loaded: false,
-      lastError: undefined,
+      requestError: undefined,
+      queryError: undefined,
       databases: [],
       search: null,
       filters: defaultFilters,
@@ -101,6 +106,7 @@ describe("Databases Page", function () {
       automaticStatsCollectionEnabled: true,
       indexRecommendationsEnabled: true,
       showNodeRegionsColumn: false,
+      csIndexUnusedDuration: indexUnusedDuration,
     });
   });
 
@@ -134,29 +140,30 @@ describe("Databases Page", function () {
     driver.assertProperties({
       loading: false,
       loaded: true,
-      lastError: null,
+      requestError: null,
+      queryError: undefined,
       databases: [
         {
           loading: false,
           loaded: false,
-          lastError: undefined,
+          requestError: undefined,
+          queryError: undefined,
           name: "system",
           nodes: [],
-          sizeInBytes: 0,
-          tableCount: 0,
-          rangeCount: 0,
+          spanStats: undefined,
+          tables: undefined,
           nodesByRegionString: "",
           numIndexRecommendations: 0,
         },
         {
           loading: false,
           loaded: false,
-          lastError: undefined,
+          requestError: undefined,
+          queryError: undefined,
           name: "test",
           nodes: [],
-          sizeInBytes: 0,
-          tableCount: 0,
-          rangeCount: 0,
+          spanStats: undefined,
+          tables: undefined,
           nodesByRegionString: "",
           numIndexRecommendations: 0,
         },
@@ -168,6 +175,7 @@ describe("Databases Page", function () {
       sortSetting: { ascending: true, columnTitle: "name" },
       showNodeRegionsColumn: false,
       indexRecommendationsEnabled: true,
+      csIndexUnusedDuration: indexUnusedDuration,
       automaticStatsCollectionEnabled: true,
     });
   });
@@ -218,7 +226,10 @@ describe("Databases Page", function () {
     );
 
     fakeApi.stubSqlApiCall<clusterUiApi.DatabaseDetailsRow>(
-      clusterUiApi.createDatabaseDetailsReq("test"),
+      clusterUiApi.createDatabaseDetailsReq({
+        database: "test",
+        csIndexUnusedDuration: indexUnusedDuration,
+      }),
       [
         // Id
         { rows: [] },
@@ -279,17 +290,24 @@ describe("Databases Page", function () {
 
     await driver.refreshNodes();
     await driver.refreshDatabases();
-    await driver.refreshDatabaseDetails("test");
+    await driver.refreshDatabaseDetails("test", indexUnusedDuration);
 
     driver.assertDatabaseProperties("test", {
       loading: false,
       loaded: true,
-      lastError: undefined,
+      requestError: null,
+      queryError: undefined,
       name: "test",
       nodes: [1, 2, 3],
-      sizeInBytes: 100,
-      tableCount: 2,
-      rangeCount: 400,
+      spanStats: {
+        approximate_disk_bytes: 100,
+        live_bytes: 200,
+        total_bytes: 300,
+        range_count: 400,
+      },
+      tables: {
+        tables: [`"public"."foo"`, `"public"."bar"`],
+      },
       nodesByRegionString: "gcp-europe-west1(n3), gcp-us-east1(n1,n2)",
       numIndexRecommendations: 1,
     });

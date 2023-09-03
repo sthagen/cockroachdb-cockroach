@@ -48,7 +48,6 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/clusterversion",
-        "//pkg/keys",
         "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/security/securityassets",
@@ -61,6 +60,7 @@ go_test(
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
+        "//pkg/util/log",
         "@com_github_stretchr_testify//require",
     ],
 )

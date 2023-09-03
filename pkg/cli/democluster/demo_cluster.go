@@ -308,16 +308,6 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 			}
 			rpcAddrReadyChs[i] = rpcAddrReady
 		}
-
-		// Ensure we close all sticky stores we've created when the stopper
-		// instructs the entire cluster to stop. We do this only here
-		// because we want this closer to be registered after all the
-		// individual servers' Stop() methods have been registered
-		// via createAndAddNode() above.
-		c.stopper.AddCloser(stop.CloserFn(func() {
-			c.stickyVFSRegistry.CloseAllEngines()
-		}))
-
 		// Start the remaining nodes asynchronously.
 		for i := 1; i < c.demoCtx.NumNodes; i++ {
 			if err := c.startNodeAsync(ctx, i, errCh, timeoutCh); err != nil {
@@ -457,7 +447,7 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 			// Choose the tenant to use when no tenant is specified on a
 			// connection or web URL.
 			if _, err := ie.Exec(ctx, "default-tenant", nil,
-				`SET CLUSTER SETTING `+multitenant.DefaultTenantSelectSettingName+` = $1`,
+				`SET CLUSTER SETTING `+multitenant.DefaultClusterSelectSettingName+` = $1`,
 				demoTenantName); err != nil {
 				return err
 			}
@@ -654,7 +644,7 @@ func (c *transientCluster) createAndAddNode(
 	if err != nil {
 		return nil, err
 	}
-	s := srv.(serverutils.TestServerInterface)
+	s := &wrap{srv.(serverutils.TestServerInterfaceRaw)}
 
 	// Ensure that this server gets stopped when the top level demo
 	// stopper instructs the cluster to stop.
@@ -1169,7 +1159,7 @@ func (c *transientCluster) startServerInternal(
 	if err != nil {
 		return 0, err
 	}
-	s := srv.(serverutils.TestServerInterface)
+	s := &wrap{srv.(serverutils.TestServerInterfaceRaw)}
 
 	// We want to only return after the server is ready.
 	readyCh := make(chan struct{})
@@ -2153,3 +2143,16 @@ func (c *transientCluster) TenantName() string {
 	}
 	return catconstants.SystemTenantName
 }
+
+type wrap struct {
+	serverutils.TestServerInterfaceRaw
+}
+
+var _ serverutils.TestServerInterface = (*wrap)(nil)
+
+func (w *wrap) ApplicationLayer() serverutils.ApplicationLayerInterface {
+	return w.TestServerInterfaceRaw
+}
+func (w *wrap) SystemLayer() serverutils.ApplicationLayerInterface   { return w.TestServerInterfaceRaw }
+func (w *wrap) TenantController() serverutils.TenantControlInterface { return w.TestServerInterfaceRaw }
+func (w *wrap) StorageLayer() serverutils.StorageLayerInterface      { return w.TestServerInterfaceRaw }

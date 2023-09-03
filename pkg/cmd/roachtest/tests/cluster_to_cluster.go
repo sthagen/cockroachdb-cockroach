@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/clusterstats"
@@ -341,6 +342,12 @@ type replicationSpec struct {
 	// maxLatency override the maxAcceptedLatencyDefault.
 	maxAcceptedLatency time.Duration
 
+	// skipNodeDistributionCheck removes the requirement that multiple source and
+	// destination nodes must participate in the replication stream. This should
+	// be set if the roachtest runs on single node clusters or if the
+	// roachtest completes before the auto replanner distributes the workload.
+	skipNodeDistributionCheck bool
+
 	// If non-empty, the test will be skipped with the supplied reason.
 	skip string
 
@@ -354,6 +361,9 @@ type replicationDriver struct {
 
 	// beforeWorkloadHook is called before the main workload begins.
 	beforeWorkloadHook func()
+
+	// cutoverStarted closes once the driver issues a cutover commmand.
+	cutoverStarted chan struct{}
 
 	// replicationStartHook is called as soon as the replication job begins.
 	replicationStartHook func(ctx context.Context, sp *replicationDriver)
@@ -449,6 +459,7 @@ func (rd *replicationDriver) setupC2C(ctx context.Context, t test.Test, c cluste
 	rd.metrics = &c2cMetrics{}
 	rd.replicationStartHook = func(ctx context.Context, sp *replicationDriver) {}
 	rd.beforeWorkloadHook = func() {}
+	rd.cutoverStarted = make(chan struct{})
 
 	if !c.IsLocal() {
 		// TODO(msbutler): pass a proper cluster replication dashboard and figure out why we need to
@@ -555,18 +566,35 @@ func (rd *replicationDriver) getWorkloadTimeout() time.Duration {
 
 // getReplicationRetainedTime returns the `retained_time` of the replication
 // job.
-func (rd *replicationDriver) getReplicationRetainedTime() time.Time {
+func (rd *replicationDriver) getReplicationRetainedTime() hlc.Timestamp {
 	var retainedTime time.Time
 	rd.setup.dst.sysSQL.QueryRow(rd.t,
 		`SELECT retained_time FROM [SHOW TENANT $1 WITH REPLICATION STATUS]`,
 		roachpb.TenantName(rd.setup.dst.name)).Scan(&retainedTime)
-	return retainedTime
+	return hlc.Timestamp{WallTime: retainedTime.UnixNano()}
+}
+
+func DecimalTimeToHLC(t test.Test, s string) hlc.Timestamp {
+	d, _, err := apd.NewFromString(s)
+	require.NoError(t, err)
+	ts, err := hlc.DecimalToHLC(d)
+	require.NoError(t, err)
+	return ts
 }
 
 func (rd *replicationDriver) stopReplicationStream(
 	ctx context.Context, ingestionJob int, cutoverTime time.Time,
-) {
-	rd.setup.dst.sysSQL.Exec(rd.t, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`, rd.setup.dst.name, cutoverTime)
+) (actualCutoverTime hlc.Timestamp) {
+	var cutoverStr string
+	if cutoverTime.IsZero() {
+		rd.setup.dst.sysSQL.QueryRow(rd.t, `ALTER TENANT $1 COMPLETE REPLICATION TO LATEST`,
+			rd.setup.dst.name).Scan(&cutoverStr)
+	} else {
+		rd.setup.dst.sysSQL.QueryRow(rd.t, `ALTER TENANT $1 COMPLETE REPLICATION TO SYSTEM TIME $2::string`,
+			rd.setup.dst.name, cutoverTime).Scan(&cutoverStr)
+	}
+	actualCutoverTime = DecimalTimeToHLC(rd.t, cutoverStr)
+	close(rd.cutoverStarted)
 	err := retry.ForDuration(rd.rs.cutoverTimeout, func() error {
 		var status string
 		var payloadBytes []byte
@@ -590,20 +618,18 @@ func (rd *replicationDriver) stopReplicationStream(
 		return nil
 	})
 	require.NoError(rd.t, err)
+	return actualCutoverTime
 }
 
 func (rd *replicationDriver) compareTenantFingerprintsAtTimestamp(
-	ctx context.Context, startTime, endTime time.Time,
+	ctx context.Context, startTime, endTime hlc.Timestamp,
 ) {
 	rd.t.Status(fmt.Sprintf("comparing tenant fingerprints between start time %s and end time %s",
-		startTime.UTC(), endTime.UTC()))
-
-	startTimeDecimal := hlc.Timestamp{WallTime: startTime.UnixNano()}.AsOfSystemTime()
-	aost := hlc.Timestamp{WallTime: endTime.UnixNano()}.AsOfSystemTime()
+		startTime, endTime))
 	fingerprintQuery := fmt.Sprintf(`
 SELECT *
 FROM crdb_internal.fingerprint(crdb_internal.tenant_span($1::INT), '%s'::DECIMAL, true)
-AS OF SYSTEM TIME '%s'`, startTimeDecimal, aost)
+AS OF SYSTEM TIME '%s'`, startTime.AsOfSystemTime(), endTime.AsOfSystemTime())
 
 	var srcFingerprint int64
 	fingerPrintMonitor := rd.newMonitor(ctx)
@@ -624,42 +650,40 @@ AS OF SYSTEM TIME '%s'`, startTimeDecimal, aost)
 	// If the goroutine gets cancelled or fataled, return before comparing fingerprints.
 	require.NoError(rd.t, fingerPrintMonitor.WaitE())
 	if srcFingerprint != destFingerprint {
-		startHlc := hlc.Timestamp{WallTime: startTime.UnixNano()}
-		endHlc := hlc.Timestamp{WallTime: endTime.UnixNano()}
 		rd.t.L().Printf("fingerpint mismatch: conducting table level fingerprints")
 		srcTenantConn := rd.c.Conn(ctx, rd.t.L(), 1, option.TenantName(rd.setup.src.name))
 		dstTenantConn := rd.c.Conn(ctx, rd.t.L(), rd.rs.srcNodes+1, option.TenantName(rd.setup.dst.name))
 		require.NoError(rd.t, replicationutils.InvestigateFingerprints(ctx, srcTenantConn, dstTenantConn,
-			startHlc,
-			endHlc))
+			startTime,
+			endTime))
 		rd.t.L().Printf("fingerprints by table seem to match")
 	}
 	require.Equal(rd.t, srcFingerprint, destFingerprint)
 }
 
 // checkParticipatingNodes asserts that multiple nodes in the source and dest cluster are
-// participating in the replication stream, if the test is running on multi node clusters.
+// participating in the replication stream.
 //
 // Note: this isn't a strict requirement of all physical replication streams,
 // rather we check this here because we expect a distributed physical
 // replication stream in a healthy pair of multinode clusters.
 func (rd *replicationDriver) checkParticipatingNodes(ingestionJobId int) {
+	if rd.rs.skipNodeDistributionCheck {
+		return
+	}
 	progress := getJobProgress(rd.t, rd.setup.dst.sysSQL, jobspb.JobID(ingestionJobId)).GetStreamIngest()
-	if rd.rs.srcNodes > 1 {
-		require.Greater(rd.t, len(progress.StreamAddresses), 1, "only 1 src node participating")
-	}
-	if rd.rs.dstNodes > 1 {
-		var destNodeCount int
-		destNodes := make(map[int]struct{})
-		for _, dstNode := range progress.PartitionProgress {
-			dstNodeID := int(dstNode.DestSQLInstanceID)
-			if _, ok := destNodes[dstNodeID]; !ok {
-				destNodes[dstNodeID] = struct{}{}
-				destNodeCount++
-			}
+	require.Greater(rd.t, len(progress.StreamAddresses), 1, "only 1 src node participating")
+
+	var destNodeCount int
+	destNodes := make(map[int]struct{})
+	for _, dstNode := range progress.PartitionProgress {
+		dstNodeID := int(dstNode.DestSQLInstanceID)
+		if _, ok := destNodes[dstNodeID]; !ok {
+			destNodes[dstNodeID] = struct{}{}
+			destNodeCount++
 		}
-		require.Greater(rd.t, destNodeCount, 1, "only 1 dst node participating")
 	}
+	require.Greater(rd.t, destNodeCount, 1, "only 1 dst node participating")
 }
 
 func (rd *replicationDriver) main(ctx context.Context) {
@@ -741,23 +765,28 @@ func (rd *replicationDriver) main(ctx context.Context) {
 		rd.t.L().Printf(`roachtest context cancelled while waiting for workload duration to complete`)
 		return
 	}
-	var currentTime time.Time
-	rd.setup.dst.sysSQL.QueryRow(rd.t, "SELECT clock_timestamp()").Scan(&currentTime)
-	cutoverTime := currentTime.Add(-rd.rs.cutover)
-	rd.t.Status("cutover time chosen: ", cutoverTime.String())
 
 	rd.checkParticipatingNodes(ingestionJobID)
 
 	retainedTime := rd.getReplicationRetainedTime()
-	require.GreaterOrEqual(rd.t, cutoverTime, retainedTime,
-		"cannot cutover to a time below the retained time (did the test already fail?)")
+	var cutoverTime time.Time
+	cutoverTo := "LATEST"
+	if rd.rs.cutover.Nanoseconds() != 0 {
+		var currentTime time.Time
+		rd.setup.dst.sysSQL.QueryRow(rd.t, "SELECT clock_timestamp()").Scan(&currentTime)
+		cutoverTime = currentTime.Add(-rd.rs.cutover)
+		rd.t.Status("cutover time chosen: ", cutoverTime.String())
+		cutoverTo = cutoverTime.String()
+		require.GreaterOrEqual(rd.t, cutoverTime, retainedTime.GoTime(),
+			"cannot cutover to a time below the retained time (did the test already fail?)")
+	}
 
-	rd.metrics.cutoverTo = newMetricSnapshot(metricSnapper, cutoverTime)
 	rd.metrics.cutoverStart = newMetricSnapshot(metricSnapper, timeutil.Now())
 
-	rd.t.Status(fmt.Sprintf("waiting for replication stream to cutover to %s",
-		cutoverTime.String()))
-	rd.stopReplicationStream(ctx, ingestionJobID, cutoverTime)
+	rd.t.Status(fmt.Sprintf("waiting for replication stream to cutover to %s", cutoverTo))
+	actualCutoverTime := rd.stopReplicationStream(ctx, ingestionJobID, cutoverTime)
+
+	rd.metrics.cutoverTo = newMetricSnapshot(metricSnapper, actualCutoverTime.GoTime())
 	rd.metrics.cutoverEnd = newMetricSnapshot(metricSnapper, timeutil.Now())
 
 	rd.metrics.export(rd.t, len(rd.setup.src.nodes))
@@ -766,7 +795,7 @@ func (rd *replicationDriver) main(ctx context.Context) {
 	rd.compareTenantFingerprintsAtTimestamp(
 		ctx,
 		retainedTime,
-		cutoverTime,
+		actualCutoverTime,
 	)
 	lv.assertValid(rd.t)
 }
@@ -807,20 +836,29 @@ func runAcceptanceClusterReplication(ctx context.Context, t test.Test, c cluster
 		srcNodes: 1,
 		dstNodes: 1,
 		// The timeout field ensures the c2c roachtest driver behaves properly.
-		timeout:            10 * time.Minute,
-		workload:           replicateKV{readPercent: 0, debugRunDuration: 1 * time.Minute, maxBlockBytes: 1},
-		additionalDuration: 0 * time.Minute,
-		cutover:            30 * time.Second,
+		timeout:                   10 * time.Minute,
+		workload:                  replicateKV{readPercent: 0, debugRunDuration: 1 * time.Minute, maxBlockBytes: 1},
+		additionalDuration:        0 * time.Minute,
+		cutover:                   30 * time.Second,
+		skipNodeDistributionCheck: true,
 	}
 	rd := makeReplicationDriver(t, c, sp)
 	rd.setupC2C(ctx, t, c)
-	rd.main(ctx)
+
+	// Spin up a monitor to capture any node deaths.
+	m := rd.newMonitor(ctx)
+	m.Go(func(ctx context.Context) error {
+		rd.main(ctx)
+		return nil
+	})
+	m.Wait()
 }
 
 func registerClusterToCluster(r registry.Registry) {
 	for _, sp := range []replicationSpec{
 		{
-			name:      "c2c/tpcc/warehouses=500/duration=10/cutover=5",
+			// Cutover TO LATEST:
+			name:      "c2c/tpcc/warehouses=500/duration=10/cutover=0",
 			benchmark: true,
 			srcNodes:  4,
 			dstNodes:  4,
@@ -833,7 +871,7 @@ func registerClusterToCluster(r registry.Registry) {
 			workload:           replicateTPCC{warehouses: 500},
 			timeout:            1 * time.Hour,
 			additionalDuration: 10 * time.Minute,
-			cutover:            5 * time.Minute,
+			cutover:            0,
 		},
 		{
 			name:      "c2c/tpcc/warehouses=1000/duration=60/cutover=30",
@@ -872,10 +910,11 @@ func registerClusterToCluster(r registry.Registry) {
 			pdSize:   10,
 			workload: replicateKV{readPercent: 0, debugRunDuration: 1 * time.Minute,
 				maxBlockBytes: 1024},
-			timeout:            5 * time.Minute,
-			additionalDuration: 0 * time.Minute,
-			cutover:            30 * time.Second,
-			skip:               "for local ad hoc testing",
+			timeout:                   5 * time.Minute,
+			additionalDuration:        0 * time.Minute,
+			cutover:                   30 * time.Second,
+			skipNodeDistributionCheck: true,
+			skip:                      "for local ad hoc testing",
 		},
 		{
 			name:               "c2c/BulkOps/full",
@@ -903,6 +942,10 @@ func registerClusterToCluster(r registry.Registry) {
 			additionalDuration: 0,
 			cutover:            1 * time.Minute,
 			maxAcceptedLatency: 1 * time.Hour,
+
+			// skipNodeDistributionCheck is set to true because the roachtest
+			// completes before the automatic replanner can run.
+			skipNodeDistributionCheck: true,
 		},
 	} {
 		sp := sp
@@ -910,18 +953,13 @@ func registerClusterToCluster(r registry.Registry) {
 			func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				rd := makeReplicationDriver(t, c, sp)
 				rd.setupC2C(ctx, t, c)
+				// Spin up a monitor to capture any node deaths.
 				m := rd.newMonitor(ctx)
-
-				hc := roachtestutil.NewHealthChecker(t, c, rd.crdbNodes())
 				m.Go(func(ctx context.Context) error {
-					require.NoError(t, hc.Runner(ctx))
+					rd.main(ctx)
 					return nil
 				})
-				defer func() {
-					hc.Done()
-					m.Wait()
-				}()
-				rd.main(ctx)
+				m.Wait()
 			})
 	}
 }
@@ -1005,11 +1043,11 @@ func (rrd *replShutdownDriver) getJobIDs(ctx context.Context) {
 	jobIDQuery := `SELECT job_id FROM [SHOW JOBS] WHERE job_type = '%s'`
 	testutils.SucceedsWithin(rrd.t, func() error {
 		if err := rrd.setup.dst.db.QueryRowContext(ctx, fmt.Sprintf(jobIDQuery,
-			`STREAM INGESTION`)).Scan(&rrd.dstJobID); err != nil {
+			`REPLICATION STREAM INGESTION`)).Scan(&rrd.dstJobID); err != nil {
 			return err
 		}
 		if err := rrd.setup.src.db.QueryRowContext(ctx, fmt.Sprintf(jobIDQuery,
-			`STREAM REPLICATION`)).Scan(&rrd.srcJobID); err != nil {
+			`REPLICATION STREAM PRODUCER`)).Scan(&rrd.srcJobID); err != nil {
 			return err
 		}
 		return nil
@@ -1085,28 +1123,45 @@ func getPhase(rd *replicationDriver, dstJobID jobspb.JobID) c2cPhase {
 	return phaseCutover
 }
 
-func waitForTargetPhase(rd *replicationDriver, dstJobID jobspb.JobID, targetPhase c2cPhase) error {
+func waitForTargetPhase(
+	ctx context.Context, rd *replicationDriver, dstJobID jobspb.JobID, targetPhase c2cPhase,
+) error {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 	for {
 		currentPhase := getPhase(rd, dstJobID)
-		rd.t.L().Printf("Current Phase %s", currentPhase.String())
-		switch {
-		case currentPhase < targetPhase:
-			time.Sleep(5 * time.Second)
-		case currentPhase == targetPhase:
-			rd.t.L().Printf("In target phase %s", currentPhase.String())
+		rd.t.L().Printf("current Phase %s", currentPhase.String())
+		select {
+		case <-rd.cutoverStarted:
+			require.Equal(rd.t, phaseCutover, getPhase(rd, dstJobID), "the replication job is not yet in the cutover phase")
+			rd.t.L().Printf("cutover phase discovered via channel")
 			return nil
-		default:
-			return errors.New("c2c job past target phase")
+		case <-ticker.C:
+			switch {
+			case currentPhase < targetPhase:
+			case currentPhase == targetPhase:
+				rd.t.L().Printf("In target phase %s", currentPhase.String())
+				return nil
+			default:
+				return errors.New("c2c job past target phase")
+			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
-func sleepBeforeResiliencyEvent(rd *replicationDriver) {
+func sleepBeforeResiliencyEvent(rd *replicationDriver, phase c2cPhase) {
 	// Assuming every C2C phase lasts at least 10 seconds, introduce some waiting
 	// before a resiliency event (e.g. a node shutdown) to ensure the event occurs
 	// once we're fully settled into the target phase (e.g. the stream ingestion
 	// processors have observed the cutover signal).
-	randomSleep := time.Duration(1+rd.rng.Intn(2)) * time.Second
+	baseSleep := 1
+	if phase == phaseCutover {
+		// Cutover can sometimes be fast, so sleep for less time.
+		baseSleep = 0
+	}
+	randomSleep := time.Duration(baseSleep+rd.rng.Intn(2)) * time.Second
 	rd.t.L().Printf("Take a %s power nap", randomSleep)
 	time.Sleep(randomSleep)
 }
@@ -1220,10 +1275,10 @@ func registerClusterReplicationResilience(r registry.Registry) {
 				// DR scenario the src cluster may have gone belly up during a
 				// successful c2c replication execution.
 				shutdownStarter := func() jobStarter {
-					return func(c cluster.Cluster, t test.Test) (string, error) {
-						require.NoError(t, waitForTargetPhase(rrd.replicationDriver, rrd.dstJobID, rrd.phase))
-						sleepBeforeResiliencyEvent(rrd.replicationDriver)
-						return fmt.Sprintf("%d", rrd.dstJobID), nil
+					return func(c cluster.Cluster, t test.Test) (jobspb.JobID, error) {
+						require.NoError(t, waitForTargetPhase(ctx, rrd.replicationDriver, rrd.dstJobID, rrd.phase))
+						sleepBeforeResiliencyEvent(rrd.replicationDriver, rrd.phase)
+						return rrd.dstJobID, nil
 					}
 				}
 				destinationWatcherNode := rrd.watcherNode
@@ -1284,8 +1339,8 @@ func registerClusterReplicationDisconnect(r registry.Registry) {
 		dstJobID := jobspb.JobID(getIngestionJobID(t, rd.setup.dst.sysSQL, rd.setup.dst.name))
 
 		// TODO(msbutler): disconnect nodes during a random phase
-		require.NoError(t, waitForTargetPhase(rd, dstJobID, phaseSteadyState))
-		sleepBeforeResiliencyEvent(rd)
+		require.NoError(t, waitForTargetPhase(ctx, rd, dstJobID, phaseSteadyState))
+		sleepBeforeResiliencyEvent(rd, phaseSteadyState)
 		ingestionProgress := getJobProgress(t, rd.setup.dst.sysSQL, dstJobID).GetStreamIngest()
 
 		srcDestConnections := getSrcDestNodePairs(rd, ingestionProgress)

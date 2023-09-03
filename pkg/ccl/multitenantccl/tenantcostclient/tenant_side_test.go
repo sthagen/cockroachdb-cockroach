@@ -553,6 +553,7 @@ func (ts *testState) usage(*testing.T, *datadriven.TestData, cmdArgs) string {
 	return fmt.Sprintf(""+
 		"RU:  %.2f\n"+
 		"KVRU:  %.2f\n"+
+		"CrossRegionNetworkRU:  %.2f\n"+
 		"Reads:  %d requests in %d batches (%d bytes)\n"+
 		"Writes:  %d requests in %d batches (%d bytes)\n"+
 		"SQL Pods CPU seconds:  %.2f\n"+
@@ -561,6 +562,7 @@ func (ts *testState) usage(*testing.T, *datadriven.TestData, cmdArgs) string {
 		"ExternalIO ingress: %d bytes\n",
 		c.RU,
 		c.KVRU,
+		c.CrossRegionNetworkRU,
 		c.ReadRequests,
 		c.ReadBatches,
 		c.ReadBytes,
@@ -1301,11 +1303,10 @@ func BenchmarkExternalIOAccounting(b *testing.B) {
 	nullsink.NullRequiresExternalIOAccounting = true
 
 	setRUAccountingMode := func(b *testing.B, mode string) {
-		_, err := hostSQL.Exec(fmt.Sprintf("SET CLUSTER SETTING tenant_external_io_ru_accounting_mode = '%s'", mode))
+		_, err := hostSQL.Exec(fmt.Sprintf("SET CLUSTER SETTING tenant_cost_control.external_io.ru_accounting_mode = '%s'", mode))
 		require.NoError(b, err)
 
-		_, err = hostSQL.Exec(`UPSERT INTO system.tenant_settings (tenant_id, name, value, value_type) VALUES ($1, $2, $3, $4)`,
-			0, "tenant_external_io_ru_accounting_mode", mode, "s")
+		_, err = hostSQL.Exec(fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING tenant_cost_control.external_io.ru_accounting_mode = '%s'", mode))
 		require.NoError(b, err)
 	}
 
@@ -1437,7 +1438,7 @@ func TestRUSettingsChanged(t *testing.T) {
 	tenant1, tenantDB1 := serverutils.StartTenant(t, s, base.TestTenantArgs{
 		TenantID: tenantID,
 	})
-	defer tenant1.Stopper().Stop(ctx)
+	defer tenant1.AppStopper().Stop(ctx)
 	defer tenantDB1.Close()
 
 	costClient, err := tenantcostclient.NewTenantSideCostController(tenant1.ClusterSettings(), tenantID, nil)
@@ -1459,7 +1460,7 @@ func TestRUSettingsChanged(t *testing.T) {
 		tenantcostmodel.ExternalIOIngressCostPerMiB,
 	}
 	for _, setting := range settings {
-		sysDB.Exec(t, fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING %s = $1", setting.Key()), setting.Default()*100)
+		sysDB.Exec(t, fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING %s = $1", setting.Name()), setting.Default()*100)
 	}
 
 	// Check to make sure the cost of the query increased. Use SucceedsSoon

@@ -1836,7 +1836,8 @@ func TestPropagateTxnOnError(t *testing.T) {
 	epoch := 0
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Observe the commit timestamp to prevent refreshes.
-		_ = txn.CommitTimestamp()
+		_, err := txn.CommitTimestamp()
+		require.NoError(t, err)
 
 		epoch++
 		proto := txn.TestingCloneTxn()
@@ -1858,7 +1859,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 		b.Put(keyA, "val")
 		b.CPut(keyB, "new_val", origBytes)
 		b.Put(keyC, "val2")
-		err := txn.CommitInBatch(ctx, b)
+		err = txn.CommitInBatch(ctx, b)
 		if epoch == 1 {
 			if retErr := (*kvpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &retErr) {
 				if !testutils.IsError(retErr, "ReadWithinUncertaintyIntervalError") {
@@ -2016,6 +2017,8 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	// operates between keys "a" and "z" and expects a single split point at "b".
 	// See the call to setupMultipleRanges below.
 	storeKnobs.DisableLoadBasedSplitting = true
+	// Similarly, disable the merge queue to avoid unexpected merges.
+	storeKnobs.DisableMergeQueue = true
 
 	var refreshSpansCondenseFilter atomic.Value
 	s := serverutils.StartServerOnly(t,
@@ -3892,7 +3895,8 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				}
 				// Read the commit timestamp so the expectation is that
 				// this transaction cannot be restarted internally.
-				_ = txn.CommitTimestamp()
+				_, err := txn.CommitTimestamp()
+				require.NoError(t, err)
 			}
 
 			if tc.priorReads {
@@ -4284,4 +4288,67 @@ func BenchmarkReturnOnRangeBoundary(b *testing.B) {
 		}
 		require.NoError(b, txn.Commit(ctx))
 	}
+}
+
+func TestRefreshFailureIncludesConflictingTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testutils.RunTrueAndFalse(t, "committed", func(t *testing.T, committed bool) {
+		testutils.RunTrueAndFalse(t, "range-refresh", func(t *testing.T, rangeRefresh bool) {
+			ctx := context.Background()
+			s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+			defer s.Stopper().Stop(ctx)
+
+			keyA := "a"
+			endRangeA := "a2"
+			keyB := "b"
+
+			err := db.Put(ctx, keyA, "put")
+			require.NoError(t, err)
+
+			txn1 := db.NewTxn(ctx, "original txn")
+			txn2 := db.NewTxn(ctx, "contending txn")
+
+			if rangeRefresh {
+				_, err = txn1.Scan(ctx, keyA, endRangeA, 10)
+				require.NoError(t, err)
+			} else {
+				_, err = txn1.Get(ctx, keyA)
+				require.NoError(t, err)
+			}
+
+			// This bumps the timestamp cache on keyB so that the next put from txn1
+			// causes its write timestamp to skew, thereby forcing a refresh.
+			_, err = txn2.Get(ctx, keyB)
+			require.NoError(t, err)
+
+			err = txn2.Put(ctx, keyA, "put")
+			require.NoError(t, err)
+
+			if committed {
+				require.NoError(t, txn2.Commit(ctx))
+				// Force intent clean up.
+				_, err = db.Get(ctx, keyA)
+				require.NoError(t, err)
+			}
+
+			err = txn1.Put(ctx, keyB, "put")
+			require.NoError(t, err)
+
+			err = txn1.Commit(ctx)
+			require.Error(t, err)
+
+			tErr := (*kvpb.TransactionRetryWithProtoRefreshError)(nil)
+			require.ErrorAs(t, err, &tErr)
+
+			if committed {
+				require.Nil(t, tErr.ConflictingTxn)
+			} else {
+				require.NotNil(t, tErr.ConflictingTxn)
+				require.Equal(t, txn2.ID(), tErr.ConflictingTxn.ID)
+				require.Equal(t, int32(1), tErr.ConflictingTxn.CoordinatorNodeID)
+			}
+		})
+	})
 }

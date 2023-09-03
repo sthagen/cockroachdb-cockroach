@@ -63,7 +63,7 @@ var reportFrequency = settings.RegisterDurationSetting(
 	"interval at which diagnostics data should be reported",
 	time.Hour,
 	settings.NonNegativeDuration,
-).WithPublic()
+	settings.WithPublic)
 
 // Reporter is a helper struct that phones home to report usage and diagnostics.
 type Reporter struct {
@@ -213,9 +213,9 @@ func (r *Reporter) CreateReport(
 		var ok bool
 		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 			row := it.Cur()
-			name := string(tree.MustBeDString(row[0]))
-			info.AlteredSettings[name] = settings.RedactedValue(
-				name, &r.Settings.SV, r.TenantID == roachpb.SystemTenantID,
+			internalKey := string(tree.MustBeDString(row[0]))
+			info.AlteredSettings[internalKey] = settings.RedactedValue(
+				settings.InternalKey(internalKey), &r.Settings.SV, r.TenantID == roachpb.SystemTenantID,
 			)
 		}
 		if err != nil {

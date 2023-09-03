@@ -83,7 +83,7 @@ enum ResumeReason {
   // NB: 21.2 and below will return RESUME_KEY_LIMIT instead.
   RESUME_BYTE_LIMIT = 2;
   // An intent limit was exceeded. This is currently never returned to clients,
-  // since MVCCScan converts the result into a WriteIntentError.
+  // since MVCCScan converts the result into a LockConflictError.
   // NB: 21.2 and below will return RESUME_KEY_LIMIT instead.
   RESUME_INTENT_LIMIT = 3;
   // The DistSender encountered a range boundary and returned a partial result,
@@ -2525,7 +2525,7 @@ message Header {
   // encounters a conflicting lock held by another active transaction.
   //
   // If an Error wait policy is set and a conflicting lock held by an active
-  // transaction is encountered, a WriteIntentError will be returned.
+  // transaction is encountered, a LockConflictError will be returned.
   //
   // If a SkipLocked wait policy is set and a conflicting lock held by an active
   // transaction is encountered, the corresponding key is not included in the
@@ -2539,7 +2539,7 @@ message Header {
   // will wait while attempting to acquire a lock on a key or while blocking on
   // an existing lock in order to perform a non-locking read on a key. The time
   // limit applies separately to each lock acquisition attempt. If the timeout
-  // elapses when waiting for a lock, a WriteIntentError will be returned.
+  // elapses when waiting for a lock, a LockConflictError will be returned.
   //
   // Unlike in some other systems like PostgreSQL, where non-locking reads do
   // not wait on conflicting locks, in CockroachDB, non-locking reads do wait
@@ -3256,9 +3256,9 @@ message TenantSettingsEvent {
   // NEXT ID: 10
 }
 
-// TenantSetting contains the name and value of a tenant setting.
+// TenantSetting contains the setting key and value of a tenant setting.
 message TenantSetting {
-  string name = 1;
+  string internal_key = 1 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/settings.InternalKey"];
   settings.EncodedValue value = 2 [(gogoproto.nullable) = false];
 }
 
@@ -3277,6 +3277,7 @@ message TenantConsumption {
   uint64 pgwire_egress_bytes = 7 [(gogoproto.customname) = "PGWireEgressBytes"];
   uint64 external_io_ingress_bytes = 9 [(gogoproto.customname) = "ExternalIOIngressBytes"];
   uint64 external_io_egress_bytes = 10 [(gogoproto.customname) = "ExternalIOEgressBytes"];
+  double cross_region_network_r_u = 13;
   // Note: if any fields are changed, the Sub and Add methods must be updated.
 }
 

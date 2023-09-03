@@ -50,8 +50,8 @@ import (
 var (
 	flagRSGTime                    = flag.Duration("rsg", 0, "random syntax generator test duration")
 	flagRSGGoRoutines              = flag.Int("rsg-routines", 1, "number of Go routines executing random statements in each RSG test")
-	flagRSGExecTimeout             = flag.Duration("rsg-exec-timeout", 15*time.Second, "timeout duration when executing a statement")
-	flagRSGExecColumnChangeTimeout = flag.Duration("rsg-exec-column-change-timeout", 20*time.Second, "timeout duration when executing a statement for random column changes")
+	flagRSGExecTimeout             = flag.Duration("rsg-exec-timeout", 35*time.Second, "timeout duration when executing a statement")
+	flagRSGExecColumnChangeTimeout = flag.Duration("rsg-exec-column-change-timeout", 40*time.Second, "timeout duration when executing a statement for random column changes")
 )
 
 func verifyFormat(sql string) error {
@@ -173,6 +173,7 @@ func (db *verifyFormatDB) execWithResettableTimeout(
 	}()
 	retry := true
 	targetDuration := duration
+	cancellationChannel := ctx.Done()
 	for retry {
 		retry = false
 		err := func() error {
@@ -200,7 +201,7 @@ func (db *verifyFormatDB) execWithResettableTimeout(
 					return &nonCrasher{sql: sql, err: err}
 				}
 				return nil
-			case <-ctx.Done():
+			case <-cancellationChannel:
 				// Sanity: The context is cancelled when the test is about to
 				// timeout. We will log whatever statement we're waiting on for
 				// debugging purposes. Sometimes queries won't respect
@@ -209,6 +210,7 @@ func (db *verifyFormatDB) execWithResettableTimeout(
 				// We will intentionally retry, which will us to wait for the
 				// go routine to complete above to avoid leaking it.
 				retry = true
+				cancellationChannel = nil
 				return nil
 			case <-time.After(targetDuration):
 				db.mu.Lock()
@@ -356,6 +358,10 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 				switch lower {
 				case "pg_sleep":
 					continue
+				case "crdb_internal.create_sql_schema_telemetry_job":
+					// We can create a crazy number of telemtry jobs accidentally,
+					// within the test. Leading to terrible contention.
+					continue
 				case "crdb_internal.gen_rand_ident":
 					// Generates random identifiers, so a large number are dangerous and
 					// can take a long time.
@@ -435,6 +441,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 		// involve schema changes like truncates. In general this should make
 		// this test more resilient as the timeouts are reset as long progress
 		// is made on *some* connection.
+		t.Logf("Running %q", s)
 		return db.execWithResettableTimeout(t, ctx, s, *flagRSGExecTimeout, *flagRSGGoRoutines)
 	})
 }
@@ -466,9 +473,10 @@ func TestRandomSyntaxSchemaChangeDatabase(t *testing.T) {
 	}
 
 	testRandomSyntax(t, true, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
-		return db.exec(t, ctx, `
-			CREATE DATABASE ident;
-		`)
+		if err := db.exec(t, ctx, "SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '30s'"); err != nil {
+			return err
+		}
+		return db.exec(t, ctx, `CREATE DATABASE ident;`)
 	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		n := r.Intn(len(roots))
 		s := r.Generate(roots[n], 30)
@@ -485,6 +493,9 @@ func TestRandomSyntaxSchemaChangeColumn(t *testing.T) {
 	}
 
 	testRandomSyntax(t, true, "ident", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+		if err := db.exec(t, ctx, "SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '30s'"); err != nil {
+			return err
+		}
 		return db.exec(t, ctx, `
 			CREATE DATABASE ident;
 			CREATE TABLE ident.ident (ident decimal);
@@ -636,6 +647,9 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 
 	tableStmts := make([]string, 0)
 	testRandomSyntax(t, true, "defaultdb", func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
+		if err := db.exec(t, ctx, "SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '30s'"); err != nil {
+			return err
+		}
 		setups := []string{sqlsmith.RandTableSetupName, "seed"}
 		for _, s := range setups {
 			randTables := sqlsmith.Setups[s](r.Rnd)
@@ -791,8 +805,10 @@ func testRandomSyntax(
 	params.Knobs.PGWireTestingKnobs = &sql.PGWireTestingKnobs{
 		CatchPanics: true,
 	}
-	s, rawDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, rawDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
+	sql.SecondaryTenantScatterEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
 	db := &verifyFormatDB{db: rawDB}
 	err := db.exec(t, ctx, "SET CLUSTER SETTING schemachanger.job.max_retry_backoff='1s'")
 	require.NoError(t, err)

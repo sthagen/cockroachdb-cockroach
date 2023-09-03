@@ -4262,7 +4262,7 @@ func TestStrictGCEnforcement(t *testing.T) {
 		// Disable follower reads. When metamorphically enabling expiration-based
 		// leases, an expired lease will cause a follower read which bypasses the
 		// strict GC enforcement.
-		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = false")
+		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.follower_reads.enabled = false")
 
 		sqlDB.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10 ms'")
 		defer sqlDB.Exec(t, `SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = DEFAULT`)
@@ -4536,8 +4536,8 @@ func TestDiscoverIntentAcrossLeaseTransferAwayAndBack(t *testing.T) {
 				TestingConcurrencyRetryFilter: func(ctx context.Context, ba *kvpb.BatchRequest, pErr *kvpb.Error) {
 					if txn := ba.Txn; txn != nil && txn.ID == txn2ID.Load() {
 						txn2BBlockOnce.Do(func() {
-							if !errors.HasType(pErr.GoError(), (*kvpb.WriteIntentError)(nil)) {
-								t.Errorf("expected WriteIntentError; got %v", pErr)
+							if !errors.HasType(pErr.GoError(), (*kvpb.LockConflictError)(nil)) {
+								t.Errorf("expected LockConflictError; got %v", pErr)
 							}
 
 							unblockCh := make(chan struct{})

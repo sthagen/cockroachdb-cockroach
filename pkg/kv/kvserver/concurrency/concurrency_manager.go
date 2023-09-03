@@ -69,7 +69,7 @@ var MaxLockWaitQueueLength = settings.RegisterIntSetting(
 		"wait-queue is already equal to or exceeding this length, requests will be rejected "+
 		"eagerly instead of entering the queue and waiting. Set to 0 to disable.",
 	0,
-	func(v int64) error {
+	settings.WithValidateInt(func(v int64) error {
 		if v < 0 {
 			return errors.Errorf("cannot be set to a negative value: %d", v)
 		}
@@ -83,7 +83,7 @@ var MaxLockWaitQueueLength = settings.RegisterIntSetting(
 			return errors.Errorf("cannot be set below %d: %d", minSafeMaxLength, v)
 		}
 		return nil
-	},
+	}),
 )
 
 // DiscoveredLocksThresholdToConsultTxnStatusCache sets a threshold as mentioned
@@ -361,7 +361,7 @@ func (m *managerImpl) maybeInterceptReq(ctx context.Context, req Request) (Respo
 		// If necessary, wait in the txnWaitQueue for the pushee transaction to
 		// expire or to move to a finalized state.
 		t := req.Requests[0].GetPushTxn()
-		resp, err := m.twq.MaybeWaitForPush(ctx, t)
+		resp, err := m.twq.MaybeWaitForPush(ctx, t, req.WaitPolicy)
 		if err != nil {
 			return nil, err
 		} else if resp != nil {
@@ -450,12 +450,12 @@ func (m *managerImpl) FinishReq(g *Guard) {
 	releaseGuard(g)
 }
 
-// HandleWriterIntentError implements the ContentionHandler interface.
-func (m *managerImpl) HandleWriterIntentError(
-	ctx context.Context, g *Guard, seq roachpb.LeaseSequence, t *kvpb.WriteIntentError,
+// HandleLockConflictError implements the ContentionHandler interface.
+func (m *managerImpl) HandleLockConflictError(
+	ctx context.Context, g *Guard, seq roachpb.LeaseSequence, t *kvpb.LockConflictError,
 ) (*Guard, *Error) {
 	if g.ltg == nil {
-		log.Fatalf(ctx, "cannot handle WriteIntentError %v for request without "+
+		log.Fatalf(ctx, "cannot handle LockConflictError %v for request without "+
 			"lockTableGuard; were lock spans declared for this request?", t)
 	}
 
@@ -472,7 +472,7 @@ func (m *managerImpl) HandleWriterIntentError(
 	//    wait in the new leaseholder's lock table.
 	// 2) if the request can be served on this follower replica according to the
 	//    closed timestamp then it will likely re-encounter the same intent on its
-	//    next evaluation attempt. The WriteIntentError will then be mapped to an
+	//    next evaluation attempt. The LockConflictError will then be mapped to an
 	//    InvalidLeaseError in maybeAttachLease, which will indicate that the
 	//    request cannot be served as a follower read after all and cause the
 	//    request to be redirected to the leaseholder.
@@ -480,17 +480,17 @@ func (m *managerImpl) HandleWriterIntentError(
 	// Either way, there is no possibility of the request entering an infinite
 	// loop without making progress.
 	consultTxnStatusCache :=
-		int64(len(t.Intents)) > DiscoveredLocksThresholdToConsultTxnStatusCache.Get(&m.st.SV)
-	for i := range t.Intents {
-		intent := &t.Intents[i]
-		added, err := m.lt.AddDiscoveredLock(intent, seq, consultTxnStatusCache, g.ltg)
+		int64(len(t.Locks)) > DiscoveredLocksThresholdToConsultTxnStatusCache.Get(&m.st.SV)
+	for i := range t.Locks {
+		foundLock := &t.Locks[i]
+		added, err := m.lt.AddDiscoveredLock(foundLock, seq, consultTxnStatusCache, g.ltg)
 		if err != nil {
 			log.Fatalf(ctx, "%v", err)
 		}
 		if !added {
 			log.VEventf(ctx, 2,
 				"intent on %s discovered but not added to disabled lock table",
-				intent.Key.String())
+				foundLock.Key.String())
 		}
 	}
 
@@ -612,7 +612,7 @@ func (m *managerImpl) OnReplicaSnapshotApplied() {
 	// through LockManager listener methods. If there's a chance it missed a
 	// state transition, it is safer to simply clear the lockTable and rebuild
 	// it from persistent intent state by allowing requests to discover locks
-	// and inform the manager through calls to HandleWriterIntentError.
+	// and inform the manager through calls to HandleLockConflictError.
 	//
 	// A range only maintains locks in the lockTable of its leaseholder replica
 	// even thought it runs a concurrency manager on all replicas. Because of
@@ -645,7 +645,7 @@ func (m *managerImpl) TestingTxnWaitQueue() *txnwait.Queue {
 
 // TestingSetMaxLocks implements the TestingAccessor interface.
 func (m *managerImpl) TestingSetMaxLocks(maxLocks int64) {
-	m.lt.(*lockTableImpl).setMaxLocks(maxLocks)
+	m.lt.(*lockTableImpl).setMaxKeysLocked(maxLocks)
 }
 
 func (r *Request) isSingle(m kvpb.Method) bool {
@@ -767,25 +767,23 @@ func (g *Guard) CheckOptimisticNoLatchConflicts() (ok bool) {
 	return g.lm.CheckOptimisticNoConflicts(g.lg, g.Req.LatchSpans)
 }
 
-// IsKeyLockedByConflictingTxn returns whether the specified key is claimed
-// (see claimantTxn()) by a conflicting transaction in the lockTableGuard's
-// snapshot of the lock table, given the caller's own desired locking
-// strength. If so, true is returned. If the key is locked, the lock holder is
-// also returned. Otherwise, if the key was claimed by a concurrent request
-// still sequencing through the lock table, but the lock isn't held (yet), nil
-// is also returned.
+// IsKeyLockedByConflictingTxn returns whether the specified key is locked by
+// a conflicting transaction in the lockTableGuard's snapshot of the lock
+// table, given the caller's own desired locking strength. If so, true is
+// returned and so is the lock holder. If the lock is held by the transaction
+// itself, there's no conflict to speak of, so false is returned.
 //
-// If the lock has been claimed (held or otherwise) by the transaction itself,
-// there's no conflict to speak of, so false is returned. In cases where the
-// lock isn't held, but the lock has been claimed by the transaction itself,
-// we do not make a distinction about which request claimed the key -- it
-// could either be the request itself, or a different concurrent request from
-// the same transaction; The specifics do not affect the caller.
 // This method is used by requests in conjunction with the SkipLocked wait
 // policy to determine which keys they should skip over during evaluation.
+//
+// If the supplied lock strength is locking (!= lock.None), then any queued
+// locking requests that came before the lockTableGuard will also be checked
+// for conflicts. This helps prevent a stream of locking SKIP LOCKED requests
+// from starving out regular locking requests. In such cases, true is
+// returned, but so is nil.
 func (g *Guard) IsKeyLockedByConflictingTxn(
 	key roachpb.Key, strength lock.Strength,
-) (bool, *enginepb.TxnMeta) {
+) (bool, *enginepb.TxnMeta, error) {
 	return g.ltg.IsKeyLockedByConflictingTxn(key, strength)
 }
 

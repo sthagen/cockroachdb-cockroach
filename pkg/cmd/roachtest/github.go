@@ -143,7 +143,7 @@ func (g *githubIssues) createPostRequest(
 	// Overrides to shield eng teams from potential flakes
 	switch {
 	case failureContainsError(firstFailure, errClusterProvisioningFailed):
-		issueOwner = registry.OwnerDevInf
+		issueOwner = registry.OwnerTestEng
 		issueName = "cluster_creation"
 		messagePrefix = fmt.Sprintf("test %s was skipped due to ", testName)
 		infraFlake = true
@@ -159,8 +159,13 @@ func (g *githubIssues) createPostRequest(
 	// Issues posted from roachtest are identifiable as such, and they are also release blockers
 	// (this label may be removed by a human upon closer investigation).
 	labels := []string{"O-roachtest"}
-	if !spec.NonReleaseBlocker && !infraFlake {
+	if infraFlake {
+		labels = append(labels, "X-infra-flake")
+	} else if !spec.NonReleaseBlocker {
 		labels = append(labels, "release-blocker")
+	}
+	if len(spec.ExtraLabels) > 0 {
+		labels = append(labels, spec.ExtraLabels...)
 	}
 
 	teams, err := g.teamLoader()
@@ -217,15 +222,16 @@ func (g *githubIssues) createPostRequest(
 			"consult the logs for details. WARNING: DO NOT COPY UNREDACTED ARTIFACTS TO THIS ISSUE."
 	}
 	return issues.PostRequest{
-		MentionOnCreate: mention,
-		ProjectColumnID: projColID,
-		PackageName:     "roachtest",
-		TestName:        issueName,
-		Message:         issueMessage,
-		Artifacts:       artifacts,
-		ExtraLabels:     labels,
-		ExtraParams:     clusterParams,
-		HelpCommand:     generateHelpCommand(issueClusterName, spec.Cluster.Cloud, start, end),
+		MentionOnCreate:      mention,
+		ProjectColumnID:      projColID,
+		PackageName:          "roachtest",
+		TestName:             issueName,
+		Message:              issueMessage,
+		SkipLabelTestFailure: infraFlake, // infra-flakes are not marked as C-test-failure
+		Artifacts:            artifacts,
+		ExtraLabels:          labels,
+		ExtraParams:          clusterParams,
+		HelpCommand:          generateHelpCommand(issueClusterName, spec.Cluster.Cloud, start, end),
 	}, nil
 }
 

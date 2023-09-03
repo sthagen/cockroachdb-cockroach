@@ -52,7 +52,7 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	skip.UnderDeadlock(t, "takes >1min under deadlock")
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "r1"}}}},
 			1: {Locality: roachpb.Locality{Tiers: []roachpb.Tier{{Key: "region", Value: "r1"}}}},
@@ -69,6 +69,7 @@ func TestConstraintConformanceReportIntegration(t *testing.T) {
 	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Create a table and a zone config for it.
 	// The zone will be configured with a constraints that can't be satisfied
@@ -129,7 +130,7 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	// 2 regions, 3 dcs per region.
-	tc := serverutils.StartNewTestCluster(t, 6, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 6, base.TestClusterArgs{
 		// We're going to do our own replication.
 		// All the system ranges will start with a single replica on node 1.
 		ReplicationMode: base.ReplicationManual,
@@ -174,6 +175,7 @@ func TestCriticalLocalitiesReportIntegration(t *testing.T) {
 	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Since we're using ReplicationManual, all the ranges will start with a
 	// single replica on node 1. So, the node's dc and the node's region are
@@ -310,7 +312,7 @@ func TestReplicationStatusReportIntegration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 4, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 4, base.TestClusterArgs{
 		// We're going to do our own replication.
 		// All the system ranges will start with a single replica on node 1.
 		ReplicationMode: base.ReplicationManual,
@@ -323,6 +325,7 @@ func TestReplicationStatusReportIntegration(t *testing.T) {
 	tdb.Exec(t, "SET CLUSTER SETTING kv.replication_reports.interval = '1ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'")
 	tdb.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '10 ms'")
+	tdb.Exec(t, "SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '10 ms'")
 
 	// Create a table with a dummy zone config. Configuring the zone is useful
 	// only for creating the zone; we don't actually care about the configuration.
@@ -388,7 +391,9 @@ func TestMeta2RangeIter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	// First make an interator with a large page size and use it to determine the numner of ranges.
@@ -424,7 +429,9 @@ func TestRetriableErrorWhenGenerationReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
 	defer s.Stopper().Stop(ctx)
 
 	cfg := s.ExecutorConfig().(sql.ExecutorConfig).SystemConfig.GetSystemConfig()
@@ -462,7 +469,7 @@ func (it *erroryRangeIterator) Next(ctx context.Context) (roachpb.RangeDescripto
 
 		var err error
 		err = kvpb.NewTransactionRetryWithProtoRefreshError(
-			"injected err", uuid.Nil, roachpb.Transaction{})
+			"injected err", uuid.Nil, 0 /* prevTxnEpoch */, roachpb.Transaction{})
 		// Let's wrap the error to check the unwrapping.
 		err = errors.Wrap(err, "dummy wrapper")
 		// Feed the error to the underlying iterator to reset it.

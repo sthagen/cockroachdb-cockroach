@@ -132,6 +132,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/schedulerlatency"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 )
@@ -268,13 +269,15 @@ type granterWithIOTokens interface {
 	// provided by tokens. This method needs to be called periodically.
 	// {io, elasticDiskBandwidth}TokensCapacity is the ceiling up to which we allow
 	// elastic or disk bandwidth tokens to accumulate. The return value is the
-	// number of used tokens in the interval since the prior call to this method.
-	// Note that tokensUsed can be negative, though that will be rare, since it is
-	// possible for tokens to be returned.
+	// number of used tokens in the interval since the prior call to this method
+	// (and the tokens used by elastic work). Note that tokensUsed* can be
+	// negative, though that will be rare, since it is possible for tokens to be
+	// returned.
 	setAvailableTokens(
-		ioTokens int64, elasticDiskBandwidthTokens int64,
-		ioTokensCapacity int64, elasticDiskBandwidthTokensCapacity int64,
-	) (tokensUsed int64)
+		ioTokens int64, elasticIOTokens int64, elasticDiskBandwidthTokens int64,
+		ioTokensCapacity int64, elasticIOTokenCapacity int64, elasticDiskBandwidthTokensCapacity int64,
+		lastTick bool,
+	) (tokensUsed int64, tokensUsedByElasticWork int64)
 	// getDiskTokensUsedAndReset returns the disk bandwidth tokens used
 	// since the last such call.
 	getDiskTokensUsedAndReset() [admissionpb.NumWorkClasses]int64
@@ -361,9 +364,7 @@ type elasticCPULimiter interface {
 
 // SchedulerLatencyListener listens to the latest scheduler latency data. We
 // expect this to be called every scheduler_latency.sample_period.
-type SchedulerLatencyListener interface {
-	SchedulerLatency(p99, period time.Duration)
-}
+type SchedulerLatencyListener = schedulerlatency.LatencyObserver
 
 // grantKind represents the two kind of ways we grant admission: using a slot
 // or a token. The slot terminology is akin to a scheduler, where a scheduling

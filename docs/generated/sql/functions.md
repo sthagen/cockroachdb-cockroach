@@ -388,10 +388,48 @@
 <tbody>
 <tr><td><a name="crypt"></a><code>crypt(password: <a href="string.html">string</a>, salt: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Generates a hash based on a password and salt. The hash algorithm and number of rounds if applicable are encoded in the salt.</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="decrypt"></a><code>decrypt(data: <a href="bytes.html">bytes</a>, key: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decrypt <code>data</code> with <code>key</code> using the cipher method specified by <code>type</code>.</p>
+<p>The cipher type must have the format <code>&lt;algorithm&gt;[-&lt;mode&gt;][/pad:&lt;padding&gt;]</code> where:</p>
+<ul>
+<li><code>&lt;algorithm&gt;</code> is <code>aes</code></li>
+<li><code>&lt;mode&gt;</code> is <code>cbc</code> (default)</li>
+<li><code>&lt;padding&gt;</code> is <code>pkcs</code> (default) or <code>none</code></li>
+</ul>
+<p>This function requires an enterprise license on a CCL distribution.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="decrypt_iv"></a><code>decrypt_iv(data: <a href="bytes.html">bytes</a>, key: <a href="bytes.html">bytes</a>, iv: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Decrypt <code>data</code> with <code>key</code> using the cipher method specified by <code>type</code>. If the mode is CBC, the provided <code>iv</code> will be used. Otherwise, it will be ignored.</p>
+<p>The cipher type must have the format <code>&lt;algorithm&gt;[-&lt;mode&gt;][/pad:&lt;padding&gt;]</code> where:</p>
+<ul>
+<li><code>&lt;algorithm&gt;</code> is <code>aes</code></li>
+<li><code>&lt;mode&gt;</code> is <code>cbc</code> (default)</li>
+<li><code>&lt;padding&gt;</code> is <code>pkcs</code> (default) or <code>none</code></li>
+</ul>
+<p>This function requires an enterprise license on a CCL distribution.</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="digest"></a><code>digest(data: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Computes a binary hash of the given <code>data</code>. <code>type</code> is the algorithm to use (md5, sha1, sha224, sha256, sha384, or sha512).</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="digest"></a><code>digest(data: <a href="string.html">string</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Computes a binary hash of the given <code>data</code>. <code>type</code> is the algorithm to use (md5, sha1, sha224, sha256, sha384, or sha512).</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="encrypt"></a><code>encrypt(data: <a href="bytes.html">bytes</a>, key: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encrypt <code>data</code> with <code>key</code> using the cipher method specified by <code>type</code>.</p>
+<p>The cipher type must have the format <code>&lt;algorithm&gt;[-&lt;mode&gt;][/pad:&lt;padding&gt;]</code> where:</p>
+<ul>
+<li><code>&lt;algorithm&gt;</code> is <code>aes</code></li>
+<li><code>&lt;mode&gt;</code> is <code>cbc</code> (default)</li>
+<li><code>&lt;padding&gt;</code> is <code>pkcs</code> (default) or <code>none</code></li>
+</ul>
+<p>This function requires an enterprise license on a CCL distribution.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="encrypt_iv"></a><code>encrypt_iv(data: <a href="bytes.html">bytes</a>, key: <a href="bytes.html">bytes</a>, iv: <a href="bytes.html">bytes</a>, type: <a href="string.html">string</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Encrypt <code>data</code> with <code>key</code> using the cipher method specified by <code>type</code>. If the mode is CBC, the provided <code>iv</code> will be used. Otherwise, it will be ignored.</p>
+<p>The cipher type must have the format <code>&lt;algorithm&gt;[-&lt;mode&gt;][/pad:&lt;padding&gt;]</code> where:</p>
+<ul>
+<li><code>&lt;algorithm&gt;</code> is <code>aes</code></li>
+<li><code>&lt;mode&gt;</code> is <code>cbc</code> (default)</li>
+<li><code>&lt;padding&gt;</code> is <code>pkcs</code> (default) or <code>none</code></li>
+</ul>
+<p>This function requires an enterprise license on a CCL distribution.</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="gen_random_bytes"></a><code>gen_random_bytes(count: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a></code></td><td><span class="funcdesc"><p>Returns <code>count</code> cryptographically strong random bytes. At most 1024 bytes can be extracted at a time.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="gen_salt"></a><code>gen_salt(type: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Generates a salt for input into the <code>crypt</code> function using the default number of rounds.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="gen_salt"></a><code>gen_salt(type: <a href="string.html">string</a>, iter_count: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Generates a salt for input into the <code>crypt</code> function using <code>iter_count</code> number of rounds.</p>
@@ -521,6 +559,11 @@ significant than <code>element</code> to zero (or one, for day and month)</p>
 <p>Compatible elements: millennium, century, decade, year, quarter, month,
 week, day, hour, minute, second, millisecond, microsecond.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="date_trunc"></a><code>date_trunc(element: <a href="string.html">string</a>, input: <a href="timestamp.html">timestamptz</a>, timezone: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Truncates <code>input</code> to precision <code>element</code> in the specified <code>timezone</code>.  Sets all fields that are less
+significant than <code>element</code> to zero (or one, for day and month)</p>
+<p>Compatible elements: millennium, century, decade, year, quarter, month,
+week, day, hour, minute, second, millisecond, microsecond.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="experimental_follower_read_timestamp"></a><code>experimental_follower_read_timestamp() &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Same as follower_read_timestamp. This name is deprecated.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="experimental_strftime"></a><code>experimental_strftime(input: <a href="date.html">date</a>, extract_format: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>From <code>input</code>, extracts and formats the time as identified in <code>extract_format</code> using standard <code>strftime</code> notation (though not all formatting is supported).</p>
@@ -604,6 +647,14 @@ has no relationship with the commit order of concurrent transactions.</p>
 <p>The value is based on a timestamp picked when the transaction starts
 and which stays constant throughout the transaction. This timestamp
 has no relationship with the commit order of concurrent transactions.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="make_date"></a><code>make_date(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>) &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Create date (formatted according to ISO 8601) from year, month, and day fields (negative years signify BC).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="make_timestamp"></a><code>make_timestamp(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamp</a></code></td><td><span class="funcdesc"><p>Create timestamp (formatted according to ISO 8601) from year, month, day, hour, minute, and seconds fields (negative years signify BC).</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="make_timestamptz"></a><code>make_timestamptz(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Create timestamp (formatted according to ISO 8601) with time zone from year, month, day, hour, minute and seconds fields (negative years signify BC). If timezone is not specified, the current time zone is used.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="make_timestamptz"></a><code>make_timestamptz(year: <a href="int.html">int</a>, month: <a href="int.html">int</a>, day: <a href="int.html">int</a>, hour: <a href="int.html">int</a>, min: <a href="int.html">int</a>, sec: <a href="float.html">float</a>, timezone: <a href="string.html">string</a>) &rarr; <a href="timestamp.html">timestamptz</a></code></td><td><span class="funcdesc"><p>Create timestamp (formatted according to ISO 8601) with time zone from year, month, day, hour, minute and seconds fields (negative years signify BC). If timezone is not specified, the current time zone is used.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="now"></a><code>now() &rarr; <a href="date.html">date</a></code></td><td><span class="funcdesc"><p>Returns the time of the current transaction.</p>
 <p>The value is based on a timestamp picked when the transaction starts

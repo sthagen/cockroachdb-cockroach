@@ -468,10 +468,12 @@ func (q *WorkQueue) startClosingEpochs() {
 		const minTimerDur = time.Millisecond
 		var timer *time.Timer
 		for {
-			q.mu.Lock()
-			q.sampleEpochLIFOSettingsLocked()
-			nextCloseTime := q.nextEpochCloseTimeLocked()
-			q.mu.Unlock()
+			nextCloseTime := func() time.Time {
+				q.mu.Lock()
+				defer q.mu.Unlock()
+				q.sampleEpochLIFOSettingsLocked()
+				return q.nextEpochCloseTimeLocked()
+			}()
 			timeNow := q.timeNow()
 			timerDur := nextCloseTime.Sub(timeNow)
 			if timerDur > 0 {
@@ -564,6 +566,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 	if !info.ReplicatedWorkInfo.Enabled {
 		enabledSetting := admissionControlEnabledSettings[q.workKind]
 		if enabledSetting != nil && !enabledSetting.Get(&q.settings.SV) {
+			q.metrics.recordBypassedAdmission(info.Priority)
 			return false, nil
 		}
 	}
@@ -618,6 +621,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 		q.admitMu.Unlock()
 		q.granter.tookWithoutPermission(info.RequestedCount)
 		q.metrics.incAdmitted(info.Priority)
+		q.metrics.recordBypassedAdmission(info.Priority)
 		return true, nil
 	}
 	// Work is subject to admission control.
@@ -663,6 +667,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 					false, /* coordMuLocked */
 				)
 			}
+			q.metrics.recordFastPathAdmission(info.Priority)
 			return true, nil
 		}
 		// Did not get token/slot.
@@ -1055,20 +1060,27 @@ func (q *WorkQueue) SetTenantWeights(tenantWeights map[uint64]uint32) {
 		}
 		q.mu.tenantWeights.inactive[k] = w
 	}
-	q.mu.Lock()
 	// Establish the new active map.
-	q.mu.tenantWeights.active, q.mu.tenantWeights.inactive =
-		q.mu.tenantWeights.inactive, q.mu.tenantWeights.active
+	func() {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		q.mu.tenantWeights.active, q.mu.tenantWeights.inactive =
+			q.mu.tenantWeights.inactive, q.mu.tenantWeights.active
+	}()
 	// Create a slice for storing all the tenantIDs. We use this to split the
 	// update to the data-structures that require holding q.mu, in case there
 	// are 1000s of tenants (we don't want to hold q.mu for long durations).
-	tenantIDs := make([]uint64, len(q.mu.tenants))
-	i := 0
-	for k := range q.mu.tenants {
-		tenantIDs[i] = k
-		i++
-	}
-	q.mu.Unlock()
+	tenantIDs := func() []uint64 {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		tIDs := make([]uint64, len(q.mu.tenants))
+		i := 0
+		for k := range q.mu.tenants {
+			tIDs[i] = k
+			i++
+		}
+		return tIDs
+	}()
 	// Any tenants not in tenantIDs will see the latest weight when their
 	// tenantInfo is created. The existing ones need their weights to be
 	// updated.
@@ -1757,6 +1769,26 @@ func (m *WorkQueueMetrics) recordFinishWait(priority admissionpb.WorkPriority, d
 	priorityStats.WaitDurations.RecordValue(dur.Nanoseconds())
 }
 
+func (m *WorkQueueMetrics) recordBypassedAdmission(priority admissionpb.WorkPriority) {
+	// For work that either bypasses admission queues (because of the nature of
+	// the work itself or because certain queues are disabled), we'll explicit
+	// record a zero wait duration so that the histogram percentiles remain
+	// accurate.
+	m.total.WaitDurations.RecordValue(0)
+	priorityStats := m.getOrCreate(priority)
+	priorityStats.WaitDurations.RecordValue(0)
+}
+
+func (m *WorkQueueMetrics) recordFastPathAdmission(priority admissionpb.WorkPriority) {
+	// Explicitly record a zero wait queue duration when we're able to acquire
+	// tokens/slots without needing to add ourselves to tenant heaps. Explicitly
+	// recording zeros ensure that our histograms are accurate with respect to
+	// all work going through admission control.
+	m.total.WaitDurations.RecordValue(0)
+	priorityStats := m.getOrCreate(priority)
+	priorityStats.WaitDurations.RecordValue(0)
+}
+
 // MetricStruct implements the metric.Struct interface.
 func (*WorkQueueMetrics) MetricStruct() {}
 
@@ -1830,6 +1862,8 @@ type StoreWorkQueue struct {
 	settings           *cluster.Settings
 	onLogEntryAdmitted OnLogEntryAdmitted
 
+	ioTokensBypassed *metric.Counter
+
 	knobs *TestingKnobs
 }
 
@@ -1873,9 +1907,11 @@ func (q *StoreWorkQueue) Admit(
 		//
 		// [1]: This happens asynchronously -- i.e. we may have already returned
 		//      from StoreWorkQueue.Admit().
-		q.mu.RLock()
-		info.RequestedCount = q.mu.estimates.writeTokens
-		q.mu.RUnlock()
+		info.RequestedCount = func() int64 {
+			q.mu.RLock()
+			defer q.mu.RUnlock()
+			return q.mu.estimates.writeTokens
+		}()
 	}
 	if info.ReplicatedWorkInfo.Enabled {
 		info.CreateTime = q.sequenceReplicatedWork(info.CreateTime, info.ReplicatedWorkInfo)
@@ -2049,22 +2085,24 @@ func (q *StoreWorkQueue) BypassedWorkDone(workCount int64, doneInfo StoreWorkDon
 	q.updateStoreStatsAfterWorkDone(uint64(workCount), doneInfo, true)
 	// Since we have no control over such work, we choose to count it as
 	// regularWorkClass.
-	_ = q.granters[admissionpb.RegularWorkClass].storeWriteDone(0, doneInfo)
+	additionalTokensTaken := q.granters[admissionpb.RegularWorkClass].storeWriteDone(0 /* originalTokens */, doneInfo)
+	q.ioTokensBypassed.Inc(additionalTokensTaken)
 }
 
 // StatsToIgnore is called for range snapshot ingestion -- see the comment in
 // storeAdmissionStats.
 func (q *StoreWorkQueue) StatsToIgnore(ingestStats pebble.IngestOperationStats) {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.mu.stats.statsToIgnore.Bytes += ingestStats.Bytes
 	q.mu.stats.statsToIgnore.ApproxIngestedIntoL0Bytes += ingestStats.ApproxIngestedIntoL0Bytes
-	q.mu.Unlock()
 }
 
 func (q *StoreWorkQueue) updateStoreStatsAfterWorkDone(
 	workCount uint64, doneInfo StoreWorkDoneInfo, bypassed bool,
 ) {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.mu.stats.workCount += workCount
 	q.mu.stats.writeAccountedBytes += uint64(doneInfo.WriteBytes)
 	q.mu.stats.ingestedAccountedBytes += uint64(doneInfo.IngestedBytes)
@@ -2073,7 +2111,6 @@ func (q *StoreWorkQueue) updateStoreStatsAfterWorkDone(
 		q.mu.stats.aux.writeBypassedAccountedBytes += uint64(doneInfo.WriteBytes)
 		q.mu.stats.aux.ingestedBypassedAccountedBytes += uint64(doneInfo.IngestedBytes)
 	}
-	q.mu.Unlock()
 }
 
 // SetTenantWeights passes through to WorkQueue.SetTenantWeights.
@@ -2107,8 +2144,8 @@ func (q *StoreWorkQueue) getStoreAdmissionStats() storeAdmissionStats {
 
 func (q *StoreWorkQueue) setStoreRequestEstimates(estimates storeRequestEstimates) {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.mu.estimates = estimates
-	q.mu.Unlock()
 }
 
 func makeStoreWorkQueue(
@@ -2120,6 +2157,7 @@ func makeStoreWorkQueue(
 	opts workQueueOptions,
 	knobs *TestingKnobs,
 	onLogEntryAdmitted OnLogEntryAdmitted,
+	ioTokensBypassedMetric *metric.Counter,
 	coordMu *syncutil.Mutex,
 ) storeRequester {
 	if knobs == nil {
@@ -2137,6 +2175,7 @@ func makeStoreWorkQueue(
 		timeSource:         opts.timeSource,
 		settings:           settings,
 		onLogEntryAdmitted: onLogEntryAdmitted,
+		ioTokensBypassed:   ioTokensBypassedMetric,
 	}
 
 	opts.usesAsyncAdmit = true
@@ -2178,13 +2217,16 @@ func (q *StoreWorkQueue) gcSequencers() {
 }
 
 func (q *StoreWorkQueue) sequenceReplicatedWork(createTime int64, info ReplicatedWorkInfo) int64 {
-	q.sequencersMu.Lock()
-	seq, ok := q.sequencersMu.s[info.RangeID]
-	if !ok {
-		seq = &sequencer{}
-		q.sequencersMu.s[info.RangeID] = seq
-	}
-	q.sequencersMu.Unlock()
+	seq := func() *sequencer {
+		q.sequencersMu.Lock()
+		defer q.sequencersMu.Unlock()
+		sqr, ok := q.sequencersMu.s[info.RangeID]
+		if !ok {
+			sqr = &sequencer{}
+			q.sequencersMu.s[info.RangeID] = sqr
+		}
+		return sqr
+	}()
 	// We're assuming sequenceReplicatedWork is never invoked concurrently for a
 	// given RangeID.
 	return seq.sequence(createTime)

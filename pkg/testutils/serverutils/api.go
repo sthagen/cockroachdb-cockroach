@@ -65,8 +65,15 @@ type TestServerInterface interface {
 
 	// ApplicationLayerInterface is implemented by TestServerInterface
 	// for backward-compatibility with existing test code.
-	// New code should spell out their intent clearly by calling
-	// the .ApplicationLayer() or .SystemLayer() methods directly.
+	//
+	// It is CURRENTLY equivalent to .SystemLayer() however this is
+	// a misdesign and results in poor test semantics.
+	//
+	// See: https://go.crdb.dev/p/testserver-api-problem
+	//
+	// New tests should spell out their intent clearly by calling the
+	// .ApplicationLayer() (preferred) or .SystemLayer() methods
+	// directly.
 	ApplicationLayerInterface
 
 	// TenantControlInterface is implemented by TestServerInterface
@@ -78,7 +85,7 @@ type TestServerInterface interface {
 	// ApplicationLayer returns the interface to the application layer that is
 	// exercised by the test. Depending on how the test server is started
 	// and (optionally) randomization, this can be either the SQL layer
-	// of a secondary tenant or that of the system tenant.
+	// of a virtual cluster or that of the system interface.
 	ApplicationLayer() ApplicationLayerInterface
 
 	// SystemLayer returns the interface to the application layer
@@ -137,8 +144,7 @@ type TestServerController interface {
 
 // ApplicationLayerInterface defines accessors to the application
 // layer of a test server. Tests written against this interface are
-// effectively agnostic to whether they use a secondary tenant or not.
-// This interface is implemented by server.Test{Tenant,Server}.
+// effectively agnostic to whether they use a virtual cluster or not.
 type ApplicationLayerInterface interface {
 	// Readiness returns true when the server is ready, that is,
 	// when it is accepting connections and it is not draining.
@@ -167,6 +173,10 @@ type ApplicationLayerInterface interface {
 
 	// RPCAddr returns the server's RPC address.
 	RPCAddr() string
+
+	// NodeDialer exposes the instance-to-instance dialer interface{}.
+	// The concrete type is *nodedialer.Dialer.
+	NodeDialer() interface{}
 
 	// SQLConn returns a handle to the server's SQL interface, opened
 	// with the 'root' user.
@@ -458,7 +468,7 @@ type ApplicationLayerInterface interface {
 // start the SQL and HTTP service for secondary tenants (virtual
 // clusters).
 type TenantControlInterface interface {
-	// StartSharedProcessTenant starts the service for a secondary tenant
+	// StartSharedProcessTenant starts the service for a virtual cluster
 	// using the special configuration we define for shared-process deployments.
 	//
 	// args.TenantName must be specified. If a tenant with that name already
@@ -473,7 +483,7 @@ type TenantControlInterface interface {
 		ctx context.Context, args base.TestSharedProcessTenantArgs,
 	) (ApplicationLayerInterface, *gosql.DB, error)
 
-	// StartTenant starts the service for a secondary tenant using the special
+	// StartTenant starts the service for a virtual cluster using the special
 	// configuration we define for separate-process deployments. This incidentally
 	// is also the configuration we use in CC Serverless.
 	//
@@ -490,6 +500,16 @@ type TenantControlInterface interface {
 	// this is called can run into a "missing record" error even
 	// if the tenant record exists in KV.
 	WaitForTenantReadiness(ctx context.Context, tenantID roachpb.TenantID) error
+
+	// WaitForTenantCapabilities waits until the in-RAM cache of
+	// tenant capabilities has been populated for the given tenant ID
+	// with the expected target capability values.
+	WaitForTenantCapabilities(
+		ctx context.Context,
+		tenID roachpb.TenantID,
+		targetCaps map[tenantcapabilities.ID]string,
+		errPrefix string,
+	) error
 
 	// TestTenant returns the test tenant associated with the server.
 	//
@@ -531,10 +551,6 @@ type StorageLayerInterface interface {
 
 	// HeartbeatNodeLiveness heartbeats the server's NodeLiveness record.
 	HeartbeatNodeLiveness() error
-
-	// NodeDialer exposes the NodeDialer instance used by the TestServer as an
-	// interface{}.
-	NodeDialer() interface{}
 
 	// WriteSummaries records summaries of time-series data, which is required for
 	// any tests that query server stats.

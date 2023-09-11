@@ -441,9 +441,9 @@ func TestTxnReadWithinUncertaintyInterval(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testutils.RunTrueAndFalse(t, "observedTS", func(t *testing.T, observedTS bool) {
-		readOps := []interface{}{"get", "scan", "revScan"}
-		testutils.RunValues(t, "readOp", readOps, func(t *testing.T, readOp interface{}) {
-			testTxnReadWithinUncertaintyInterval(t, observedTS, readOp.(string))
+		readOps := []string{"get", "scan", "revScan"}
+		testutils.RunValues(t, "readOp", readOps, func(t *testing.T, readOp string) {
+			testTxnReadWithinUncertaintyInterval(t, observedTS, readOp)
 		})
 	})
 }
@@ -4228,15 +4228,9 @@ func TestStrictGCEnforcement(t *testing.T) {
 				}
 				ptsReader := tc.GetFirstStoreFromServer(t, i).GetStoreConfig().ProtectedTimestampReader
 				_, r := getFirstStoreReplica(t, tc.Server(i), tableKey)
-				testutils.SucceedsSoon(t, func() error {
-					if err := ptutil.TestingVerifyProtectionTimestampExistsOnSpans(ctx, t, tc.Server(i),
-						ptsReader, protectionTimestamp,
-						[]roachpb.Span{span}); err != nil {
-						return errors.Newf("protection timestamp %s does not exist on span %s",
-							protectionTimestamp, span)
-					}
-					return nil
-				})
+				ptutil.TestingWaitForProtectedTimestampToExistOnSpans(ctx, t, tc.Server(i),
+					ptsReader, protectionTimestamp,
+					[]roachpb.Span{span})
 				require.NoError(t, r.ReadProtectedTimestampsForTesting(ctx))
 			}
 		}

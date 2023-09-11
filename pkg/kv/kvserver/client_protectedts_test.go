@@ -72,6 +72,9 @@ func TestProtectedTimestamps(t *testing.T) {
 	_, err = conn.Exec("SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'") // speeds up the test
 	require.NoError(t, err)
 
+	_, err = conn.Exec("SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '200ms'") // speeds up the test
+	require.NoError(t, err)
+
 	_, err = conn.Exec("SET CLUSTER SETTING kv.enqueue_in_replicate_queue_on_span_config_update.enabled = true") // speeds up the test
 	require.NoError(t, err)
 
@@ -180,6 +183,12 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 		Target:    ptpb.MakeSchemaObjectsTarget([]descpb.ID{getTableID()}),
 	}
 	require.NoError(t, ptsWithDB.Protect(ctx, &ptsRec))
+	// Verify that the record did indeed make its way down into KV where the
+	// replica can read it from.
+	ptsReader := tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().ProtectedTimestampReader
+	ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+		ctx, t, s0, ptsReader, ptsRec.Timestamp, ptsRec.DeprecatedSpans,
+	)
 	upsertUntilBackpressure()
 	// We need to be careful choosing a time. We're a little limited because the
 	// ttl is defined in seconds and we need to wait for the threshold to be
@@ -202,16 +211,6 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	thresh := thresholdFromTrace(trace)
 	require.Truef(t, thresh.Less(ptsRec.Timestamp), "threshold: %v, protected %v %q", thresh, ptsRec.Timestamp, trace)
 
-	// Verify that the record did indeed make its way down into KV where the
-	// replica can read it from.
-	ptsReader := tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().ProtectedTimestampReader
-	require.NoError(
-		t,
-		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
-			ctx, t, s0, ptsReader, ptsRec.Timestamp, ptsRec.DeprecatedSpans,
-		),
-	)
-
 	// Make a new record that is doomed to fail.
 	failedRec := ptsRec
 	failedRec.ID = uuid.MakeV4().GetBytes()
@@ -224,11 +223,8 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	// Verify that the record did indeed make its way down into KV where the
 	// replica can read it from. We then verify (below) that the failed record
 	// does not affect the ability to GC.
-	require.NoError(
-		t,
-		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
-			ctx, t, s0, ptsReader, failedRec.Timestamp, failedRec.DeprecatedSpans,
-		),
+	ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+		ctx, t, s0, ptsReader, failedRec.Timestamp, failedRec.DeprecatedSpans,
 	)
 
 	// Add a new record that is after the old record.
@@ -237,11 +233,8 @@ ORDER BY raw_start_key ASC LIMIT 1`)
 	laterRec.Timestamp = afterWrites
 	laterRec.Timestamp.Logical = 0
 	require.NoError(t, ptsWithDB.Protect(ctx, &laterRec))
-	require.NoError(
-		t,
-		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
-			ctx, t, s0, ptsReader, laterRec.Timestamp, laterRec.DeprecatedSpans,
-		),
+	ptutil.TestingWaitForProtectedTimestampToExistOnSpans(
+		ctx, t, s0, ptsReader, laterRec.Timestamp, laterRec.DeprecatedSpans,
 	)
 
 	// Release the record that had succeeded and ensure that GC eventually

@@ -131,14 +131,20 @@ func (s *spanConfigEventStream) startStreamProcessor(ctx context.Context) {
 	// Context group responsible for coordinating rangefeed event production with
 	// ValueGenerator implementation that consumes rangefeed events and forwards them to the
 	// destination cluster consumer.
-	streamCtx, sp := tracing.ChildSpan(ctx, "event stream")
+	streamCtx, sp := tracing.ChildSpan(ctx, "span config event stream")
 	s.sp = sp
 	s.streamGroup = ctxgroup.WithContext(streamCtx)
 	s.streamGroup.GoCtx(withErrCapture(func(ctx context.Context) error {
 		return s.streamLoop(ctx)
 	}))
 
-	// TODO(msbutler): consider using rangefeedcache.Run(), though it seems overly complicated.
+	// TODO(msbutler): consider using rangefeedcache.Start() which calls rfc.Run()
+	// with retry logic. The pro of that refactor is that all c2c machinery would
+	// not need to restart over so some retryable rangefeed error. The con is that
+	// the ingestion side initial scan logic could no longer assume that an
+	// initial scan flush will only ever be the first rangefeed cache flush. In
+	// other words, with this change, an initial scan flush could occur after some
+	// incremental updates.
 	s.streamGroup.GoCtx(withErrCapture(s.rfc.Run))
 }
 
@@ -174,7 +180,7 @@ func (s *spanConfigEventStream) Close(ctx context.Context) {
 func (s *spanConfigEventStream) handleUpdate(ctx context.Context, update rangefeedcache.Update) {
 	select {
 	case <-ctx.Done():
-		s.errCh <- ctx.Err()
+		log.Warningf(ctx, "rangefeedcache context cancelled with error %s", ctx.Err())
 	case s.updateCh <- update:
 		if update.Type == rangefeedcache.CompleteUpdate {
 			log.VInfof(ctx, 1, "completed initial scan")
@@ -256,7 +262,7 @@ func (s *spanConfigEventStream) streamLoop(ctx context.Context) error {
 			}
 			batcher.addSpanConfigs(bufferedEvents, update.Timestamp)
 			bufferedEvents = bufferedEvents[:0]
-			if pacer.shouldCheckpoint(update.Timestamp, true) {
+			if pacer.shouldCheckpoint(update.Timestamp, true) || update.Type == rangefeedcache.CompleteUpdate {
 				if batcher.getSize() > 0 {
 					if err := s.flushEvent(ctx, &streampb.StreamEvent{Batch: &batcher.batch}); err != nil {
 						return err

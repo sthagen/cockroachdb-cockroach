@@ -109,7 +109,7 @@ pushed-txn-updated txn=<name> status=committed|aborted|pending [ts=<ts>]
 
  Informs the lock table that the named transaction is finalized.
 
-add-discovered r=<name> k=<key> txn=<name> [lease-seq=<seq>] [consult-txn-status-cache=<bool>]
+add-discovered r=<name> k=<key> txn=<name> [lease-seq=<seq>] [consult-txn-status-cache=<bool>] [strength=<strength>]
 ----
 <error string>
 
@@ -467,6 +467,12 @@ func TestLockTableBasic(t *testing.T) {
 					d.ScanArgs(t, "consult-txn-status-cache", &consultTxnStatusCache)
 				}
 				leaseSeq := roachpb.LeaseSequence(seq)
+				str := lock.Intent // default replicated locks to write intents
+				if d.HasArg("strength") {
+					str = ScanLockStrength(t, d)
+				}
+				foundLock.Strength = str
+
 				if _, err := lt.AddDiscoveredLock(
 					&foundLock, leaseSeq, consultTxnStatusCache, g); err != nil {
 					return err.Error()
@@ -1886,14 +1892,14 @@ func TestLockStateSafeFormat(t *testing.T) {
 	holder.unreplicatedInfo.ts = hlc.Timestamp{WallTime: 123, Logical: 7}
 	require.NoError(t, holder.unreplicatedInfo.acquire(lock.Exclusive, 1))
 	require.NoError(t, holder.unreplicatedInfo.acquire(lock.Shared, 3))
-	holder.replicatedInfo.ts = hlc.Timestamp{WallTime: 125, Logical: 1}
-	holder.replicatedInfo.acquire(lock.Intent)
-	holder.replicatedInfo.acquire(lock.Shared)
+	replTS := hlc.Timestamp{WallTime: 125, Logical: 1}
+	holder.replicatedInfo.acquire(lock.Intent, replTS)
+	holder.replicatedInfo.acquire(lock.Shared, replTS)
 	require.EqualValues(t,
-		" lock: ‹\"KEY\"›\n  holder: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000123,7, info: repl [Intent, Shared], unrepl [(str: Exclusive seq: 1), (str: Shared seq: 3)]\n",
+		" lock: ‹\"KEY\"›\n  holder: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000125,1, info: repl [Intent, Shared], unrepl [(str: Exclusive seq: 1), (str: Shared seq: 3)]\n",
 		redact.Sprint(l))
 	require.EqualValues(t,
-		" lock: ‹×›\n  holder: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000123,7, info: repl [Intent, Shared], unrepl [(str: Exclusive seq: 1), (str: Shared seq: 3)]\n",
+		" lock: ‹×›\n  holder: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000125,1, info: repl [Intent, Shared], unrepl [(str: Exclusive seq: 1), (str: Shared seq: 3)]\n",
 		redact.Sprint(l).Redact())
 }
 
@@ -1919,13 +1925,13 @@ func TestLockStateSafeFormatMultipleLockHolders(t *testing.T) {
 	require.NoError(t, holder2.unreplicatedInfo.acquire(lock.Shared, 6))
 	require.EqualValues(t,
 		" lock: ‹\"KEY\"›\n"+
-			"  holders: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000123,7, info: unrepl [(str: Shared seq: 3)]\n"+
-			"           txn: 6ba7b811-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000125,1, info: unrepl [(str: Shared seq: 6)]\n",
+			"  holders: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, info: unrepl [(str: Shared seq: 3)]\n"+
+			"           txn: 6ba7b811-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, info: unrepl [(str: Shared seq: 6)]\n",
 		redact.Sprint(kl))
 	require.EqualValues(t,
 		" lock: ‹×›\n"+
-			"  holders: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000123,7, info: unrepl [(str: Shared seq: 3)]\n"+
-			"           txn: 6ba7b811-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000125,1, info: unrepl [(str: Shared seq: 6)]\n",
+			"  holders: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, info: unrepl [(str: Shared seq: 3)]\n"+
+			"           txn: 6ba7b811-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, info: unrepl [(str: Shared seq: 6)]\n",
 		redact.Sprint(kl).Redact())
 }
 

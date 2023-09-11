@@ -895,7 +895,7 @@ func registerBackup(r registry.Registry) {
 		Leases:            registry.MetamorphicLeases,
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			if c.Spec().Cloud != spec.GCE {
+			if c.Spec().Cloud != spec.GCE && !c.IsLocal() {
 				t.Skip("uses gs://cockroach-fixtures; see https://github.com/cockroachdb/cockroach/issues/105968")
 			}
 			runBackupMVCCRangeTombstones(ctx, t, c, mvccRangeTombstoneConfig{})
@@ -954,10 +954,6 @@ func runBackupMVCCRangeTombstones(
 	t.Status("configuring cluster")
 	_, err := conn.Exec(`SET CLUSTER SETTING kv.bulk_ingest.max_index_buffer_size = '2gb'`)
 	require.NoError(t, err)
-	if config.tenantName == "" {
-		_, err = conn.Exec(`SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = 't'`)
-		require.NoError(t, err)
-	}
 	_, err = conn.Exec(`SET CLUSTER SETTING server.debug.default_vmodule = 'txn=2,sst_batcher=4,
 revert=2'`)
 	require.NoError(t, err)

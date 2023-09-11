@@ -1,6 +1,6 @@
 module github.com/cockroachdb/cockroach
 
-go 1.19
+go 1.20
 
 // The following dependencies are key infrastructure dependencies and
 // should be updated as their own commit (i.e. not bundled with a dep
@@ -115,7 +115,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20230901194557-14df16a60758
+	github.com/cockroachdb/pebble v0.0.0-20230905224231-5283f24b2a69
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -128,7 +128,7 @@ require (
 	github.com/dave/dst v0.24.0
 	github.com/davecgh/go-spew v1.1.1
 	github.com/docker/distribution v2.7.1+incompatible
-	github.com/docker/docker v20.10.17+incompatible
+	github.com/docker/docker v24.0.6+incompatible
 	github.com/docker/go-connections v0.4.0
 	github.com/dustin/go-humanize v1.0.0
 	github.com/edsrzf/mmap-go v1.0.0
@@ -440,7 +440,7 @@ replace vitess.io/vitess => github.com/cockroachdb/vitess v0.0.0-20210218160543-
 
 replace gopkg.in/yaml.v2 => github.com/cockroachdb/yaml v0.0.0-20210825132133-2d6955c8edbc
 
-replace github.com/docker/docker => github.com/moby/moby v20.10.6+incompatible
+replace github.com/docker/docker => github.com/moby/moby v24.0.6+incompatible
 
 replace golang.org/x/time => github.com/cockroachdb/x-time v0.3.1-0.20230525123634-71747adb5d5c
 

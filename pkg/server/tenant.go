@@ -316,6 +316,10 @@ func newTenantServer(
 	// construct the status server with a nil sqlServer, and then assign it once
 	// an SQL server gets created. We are going to assume that the status server
 	// won't require the SQL server object until later.
+	var serverKnobs TestingKnobs
+	if s, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
+		serverKnobs = *s
+	}
 	sStatus := newStatusServer(
 		baseCfg.AmbientCtx,
 		baseCfg.Settings,
@@ -331,6 +335,7 @@ func newTenantServer(
 		args.circularInternalExecutor,
 		serverIterator,
 		args.clock,
+		&serverKnobs,
 	)
 	args.sqlStatusServer = sStatus
 
@@ -1185,7 +1190,7 @@ func makeTenantSQLServerArgs(
 	externalStorage := esb.makeExternalStorage
 	externalStorageFromURI := esb.makeExternalStorageFromURI
 
-	grpcServer, err := newGRPCServer(rpcContext)
+	grpcServer, err := newGRPCServer(startupCtx, rpcContext)
 	if err != nil {
 		return sqlServerArgs{}, err
 	}

@@ -310,7 +310,7 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 		pool = ca.knobs.MemMonitor
 	}
 	limit := changefeedbase.PerChangefeedMemLimit.Get(&ca.flowCtx.Cfg.Settings.SV)
-	ca.eventProducer, ca.kvFeedDoneCh, ca.errCh, err = ca.startKVFeed(ctx, spans, kvFeedHighWater, needsInitialScan, feed, pool, limit)
+	ca.eventProducer, ca.kvFeedDoneCh, ca.errCh, err = ca.startKVFeed(ctx, spans, kvFeedHighWater, needsInitialScan, feed, pool, limit, opts)
 	if err != nil {
 		ca.MoveToDraining(err)
 		ca.cancel()
@@ -361,6 +361,7 @@ func (ca *changeAggregator) startKVFeed(
 	config ChangefeedConfig,
 	parentMemMon *mon.BytesMonitor,
 	memLimit int64,
+	opts changefeedbase.StatementOptions,
 ) (kvevent.Reader, chan struct{}, chan error, error) {
 	cfg := ca.flowCtx.Cfg
 	kvFeedMemMon := mon.NewMonitorInheritWithLimit("kvFeed", memLimit, parentMemMon)
@@ -371,7 +372,7 @@ func (ca *changeAggregator) startKVFeed(
 
 	// KVFeed takes ownership of the kvevent.Writer portion of the buffer, while
 	// we return the kvevent.Reader part to the caller.
-	kvfeedCfg, err := ca.makeKVFeedCfg(ctx, config, spans, buf, initialHighWater, needsInitialScan, kvFeedMemMon)
+	kvfeedCfg, err := ca.makeKVFeedCfg(ctx, config, spans, buf, initialHighWater, needsInitialScan, kvFeedMemMon, opts)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -414,6 +415,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 	initialHighWater hlc.Timestamp,
 	needsInitialScan bool,
 	memMon *mon.BytesMonitor,
+	opts changefeedbase.StatementOptions,
 ) (kvfeed.Config, error) {
 	schemaChange, err := config.Opts.GetSchemaChangeHandlingOptions()
 	if err != nil {
@@ -432,29 +434,51 @@ func (ca *changeAggregator) makeKVFeedCfg(
 			initialHighWater, &ca.metrics.SchemaFeedMetrics, config.Opts.GetCanHandle())
 	}
 
+	monitoringCfg, err := makeKVFeedMonitoringCfg(ca.sliMetrics, opts)
+	if err != nil {
+		return kvfeed.Config{}, err
+	}
+
 	return kvfeed.Config{
-		Writer:                  buf,
-		Settings:                cfg.Settings,
-		DB:                      cfg.DB.KV(),
-		Codec:                   cfg.Codec,
-		Clock:                   cfg.DB.KV().Clock(),
-		Spans:                   spans,
-		CheckpointSpans:         ca.spec.Checkpoint.Spans,
-		CheckpointTimestamp:     ca.spec.Checkpoint.Timestamp,
-		Targets:                 AllTargets(ca.spec.Feed),
-		Metrics:                 &ca.metrics.KVFeedMetrics,
-		OnBackfillCallback:      ca.sliMetrics.getBackfillCallback(),
-		OnBackfillRangeCallback: ca.sliMetrics.getBackfillRangeCallback(),
-		MM:                      memMon,
-		InitialHighWater:        initialHighWater,
-		EndTime:                 config.EndTime,
-		WithDiff:                filters.WithDiff,
-		NeedsInitialScan:        needsInitialScan,
-		SchemaChangeEvents:      schemaChange.EventClass,
-		SchemaChangePolicy:      schemaChange.Policy,
-		SchemaFeed:              sf,
-		Knobs:                   ca.knobs.FeedKnobs,
-		UseMux:                  changefeedbase.UseMuxRangeFeed.Get(&cfg.Settings.SV),
+		Writer:              buf,
+		Settings:            cfg.Settings,
+		DB:                  cfg.DB.KV(),
+		Codec:               cfg.Codec,
+		Clock:               cfg.DB.KV().Clock(),
+		Spans:               spans,
+		CheckpointSpans:     ca.spec.Checkpoint.Spans,
+		CheckpointTimestamp: ca.spec.Checkpoint.Timestamp,
+		Targets:             AllTargets(ca.spec.Feed),
+		Metrics:             &ca.metrics.KVFeedMetrics,
+		MM:                  memMon,
+		InitialHighWater:    initialHighWater,
+		EndTime:             config.EndTime,
+		WithDiff:            filters.WithDiff,
+		NeedsInitialScan:    needsInitialScan,
+		SchemaChangeEvents:  schemaChange.EventClass,
+		SchemaChangePolicy:  schemaChange.Policy,
+		SchemaFeed:          sf,
+		Knobs:               ca.knobs.FeedKnobs,
+		UseMux:              changefeedbase.UseMuxRangeFeed.Get(&cfg.Settings.SV),
+		MonitoringCfg:       monitoringCfg,
+	}, nil
+}
+
+func makeKVFeedMonitoringCfg(
+	sliMetrics *sliMetrics, opts changefeedbase.StatementOptions,
+) (kvfeed.MonitoringConfig, error) {
+	laggingRangesThreshold, laggingRangesInterval, err := opts.GetLaggingRangesConfig()
+	if err != nil {
+		return kvfeed.MonitoringConfig{}, err
+	}
+
+	return kvfeed.MonitoringConfig{
+		LaggingRangesCallback:        sliMetrics.getLaggingRangesCallback(),
+		LaggingRangesThreshold:       laggingRangesThreshold,
+		LaggingRangesPollingInterval: laggingRangesInterval,
+
+		OnBackfillCallback:      sliMetrics.getBackfillCallback(),
+		OnBackfillRangeCallback: sliMetrics.getBackfillRangeCallback(),
 	}, nil
 }
 
@@ -1183,11 +1207,13 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 		}
 	}
 
-	cf.metrics.mu.Lock()
-	cf.metricsID = cf.metrics.mu.id
-	cf.metrics.mu.id++
-	sli.RunningCount.Inc(1)
-	cf.metrics.mu.Unlock()
+	func() {
+		cf.metrics.mu.Lock()
+		defer cf.metrics.mu.Unlock()
+		cf.metricsID = cf.metrics.mu.id
+		cf.metrics.mu.id++
+		sli.RunningCount.Inc(1)
+	}()
 
 	cf.sliMetricsID = cf.sliMetrics.claimId()
 
@@ -1223,13 +1249,15 @@ func (cf *changeFrontier) close() {
 func (cf *changeFrontier) closeMetrics() {
 	// Delete this feed from the MaxBehindNanos metric so it's no longer
 	// considered by the gauge.
-	cf.metrics.mu.Lock()
-	if cf.metricsID > 0 {
-		cf.sliMetrics.RunningCount.Dec(1)
-	}
-	delete(cf.metrics.mu.resolved, cf.metricsID)
-	cf.metricsID = -1
-	cf.metrics.mu.Unlock()
+	func() {
+		cf.metrics.mu.Lock()
+		defer cf.metrics.mu.Unlock()
+		if cf.metricsID > 0 {
+			cf.sliMetrics.RunningCount.Dec(1)
+		}
+		delete(cf.metrics.mu.resolved, cf.metricsID)
+		cf.metricsID = -1
+	}()
 
 	cf.sliMetrics.closeId(cf.sliMetricsID)
 }
@@ -1377,11 +1405,13 @@ func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
 		cf.sliMetrics.setCheckpoint(cf.sliMetricsID, newResolved)
 
 		// This backs max_behind_nanos which is deprecated in favor of checkpoint_progress
-		cf.metrics.mu.Lock()
-		if cf.metricsID != -1 {
-			cf.metrics.mu.resolved[cf.metricsID] = newResolved
-		}
-		cf.metrics.mu.Unlock()
+		func() {
+			cf.metrics.mu.Lock()
+			defer cf.metrics.mu.Unlock()
+			if cf.metricsID != -1 {
+				cf.metrics.mu.resolved[cf.metricsID] = newResolved
+			}
+		}()
 
 		return cf.maybeEmitResolved(newResolved)
 	}

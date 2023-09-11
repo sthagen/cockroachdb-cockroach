@@ -112,7 +112,7 @@ func TestGranterBasic(t *testing.T) {
 				makeStoreRequesterFunc: func(
 					ambientCtx log.AmbientContext, _ roachpb.StoreID, granters [admissionpb.NumWorkClasses]granterWithStoreReplicatedWorkAdmitted,
 					settings *cluster.Settings, metrics *WorkQueueMetrics, opts workQueueOptions, knobs *TestingKnobs,
-					_ OnLogEntryAdmitted, _ *syncutil.Mutex,
+					_ OnLogEntryAdmitted, _ *metric.Counter, _ *syncutil.Mutex,
 				) storeRequester {
 					makeTestRequester := func(wc admissionpb.WorkClass) *testRequester {
 						req := &testRequester{
@@ -137,14 +137,17 @@ func TestGranterBasic(t *testing.T) {
 					requesters[numWorkKinds] = req.requesters[admissionpb.ElasticWorkClass]
 					return req
 				},
-				kvIOTokensExhaustedDuration:     metrics.KVIOTokensExhaustedDuration,
-				kvIOTokensAvailable:             metrics.KVIOTokensAvailable,
-				kvElasticIOTokensAvailable:      metrics.KVElasticIOTokensAvailable,
-				kvIOTokensTookWithoutPermission: metrics.KVIOTokensTookWithoutPermission,
-				kvIOTotalTokensTaken:            metrics.KVIOTotalTokensTaken,
-				workQueueMetrics:                workQueueMetrics,
-				disableTickerForTesting:         true,
-				knobs:                           &TestingKnobs{},
+				kvIOTokensExhaustedDuration: metrics.KVIOTokensExhaustedDuration,
+				kvIOTokensAvailable:         metrics.KVIOTokensAvailable,
+				kvElasticIOTokensAvailable:  metrics.KVElasticIOTokensAvailable,
+				kvIOTokensTaken:             metrics.KVIOTokensTaken,
+				kvIOTokensReturned:          metrics.KVIOTokensReturned,
+				kvIOTokensBypassed:          metrics.KVIOTokensBypassed,
+				l0CompactedBytes:            metrics.L0CompactedBytes,
+				l0TokensProduced:            metrics.L0TokensProduced,
+				workQueueMetrics:            workQueueMetrics,
+				disableTickerForTesting:     true,
+				knobs:                       &TestingKnobs{},
 			}
 			var metricsProvider testMetricsProvider
 			metricsProvider.setMetricsForStores([]int32{1}, pebble.Metrics{})
@@ -322,7 +325,8 @@ func TestStoreCoordinators(t *testing.T) {
 		makeRequesterFunc: makeRequesterFunc,
 		makeStoreRequesterFunc: func(
 			ctx log.AmbientContext, _ roachpb.StoreID, granters [admissionpb.NumWorkClasses]granterWithStoreReplicatedWorkAdmitted,
-			settings *cluster.Settings, metrics *WorkQueueMetrics, opts workQueueOptions, _ *TestingKnobs, _ OnLogEntryAdmitted, _ *syncutil.Mutex) storeRequester {
+			settings *cluster.Settings, metrics *WorkQueueMetrics, opts workQueueOptions, _ *TestingKnobs, _ OnLogEntryAdmitted,
+			_ *metric.Counter, _ *syncutil.Mutex) storeRequester {
 			reqReg := makeRequesterFunc(ctx, KVWork, granters[admissionpb.RegularWorkClass], settings, metrics, opts)
 			reqElastic := makeRequesterFunc(ctx, KVWork, granters[admissionpb.ElasticWorkClass], settings, metrics, opts)
 			str := &storeTestRequester{}

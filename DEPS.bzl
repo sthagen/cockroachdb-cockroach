@@ -1609,10 +1609,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "6835bbc6fa536264138a27d7c4faeed6a56da5c77ddf2f7a26772dd149fccccc",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20230901194557-14df16a60758",
+        sha256 = "36f9aeb90142864d2158c42f9833c8b4d360446592fb1c34a4c576ea87409d85",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20230905224231-5283f24b2a69",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20230901194557-14df16a60758.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20230905224231-5283f24b2a69.zip",
         ],
     )
     go_repository(
@@ -2399,10 +2399,10 @@ def go_deps():
         name = "com_github_docker_docker",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/docker/docker",
-        sha256 = "b96610497d8d7b41eff039cd4b4ba595eedb3944b653b813f087364805e3db76",
-        strip_prefix = "github.com/moby/moby@v20.10.6+incompatible",
+        sha256 = "92fd2184ec4e265dae066c73fc9c7d40254eaeb804f659e7a4cc27ebd3689fcc",
+        strip_prefix = "github.com/moby/moby@v24.0.6+incompatible",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/moby/moby/com_github_moby_moby-v20.10.6+incompatible.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/moby/moby/com_github_moby_moby-v24.0.6+incompatible.zip",
         ],
     )
     go_repository(

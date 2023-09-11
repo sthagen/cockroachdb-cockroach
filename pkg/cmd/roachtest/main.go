@@ -85,7 +85,6 @@ func parseCreateOpts(flags *pflag.FlagSet, opts *vm.CreateOpts) {
 }
 
 func main() {
-	rand.Seed(timeutil.Now().UnixNano())
 	username := os.Getenv("ROACHPROD_USER")
 	parallelism := 10
 	var cpuQuota int
@@ -363,7 +362,7 @@ the cluster nodes on start.
 		cmd.Flags().StringVar(
 			&cloud, "cloud", cloud, "cloud provider to use (aws, azure, or gce)")
 		cmd.Flags().StringVar(
-			&clusterID, "cluster-id", "", "an identifier to use in the test cluster's name")
+			&clusterID, "cluster-id", "", "an identifier to use in the name of the test cluster(s)")
 		cmd.Flags().IntVar(
 			&count, "count", 1, "the number of times to run each test")
 		cmd.Flags().BoolVarP(

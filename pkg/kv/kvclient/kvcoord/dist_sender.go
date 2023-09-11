@@ -222,13 +222,6 @@ This counts the number of ranges with an active rangefeed that are performing ca
 		Measurement: "Ranges",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaDistSenderRangefeedRestartStuck = metric.Metadata{
-		Name: "distsender.rangefeed.restart_stuck",
-		Help: `Number of times a rangefeed was restarted due to not receiving ` +
-			`timely updates (kv.rangefeed.range_stuck_threshold cluster setting)`,
-		Measurement: "Count",
-		Unit:        metric.Unit_COUNT,
-	}
 )
 
 // CanSendToFollower is used by the DistSender to determine if it needs to look
@@ -310,9 +303,7 @@ type DistSenderMetrics struct {
 type DistSenderRangeFeedMetrics struct {
 	RangefeedRanges        *metric.Gauge
 	RangefeedCatchupRanges *metric.Gauge
-	RangefeedErrorCatchup  *metric.Counter
-	RangefeedRestartRanges *metric.Counter
-	RangefeedRestartStuck  *metric.Counter
+	Errors                 rangeFeedErrorCounters
 }
 
 func makeDistSenderMetrics() DistSenderMetrics {
@@ -353,13 +344,87 @@ func makeDistSenderMetrics() DistSenderMetrics {
 	return m
 }
 
+// rangeFeedErrorCounters are various error related counters for rangefeed.
+type rangeFeedErrorCounters struct {
+	RangefeedRestartRanges *metric.Counter
+	RangefeedErrorCatchup  *metric.Counter
+	RetryErrors            []*metric.Counter
+	Stuck                  *metric.Counter
+	SendErrors             *metric.Counter
+	StoreNotFound          *metric.Counter
+	NodeNotFound           *metric.Counter
+	RangeNotFound          *metric.Counter
+	RangeKeyMismatch       *metric.Counter
+}
+
+func makeRangeFeedErrorCounters() rangeFeedErrorCounters {
+	var retryCounters []*metric.Counter
+	for name := range kvpb.RangeFeedRetryError_Reason_value {
+		name = strings.TrimPrefix(name, "REASON_")
+		retryCounters = append(retryCounters, metric.NewCounter(metric.Metadata{
+			Name:        fmt.Sprintf("distsender.rangefeed.retry.%s", strings.ToLower(name)),
+			Help:        fmt.Sprintf(`Number of ranges that encountered retryable %s error`, name),
+			Measurement: "Ranges",
+			Unit:        metric.Unit_COUNT,
+		}))
+	}
+
+	retryMeta := func(name string) metric.Metadata {
+		return metric.Metadata{
+			Name:        fmt.Sprintf("distsender.rangefeed.retry.%s", strings.ReplaceAll(name, " ", "_")),
+			Help:        fmt.Sprintf("Number of ranges that encountered retryable %s error", name),
+			Measurement: "Ranges",
+			Unit:        metric.Unit_COUNT,
+		}
+	}
+
+	return rangeFeedErrorCounters{
+		RangefeedRestartRanges: metric.NewCounter(metaDistSenderRangefeedRestartRanges),
+		RangefeedErrorCatchup:  metric.NewCounter(metaDistSenderRangefeedErrorCatchupRanges),
+		RetryErrors:            retryCounters,
+		Stuck:                  metric.NewCounter(retryMeta("stuck")),
+		SendErrors:             metric.NewCounter(retryMeta("send")),
+		StoreNotFound:          metric.NewCounter(retryMeta("store not found")),
+		NodeNotFound:           metric.NewCounter(retryMeta("node not found")),
+		RangeNotFound:          metric.NewCounter(retryMeta("range not found")),
+		RangeKeyMismatch:       metric.NewCounter(retryMeta("range key mismatch")),
+	}
+}
+
+// GetRangeFeedRetryCounter returns retry reason counter for the specified reason.
+// Use this method instead of direct counter access (since this method handles
+// potential gaps in retry reason values).
+func (c rangeFeedErrorCounters) GetRangeFeedRetryCounter(
+	reason kvpb.RangeFeedRetryError_Reason,
+) *metric.Counter {
+	// Normally, retry reason values are contiguous.  One way gaps could be
+	// introduced, is if some retry reasons are retired (deletions are
+	// accomplished by reserving enum value to prevent its re-use), and then more
+	// reason added after.  Then, we can't use reason value as an index into
+	// retryCounters.  Because this scenario is believed to be very unlikely, we
+	// forego any fancy re-mapping schemes, and instead opt for explicit handling.
+	switch reason {
+	case kvpb.RangeFeedRetryError_REASON_REPLICA_REMOVED,
+		kvpb.RangeFeedRetryError_REASON_RANGE_SPLIT,
+		kvpb.RangeFeedRetryError_REASON_RANGE_MERGED,
+		kvpb.RangeFeedRetryError_REASON_RAFT_SNAPSHOT,
+		kvpb.RangeFeedRetryError_REASON_LOGICAL_OPS_MISSING,
+		kvpb.RangeFeedRetryError_REASON_SLOW_CONSUMER,
+		kvpb.RangeFeedRetryError_REASON_NO_LEASEHOLDER,
+		kvpb.RangeFeedRetryError_REASON_RANGEFEED_CLOSED:
+		return c.RetryErrors[reason]
+	default:
+		panic(errors.AssertionFailedf("unknown retry reason %d", reason))
+	}
+}
+
+func (rangeFeedErrorCounters) MetricStruct() {}
+
 func makeDistSenderRangeFeedMetrics() DistSenderRangeFeedMetrics {
 	return DistSenderRangeFeedMetrics{
 		RangefeedRanges:        metric.NewGauge(metaDistSenderRangefeedTotalRanges),
 		RangefeedCatchupRanges: metric.NewGauge(metaDistSenderRangefeedCatchupRanges),
-		RangefeedErrorCatchup:  metric.NewCounter(metaDistSenderRangefeedErrorCatchupRanges),
-		RangefeedRestartRanges: metric.NewCounter(metaDistSenderRangefeedRestartRanges),
-		RangefeedRestartStuck:  metric.NewCounter(metaDistSenderRangefeedRestartStuck),
+		Errors:                 makeRangeFeedErrorCounters(),
 	}
 }
 
@@ -1268,7 +1333,7 @@ func (ds *DistSender) detectIntentMissingDueToIntentResolution(
 		// We weren't able to determine whether the intent missing error is
 		// due to intent resolution or not, so it is still ambiguous whether
 		// the commit succeeded.
-		return false, kvpb.NewAmbiguousResultErrorf("error=%s [intent missing]", pErr)
+		return false, kvpb.NewAmbiguousResultErrorf("error=%v [intent missing]", pErr)
 	}
 	resp := br.Responses[0].GetQueryTxn()
 	respTxn := &resp.QueriedTxn
@@ -2082,7 +2147,8 @@ func maybeSetResumeSpan(
 // the error that the last attempt to execute the request returned.
 func noMoreReplicasErr(ambiguousErr, lastAttemptErr error) error {
 	if ambiguousErr != nil {
-		return kvpb.NewAmbiguousResultErrorf("error=%s [exhausted]", ambiguousErr)
+		return kvpb.NewAmbiguousResultErrorf("error=%v [exhausted] (last error: %v)",
+			ambiguousErr, lastAttemptErr)
 	}
 
 	// TODO(bdarnell): The error from the last attempt is not necessarily the best
@@ -2260,6 +2326,28 @@ func (ds *DistSender) sendToReplicas(
 		ba = ba.ShallowCopy()
 		ba.Replica = curReplica
 		ba.RangeID = desc.RangeID
+
+		// When a sub-batch from a batch containing a commit experiences an
+		// ambiguous error, it is critical to ensure subsequent replay attempts
+		// do not permit changing the write timestamp, as the transaction may
+		// already have been considered implicitly committed.
+		ba.AmbiguousReplayProtection = ambiguousError != nil
+
+		// In the case that the batch has already seen an ambiguous error, in
+		// addition to enabling ambiguous replay protection, we also need to
+		// disable the ability for the server to forward the read timestamp, as
+		// the transaction may have been implicitly committed. If the intents for
+		// the implicitly committed transaction were already resolved, on a replay
+		// attempt encountering committed values above the read timestamp the
+		// server will attempt to handle what seems to be a write-write conflict by
+		// throwing a WriteTooOld, which could be refreshed away on the server if
+		// the read timestamp can be moved. Disabling this ability protects against
+		// refreshing away the error when retrying the ambiguous operation, instead
+		// returning to the DistSender so the ambiguous error can be propagated.
+		if ambiguousError != nil && ba.CanForwardReadTimestamp {
+			ba.CanForwardReadTimestamp = false
+		}
+
 		// Communicate to the server the information our cache has about the
 		// range. If it's stale, the server will return an update.
 		ba.ClientRangeInfo = roachpb.ClientRangeInfo{
@@ -2294,10 +2382,13 @@ func (ds *DistSender) sendToReplicas(
 		ds.maybeIncrementErrCounters(br, err)
 
 		if err != nil {
+			log.VErrEventf(ctx, 2, "RPC error: %s", err)
+
 			if grpcutil.IsAuthError(err) {
 				// Authentication or authorization error. Propagate.
 				if ambiguousError != nil {
-					return nil, kvpb.NewAmbiguousResultErrorf("error=%s [propagate]", ambiguousError)
+					return nil, kvpb.NewAmbiguousResultErrorf("error=%v [propagate] (last error: %v)",
+						ambiguousError, err)
 				}
 				return nil, err
 			}
@@ -2319,10 +2410,6 @@ func (ds *DistSender) sendToReplicas(
 			// ambiguity.
 			// 2) SQL recognizes AmbiguousResultErrors and gives them a special code
 			// (StatementCompletionUnknown).
-			// TODO(andrei): The use of this code is inconsistent because a) the
-			// DistSender tries to only return the code for commits, but it'll happily
-			// forward along AmbiguousResultErrors coming from the replica and b) we
-			// probably should be returning that code for non-commit statements too.
 			//
 			// We retry requests in order to avoid returning errors (in particular,
 			// AmbiguousResultError). Retrying the batch will either:
@@ -2337,6 +2424,12 @@ func (ds *DistSender) sendToReplicas(
 			//    can't claim success (and even if we could claim success, we still
 			//    wouldn't have the complete result of the successful evaluation).
 			//
+			// Note that in case c), a request is not idempotent if the retry finds
+			// the request succeeded the first time around, but requires a change to
+			// the transaction's write timestamp. This is guarded against by setting
+			// the AmbiguousReplayProtection flag, so that the replay is aware the
+			// batch has seen an ambiguous error.
+			//
 			// Case a) is great - the retry made the request succeed. Case b) is also
 			// good; due to idempotency we managed to swallow a communication error.
 			// Case c) is not great - we'll end up returning an error even though the
@@ -2349,10 +2442,12 @@ func (ds *DistSender) sendToReplicas(
 			// evaluating twice, overwriting another unrelated write that fell
 			// in-between.
 			//
+			// NB: If this partial batch does not contain the EndTxn request but the
+			// batch contains a commit, the ambiguous error should be caught on
+			// retrying the writes, should it need to be propagated.
 			if withCommit && !grpcutil.RequestDidNotStart(err) {
 				ambiguousError = err
 			}
-			log.VErrEventf(ctx, 2, "RPC error: %s", err)
 
 			// If the error wasn't just a context cancellation and the down replica
 			// is cached as the lease holder, evict it. The only other eviction
@@ -2508,7 +2603,8 @@ func (ds *DistSender) sendToReplicas(
 				}
 			default:
 				if ambiguousError != nil {
-					return nil, kvpb.NewAmbiguousResultErrorf("error=%s [propagate]", ambiguousError)
+					return nil, kvpb.NewAmbiguousResultErrorf("error=%v [propagate] (last error: %v)",
+						ambiguousError, br.Error.GoError())
 				}
 
 				// The error received is likely not specific to this

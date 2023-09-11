@@ -11,7 +11,10 @@ package spanconfigsqltranslatorccl
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +43,8 @@ import (
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
 )
+
+var tableIDPrefixRegexp = regexp.MustCompile("(/Table/)([0-9]+)(.*)")
 
 // TestDataDriven is a data-driven test for the spanconfig.SQLTranslator. It
 // allows users to set up zone config hierarchies and validate their translation
@@ -78,50 +83,58 @@ import (
 //   - "release" [record-id=<int>]
 //     Releases the protected timestamp record with id.
 func TestDataDriven(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
+	t.Cleanup(leaktest.AfterTest(t))
+	scope := log.Scope(t)
+	t.Cleanup(func() {
+		scope.Close(t)
+	})
 
 	ctx := context.Background()
-
-	gcWaiter := sync.NewCond(&syncutil.Mutex{})
-	allowGC := true
-	gcTestingKnobs := &sql.GCJobTestingKnobs{
-		RunBeforeResume: func(_ jobspb.JobID) error {
-			gcWaiter.L.Lock()
-			for !allowGC {
-				gcWaiter.Wait()
-			}
-			gcWaiter.L.Unlock()
-			return nil
-		},
-		SkipWaitingForMVCCGC: true,
-	}
-	scKnobs := &spanconfig.TestingKnobs{
-		// Instead of relying on the GC job to wait out TTLs and clear out
-		// descriptors, let's simply exclude dropped tables to simulate
-		// descriptors no longer existing. See comment on
-		// ExcludeDroppedDescriptorsFromLookup for more details.
-		ExcludeDroppedDescriptorsFromLookup: true,
-		// We run the reconciler manually in this test (through the span config
-		// test cluster).
-		ManagerDisableJobCreation: true,
-	}
-	tsArgs := func(attr string) base.TestServerArgs {
-		return base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				GCJob:      gcTestingKnobs,
-				SpanConfig: scKnobs,
-			},
-			StoreSpecs: []base.StoreSpec{
-				{InMemory: true, Attributes: roachpb.Attributes{Attrs: []string{attr}}},
-			},
-		}
-	}
 	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
-		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		t.Parallel() // SAFE FOR TESTING
+		gcWaiter := sync.NewCond(&syncutil.Mutex{})
+		allowGC := true
+		gcTestingKnobs := &sql.GCJobTestingKnobs{
+			RunBeforeResume: func(_ jobspb.JobID) error {
+				gcWaiter.L.Lock()
+				for !allowGC {
+					gcWaiter.Wait()
+				}
+				gcWaiter.L.Unlock()
+				return nil
+			},
+			SkipWaitingForMVCCGC: true,
+		}
+		scKnobs := &spanconfig.TestingKnobs{
+			// Instead of relying on the GC job to wait out TTLs and clear out
+			// descriptors, let's simply exclude dropped tables to simulate
+			// descriptors no longer existing. See comment on
+			// ExcludeDroppedDescriptorsFromLookup for more details.
+			ExcludeDroppedDescriptorsFromLookup: true,
+			// We run the reconciler manually in this test (through the span config
+			// test cluster).
+			ManagerDisableJobCreation: true,
+		}
+		tsArgs := func(attr string) base.TestServerArgs {
+			return base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					GCJob:      gcTestingKnobs,
+					SpanConfig: scKnobs,
+				},
+				StoreSpecs: []base.StoreSpec{
+					{InMemory: true, Attributes: roachpb.Attributes{Attrs: []string{attr}}},
+				},
+			}
+		}
+		isMultiNode := strings.Contains(path, "3node")
+		// Use 1 node by default to make tests run faster.
+		nodes := 1
+		if isMultiNode {
+			nodes = 3
+		}
+		tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				// Fails with nil pointer dereference. Tracked with #76378 and #106818.
-				DefaultTestTenant: base.TestDoesNotWorkWithSecondaryTenantsButWeDontKnowWhyYet(106818),
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 			},
 			ServerArgsPerNode: map[int]base.TestServerArgs{
 				0: tsArgs("n1"),
@@ -145,7 +158,8 @@ func TestDataDriven(t *testing.T) {
 		}
 		execCfg := tenant.ExecCfg()
 
-		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
+		var f func(t *testing.T, d *datadriven.TestData) string
+		f = func(t *testing.T, d *datadriven.TestData) string {
 			var generateSystemSpanConfigs bool
 			var descIDs []descpb.ID
 			switch d.Cmd {
@@ -208,7 +222,42 @@ func TestDataDriven(t *testing.T) {
 				for _, record := range records {
 					switch {
 					case record.GetTarget().IsSpanTarget():
-						output.WriteString(fmt.Sprintf("%-42s %s\n", record.GetTarget().GetSpan(),
+						var translateOutputFmt, spanStr string
+						// The span's table ID may change in multi-node tests. Replace the
+						// table ID with <table-id> or <table-id+1> to make output
+						// deterministic.
+						if isMultiNode {
+							translateOutputFmt = "%-54s %s\n"
+							span := record.GetTarget().GetSpan()
+							parseKey := func(key roachpb.Key) (prefix string, tableID int, suffix string) {
+								keyStr := key.String()
+								matches := tableIDPrefixRegexp.FindStringSubmatch(keyStr)
+								require.Lenf(t, matches, 4, keyStr)
+								prefix = matches[1]
+								var err error
+								tableID, err = strconv.Atoi(matches[2])
+								require.NoErrorf(t, err, keyStr)
+								suffix = matches[3]
+								return
+							}
+							startPrefix, startTableID, startSuffix := parseKey(span.Key)
+							var tableIDPlaceholder = "<table-id>"
+							startKeyStr := fmt.Sprintf("%s%s%s", startPrefix, tableIDPlaceholder, startSuffix)
+							endPrefix, endTableID, endSuffix := parseKey(span.EndKey)
+							switch endTableID {
+							case startTableID:
+							case startTableID + 1:
+								tableIDPlaceholder = "<table-id+1>"
+							default:
+								t.Fatalf("invalid table IDs startTableID=%d endTableID=%d", startTableID, endTableID)
+							}
+							endKeyStr := fmt.Sprintf("%s%s%s", endPrefix, tableIDPlaceholder, endSuffix)
+							spanStr = fmt.Sprintf("[%s, %s)", startKeyStr, endKeyStr)
+						} else {
+							translateOutputFmt = "%-42s %s\n"
+							spanStr = record.GetTarget().GetSpan().String()
+						}
+						output.WriteString(fmt.Sprintf(translateOutputFmt, spanStr,
 							spanconfigtestutils.PrintSpanConfigDiffedAgainstDefaults(record.GetConfig())))
 					case record.GetTarget().IsSystemTarget():
 						output.WriteString(fmt.Sprintf("%-42s %s\n", record.GetTarget().GetSystemTarget(),
@@ -297,11 +346,26 @@ func TestDataDriven(t *testing.T) {
 				allowGC = true
 				gcWaiter.Signal()
 				gcWaiter.L.Unlock()
+
+			case "repartition":
+				var fromRelativePath, toRelativePath string
+				d.ScanArgs(t, "from", &fromRelativePath)
+				d.ScanArgs(t, "to", &toRelativePath)
+				parentDir := filepath.Dir(path)
+
+				fromAbsolutePath := filepath.Join(parentDir, fromRelativePath)
+				datadriven.RunTest(t, fromAbsolutePath, f)
+
+				toAbsolutePath := filepath.Join(parentDir, toRelativePath)
+				datadriven.RunTest(t, toAbsolutePath, f)
+
 			default:
 				t.Fatalf("unknown command: %s", d.Cmd)
 			}
 
 			return ""
-		})
+		}
+
+		datadriven.RunTest(t, path, f)
 	})
 }

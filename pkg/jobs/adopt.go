@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -85,9 +86,10 @@ func (r *Registry) maybeDumpTrace(resumerCtx context.Context, resumer Resumer, j
 	resumerTraceFilename := fmt.Sprintf("%s/resumer-trace/%s",
 		r.ID().String(), timeutil.Now().Format("20060102_150405.00"))
 	td := jobspb.TraceData{CollectedSpans: sp.GetConfiguredRecording()}
-	if err := WriteProtobinExecutionDetailFile(dumpCtx, resumerTraceFilename, &td, r.db, jobID); err != nil {
+	if err := r.db.Txn(dumpCtx, func(ctx context.Context, txn isql.Txn) error {
+		return WriteProtobinExecutionDetailFile(dumpCtx, resumerTraceFilename, &td, txn, jobID)
+	}); err != nil {
 		log.Warning(dumpCtx, "failed to write trace on resumer trace file")
-		return
 	}
 }
 
@@ -426,14 +428,15 @@ func (r *Registry) runJob(
 		return errors.Newf("refusing to start %q; job registry is draining", taskName)
 	}
 
-	job.mu.Lock()
 	var finalResumeError error
-	if job.mu.payload.FinalResumeError != nil {
-		finalResumeError = errors.DecodeError(ctx, *job.mu.payload.FinalResumeError)
-	}
-	username := job.mu.payload.UsernameProto.Decode()
-	typ := job.mu.payload.Type()
-	job.mu.Unlock()
+	username, typ := func() (username.SQLUsername, jobspb.Type) {
+		job.mu.Lock()
+		defer job.mu.Unlock()
+		if job.mu.payload.FinalResumeError != nil {
+			finalResumeError = errors.DecodeError(ctx, *job.mu.payload.FinalResumeError)
+		}
+		return job.mu.payload.UsernameProto.Decode(), job.mu.payload.Type()
+	}()
 
 	// Make sure that we remove the job from the running set when this returns.
 	defer r.unregister(job.ID())

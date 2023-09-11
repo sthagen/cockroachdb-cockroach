@@ -311,15 +311,17 @@ func restore(
 		return emptyRowCount, err
 	}
 
-	progressTracker.mu.Lock()
-	filter, err := makeSpanCoveringFilter(
-		progressTracker.mu.checkpointFrontier,
-		job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater,
-		introducedSpanFrontier,
-		targetRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV),
-		progressTracker.useFrontier)
-	progressTracker.mu.Unlock()
-	if err != nil {
+	var filter spanCoveringFilter
+	if filter, err = func() (spanCoveringFilter, error) {
+		progressTracker.mu.Lock()
+		defer progressTracker.mu.Unlock()
+		return makeSpanCoveringFilter(
+			progressTracker.mu.checkpointFrontier,
+			job.Progress().Details.(*jobspb.Progress_Restore).Restore.HighWater,
+			introducedSpanFrontier,
+			targetRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV),
+			progressTracker.useFrontier)
+	}(); err != nil {
 		return roachpb.RowCount{}, err
 	}
 
@@ -2539,7 +2541,7 @@ func (r *restoreResumer) dropDescriptors(
 		if !details.DescriptorsPublished {
 			if got, exp := mutableTables[i].Version, details.TableDescs[i].Version; got != exp {
 				log.Errorf(ctx, "version changed for restored descriptor %d before "+
-					"drop: got %d, expected %d", mutableTables[i].GetVersion(), got, exp)
+					"drop: got %d, expected %d", mutableTables[i].GetID(), got, exp)
 			}
 		}
 

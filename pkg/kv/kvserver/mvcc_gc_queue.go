@@ -25,10 +25,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
@@ -115,6 +118,19 @@ var mvccGCQueueHighPriInterval = settings.RegisterDurationSetting(
 	settings.NonNegativeDuration,
 )
 
+// EnqueueInMvccGCQueueOnSpanConfigUpdateEnabled controls whether replicas
+// are enqueued into the mvcc queue, following a span config update which
+// affects the replica.
+// TODO(baptist): Enable this once we have better AC control and have verified
+// this doesn't cause any overload problems.
+var EnqueueInMvccGCQueueOnSpanConfigUpdateEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.enqueue_in_mvcc_gc_queue_on_span_config_update.enabled",
+	"controls whether replicas are enqueued into the mvcc gc queue for "+
+		"processing, when a span config update occurs which affects the replica",
+	false,
+)
+
 func largeAbortSpan(ms enginepb.MVCCStats) bool {
 	// Checks if the size of the abort span exceeds the given threshold.
 	// The abort span is not supposed to become that large, but it does
@@ -158,8 +174,9 @@ func largeAbortSpan(ms enginepb.MVCCStats) bool {
 type mvccGCQueue struct {
 	*baseQueue
 
-	// Set to true when GC finds range that has a hint indicating that range is
-	// completely cleared.
+	// lastRangeWasHighPriority is true when GC found a range with a GCHint
+	// indicating that the range is completely cleared. Reset to false after all
+	// such ranges have been processed.
 	lastRangeWasHighPriority bool
 	// leaseholderCheckInterceptor is a leasholder check used by high priority replica scanner
 	// its only purpose is to allow test function injection.
@@ -189,6 +206,7 @@ func newMVCCGCQueue(store *Store) *mvccGCQueue {
 			},
 			successes:       store.metrics.MVCCGCQueueSuccesses,
 			failures:        store.metrics.MVCCGCQueueFailures,
+			storeFailures:   store.metrics.StoreFailures,
 			pending:         store.metrics.MVCCGCQueuePending,
 			processingNanos: store.metrics.MVCCGCQueueProcessingNanos,
 			disabledConfig:  kvserverbase.MVCCGCQueueEnabled,
@@ -270,9 +288,10 @@ func makeMVCCGCQueueScore(
 	gcTTL time.Duration,
 	canAdvanceGCThreshold bool,
 ) mvccGCQueueScore {
-	repl.mu.Lock()
+	repl.mu.RLock()
 	ms := *repl.mu.state.Stats
-	repl.mu.Unlock()
+	hint := *repl.mu.state.GCHint
+	repl.mu.RUnlock()
 
 	if repl.store.cfg.TestingKnobs.DisableLastProcessedCheck {
 		lastGC = hlc.Timestamp{}
@@ -283,7 +302,7 @@ func makeMVCCGCQueueScore(
 	// trigger GC at the same time.
 	r := makeMVCCGCQueueScoreImpl(
 		ctx, int64(repl.RangeID), now, ms, gcTTL, lastGC, canAdvanceGCThreshold,
-		repl.GetGCHint(), gc.TxnCleanupThreshold.Get(&repl.ClusterSettings().SV),
+		hint, gc.TxnCleanupThreshold.Get(&repl.ClusterSettings().SV),
 	)
 	return r
 }
@@ -500,10 +519,20 @@ func makeMVCCGCQueueScoreImpl(
 		r.FinalScore++
 	}
 
-	maybeRangeDel := suspectedFullRangeDeletion(ms)
-	hasActiveGCHint := gcHintedRangeDelete(hint, gcTTL, now)
+	// Check if there is a pending GC run according to the GCHint.
+	if canGC(hint.GCTimestamp, gcTTL, now) {
+		// TODO(pavelkalinnikov): using canAdvanceGCThreshold makes the best sense
+		// now, however we should probably check a stronger condition that the GC
+		// threshold can be advanced to timestamp >= hint.GCTimestamp. The current
+		// way can result in false positives and wasteful GC runs.
+		r.ShouldQueue = canAdvanceGCThreshold
+	}
 
-	if hasActiveGCHint && (maybeRangeDel || ms.ContainsEstimates > 0) {
+	// Check if GC should be run because the entire keyspace is likely covered by
+	// MVCC range tombstones.
+	rangeDeleteHint := canGC(hint.LatestRangeDeleteTimestamp, gcTTL, now)
+	maybeRangeDel := suspectedFullRangeDeletion(ms)
+	if rangeDeleteHint && (maybeRangeDel || ms.ContainsEstimates > 0) {
 		// We have GC hint allowing us to collect range and we either satisfy
 		// heuristic that indicate no live data or we have estimates and we assume
 		// hint is correct.
@@ -520,12 +549,10 @@ func makeMVCCGCQueueScoreImpl(
 	return r
 }
 
-func gcHintedRangeDelete(hint roachpb.GCHint, ttl time.Duration, now hlc.Timestamp) bool {
-	deleteTimestamp := hint.LatestRangeDeleteTimestamp
-	if deleteTimestamp.IsEmpty() {
-		return false
-	}
-	return deleteTimestamp.Add(ttl.Nanoseconds(), 0).Less(now)
+// canGC returns true iff the given timestamp can be garbage-collected at the
+// given moment in time, provided the configured data TTL.
+func canGC(t hlc.Timestamp, ttl time.Duration, now hlc.Timestamp) bool {
+	return t.IsSet() && t.Add(ttl.Nanoseconds(), 0).Less(now)
 }
 
 // suspectedFullRangeDeletion checks for ranges where there's no live data and
@@ -570,36 +597,7 @@ func (r *replicaGCer) send(ctx context.Context, req kvpb.GCRequest) error {
 	// admission control here, as we are bypassing server.Node.
 	var admissionHandle kvadmission.Handle
 	if r.admissionController != nil {
-		pri := admissionpb.WorkPriority(gc.AdmissionPriority.Get(&r.repl.ClusterSettings().SV))
-		ba.AdmissionHeader = kvpb.AdmissionHeader{
-			// TODO(irfansharif): GC could be expected to be BulkNormalPri, so
-			// that it does not impact user-facing traffic when resources (e.g.
-			// CPU, write capacity of the store) are scarce. However long delays
-			// in GC can slow down user-facing traffic due to more versions in
-			// the store, and can increase write amplification of the store
-			// since there is more live data. Ideally, we should adjust this
-			// priority based on how far behind we are with respect to GC-ing
-			// data in this range. Keeping it static at NormalPri proved
-			// disruptive when a large volume of MVCC GC work is suddenly
-			// accrued (if an old protected timestamp record was just released
-			// for ex. following a long paused backup job being
-			// completed/canceled, or just an old, long running backup job
-			// finishing). For now, use a cluster setting that defaults to
-			// BulkNormalPri.
-			//
-			// After we implement dynamic priority adjustment, it's not clear
-			// whether we need additional pacing mechanisms to provide better
-			// latency isolation similar to ongoing work for backups (since MVCC
-			// GC work is CPU intensive): #82955. It's also worth noting that we
-			// might be able to do most MVCC GC work as part of regular
-			// compactions (#42514) -- the CPU use by the MVCC GC queue during
-			// keyspace might still be worth explicitly accounting/limiting, but
-			// it'll be lessened overall.
-			Priority:                 int32(pri),
-			CreateTime:               timeutil.Now().UnixNano(),
-			Source:                   kvpb.AdmissionHeader_ROOT_KV,
-			NoMemoryReservedAtSource: true,
-		}
+		ba.AdmissionHeader = gcAdmissionHeader(r.repl.ClusterSettings())
 		ba.Replica.StoreID = r.storeID
 		var err error
 		admissionHandle, err = r.admissionController.AdmitKVWork(ctx, roachpb.SystemTenantID, ba)
@@ -711,7 +709,19 @@ func (mgcq *mvccGCQueue) process(
 		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 
-	snap := repl.store.TODOEngine().NewSnapshot()
+	var snap storage.Reader
+	if repl.store.cfg.SharedStorageEnabled || storage.UseEFOS.Get(&repl.ClusterSettings().SV) {
+		efos := repl.store.TODOEngine().NewEventuallyFileOnlySnapshot(rditer.MakeReplicatedKeySpans(desc))
+		if util.RaceEnabled {
+			ss := rditer.MakeReplicatedKeySpanSet(desc)
+			defer ss.Release()
+			snap = spanset.NewEventuallyFileOnlySnapshot(efos, ss)
+		} else {
+			snap = efos
+		}
+	} else {
+		snap = repl.store.TODOEngine().NewSnapshot()
+	}
 	defer snap.Close()
 
 	intentAgeThreshold := gc.IntentAgeThreshold.Get(&repl.store.ClusterSettings().SV)
@@ -740,8 +750,8 @@ func (mgcq *mvccGCQueue) process(
 			storeID:             mgcq.store.StoreID(),
 		},
 		func(ctx context.Context, intents []roachpb.Intent) error {
-			intentCount, err := repl.store.intentResolver.
-				CleanupIntents(ctx, intents, gcTimestamp, kvpb.PUSH_TOUCH)
+			intentCount, err := repl.store.intentResolver.CleanupIntents(
+				ctx, gcAdmissionHeader(repl.store.ClusterSettings()), intents, gcTimestamp, kvpb.PUSH_TOUCH)
 			if err == nil {
 				mgcq.store.metrics.GCResolveSuccess.Inc(int64(intentCount))
 			} else {
@@ -751,7 +761,8 @@ func (mgcq *mvccGCQueue) process(
 		},
 		func(ctx context.Context, txn *roachpb.Transaction) error {
 			err := repl.store.intentResolver.
-				CleanupTxnIntentsOnGCAsync(ctx, repl.RangeID, txn, gcTimestamp,
+				CleanupTxnIntentsOnGCAsync(
+					ctx, gcAdmissionHeader(repl.store.ClusterSettings()), repl.RangeID, txn, gcTimestamp,
 					func(pushed, succeeded bool) {
 						if pushed {
 							mgcq.store.metrics.GCPushTxn.Inc(1)
@@ -913,4 +924,37 @@ func (*mvccGCQueue) purgatoryChan() <-chan time.Time {
 
 func (*mvccGCQueue) updateChan() <-chan time.Time {
 	return nil
+}
+
+func gcAdmissionHeader(st *cluster.Settings) kvpb.AdmissionHeader {
+	pri := admissionpb.WorkPriority(gc.AdmissionPriority.Get(&st.SV))
+	return kvpb.AdmissionHeader{
+		// TODO(irfansharif): GC could be expected to be BulkNormalPri, so
+		// that it does not impact user-facing traffic when resources (e.g.
+		// CPU, write capacity of the store) are scarce. However long delays
+		// in GC can slow down user-facing traffic due to more versions in
+		// the store, and can increase write amplification of the store
+		// since there is more live data. Ideally, we should adjust this
+		// priority based on how far behind we are with respect to GC-ing
+		// data in this range. Keeping it static at NormalPri proved
+		// disruptive when a large volume of MVCC GC work is suddenly
+		// accrued (if an old protected timestamp record was just released
+		// for ex. following a long paused backup job being
+		// completed/canceled, or just an old, long running backup job
+		// finishing). For now, use a cluster setting that defaults to
+		// BulkNormalPri.
+		//
+		// After we implement dynamic priority adjustment, it's not clear
+		// whether we need additional pacing mechanisms to provide better
+		// latency isolation similar to ongoing work for backups (since MVCC
+		// GC work is CPU intensive): #82955. It's also worth noting that we
+		// might be able to do most MVCC GC work as part of regular
+		// compactions (#42514) -- the CPU use by the MVCC GC queue during
+		// keyspace might still be worth explicitly accounting/limiting, but
+		// it'll be lessened overall.
+		Priority:                 int32(pri),
+		CreateTime:               timeutil.Now().UnixNano(),
+		Source:                   kvpb.AdmissionHeader_ROOT_KV,
+		NoMemoryReservedAtSource: true,
+	}
 }

@@ -502,6 +502,7 @@ func TestLint(t *testing.T) {
 					":!testutils/lint",
 					":!util/envutil/env.go",
 					":!testutils/data_path.go",
+					":!testutils/bazelcodecover/code_cover_on.go", // For BAZEL_COVER_DIR.
 					":!util/log/tracebacks.go",
 					":!util/sdnotify/sdnotify_unix.go",
 					":!util/grpcutil",                        // GRPC_GO_* variables
@@ -563,6 +564,7 @@ func TestLint(t *testing.T) {
 			":!*/doc.go",
 			":!util/syncutil/mutex_sync.go",
 			":!util/syncutil/mutex_sync_race.go",
+			":!testutils/lint/passes/deferunlockcheck/testdata/src/github.com/cockroachdb/cockroach/pkg/util/syncutil/mutex_sync.go",
 		)
 		if err != nil {
 			t.Fatal(err)

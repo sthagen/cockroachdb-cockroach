@@ -232,7 +232,7 @@ This session variable default should now be configured using ALTER ROLE... SET: 
 sql.defaults.vectorize	enumeration	on	"default vectorize mode [on = 0, on = 2, experimental_always = 3, off = 4]
 This cluster setting is being kept to preserve backwards-compatibility.
 This session variable default should now be configured using ALTER ROLE... SET: https://www.cockroachlabs.com/docs/stable/alter-role.html"	tenant-rw
-sql.defaults.zigzag_join.enabled	boolean	true	"default value for enable_zigzag_join session setting; allows use of zig-zag join by default
+sql.defaults.zigzag_join.enabled	boolean	false	"default value for enable_zigzag_join session setting; disallows use of zig-zag join by default
 This cluster setting is being kept to preserve backwards-compatibility.
 This session variable default should now be configured using ALTER ROLE... SET: https://www.cockroachlabs.com/docs/stable/alter-role.html"	tenant-rw
 sql.distsql.temp_storage.workmem	byte size	64 MiB	maximum amount of memory in bytes a processor can use before falling back to temp storage	tenant-rw
@@ -256,7 +256,7 @@ sql.metrics.max_mem_stmt_fingerprints	integer	100000	the maximum number of state
 sql.metrics.max_mem_txn_fingerprints	integer	100000	the maximum number of transaction fingerprints stored in memory	tenant-rw
 sql.metrics.statement_details.dump_to_logs.enabled	boolean	false	dump collected statement statistics to node logs when periodically cleared	tenant-rw
 sql.metrics.statement_details.enabled	boolean	true	collect per-statement query statistics	tenant-rw
-sql.metrics.statement_details.gateway_node.enabled	boolean	true	save the gateway node for each statement fingerprint. If false, the value will be stored as 0.	tenant-rw
+sql.metrics.statement_details.gateway_node.enabled	boolean	false	save the gateway node for each statement fingerprint. If false, the value will be stored as 0.	tenant-rw
 sql.metrics.statement_details.index_recommendation_collection.enabled	boolean	true	generate an index recommendation for each fingerprint ID	tenant-rw
 sql.metrics.statement_details.max_mem_reported_idx_recommendations	integer	5000	the maximum number of reported index recommendation info stored in memory	tenant-rw
 sql.metrics.statement_details.plan_collection.enabled	boolean	false	periodically save a logical plan for each fingerprint	tenant-rw
@@ -301,6 +301,7 @@ sql.ttl.default_delete_batch_size	integer	100	default amount of rows to delete i
 sql.ttl.default_delete_rate_limit	integer	0	default delete rate limit for all TTL jobs. Use 0 to signify no rate limit.	tenant-rw
 sql.ttl.default_select_batch_size	integer	500	default amount of rows to select in a single query during a TTL job	tenant-rw
 sql.ttl.job.enabled	boolean	true	whether the TTL job is enabled	tenant-rw
+sql.txn.read_committed_syntax.enabled	boolean	false	set to true to allow transactions to use the READ COMMITTED isolation level if specified by BEGIN/SET commands	tenant-rw
 sql.txn_fingerprint_id_cache.capacity	integer	100	the maximum number of txn fingerprint IDs stored	tenant-rw
 storage.max_sync_duration	duration	20s	maximum duration for disk operations; any operations that take longer than this setting trigger a warning log entry or process crash	tenant-ro
 storage.max_sync_duration.fatal.enabled	boolean	true	if true, fatal the process when a disk operation exceeds storage.max_sync_duration	tenant-ro
@@ -313,4 +314,4 @@ trace.opentelemetry.collector	string		address of an OpenTelemetry trace collecto
 trace.snapshot.rate	duration	0s	if non-zero, interval at which background trace snapshots are captured	tenant-rw
 trace.span_registry.enabled	boolean	true	if set, ongoing traces can be seen at https://<ui>/#/debug/tracez	tenant-rw
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.	tenant-rw
-version	version	1000023.1-22	set the active cluster version in the format '<major>.<minor>'	tenant-rw
+version	version	1000023.1-24	set the active cluster version in the format '<major>.<minor>'	tenant-rw

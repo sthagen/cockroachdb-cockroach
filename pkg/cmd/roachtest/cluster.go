@@ -892,6 +892,10 @@ func (f *clusterFactory) newCluster(
 		}
 		return c, nil, nil
 	}
+	// Ensure an allocation is specified.
+	if cfg.alloc == nil {
+		return nil, nil, errors.New("no allocation specified; cfg.alloc must be set")
+	}
 
 	if cfg.localCluster {
 		// Local clusters never expire.
@@ -1096,7 +1100,7 @@ func (c *clusterImpl) StopCockroachGracefullyOnNode(
 func (c *clusterImpl) Save(ctx context.Context, msg string, l *logger.Logger) {
 	l.PrintfCtx(ctx, "saving cluster %s for debugging (--debug specified)", c)
 	// TODO(andrei): should we extend the cluster here? For how long?
-	if c.destroyState.owned { // we won't have an alloc for an unowned cluster
+	if c.destroyState.owned && c.destroyState.alloc != nil { // we won't have an alloc for an unowned cluster
 		c.destroyState.alloc.Freeze()
 	}
 	c.r.markClusterAsSaved(c, msg)
@@ -2373,24 +2377,24 @@ func addrToHostPort(addr string) (string, int, error) {
 // InternalAdminUIAddr returns the internal Admin UI address in the form host:port
 // for the specified node.
 func (c *clusterImpl) InternalAdminUIAddr(
-	_ context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, node option.NodeListOption,
 ) ([]string, error) {
-	return c.adminUIAddr(l, node, false)
+	return c.adminUIAddr(ctx, l, node, false)
 }
 
 // ExternalAdminUIAddr returns the external Admin UI address in the form host:port
 // for the specified node.
 func (c *clusterImpl) ExternalAdminUIAddr(
-	_ context.Context, l *logger.Logger, node option.NodeListOption,
+	ctx context.Context, l *logger.Logger, node option.NodeListOption,
 ) ([]string, error) {
-	return c.adminUIAddr(l, node, true)
+	return c.adminUIAddr(ctx, l, node, true)
 }
 
 func (c *clusterImpl) adminUIAddr(
-	l *logger.Logger, node option.NodeListOption, external bool,
+	ctx context.Context, l *logger.Logger, node option.NodeListOption, external bool,
 ) ([]string, error) {
 	var addrs []string
-	adminURLs, err := roachprod.AdminURL(l, c.MakeNodes(node), "", 0, "",
+	adminURLs, err := roachprod.AdminURL(ctx, l, c.MakeNodes(node), "", 0, "",
 		external, false, false)
 	if err != nil {
 		return nil, err
@@ -2497,15 +2501,20 @@ func (c *clusterImpl) ConnE(
 		return nil, err
 	}
 
-	dataSourceName := urls[0]
-	if connOptions.User != "" {
-		u, err := url.Parse(urls[0])
-		if err != nil {
-			return nil, err
-		}
-		u.User = url.User(connOptions.User)
-		dataSourceName = u.String()
+	u, err := url.Parse(urls[0])
+	if err != nil {
+		return nil, err
 	}
+
+	if connOptions.User != "" {
+		u.User = url.User(connOptions.User)
+	}
+
+	if connOptions.DBName != "" {
+		u.Path = connOptions.DBName
+	}
+	dataSourceName := u.String()
+
 	if len(connOptions.Options) > 0 {
 		vals := make(url.Values)
 		for k, v := range connOptions.Options {

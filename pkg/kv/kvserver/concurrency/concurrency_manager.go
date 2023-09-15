@@ -332,7 +332,10 @@ func (m *managerImpl) sequenceReqWithGuard(
 		} else {
 			// Scan for conflicting locks.
 			log.Event(ctx, "scanning lock table for conflicting locks")
-			g.ltg = m.lt.ScanAndEnqueue(g.Req, g.ltg)
+			g.ltg, err = m.lt.ScanAndEnqueue(g.Req, g.ltg)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		// Wait on conflicting locks, if necessary. Note that this will never be
@@ -503,7 +506,7 @@ func (m *managerImpl) HandleLockConflictError(
 	// If the discovery process collected a set of intents to resolve before the
 	// next evaluation attempt, do so.
 	if toResolve := g.ltg.ResolveBeforeScanning(); len(toResolve) > 0 {
-		if err := m.ltw.ResolveDeferredIntents(ctx, toResolve); err != nil {
+		if err := m.ltw.ResolveDeferredIntents(ctx, g.Req.AdmissionHeader, toResolve); err != nil {
 			m.FinishReq(g)
 			return nil, err
 		}

@@ -319,7 +319,7 @@ func newTransaction(
 		offset = clock.MaxOffset().Nanoseconds()
 		now = clock.Now()
 	}
-	txn := roachpb.MakeTransaction(name, baseKey, isoLevel, userPriority, now, offset, 0)
+	txn := roachpb.MakeTransaction(name, baseKey, isoLevel, userPriority, now, offset, 0, 0)
 	return &txn
 }
 
@@ -2916,10 +2916,10 @@ func TestReplicaLatchingOptimisticEvaluationSkipLocked(t *testing.T) {
 				gArgs1, gArgs2 := getArgsString("a"), getArgsString("b")
 				gArgs3, gArgs4 := getArgsString("c"), getArgsString("d")
 				if lockingReads {
-					gArgs1.KeyLocking = lock.Exclusive
-					gArgs2.KeyLocking = lock.Exclusive
-					gArgs3.KeyLocking = lock.Exclusive
-					gArgs4.KeyLocking = lock.Exclusive
+					gArgs1.KeyLockingStrength = lock.Exclusive
+					gArgs2.KeyLockingStrength = lock.Exclusive
+					gArgs3.KeyLockingStrength = lock.Exclusive
+					gArgs4.KeyLockingStrength = lock.Exclusive
 				}
 				baRead.Add(gArgs1, gArgs2, gArgs3, gArgs4)
 			} else {
@@ -2927,8 +2927,8 @@ func TestReplicaLatchingOptimisticEvaluationSkipLocked(t *testing.T) {
 				sArgs1 := scanArgsString("a", "c")
 				sArgs2 := scanArgsString("c", "e")
 				if lockingReads {
-					sArgs1.KeyLocking = lock.Exclusive
-					sArgs2.KeyLocking = lock.Exclusive
+					sArgs1.KeyLockingStrength = lock.Exclusive
+					sArgs2.KeyLockingStrength = lock.Exclusive
 				}
 				baRead.Add(sArgs1, sArgs2)
 			}
@@ -4810,7 +4810,7 @@ func TestErrorsDontCarryWriteTooOldFlag(t *testing.T) {
 	keyB := roachpb.Key("b")
 	// Start a transaction early to get a low timestamp.
 	txn := roachpb.MakeTransaction("test", keyA, isolation.Serializable, roachpb.NormalUserPriority,
-		tc.Clock().Now(), 0 /* maxOffsetNs */, 0 /* coordinatorNodeID */)
+		tc.Clock().Now(), 0 /* maxOffsetNs */, 0 /* coordinatorNodeID */, 0)
 
 	// Write a value outside of the txn to cause a WriteTooOldError later.
 	put := putArgs(keyA, []byte("val1"))
@@ -8416,7 +8416,7 @@ func TestRefreshFromBelowGCThreshold(t *testing.T) {
 				RefreshFrom:   ts2,
 			}
 		}
-		txn := roachpb.MakeTransaction("test", keyA, 0, 0, ts2, 0, 0)
+		txn := roachpb.MakeTransaction("test", keyA, 0, 0, ts2, 0, 0, 0)
 		txn.BumpReadTimestamp(ts4)
 
 		for _, testCase := range []struct {
@@ -10373,8 +10373,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 	tc.manualClock.Advance(1)
 
 	newTxn := func(key string, ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction(
-			"test", roachpb.Key(key), isolation.Serializable, roachpb.NormalUserPriority, ts, 0, 0)
+		txn := roachpb.MakeTransaction("test", roachpb.Key(key), isolation.Serializable, roachpb.NormalUserPriority, ts, 0, 0, 0)
 		return &txn
 	}
 	send := func(ba *kvpb.BatchRequest) (hlc.Timestamp, error) {
@@ -10545,7 +10544,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				ba = &kvpb.BatchRequest{}
 				ba.Txn = newTxn("c-scan", ts.Prev())
 				scan := scanArgs(roachpb.Key("c-scan"), roachpb.Key("c-scan\x00"))
-				scan.KeyLocking = lock.Exclusive
+				scan.KeyLockingStrength = lock.Exclusive
 				ba.Add(scan)
 				return
 			},
@@ -10606,7 +10605,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				ba.Txn = newTxn("c-scan", ts.Prev())
 				ba.CanForwardReadTimestamp = true
 				scan := scanArgs(roachpb.Key("c-scan"), roachpb.Key("c-scan\x00"))
-				scan.KeyLocking = lock.Exclusive
+				scan.KeyLockingStrength = lock.Exclusive
 				ba.Add(scan)
 				return
 			},
@@ -10839,7 +10838,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				expTS = ba.Txn.WriteTimestamp
 
 				scan := scanArgs(roachpb.Key("lscan"), roachpb.Key("lscan\x00"))
-				scan.KeyLocking = lock.Exclusive
+				scan.KeyLockingStrength = lock.Exclusive
 				ba.Add(scan)
 				return
 			},
@@ -11008,7 +11007,7 @@ func TestReplicaPushed1PC(t *testing.T) {
 
 	// Start a transaction and assign its ReadTimestamp.
 	ts1 := tc.Clock().Now()
-	txn := roachpb.MakeTransaction("test", k, isolation.Serializable, roachpb.NormalUserPriority, ts1, 0, 0)
+	txn := roachpb.MakeTransaction("test", k, isolation.Serializable, roachpb.NormalUserPriority, ts1, 0, 0, 0)
 
 	// Write a value outside the transaction.
 	tc.manualClock.Advance(10)
@@ -11083,7 +11082,7 @@ func TestReplicaNotifyLockTableOn1PC(t *testing.T) {
 	txn := newTransaction("test", key, 1, tc.Clock())
 	ba := &kvpb.BatchRequest{}
 	ba.Header = kvpb.Header{Txn: txn}
-	ba.Add(kvpb.NewScan(key, key.Next(), true /* forUpdate */))
+	ba.Add(kvpb.NewScan(key, key.Next(), kvpb.ForUpdate))
 	if _, pErr := tc.Sender().Send(ctx, ba); pErr != nil {
 		t.Fatalf("unexpected error: %s", pErr)
 	}
@@ -11242,7 +11241,7 @@ func TestReplicaQueryLocks(t *testing.T) {
 			txn := newTransaction("test", keyA, 1, tc.Clock())
 			ba := &kvpb.BatchRequest{}
 			ba.Header = kvpb.Header{Txn: txn}
-			ba.Add(kvpb.NewScan(keyA, keyB.Next(), true /* forUpdate */))
+			ba.Add(kvpb.NewScan(keyA, keyB.Next(), kvpb.ForUpdate))
 			if _, pErr := tc.Sender().Send(ctx, ba); pErr != nil {
 				t.Fatalf("unexpected error: %s", pErr)
 			}

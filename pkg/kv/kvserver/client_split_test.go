@@ -138,7 +138,7 @@ func TestStoreSplitAbortSpan(t *testing.T) {
 	left, middle, right := roachpb.Key("a"), roachpb.Key("b"), roachpb.Key("c")
 
 	txn := func(key roachpb.Key, ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction("test", key, 0, 0, ts, 0, int32(s.SQLInstanceID()))
+		txn := roachpb.MakeTransaction("test", key, 0, 0, ts, 0, int32(s.SQLInstanceID()), 0)
 		return &txn
 	}
 
@@ -465,6 +465,7 @@ func TestQueryLocksAcrossRanges(t *testing.T) {
 		s.Clock().NowAsClockTimestamp().ToTimestamp(),
 		s.Clock().MaxOffset().Nanoseconds(),
 		int32(s.SQLInstanceID()),
+		0,
 	)
 	txn3ID := txn3Proto.ID
 
@@ -635,7 +636,7 @@ func TestStoreRangeSplitIdempotency(t *testing.T) {
 	// Increments are a good way of testing idempotency. Up here, we
 	// address them to the original range, then later to the one that
 	// contains the key.
-	txn := roachpb.MakeTransaction("test", []byte("c"), isolation.Serializable, 10, store.Clock().Now(), 0, int32(s.SQLInstanceID()))
+	txn := roachpb.MakeTransaction("test", []byte("c"), isolation.Serializable, 10, store.Clock().Now(), 0, int32(s.SQLInstanceID()), 0)
 	lIncArgs := incrementArgs([]byte("apoptosis"), 100)
 	lTxn := txn
 	lTxn.Sequence++
@@ -1230,7 +1231,7 @@ func TestStoreRangeSplitBackpressureWrites(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			var activateSplitFilter int32
-			splitKey := roachpb.RKey(bootstrap.TestingUserTableDataMin())
+			splitKey := roachpb.RKey(bootstrap.TestingUserTableDataMin(keys.SystemSQLCodec))
 			splitPending, blockSplits := make(chan struct{}), make(chan struct{})
 
 			// Set maxBytes to something small so we can exceed the maximum split
@@ -2452,13 +2453,13 @@ func TestStoreTxnWaitQueueEnabledOnSplit(t *testing.T) {
 	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	require.NoError(t, err)
 
-	key := bootstrap.TestingUserTableDataMin()
+	key := bootstrap.TestingUserTableDataMin(keys.SystemSQLCodec)
 	args := adminSplitArgs(key)
 	if _, pErr := kv.SendWrapped(ctx, store.TestSender(), args); pErr != nil {
 		t.Fatalf("%q: split unexpected error: %s", key, pErr)
 	}
 
-	rhsRepl := store.LookupReplica(roachpb.RKey(bootstrap.TestingUserTableDataMin()))
+	rhsRepl := store.LookupReplica(roachpb.RKey(bootstrap.TestingUserTableDataMin(keys.SystemSQLCodec)))
 	if !rhsRepl.GetConcurrencyManager().TestingTxnWaitQueue().IsEnabled() {
 		t.Errorf("expected RHS replica's push txn queue to be enabled post-split")
 	}
@@ -3235,9 +3236,7 @@ func TestRangeLookupAsyncResolveIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	txn := roachpb.MakeTransaction("test", key2, isolation.Serializable, 1,
-		store.Clock().Now(), store.Clock().MaxOffset().Nanoseconds(),
-		int32(s.SQLInstanceID()))
+	txn := roachpb.MakeTransaction("test", key2, isolation.Serializable, 1, store.Clock().Now(), store.Clock().MaxOffset().Nanoseconds(), int32(s.SQLInstanceID()), 0)
 	// Officially begin the transaction. If not for this, the intent resolution
 	// machinery would simply remove the intent we write below, see #3020.
 	// We send directly to Replica throughout this test, so there's no danger

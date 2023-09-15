@@ -110,7 +110,7 @@ var EnqueueInReplicateQueueOnSpanConfigUpdateEnabled = settings.RegisterBoolSett
 	"kv.enqueue_in_replicate_queue_on_span_config_update.enabled",
 	"controls whether replicas are enqueued into the replicate queue for "+
 		"processing, when a span config update occurs, which affects the replica",
-	false,
+	true,
 )
 
 var (
@@ -586,6 +586,7 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 			processTimeoutFunc: makeRateLimitedTimeoutFunc(rebalanceSnapshotRate),
 			successes:          store.metrics.ReplicateQueueSuccesses,
 			failures:           store.metrics.ReplicateQueueFailures,
+			storeFailures:      store.metrics.StoreFailures,
 			pending:            store.metrics.ReplicateQueuePending,
 			processingNanos:    store.metrics.ReplicateQueueProcessingNanos,
 			purgatory:          store.metrics.ReplicateQueuePurgatory,

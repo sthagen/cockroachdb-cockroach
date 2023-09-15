@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -52,7 +53,7 @@ var (
 	flagRSGTime                    = flag.Duration("rsg", 0, "random syntax generator test duration")
 	flagRSGGoRoutines              = flag.Int("rsg-routines", 1, "number of Go routines executing random statements in each RSG test")
 	flagRSGExecTimeout             = flag.Duration("rsg-exec-timeout", 35*time.Second, "timeout duration when executing a statement")
-	flagRSGExecColumnChangeTimeout = flag.Duration("rsg-exec-column-change-timeout", 40*time.Second, "timeout duration when executing a statement for random column changes")
+	flagRSGExecColumnChangeTimeout = flag.Duration("rsg-exec-column-change-timeout", 50*time.Second, "timeout duration when executing a statement for random column changes")
 )
 
 func verifyFormat(sql string) error {
@@ -643,6 +644,7 @@ var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
 func TestRandomSyntaxSQLSmith(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()() // allow usage of partitions
 
 	var smither *sqlsmith.Smither
 
@@ -808,8 +810,6 @@ func testRandomSyntax(
 	}
 	srv, rawDB, _ := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(ctx)
-	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
-	sql.SecondaryTenantScatterEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
 	db := &verifyFormatDB{db: rawDB}
 	err := db.exec(t, ctx, "SET CLUSTER SETTING schemachanger.job.max_retry_backoff='1s'")
 	require.NoError(t, err)

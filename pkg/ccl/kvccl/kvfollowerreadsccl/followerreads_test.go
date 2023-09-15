@@ -98,7 +98,7 @@ func TestCanSendToFollower(t *testing.T) {
 	future := clock.Now().Add(2*clock.MaxOffset().Nanoseconds(), 0)
 
 	txn := func(ts hlc.Timestamp) *roachpb.Transaction {
-		txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, 1)
+		txn := roachpb.MakeTransaction("txn", nil, 0, 0, ts, 0, 1, 0)
 		return &txn
 	}
 	withWriteTimestamp := func(txn *roachpb.Transaction, ts hlc.Timestamp) *roachpb.Transaction {
@@ -208,7 +208,7 @@ func TestCanSendToFollower(t *testing.T) {
 		},
 		{
 			name: "stale locking read",
-			ba:   batch(txn(stale), &kvpb.GetRequest{KeyLocking: lock.Exclusive}),
+			ba:   batch(txn(stale), &kvpb.GetRequest{KeyLockingStrength: lock.Exclusive}),
 			exp:  false,
 		},
 		{
@@ -345,7 +345,7 @@ func TestCanSendToFollower(t *testing.T) {
 		},
 		{
 			name:     "stale locking read, global reads policy",
-			ba:       batch(txn(stale), &kvpb.GetRequest{KeyLocking: lock.Exclusive}),
+			ba:       batch(txn(stale), &kvpb.GetRequest{KeyLockingStrength: lock.Exclusive}),
 			ctPolicy: roachpb.LEAD_FOR_GLOBAL_READS,
 			exp:      false,
 		},

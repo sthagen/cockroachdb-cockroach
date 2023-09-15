@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -26,14 +27,17 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const (
+var (
 	// DefaultPushTxnsInterval is the default interval at which a Processor will
 	// push all transactions in the unresolvedIntentQueue that are above the age
 	// specified by PushTxnsAge.
-	DefaultPushTxnsInterval = 250 * time.Millisecond
+	DefaultPushTxnsInterval = envutil.EnvOrDefaultDuration(
+		"COCKROACH_RANGEFEED_PUSH_TXNS_INTERVAL", time.Second)
+
 	// defaultPushTxnsAge is the default age at which a Processor will begin to
 	// consider a transaction old enough to push.
-	defaultPushTxnsAge = 10 * time.Second
+	defaultPushTxnsAge = envutil.EnvOrDefaultDuration(
+		"COCKROACH_RANGEFEED_PUSH_TXNS_AGE", 10*time.Second)
 )
 
 // newErrBufferCapacityExceeded creates an error that is returned to subscribers
@@ -462,9 +466,9 @@ func (p *LegacyProcessor) run(
 
 		// Check whether any unresolved intents need a push.
 		case <-txnPushTickerC:
-			// Don't perform transaction push attempts until the resolved
-			// timestamp has been initialized.
-			if !p.rts.IsInit() {
+			// Don't perform transaction push attempts until the resolved timestamp
+			// has been initialized, or if we're not tracking any intents.
+			if !p.rts.IsInit() || p.rts.intentQ.Len() == 0 {
 				continue
 			}
 

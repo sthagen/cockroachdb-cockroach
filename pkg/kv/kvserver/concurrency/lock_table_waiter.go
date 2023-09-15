@@ -161,7 +161,10 @@ func (w *lockTableWaiterImpl) WaitOn(
 		// about another contending transaction on newStateC.
 		case <-newStateC:
 			timerC = nil
-			state := guard.CurState()
+			state, err := guard.CurState()
+			if err != nil {
+				return kvpb.NewError(err)
+			}
 			log.VEventf(ctx, 3, "lock wait-queue event: %s", state)
 			tracer.notify(ctx, state)
 			switch state.kind {
@@ -326,7 +329,7 @@ func (w *lockTableWaiterImpl) WaitOn(
 				// the comment in lockTableImpl.tryActiveWait for the proper way to
 				// remove this and other evaluation races.
 				toResolve := guard.ResolveBeforeScanning()
-				return w.ResolveDeferredIntents(ctx, toResolve)
+				return w.ResolveDeferredIntents(ctx, req.AdmissionHeader, toResolve)
 
 			default:
 				panic("unexpected waiting state")
@@ -626,7 +629,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 		resolve.ClockWhilePending = beforePushObs
 	}
 	logResolveIntent(ctx, resolve)
-	opts := intentresolver.ResolveOptions{Poison: true}
+	opts := intentresolver.ResolveOptions{Poison: true, AdmissionHeader: req.AdmissionHeader}
 	return w.ir.ResolveIntent(ctx, resolve, opts)
 }
 
@@ -808,7 +811,9 @@ func (w *lockTableWaiterImpl) timeUntilDeadline(deadline time.Time) time.Duratio
 
 // ResolveDeferredIntents implements the lockTableWaiter interface.
 func (w *lockTableWaiterImpl) ResolveDeferredIntents(
-	ctx context.Context, deferredResolution []roachpb.LockUpdate,
+	ctx context.Context,
+	admissionHeader kvpb.AdmissionHeader,
+	deferredResolution []roachpb.LockUpdate,
 ) *Error {
 	if len(deferredResolution) == 0 {
 		return nil
@@ -818,7 +823,7 @@ func (w *lockTableWaiterImpl) ResolveDeferredIntents(
 		logResolveIntent(ctx, intent)
 	}
 	// See pushLockTxn for an explanation of these options.
-	opts := intentresolver.ResolveOptions{Poison: true}
+	opts := intentresolver.ResolveOptions{Poison: true, AdmissionHeader: admissionHeader}
 	return w.ir.ResolveIntents(ctx, deferredResolution, opts)
 }
 

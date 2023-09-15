@@ -139,6 +139,7 @@ func NewTxnWithAdmissionControl(
 		now.ToTimestamp(),
 		db.clock.MaxOffset().Nanoseconds(),
 		int32(db.ctx.NodeID.SQLInstanceID()),
+		priority,
 	)
 	txn := NewTxnFromProto(ctx, db, gatewayNodeID, now, RootTxn, &kvTxn)
 	txn.admissionHeader = kvpb.AdmissionHeader{
@@ -485,6 +486,20 @@ func (txn *Txn) GetForUpdate(ctx context.Context, key interface{}) (KeyValue, er
 	return getOneRow(txn.Run(ctx, b), b)
 }
 
+// GetForShare retrieves the value for a key, returning the retrieved key/value
+// or an error. An unreplicated, shared lock is acquired on the key, if it
+// exists. It is not considered an error for the key to not exist.
+//
+//	r, err := txn.GetForShare("a")
+//	// string(r.Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) GetForShare(ctx context.Context, key interface{}) (KeyValue, error) {
+	b := txn.NewBatch()
+	b.GetForShare(key)
+	return getOneRow(txn.Run(ctx, b), b)
+}
+
 // GetProto retrieves the value for a key and decodes the result as a proto
 // message. If the key doesn't exist, the proto will simply be reset.
 //
@@ -575,13 +590,17 @@ func (txn *Txn) Inc(ctx context.Context, key interface{}, value int64) (KeyValue
 }
 
 func (txn *Txn) scan(
-	ctx context.Context, begin, end interface{}, maxRows int64, isReverse, forUpdate bool,
+	ctx context.Context,
+	begin, end interface{},
+	maxRows int64,
+	isReverse bool,
+	str kvpb.KeyLockingStrengthType,
 ) ([]KeyValue, error) {
 	b := txn.NewBatch()
 	if maxRows > 0 {
 		b.Header.MaxSpanRequestKeys = maxRows
 	}
-	b.scan(begin, end, isReverse, forUpdate)
+	b.scan(begin, end, isReverse, str)
 	r, err := getOneResult(txn.Run(ctx, b), b)
 	return r.Rows, err
 }
@@ -596,7 +615,7 @@ func (txn *Txn) scan(
 func (txn *Txn) Scan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, false /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.NonLocking)
 }
 
 // ScanForUpdate retrieves the rows between begin (inclusive) and end
@@ -610,7 +629,21 @@ func (txn *Txn) Scan(
 func (txn *Txn) ScanForUpdate(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, true /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForUpdate)
+}
+
+// ScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in ascending order. Unreplicated, shared locks are acquired on
+// each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements (or all results
+// when zero is supplied).
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) ScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64,
+) ([]KeyValue, error) {
+	return txn.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForShare)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -623,7 +656,7 @@ func (txn *Txn) ScanForUpdate(
 func (txn *Txn) ReverseScan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, false /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.NonLocking)
 }
 
 // ReverseScanForUpdate retrieves the rows between begin (inclusive) and end
@@ -637,7 +670,21 @@ func (txn *Txn) ReverseScan(
 func (txn *Txn) ReverseScanForUpdate(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, true /* forUpdate */)
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForUpdate)
+}
+
+// ReverseScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in descending order. Unreplicated, shared locks are acquired
+// on each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements (or all results
+// when zero is supplied).
+//
+// key can be either a byte slice or a string.
+func (txn *Txn) ReverseScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64,
+) ([]KeyValue, error) {
+	return txn.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForShare)
 }
 
 // Iterate performs a paginated scan and applying the function f to every page.
@@ -1639,20 +1686,8 @@ func (txn *Txn) DeferCommitWait(ctx context.Context) func(context.Context) error
 func (txn *Txn) AdmissionHeader() kvpb.AdmissionHeader {
 	h := txn.admissionHeader
 	if txn.mu.sender.IsLocking() {
-		// Assign higher priority to requests by txns that are locking, so that
-		// they release locks earlier. Note that this is a crude approach, and is
-		// worse than priority inheritance used for locks in realtime systems. We
-		// do this because admission control does not have visibility into the
-		// exact locks held by waiters in the admission queue, and cannot compare
-		// that with priorities of waiting requests in the various lock table
-		// queues. This crude approach has shown some benefit in tpcc with 3000
-		// warehouses, where it halved the number of lock waiters, and increased
-		// the transaction throughput by 10+%. In that experiment 40% of the
-		// BatchRequests evaluated by KV had been assigned high priority due to
-		// locking.
-		if h.Priority < int32(admissionpb.LockingPri) {
-			h.Priority = int32(admissionpb.LockingPri)
-		}
+		h.Priority = int32(admissionpb.AdjustedPriorityWhenHoldingLocks(
+			admissionpb.WorkPriority(h.Priority)))
 	}
 	return h
 }

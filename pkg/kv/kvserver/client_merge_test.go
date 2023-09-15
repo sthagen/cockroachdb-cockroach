@@ -587,8 +587,8 @@ func mergeCheckingTimestampCaches(
 	// Simulate a txn abort on the RHS from a node with a newer clock. Because
 	// the transaction record for the pushee was not yet written, this will bump
 	// the timestamp cache to record the abort.
-	pushee := roachpb.MakeTransaction("pushee", rhsKey, isolation.Serializable, roachpb.MinUserPriority, readTS, 0, 0)
-	pusher := roachpb.MakeTransaction("pusher", rhsKey, isolation.Serializable, roachpb.MaxUserPriority, readTS, 0, 0)
+	pushee := roachpb.MakeTransaction("pushee", rhsKey, isolation.Serializable, roachpb.MinUserPriority, readTS, 0, 0, 0)
+	pusher := roachpb.MakeTransaction("pusher", rhsKey, isolation.Serializable, roachpb.MaxUserPriority, readTS, 0, 0, 0)
 	ba = &kvpb.BatchRequest{}
 	ba.Timestamp = readTS.Next()
 	ba.RangeID = rhsDesc.RangeID
@@ -1681,7 +1681,7 @@ func TestStoreRangeMergeSplitRace_SplitWins(t *testing.T) {
 	var mergeEndTxnTimestamp atomic.Value
 	testingRequestFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		for _, req := range ba.Requests {
-			if get := req.GetGet(); get != nil && get.KeyLocking != lock.None {
+			if get := req.GetGet(); get != nil && get.KeyLockingStrength != lock.None {
 				if v := lhsDescKey.Load(); v != nil && v.(roachpb.Key).Equal(get.Key) {
 					// If this is the first merge attempt, launch the split
 					// before the merge's first locking read succeeds.
@@ -4958,7 +4958,7 @@ func sendWithTxn(
 	maxOffset time.Duration,
 	args kvpb.Request,
 ) error {
-	txn := roachpb.MakeTransaction("test txn", desc.StartKey.AsRawKey(), 0, 0, ts, maxOffset.Nanoseconds(), 0)
+	txn := roachpb.MakeTransaction("test txn", desc.StartKey.AsRawKey(), 0, 0, ts, maxOffset.Nanoseconds(), 0, 0)
 	_, pErr := kv.SendWrappedWith(context.Background(), store.TestSender(), kvpb.Header{Txn: &txn}, args)
 	return pErr.GoError()
 }
@@ -5251,42 +5251,70 @@ func TestStoreMergeGCHint(t *testing.T) {
 		name                string
 		dataLeft, dataRight bool
 		delLeft, delRight   bool
-		expectHint          bool
-	}{
-		{
-			name:       "merge similar ranges",
-			dataLeft:   true,
-			dataRight:  true,
-			delLeft:    true,
-			delRight:   true,
-			expectHint: true,
-		},
-		{
-			name:       "merge with data on right",
-			dataLeft:   true,
-			dataRight:  true,
-			delLeft:    true,
-			expectHint: false,
-		},
-		{
-			name:       "merge with data on left",
-			dataLeft:   true,
-			dataRight:  true,
-			delRight:   true,
-			expectHint: false,
-		},
-		{
-			name:       "merge with empty on left",
-			dataRight:  true,
-			delRight:   true,
-			expectHint: true,
-		},
-		{
-			name:       "merge with empty on right",
-			dataLeft:   true,
-			delLeft:    true,
-			expectHint: true,
-		},
+
+		wantRangeDelete bool // the hint must indicate a whole range deletion
+		wantGCTimestamp bool // the hint must indicate a pending GC timestamp
+	}{{
+		name:     "merge empty ranges",
+		dataLeft: false, dataRight: false,
+		delLeft: false, delRight: false,
+		wantRangeDelete: false,
+		wantGCTimestamp: false,
+	}, {
+		name:     "merge after deleting empty left",
+		dataLeft: false, dataRight: false,
+		delLeft: true, delRight: false,
+		wantRangeDelete: true,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge after deleting empty right",
+		dataLeft: false, dataRight: false,
+		delLeft: false, delRight: true,
+		wantRangeDelete: true,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge after deleting both empty",
+		dataLeft: false, dataRight: false,
+		delLeft: true, delRight: true,
+		wantRangeDelete: true,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge similar ranges",
+		dataLeft: true, dataRight: true,
+		delLeft: true, delRight: true,
+		wantRangeDelete: true,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge with data on right",
+		dataLeft: true, dataRight: true,
+		delLeft: true, delRight: false,
+		wantRangeDelete: false,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge with data on left",
+		dataLeft: true, dataRight: true,
+		delLeft: false, delRight: true,
+		wantRangeDelete: false,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge with no deletes",
+		dataLeft: true, dataRight: true,
+		delLeft: false, delRight: false,
+		wantRangeDelete: false,
+		wantGCTimestamp: false,
+	}, {
+		name:     "merge with empty on left",
+		dataLeft: false, dataRight: true,
+		delLeft: false, delRight: true,
+		wantRangeDelete: true,
+		wantGCTimestamp: true,
+	}, {
+		name:     "merge with empty on right",
+		dataLeft: true, dataRight: false,
+		delLeft: true, delRight: false,
+		wantRangeDelete: true,
+		wantGCTimestamp: true,
+	},
 	} {
 		t.Run(d.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -5358,8 +5386,10 @@ func TestStoreMergeGCHint(t *testing.T) {
 
 			repl := store.LookupReplica(roachpb.RKey(leftKey))
 			gcHint := repl.GetGCHint()
-			require.Equal(t, d.expectHint, !gcHint.IsEmpty(), "GC hint is empty after range delete")
-			if d.expectHint && d.delLeft && d.delRight {
+			require.Equal(t, d.wantRangeDelete, gcHint.LatestRangeDeleteTimestamp.IsSet())
+			require.Equal(t, d.wantGCTimestamp, gcHint.GCTimestamp.IsSet())
+
+			if d.wantRangeDelete && d.delLeft && d.delRight {
 				require.Greater(t, gcHint.LatestRangeDeleteTimestamp.WallTime, beforeSecondDel,
 					"highest timestamp wasn't picked up")
 			}

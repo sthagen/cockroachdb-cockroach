@@ -78,11 +78,11 @@ var distSQLNumRunnersMax = 256 * int64(runtime.GOMAXPROCS(0))
 
 // runnerRequest is the request that is sent (via a channel) to a worker.
 type runnerRequest struct {
-	ctx           context.Context
-	podNodeDialer *nodedialer.Dialer
-	flowReq       *execinfrapb.SetupFlowRequest
-	sqlInstanceID base.SQLInstanceID
-	resultChan    chan<- runnerResult
+	ctx               context.Context
+	sqlInstanceDialer *nodedialer.Dialer
+	flowReq           *execinfrapb.SetupFlowRequest
+	sqlInstanceID     base.SQLInstanceID
+	resultChan        chan<- runnerResult
 }
 
 // runnerResult is returned by a worker (via a channel) for each received
@@ -117,7 +117,7 @@ func (req runnerRequest) run() error {
 		physicalplan.ReleaseFlowSpec(&req.flowReq.Flow)
 	}()
 
-	conn, err := req.podNodeDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
+	conn, err := req.sqlInstanceDialer.Dial(req.ctx, roachpb.NodeID(req.sqlInstanceID), rpc.DefaultClass)
 	if err != nil {
 		// Mark this error as special runnerDialErr so that we could retry this
 		// distributed query as local.
@@ -256,8 +256,7 @@ func (dsp *DistSQLPlanner) initCancelingWorkers(initCtx context.Context) {
 						continue
 					}
 					log.VEventf(parentCtx, 2, "worker %d is canceling at most %d flows on node %d", workerID, len(req.FlowIDs), sqlInstanceID)
-					// TODO: Double check that we only ever cancel flows on SQL nodes/pods here.
-					conn, err := dsp.podNodeDialer.Dial(parentCtx, roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
+					conn, err := dsp.sqlInstanceDialer.Dial(parentCtx, roachpb.NodeID(sqlInstanceID), rpc.DefaultClass)
 					if err != nil {
 						// We failed to dial the node, so we give up given that
 						// our cancellation is best effort. It is possible that
@@ -551,11 +550,11 @@ func (dsp *DistSQLPlanner) setupFlows(
 		req := setupReq
 		req.Flow = *flowSpec
 		runReq := runnerRequest{
-			ctx:           runnerCtx,
-			podNodeDialer: dsp.podNodeDialer,
-			flowReq:       &req,
-			sqlInstanceID: nodeID,
-			resultChan:    resultChan,
+			ctx:               runnerCtx,
+			sqlInstanceDialer: dsp.sqlInstanceDialer,
+			flowReq:           &req,
+			sqlInstanceID:     nodeID,
+			resultChan:        resultChan,
 		}
 
 		// Send out a request to the workers; if no worker is available, run
@@ -1579,9 +1578,8 @@ var (
 	// true or the underlying query does not satisfy the restriction.
 	ErrLimitedResultNotSupported = unimplemented.NewWithIssue(
 		40195,
-		"multiple active portals not supported, "+
-			"please set session variable multiple_active_portals_enabled to true. "+
-			"Note: this feature is in preview",
+		"multiple active portals is in preview, "+
+			"please set session variable multiple_active_portals_enabled to true to enable them",
 	)
 	// ErrStmtNotSupportedForPausablePortal is returned when the user have set
 	// session variable multiple_active_portals_enabled to true but set an unsupported

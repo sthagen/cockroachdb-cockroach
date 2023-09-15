@@ -10,6 +10,7 @@ stmt ::=
 stmt_without_legacy_transaction ::=
 	preparable_stmt
 	| analyze_stmt
+	| call_stmt
 	| copy_stmt
 	| comment_stmt
 	| execute_stmt
@@ -62,6 +63,9 @@ preparable_stmt ::=
 analyze_stmt ::=
 	'ANALYZE' analyze_target
 	| 'ANALYSE' analyze_target
+
+call_stmt ::=
+	'CALL' proc_name '(' opt_expr_list ')'
 
 copy_stmt ::=
 	'COPY' table_name opt_column_list 'FROM' 'STDIN' opt_with_copy_options opt_where_clause
@@ -312,6 +316,13 @@ upsert_stmt ::=
 
 analyze_target ::=
 	table_name
+
+proc_name ::=
+	db_object_name
+
+opt_expr_list ::=
+	expr_list
+	| 
 
 table_name ::=
 	db_object_name
@@ -785,8 +796,7 @@ show_backup_stmt ::=
 	| 'SHOW' 'BACKUP' 'FILES' string_or_placeholder opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' 'RANGES' string_or_placeholder opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' 'VALIDATE' string_or_placeholder opt_with_show_backup_options
-	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder
-	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder 'WITH' show_backup_connection_options_list
+	| 'SHOW' 'BACKUP' 'CONNECTION' string_or_placeholder opt_with_show_backup_connection_options_list
 
 show_columns_stmt ::=
 	'SHOW' 'COLUMNS' 'FROM' table_name with_comment
@@ -975,6 +985,9 @@ db_object_name ::=
 	simple_db_object_name
 	| complex_db_object_name
 
+expr_list ::=
+	( a_expr ) ( ( ',' a_expr ) )*
+
 name_list ::=
 	( name ) ( ( ',' name ) )*
 
@@ -1001,9 +1014,6 @@ index_name ::=
 
 standalone_index_name ::=
 	db_object_name
-
-expr_list ::=
-	( a_expr ) ( ( ',' a_expr ) )*
 
 unreserved_keyword ::=
 	'ABORT'
@@ -1935,8 +1945,10 @@ opt_with_show_backup_options ::=
 	| 'WITH' 'OPTIONS' '(' show_backup_options_list ')'
 	| 
 
-show_backup_connection_options_list ::=
-	( show_backup_connection_options ) ( ( ',' show_backup_connection_options ) )*
+opt_with_show_backup_connection_options_list ::=
+	'WITH' show_backup_connection_options_list
+	| 'WITH' 'OPTIONS' '(' show_backup_connection_options_list ')'
+	| 
 
 with_comment ::=
 	'WITH' 'COMMENT'
@@ -2685,10 +2697,8 @@ extra_var_value ::=
 show_backup_options_list ::=
 	( show_backup_options ) ( ( ',' show_backup_options ) )*
 
-show_backup_connection_options ::=
-	'TRANSFER' '=' string_or_placeholder
-	| 'TIME' '=' string_or_placeholder
-	| 'CONCURRENTLY' '=' a_expr
+show_backup_connection_options_list ::=
+	( show_backup_connection_options ) ( ( ',' show_backup_connection_options ) )*
 
 targets_roles ::=
 	'ROLE' role_spec_list
@@ -3001,10 +3011,6 @@ case_expr ::=
 operator_op ::=
 	all_op
 
-opt_expr_list ::=
-	expr_list
-	| 
-
 expr_tuple_unambiguous ::=
 	'(' ')'
 	| '(' tuple1_unambiguous_values ')'
@@ -3254,6 +3260,11 @@ show_backup_options ::=
 	| 'PRIVILEGES'
 	| 'ENCRYPTION_INFO_DIR' '=' string_or_placeholder
 	| 'DEBUG_DUMP_METADATA_SST'
+
+show_backup_connection_options ::=
+	'TRANSFER' '=' string_or_placeholder
+	| 'TIME' '=' string_or_placeholder
+	| 'CONCURRENTLY' '=' a_expr
 
 schema_wildcard ::=
 	wildcard_pattern

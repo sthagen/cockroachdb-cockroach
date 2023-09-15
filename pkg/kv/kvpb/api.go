@@ -198,28 +198,28 @@ type Request interface {
 // strength of a read-only request.
 type LockingReadRequest interface {
 	Request
-	KeyLockingStrength() lock.Strength
+	KeyLocking() (lock.Strength, lock.Durability)
 }
 
 var _ LockingReadRequest = (*GetRequest)(nil)
 
-// KeyLockingStrength implements the LockingReadRequest interface.
-func (gr *GetRequest) KeyLockingStrength() lock.Strength {
-	return gr.KeyLocking
+// KeyLocking implements the LockingReadRequest interface.
+func (gr *GetRequest) KeyLocking() (lock.Strength, lock.Durability) {
+	return gr.KeyLockingStrength, gr.KeyLockingDurability
 }
 
 var _ LockingReadRequest = (*ScanRequest)(nil)
 
-// KeyLockingStrength implements the LockingReadRequest interface.
-func (sr *ScanRequest) KeyLockingStrength() lock.Strength {
-	return sr.KeyLocking
+// KeyLocking implements the LockingReadRequest interface.
+func (sr *ScanRequest) KeyLocking() (lock.Strength, lock.Durability) {
+	return sr.KeyLockingStrength, sr.KeyLockingDurability
 }
 
 var _ LockingReadRequest = (*ReverseScanRequest)(nil)
 
-// KeyLockingStrength implements the LockingReadRequest interface.
-func (rsr *ReverseScanRequest) KeyLockingStrength() lock.Strength {
-	return rsr.KeyLocking
+// KeyLocking implements the LockingReadRequest interface.
+func (rsr *ReverseScanRequest) KeyLocking() (lock.Strength, lock.Durability) {
+	return rsr.KeyLockingStrength, rsr.KeyLockingDurability
 }
 
 // SizedWriteRequest is an interface used to expose the number of bytes a
@@ -1192,12 +1192,12 @@ func (r *IsSpanEmptyRequest) ShallowCopy() Request {
 // NewGet returns a Request initialized to get the value at key. If
 // forUpdate is true, an unreplicated, exclusive lock is acquired on on
 // the key, if it exists.
-func NewGet(key roachpb.Key, forUpdate bool) Request {
+func NewGet(key roachpb.Key, str KeyLockingStrengthType) Request {
 	return &GetRequest{
 		RequestHeader: RequestHeader{
 			Key: key,
 		},
-		KeyLocking: scanLockStrength(forUpdate),
+		KeyLockingStrength: scanLockStrength(str),
 	}
 }
 
@@ -1317,34 +1317,62 @@ func NewDeleteRange(startKey, endKey roachpb.Key, returnKeys bool) Request {
 // NewScan returns a Request initialized to scan from start to end keys.
 // If forUpdate is true, unreplicated, exclusive locks are acquired on
 // each of the resulting keys.
-func NewScan(key, endKey roachpb.Key, forUpdate bool) Request {
+func NewScan(key, endKey roachpb.Key, str KeyLockingStrengthType) Request {
 	return &ScanRequest{
 		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
-		KeyLocking: scanLockStrength(forUpdate),
+		KeyLockingStrength: scanLockStrength(str),
 	}
 }
 
 // NewReverseScan returns a Request initialized to reverse scan from end.
 // If forUpdate is true, unreplicated, exclusive locks are acquired on
 // each of the resulting keys.
-func NewReverseScan(key, endKey roachpb.Key, forUpdate bool) Request {
+func NewReverseScan(key, endKey roachpb.Key, str KeyLockingStrengthType) Request {
 	return &ReverseScanRequest{
 		RequestHeader: RequestHeader{
 			Key:    key,
 			EndKey: endKey,
 		},
-		KeyLocking: scanLockStrength(forUpdate),
+		KeyLockingStrength: scanLockStrength(str),
 	}
 }
 
-func scanLockStrength(forUpdate bool) lock.Strength {
-	if forUpdate {
+// KeyLockingStrengthType is used to describe per-key locking strengths
+// associated with Get, Scan, and ReverseScan requests.
+type KeyLockingStrengthType int8
+
+const (
+	_ KeyLockingStrengthType = iota
+	// NonLocking indicates any keys returned will not be locked.
+	NonLocking
+	// ForShare indicates any keys returned will be locked for share; this means
+	// concurrent requests will be able to read the key or lock it ForShare
+	// themselves. Requests will not be allowed to write to the key. The semantics
+	// here correspond to acquiring a Read lock for a ReadWrite mutex.
+	ForShare
+	// ForUpdate indicates any keys returned will be locked for update; the
+	// transaction that holds the lock will have exclusive write access to the
+	// key. No other transaction is able to acquire a lock on the key; note that
+	// locking a key ForUpdate does not impact concurrent non-locking requests.
+	// The semantics here correspond to acquiring a Write lock in a ReadWrite
+	// mutex.
+	ForUpdate
+)
+
+func scanLockStrength(str KeyLockingStrengthType) lock.Strength {
+	switch str {
+	case NonLocking:
+		return lock.None
+	case ForShare:
+		return lock.Shared
+	case ForUpdate:
 		return lock.Exclusive
+	default:
+		panic(fmt.Sprintf("unknown strength type: %d", str))
 	}
-	return lock.None
 }
 
 func flagForLockStrength(l lock.Strength) flag {
@@ -1355,7 +1383,7 @@ func flagForLockStrength(l lock.Strength) flag {
 }
 
 func (gr *GetRequest) flags() flag {
-	maybeLocking := flagForLockStrength(gr.KeyLocking)
+	maybeLocking := flagForLockStrength(gr.KeyLockingStrength)
 	return isRead | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
 }
 
@@ -1445,12 +1473,12 @@ func (*RevertRangeRequest) flags() flag {
 }
 
 func (sr *ScanRequest) flags() flag {
-	maybeLocking := flagForLockStrength(sr.KeyLocking)
+	maybeLocking := flagForLockStrength(sr.KeyLockingStrength)
 	return isRead | isRange | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
 }
 
 func (rsr *ReverseScanRequest) flags() flag {
-	maybeLocking := flagForLockStrength(rsr.KeyLocking)
+	maybeLocking := flagForLockStrength(rsr.KeyLockingStrength)
 	return isRead | isRange | isReverse | isTxn | maybeLocking | updatesTSCache | needsRefresh | canSkipLocked
 }
 

@@ -71,7 +71,7 @@ enable_multiple_modifications_of_table                     off
 enable_multiregion_placement_policy                        off
 enable_seqscan                                             on
 enable_super_regions                                       off
-enable_zigzag_join                                         on
+enable_zigzag_join                                         off
 enforce_home_region                                        off
 enforce_home_region_follower_reads_enabled                 off
 escape_string_warning                                      on
@@ -264,10 +264,10 @@ SELECT * FROM [SHOW SCHEMAS FROM system]
 ----
 schema_name         owner
 public              admin
-crdb_internal       NULL
-information_schema  NULL
-pg_catalog          NULL
-pg_extension        NULL
+crdb_internal       node
+pg_extension        node
+pg_catalog          node
+information_schema  node
 
 query TT colnames,rowsort
 SELECT * FROM [SHOW SEQUENCES FROM system]
@@ -418,10 +418,10 @@ SELECT * FROM [SHOW SCHEMAS]
 ----
 schema_name         owner
 public              admin
-crdb_internal       NULL
-information_schema  NULL
-pg_catalog          NULL
-pg_extension        NULL
+crdb_internal       node
+pg_extension        node
+pg_catalog          node
+information_schema  node
 
 query TTTTIT colnames
 CREATE TABLE foo(x INT); SELECT * FROM [SHOW TABLES]

@@ -324,7 +324,7 @@ func createDummySpanConfigIngestor(
 	sourceTenantID, destTenantID roachpb.TenantID,
 ) (spanConfigIngestor, func()) {
 	maybeInlineURL := h.MaybeGenerateInlineURL(t)
-	client, err := streamclient.NewSpanConfigStreamClient(ctx, maybeInlineURL)
+	client, err := streamclient.NewSpanConfigStreamClient(ctx, maybeInlineURL, nil)
 	require.NoError(t, err)
 
 	rekeyCfg := execinfrapb.TenantRekey{
@@ -340,7 +340,7 @@ func createDummySpanConfigIngestor(
 		true /* restoreTenantFromStream */)
 	require.NoError(t, err)
 
-	session, err := h.SysServer.SQLLivenessProvider().(sqlliveness.Provider).Session(ctx)
+	session, err := h.TestServer.StorageLayer().SQLLivenessProvider().(sqlliveness.Provider).Session(ctx)
 	require.NoError(t, err)
 
 	stopperCh := make(chan struct{})

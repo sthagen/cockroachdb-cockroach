@@ -105,7 +105,7 @@ require (
 	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/charmbracelet/bubbles v0.15.1-0.20230123181021-a6a12c4a31eb
 	github.com/client9/misspell v0.3.4
-	github.com/cockroachdb/apd/v3 v3.2.0
+	github.com/cockroachdb/apd/v3 v3.2.1
 	github.com/cockroachdb/circuitbreaker v2.2.2-0.20190114160014-a614b14ccf63+incompatible
 	github.com/cockroachdb/cmux v0.0.0-20170110192607-30d10be49292
 	github.com/cockroachdb/cockroach-go/v2 v2.3.5
@@ -115,7 +115,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20230905224231-5283f24b2a69
+	github.com/cockroachdb/pebble v0.0.0-20230915152238-6d6570bf1e25
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b

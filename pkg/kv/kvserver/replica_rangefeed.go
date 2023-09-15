@@ -28,7 +28,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -78,15 +80,19 @@ var RangeFeedSmearInterval = settings.RegisterDurationSetting(
 
 // RangeFeedUseScheduler controls type of rangefeed processor is used to process
 // raft updates and sends updates to clients.
-// TODO(oleg): add metamorphic variable for processor type selection.
 var RangeFeedUseScheduler = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.rangefeed.scheduler.enabled",
 	"use shared fixed pool of workers for all range feeds instead of a "+
 		"worker per range (worker pool size is determined by "+
 		"COCKROACH_RANGEFEED_SCHEDULER_WORKERS env variable)",
-	false,
+	util.ConstantWithMetamorphicTestBool("kv_rangefeed_scheduler_enabled", false),
 )
+
+// RangefeedSchedulerDisabled is a kill switch for scheduler based rangefeed
+// processors. To be removed in 24.1 after new processor becomes default.
+var RangefeedSchedulerDisabled = envutil.EnvOrDefaultBool("COCKROACH_RANGEFEED_DISABLE_SCHEDULER",
+	false)
 
 func init() {
 	// Inject into kvserverbase to allow usage from kvcoord.
@@ -180,7 +186,16 @@ func (tp *rangefeedTxnPusher) ResolveIntents(
 ) error {
 	return tp.ir.ResolveIntents(ctx, intents,
 		// NB: Poison is ignored for non-ABORTED intents.
-		intentresolver.ResolveOptions{Poison: true},
+		intentresolver.ResolveOptions{Poison: true, AdmissionHeader: kvpb.AdmissionHeader{
+			// Use NormalPri for rangefeed intent resolution, since it needs to be
+			// timely. NB: makeRangeFeedRequest decides the priority based on
+			// isSystemRange, but that is only for the initial scan, which can be
+			// expensive.
+			Priority:                 int32(admissionpb.NormalPri),
+			CreateTime:               timeutil.Now().UnixNano(),
+			Source:                   kvpb.AdmissionHeader_FROM_SQL,
+			NoMemoryReservedAtSource: true,
+		}},
 	).GoError()
 }
 
@@ -397,7 +412,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	feedBudget := r.store.GetStoreConfig().RangefeedBudgetFactory.CreateBudget(r.startKey)
 
 	var sched *rangefeed.Scheduler
-	if RangeFeedUseScheduler.Get(&r.ClusterSettings().SV) {
+	if shouldUseRangefeedScheduler(&r.ClusterSettings().SV) {
 		sched = r.store.getRangefeedScheduler()
 	}
 
@@ -832,4 +847,15 @@ func (r *Replica) ensureClosedTimestampStarted(ctx context.Context) *kvpb.Error 
 		}
 	}
 	return nil
+}
+
+func shouldUseRangefeedScheduler(sv *settings.Values) bool {
+	return RangeFeedUseScheduler.Get(sv) && !RangefeedSchedulerDisabled
+}
+
+// TestGetReplicaRangefeedProcessor exposes rangefeed processor for test
+// introspection. Note that while retrieving processor is threadsafe, invoking
+// processor methods should be done with caution to not break any invariants.
+func TestGetReplicaRangefeedProcessor(r *Replica) rangefeed.Processor {
+	return r.getRangefeedProcessor()
 }

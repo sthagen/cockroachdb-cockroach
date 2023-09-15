@@ -352,7 +352,12 @@ func TestFailedInsights(t *testing.T) {
 			}
 
 			if problems != tc.problems {
-				return fmt.Errorf("expected problems to be '%s', but was '%s'. stmts: %s", tc.problems, problems, tc.stmts)
+				// During tests some transactions can stay open for longer, adding an extra `SlowExecution` to the problems
+				// list. This checks for that possibility.
+				withSlow := strings.Replace(tc.problems, "{", "{SlowExecution,", -1)
+				if problems != withSlow {
+					return fmt.Errorf("expected problems to be '%s', but was '%s'. stmts: %s", tc.problems, problems, tc.stmts)
+				}
 			}
 
 			if status != tc.txnStatus {
@@ -564,8 +569,8 @@ func TestInsightsIntegrationForContention(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		rows, err := conn.DB.QueryContext(ctx, `SELECT
 		query,
-		insight.contention::FLOAT,
-		sum(txn_contention.contention_duration)::FLOAT AS durationMs,
+		COALESCE(insight.contention, 0::INTERVAL)::FLOAT,
+		COALESCE(sum(txn_contention.contention_duration), 0::INTERVAL)::FLOAT AS durationMs,
 		txn_contention.schema_name,
 		txn_contention.database_name,
 		txn_contention.table_name,

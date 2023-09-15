@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -66,6 +67,9 @@ type clusterInfo struct {
 	// sql provides a sql connection to the system tenant
 	sysSQL *sqlutils.SQLRunner
 
+	// gatewayNodes identify the nodes that should remain available during the whole roachtest.
+	gatewayNodes option.NodeListOption
+
 	// nodes indicates the roachprod nodes running the cluster's nodes
 	nodes option.NodeListOption
 }
@@ -77,9 +81,7 @@ type c2cSetup struct {
 	// workloadNode identifies the node in the roachprod cluster that runs the workload.
 	workloadNode option.NodeListOption
 
-	// gatewayNodes  identify the nodes in the source cluster to connect the main workload to.
-	gatewayNodes option.NodeListOption
-	promCfg      *prometheus.Config
+	promCfg *prometheus.Config
 }
 
 const maxExpectedLatencyDefault = 2 * time.Minute
@@ -209,7 +211,7 @@ type streamingWorkload interface {
 func defaultWorkloadDriver(
 	workloadCtx context.Context, setup *c2cSetup, c cluster.Cluster, workload streamingWorkload,
 ) error {
-	return c.RunE(workloadCtx, setup.workloadNode, workload.sourceRunCmd(setup.src.name, setup.gatewayNodes))
+	return c.RunE(workloadCtx, setup.workloadNode, workload.sourceRunCmd(setup.src.name, setup.src.gatewayNodes))
 }
 
 type replicateTPCC struct {
@@ -244,6 +246,15 @@ type replicateKV struct {
 
 	// max size of raw data written during each insertion
 	maxBlockBytes int
+
+	// partitionKVDatabaseInRegion constrains the kv database in the specified
+	// region and asserts, before cutover, that the replicated span configuration
+	// correctly enforces the regional constraint in the destination tenant.
+	partitionKVDatabaseInRegion string
+
+	// antiRegion is the region we do not expect any kv data to reside in if
+	// partitionKVDatabaseInRegion is set.
+	antiRegion string
 }
 
 func (kv replicateKV) sourceInitCmd(tenantName string, nodes option.NodeListOption) string {
@@ -269,7 +280,45 @@ func (kv replicateKV) sourceRunCmd(tenantName string, nodes option.NodeListOptio
 func (kv replicateKV) runDriver(
 	workloadCtx context.Context, c cluster.Cluster, t test.Test, setup *c2cSetup,
 ) error {
+	if kv.partitionKVDatabaseInRegion != "" {
+		require.NotEqual(t, "", kv.antiRegion, "if partitionKVDatabaseInRegion is set, then antiRegion must be set")
+		t.L().Printf("constrain the kv database to region %s", kv.partitionKVDatabaseInRegion)
+		alterStmt := fmt.Sprintf("ALTER DATABASE kv CONFIGURE ZONE USING constraints = '[+region=%s]'", kv.partitionKVDatabaseInRegion)
+		srcTenantConn := c.Conn(workloadCtx, t.L(), setup.src.nodes.RandNode()[0], option.TenantName(setup.src.name))
+		srcTenantSQL := sqlutils.MakeSQLRunner(srcTenantConn)
+		srcTenantSQL.Exec(t, alterStmt)
+		defer kv.checkRegionalConstraints(t, setup, srcTenantSQL)
+	}
 	return defaultWorkloadDriver(workloadCtx, setup, c, kv)
+}
+
+// checkRegionalConstraints checks that the kv table is constrained to the
+// expected locality.
+func (kv replicateKV) checkRegionalConstraints(
+	t test.Test, setup *c2cSetup, srcTenantSQL *sqlutils.SQLRunner,
+) {
+
+	var kvTableID uint32
+	srcTenantSQL.QueryRow(t, `SELECT id FROM system.namespace WHERE name ='kv' AND "parentID" != 0`).Scan(&kvTableID)
+
+	dstTenantCodec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(uint64(setup.dst.ID)))
+	tablePrefix := dstTenantCodec.TablePrefix(kvTableID)
+	t.L().Printf("Checking replica localities in destination side kv table, id %d and table prefix %s", kvTableID, tablePrefix)
+
+	distinctQuery := fmt.Sprintf(`
+SELECT 
+  DISTINCT replica_localities
+FROM 
+  [SHOW CLUSTER RANGES]
+WHERE 
+  start_key ~ '%s'
+`, tablePrefix)
+
+	res := setup.dst.sysSQL.QueryStr(t, distinctQuery)
+	require.Equal(t, 1, len(res), "expected only one distinct locality")
+	locality := res[0][0]
+	require.Contains(t, locality, kv.partitionKVDatabaseInRegion)
+	require.False(t, strings.Contains(locality, kv.antiRegion), "region %s is in locality %s", kv.antiRegion, locality)
 }
 
 type replicateBulkOps struct {
@@ -324,6 +373,9 @@ type replicationSpec struct {
 	// workload specifies the streaming workload.
 	workload streamingWorkload
 
+	// multiregion specifies multiregion cluster specs
+	multiregion multiRegionSpecs
+
 	// additionalDuration specifies how long the workload will run after the initial scan
 	//completes. If the time out is set to 0, it will run until completion.
 	additionalDuration time.Duration
@@ -359,6 +411,17 @@ type replicationSpec struct {
 	tags map[string]struct{}
 }
 
+type multiRegionSpecs struct {
+	// srcLocalities specifies the zones each src node should live. The length of this array must match the number of src nodes.
+	srcLocalities []string
+
+	// destLocalities specifies the zones each src node should live. The length of this array must match the number of dest nodes.
+	destLocalities []string
+
+	// workloadNodeZone specifies the zone that the workload node should live
+	workloadNodeZone string
+}
+
 // replicationDriver manages c2c roachtest execution.
 type replicationDriver struct {
 	rs replicationSpec
@@ -391,6 +454,13 @@ func makeReplicationDriver(t test.Test, c cluster.Cluster, rs replicationSpec) *
 }
 
 func (rd *replicationDriver) setupC2C(ctx context.Context, t test.Test, c cluster.Cluster) {
+	if len(rd.rs.multiregion.srcLocalities) != 0 {
+		nodeCount := rd.rs.srcNodes + rd.rs.dstNodes
+		localityCount := len(rd.rs.multiregion.srcLocalities) + len(rd.rs.multiregion.destLocalities)
+		require.Equal(t, nodeCount, localityCount)
+		require.NotEqual(t, "", rd.rs.multiregion.workloadNodeZone)
+	}
+
 	c.Put(ctx, t.Cockroach(), "./cockroach")
 	srcCluster := c.Range(1, rd.rs.srcNodes)
 	dstCluster := c.Range(rd.rs.srcNodes+1, rd.rs.srcNodes+rd.rs.dstNodes)
@@ -439,24 +509,26 @@ func (rd *replicationDriver) setupC2C(ctx context.Context, t test.Test, c cluste
 	require.NoError(t, err)
 
 	srcTenantInfo := clusterInfo{
-		name:   srcTenantName,
-		ID:     srcTenantID,
-		pgURL:  pgURL,
-		sysSQL: srcSQL,
-		db:     srcDB,
-		nodes:  srcCluster}
+		name:         srcTenantName,
+		ID:           srcTenantID,
+		pgURL:        pgURL,
+		sysSQL:       srcSQL,
+		db:           srcDB,
+		gatewayNodes: srcCluster,
+		nodes:        srcCluster}
 	destTenantInfo := clusterInfo{
-		name:   destTenantName,
-		ID:     destTenantID,
-		sysSQL: destSQL,
-		db:     destDB,
-		nodes:  dstCluster}
+		name:         destTenantName,
+		ID:           destTenantID,
+		sysSQL:       destSQL,
+		db:           destDB,
+		gatewayNodes: dstCluster,
+		nodes:        dstCluster}
 
 	rd.setup = &c2cSetup{
 		src:          &srcTenantInfo,
 		dst:          &destTenantInfo,
 		workloadNode: workloadNode,
-		gatewayNodes: srcTenantInfo.nodes}
+	}
 
 	rd.t = t
 	rd.c = c
@@ -703,7 +775,7 @@ func (rd *replicationDriver) backupAfterFingerprintMismatch(
 	if rd.c.Spec().Cloud == spec.AWS {
 		prefix = "s3"
 	}
-	collection := fmt.Sprintf("%s://%s/c2c-fingerprint-mismatch/%s/%s/%s?AUTH=implicit", prefix, testutils.BackupTestingBucket(), rd.rs.name, rd.c.Name(), tenantName)
+	collection := fmt.Sprintf("%s://%s/c2c-fingerprint-mismatch/%s/%s/%s?AUTH=implicit", prefix, testutils.BackupTestingBucketLongTTL(), rd.rs.name, rd.c.Name(), tenantName)
 	fullBackupQuery := fmt.Sprintf("BACKUP INTO '%s' AS OF SYSTEM TIME '%s' with revision_history", collection, startTime.AsOfSystemTime())
 	_, err := conn.ExecContext(ctx, fullBackupQuery)
 	if err != nil {
@@ -847,7 +919,7 @@ func (rd *replicationDriver) main(ctx context.Context) {
 	rd.metrics.cutoverEnd = newMetricSnapshot(metricSnapper, timeutil.Now())
 
 	rd.t.L().Printf("starting the destination tenant")
-	startInMemoryTenant(ctx, rd.t, rd.c, rd.setup.dst.name, rd.setup.dst.nodes)
+	startInMemoryTenant(ctx, rd.t, rd.c, rd.setup.dst.name, rd.setup.dst.gatewayNodes)
 
 	rd.metrics.export(rd.t, len(rd.setup.src.nodes))
 
@@ -876,6 +948,15 @@ func c2cRegisterWrapper(
 	}
 	if sp.pdSize != 0 {
 		clusterOps = append(clusterOps, spec.VolumeSize(sp.pdSize))
+	}
+
+	if len(sp.multiregion.srcLocalities) > 0 {
+		allZones := make([]string, 0, sp.srcNodes+sp.dstNodes+1)
+		allZones = append(allZones, sp.multiregion.srcLocalities...)
+		allZones = append(allZones, sp.multiregion.destLocalities...)
+		allZones = append(allZones, sp.multiregion.workloadNodeZone)
+		clusterOps = append(clusterOps, spec.Zones(strings.Join(allZones, ",")))
+		clusterOps = append(clusterOps, spec.Geo())
 	}
 
 	r.Add(registry.TestSpec{
@@ -966,6 +1047,45 @@ func registerClusterToCluster(r registry.Registry) {
 			cutover:                              5 * time.Minute,
 			tags:                                 registry.Tags("aws"),
 			sometimesTestFingerprintMismatchCode: true,
+		},
+		{
+			// Initial scan perf test.
+			name:      "c2c/initialscan/kv0",
+			benchmark: true,
+			srcNodes:  4,
+			dstNodes:  4,
+			cpus:      8,
+			// With the machine type and size we use, this is the smallest disk that
+			// gives us max write BW of 800MB/s.
+			pdSize: 1667,
+			// Write ~50GB total (~12.5GB per node).
+			workload:           replicateKV{readPercent: 0, initRows: 50000000, maxBlockBytes: 2048},
+			timeout:            1 * time.Hour,
+			additionalDuration: 1 * time.Minute,
+			cutover:            0,
+		},
+		{
+			name:      "c2c/MultiRegion/SameRegions/kv0",
+			benchmark: true,
+			srcNodes:  4,
+			dstNodes:  4,
+			cpus:      8,
+			pdSize:    100,
+			workload: replicateKV{
+				readPercent:                 0,
+				maxBlockBytes:               1024,
+				partitionKVDatabaseInRegion: "us-west1",
+				antiRegion:                  "us-central1",
+			},
+			timeout:            1 * time.Hour,
+			additionalDuration: 10 * time.Minute,
+			cutover:            1 * time.Minute,
+			multiregion: multiRegionSpecs{
+				// gcp specific
+				srcLocalities:    []string{"us-west1-b", "us-west1-b", "us-west1-b", "us-central1-b"},
+				destLocalities:   []string{"us-central1-b", "us-west1-b", "us-west1-b", "us-west1-b"},
+				workloadNodeZone: "us-west1-b",
+			},
 		},
 		{
 			name:     "c2c/UnitTest",
@@ -1314,20 +1434,23 @@ func registerClusterReplicationResilience(r registry.Registry) {
 					if rsp.onSrc {
 						rd.setup.src.db = watcherDB
 						rd.setup.src.sysSQL = watcherSQL
-						rd.setup.gatewayNodes = c.Node(rrd.watcherNode)
+						rd.setup.src.gatewayNodes = c.Node(rrd.watcherNode)
 					} else {
 						rd.setup.dst.db = watcherDB
 						rd.setup.dst.sysSQL = watcherSQL
+						rd.setup.dst.gatewayNodes = c.Node(rrd.watcherNode)
 					}
 					t.L().Printf(`%s configured: Shutdown Node %d; Watcher node %d; Gateway nodes %s`,
-						rrd.rsp.name(), rrd.shutdownNode, rrd.watcherNode, rrd.setup.gatewayNodes)
+						rrd.rsp.name(), rrd.shutdownNode, rrd.watcherNode, rrd.setup.dst.gatewayNodes)
 				}
-				m := rrd.newMonitor(ctx)
-				m.Go(func(ctx context.Context) error {
+				mainDriverCtx, cancelMain := context.WithCancel(ctx)
+				mainMonitor := rrd.newMonitor(mainDriverCtx)
+				mainMonitor.Go(func(ctx context.Context) error {
 					rrd.main(ctx)
 					return nil
 				})
-				defer m.Wait()
+				defer cancelMain()
+				defer mainMonitor.Wait()
 
 				// Don't begin shutdown process until c2c job is set up.
 				<-shutdownSetupDone
@@ -1341,8 +1464,10 @@ func registerClusterReplicationResilience(r registry.Registry) {
 				// DR scenario the src cluster may have gone belly up during a
 				// successful c2c replication execution.
 				shutdownStarter := func() jobStarter {
-					return func(c cluster.Cluster, t test.Test) (jobspb.JobID, error) {
-						require.NoError(t, waitForTargetPhase(ctx, rrd.replicationDriver, rrd.dstJobID, rrd.phase))
+					return func(c cluster.Cluster, l *logger.Logger) (jobspb.JobID, error) {
+						if err := waitForTargetPhase(ctx, rrd.replicationDriver, rrd.dstJobID, rrd.phase); err != nil {
+							return jobspb.JobID(0), err
+						}
 						sleepBeforeResiliencyEvent(rrd.replicationDriver, rrd.phase)
 						return rrd.dstJobID, nil
 					}
@@ -1356,8 +1481,12 @@ func registerClusterReplicationResilience(r registry.Registry) {
 					watcherNode:     destinationWatcherNode,
 					crdbNodes:       rrd.crdbNodes(),
 					restartSettings: []install.ClusterSettingOption{install.SecureOption(true)},
+					rng:             rrd.rng,
 				}
-				executeNodeShutdown(ctx, t, c, shutdownCfg, shutdownStarter())
+				if err := executeNodeShutdown(ctx, t, c, shutdownCfg, shutdownStarter()); err != nil {
+					cancelMain()
+					t.Fatalf("shutdown execution failed: %s", err)
+				}
 			},
 		)
 	}

@@ -438,7 +438,7 @@ func TestSetGetChecked(t *testing.T) {
 
 func TestTransactionBumpEpoch(t *testing.T) {
 	origNow := makeTS(10, 1)
-	txn := MakeTransaction("test", Key("a"), isolation.Serializable, 1, origNow, 0, 99)
+	txn := MakeTransaction("test", Key("a"), isolation.Serializable, 1, origNow, 0, 99, 0)
 	// Advance the txn timestamp.
 	txn.WriteTimestamp = txn.WriteTimestamp.Add(10, 2)
 	txn.BumpEpoch()
@@ -568,6 +568,7 @@ var nonZeroTxn = Transaction{
 	InFlightWrites:     []SequencedWrite{{Key: []byte("c"), Sequence: 1}},
 	ReadTimestampFixed: true,
 	IgnoredSeqNums:     []enginepb.IgnoredSeqNumRange{{Start: 888, End: 999}},
+	AdmissionPriority:  1,
 }
 
 func TestTransactionUpdate(t *testing.T) {
@@ -929,7 +930,7 @@ func TestMakePriority(t *testing.T) {
 	}
 
 	// Generate values for all priorities.
-	const trials = 100000
+	const trials = 750000
 	values := make([][trials]enginepb.TxnPriority, len(userPs))
 	for i, userPri := range userPs {
 		for tr := 0; tr < trials; tr++ {
@@ -2128,7 +2129,7 @@ func TestTxnLocksAsLockUpdates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := MakeTransaction("hello", Key("k"), isolation.Serializable, 0, ts, 0, 99)
+	txn := MakeTransaction("hello", Key("k"), isolation.Serializable, 0, ts, 0, 99, 0)
 
 	txn.Status = COMMITTED
 	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}

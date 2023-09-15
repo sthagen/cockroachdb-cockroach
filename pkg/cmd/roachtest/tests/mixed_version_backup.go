@@ -45,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -946,11 +947,7 @@ func (bc *backupCollection) uri() string {
 	// global namespace represented by the BACKUP_TESTING_BUCKET
 	// bucket. The nonce allows multiple people (or TeamCity builds) to
 	// be running this test without interfering with one another.
-	gcsBackupTestingBucket := os.Getenv("BACKUP_TESTING_BUCKET")
-	if gcsBackupTestingBucket == "" {
-		gcsBackupTestingBucket = "cockroachdb-backup-testing"
-	}
-	return fmt.Sprintf("gs://"+gcsBackupTestingBucket+"/mixed-version/%s_%s?AUTH=implicit", bc.name, bc.nonce)
+	return fmt.Sprintf("gs://%s/mixed-version/%s_%s?AUTH=implicit", testutils.BackupTestingBucketLongTTL(), bc.name, bc.nonce)
 }
 
 func (bc *backupCollection) encryptionOption() *encryptionPassphrase {
@@ -1361,19 +1358,30 @@ func (mvb *mixedVersionBackup) backupName(
 // error if the job doesn't succeed within the attempted retries.
 func (mvb *mixedVersionBackup) waitForJobSuccess(
 	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper, jobID int,
-) error {
+) (resErr error) {
 	var lastErr error
-	node, db := h.RandomDB(rng, mvb.roachNodes)
+	node := h.RandomNode(rng, mvb.roachNodes)
 	l.Printf("querying job status through node %d", node)
+
+	db, err := mvb.cluster.ConnE(ctx, l, node, option.DBName("system"))
+	if err != nil {
+		l.Printf("error connecting to node %d: %v", node, err)
+		return err
+	}
+	defer func() {
+		err := db.Close()
+		resErr = errors.CombineErrors(resErr, err)
+	}()
 
 	jobsQuery := "system.jobs WHERE id = $1"
 	if hasInternalSystemJobs(h) {
 		jobsQuery = fmt.Sprintf("(%s)", jobutils.InternalSystemJobsBaseQuery)
 	}
-	for r := retry.StartWithCtx(ctx, backupCompletionRetryOptions); r.Next(); {
+	r := retry.StartWithCtx(ctx, backupCompletionRetryOptions)
+	for r.Next() {
 		var status string
 		var payloadBytes []byte
-		err := db.QueryRow(
+		err := db.QueryRowContext(ctx,
 			fmt.Sprintf(`SELECT status, payload FROM %s`, jobsQuery), jobID,
 		).Scan(&status, &payloadBytes)
 		if err != nil {
@@ -1404,7 +1412,11 @@ func (mvb *mixedVersionBackup) waitForJobSuccess(
 		return nil
 	}
 
-	return fmt.Errorf("waiting for job to finish: %w", lastErr)
+	if r.CurrentAttempt() >= backupCompletionRetryOptions.MaxRetries {
+		return fmt.Errorf("exhausted all %d retries waiting for job %d to finish, last err: %w", backupCompletionRetryOptions.MaxRetries, jobID, lastErr)
+	}
+
+	return fmt.Errorf("error waiting for job to finish: %w", lastErr)
 }
 
 // computeTableContents will generate a list of `tableContents`
@@ -2141,7 +2153,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 		RequiresLicense:   true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if c.Spec().Cloud != spec.GCE && !c.IsLocal() {
-				t.Skip("uses gs://cockroachdb-backup-testing; see https://github.com/cockroachdb/cockroach/issues/105968")
+				t.Skip("uses gs://cockroachdb-backup-testing-long-ttl; see https://github.com/cockroachdb/cockroach/issues/105968")
 			}
 
 			roachNodes := c.Range(1, c.Spec().NodeCount-1)

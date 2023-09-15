@@ -74,12 +74,12 @@ var _ lockTableGuard = &mockLockTableGuard{}
 // mockLockTableGuard implements the lockTableGuard interface.
 func (g *mockLockTableGuard) ShouldWait() bool            { return true }
 func (g *mockLockTableGuard) NewStateChan() chan struct{} { return g.signal }
-func (g *mockLockTableGuard) CurState() waitingState {
+func (g *mockLockTableGuard) CurState() (waitingState, error) {
 	s := g.state
 	if g.stateObserved != nil {
 		g.stateObserved <- struct{}{}
 	}
-	return s
+	return s, nil
 }
 func (g *mockLockTableGuard) ResolveBeforeScanning() []roachpb.LockUpdate {
 	return g.toResolve
@@ -133,7 +133,7 @@ func setupLockTableWaiterTest() (
 }
 
 func makeTxnProto(name string) roachpb.Transaction {
-	return roachpb.MakeTransaction(name, []byte("key"), 0, 0, hlc.Timestamp{WallTime: 10}, 0, 6)
+	return roachpb.MakeTransaction(name, []byte("key"), 0, 0, hlc.Timestamp{WallTime: 10}, 0, 6, 0)
 }
 
 // TestLockTableWaiterWithTxn tests the lockTableWaiter's behavior under

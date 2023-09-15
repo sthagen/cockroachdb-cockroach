@@ -1,4 +1,4 @@
-// Copyright 2021 The Cockroach Authors.
+// Copyright 2023 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -8,16 +8,14 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package cli
+package syncutil
 
-import "github.com/cockroachdb/pebble/vfs"
+import "sync"
 
-// swappableFS is a vfs.FS that can be swapped out at a future time.
-type swappableFS struct {
-	vfs.FS
+type Mutex struct {
+	sync.Mutex
 }
 
-// set replaces the FS in a swappableFS.
-func (s *swappableFS) set(fs vfs.FS) {
-	s.FS = fs
+type RWMutex struct {
+	sync.RWMutex
 }

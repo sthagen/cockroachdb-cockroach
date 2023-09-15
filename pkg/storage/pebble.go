@@ -63,6 +63,10 @@ import (
 // Default for MaxSyncDuration below.
 var maxSyncDurationDefault = envutil.EnvOrDefaultDuration("COCKROACH_ENGINE_MAX_SYNC_DURATION_DEFAULT", 20*time.Second)
 
+// Default maximum wait time before an EventuallyFileOnlySnapshot transitions
+// to a file-only snapshot.
+var maxEfosWait = envutil.EnvOrDefaultDuration("COCKROACH_EFOS_MAX_WAIT", 3*time.Second)
+
 // MaxSyncDuration is the threshold above which an observed engine sync duration
 // triggers either a warning or a fatal error.
 var MaxSyncDuration = settings.RegisterDurationSetting(
@@ -93,6 +97,17 @@ var ValueBlocksEnabled = settings.RegisterBoolSetting(
 	"set to true to enable writing of value blocks in sstables",
 	util.ConstantWithMetamorphicTestBool(
 		"storage.value_blocks.enabled", true),
+	settings.WithPublic)
+
+// UseEFOS controls whether uses of pebble Snapshots should use
+// EventuallyFileOnlySnapshots instead. This reduces write-amp with the main
+// tradeoff being higher space-amp.
+var UseEFOS = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"storage.experimental.eventually_file_only_snapshots.enabled",
+	"set to true to use eventually-file-only-snapshots",
+	util.ConstantWithMetamorphicTestBool(
+		"storage.experimental.eventually_file_only_snapshots.enabled", false), /* defaultValue */
 	settings.WithPublic)
 
 // IngestAsFlushable controls whether ingested sstables that overlap the
@@ -1105,6 +1120,18 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		onClose:          cfg.onClose,
 		replayer:         replay.NewWorkloadCollector(cfg.StorageConfig.Dir),
 	}
+	// In test builds, add a layer of VFS middleware that ensures users of an
+	// Engine don't try to use the filesystem after the Engine has been closed.
+	// Usage after close causes goroutine leaks.
+	if buildutil.CrdbTestBuild {
+		testFS := &noUseAfterClose{closed: &p.closed, fs: p.FS}
+		p.FS = testFS
+		p.onClose = append(p.onClose, func(p *Pebble) {
+			if openFiles := testFS.openFiles.Load(); openFiles > 0 {
+				panic(errors.AssertionFailedf("during Engine.Close there remain %d files open by client code; all files must be closed before closing the Engine", openFiles))
+			}
+		})
+	}
 
 	// MaxConcurrentCompactions can be set by multiple sources, but all the
 	// sources will eventually call NewPebble. So, we override
@@ -2052,6 +2079,21 @@ func (p *Pebble) NewSnapshot() Reader {
 	}
 }
 
+// NewEventuallyFileOnlySnapshot implements the Engine interface.
+func (p *Pebble) NewEventuallyFileOnlySnapshot(keyRanges []roachpb.Span) EventuallyFileOnlyReader {
+	engineKeyRanges := make([]pebble.KeyRange, len(keyRanges))
+	for i := range keyRanges {
+		engineKeyRanges[i].Start = EngineKey{Key: keyRanges[i].Key}.Encode()
+		engineKeyRanges[i].End = EngineKey{Key: keyRanges[i].EndKey}.Encode()
+	}
+	efos := p.db.NewEventuallyFileOnlySnapshot(engineKeyRanges)
+	return &pebbleEFOS{
+		efos:      efos,
+		parent:    p,
+		keyRanges: keyRanges,
+	}
+}
+
 // Type implements the Engine interface.
 func (p *Pebble) Type() enginepb.EngineType {
 	return enginepb.EngineTypePebble
@@ -2750,6 +2792,121 @@ func (p *pebbleSnapshot) ScanInternal(
 	return p.snapshot.ScanInternal(ctx, rawLower, rawUpper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
 }
 
+// pebbleEFOS represents an eventually file-only snapshot created using
+// NewEventuallyFileOnlySnapshot.
+type pebbleEFOS struct {
+	efos      *pebble.EventuallyFileOnlySnapshot
+	parent    *Pebble
+	keyRanges []roachpb.Span
+	closed    bool
+}
+
+var _ EventuallyFileOnlyReader = &pebbleEFOS{}
+
+// Close implements the Reader interface.
+func (p *pebbleEFOS) Close() {
+	_ = p.efos.Close()
+	p.closed = true
+}
+
+// Closed implements the Reader interface.
+func (p *pebbleEFOS) Closed() bool {
+	return p.closed
+}
+
+// MVCCIterate implements the Reader interface.
+func (p *pebbleEFOS) MVCCIterate(
+	start, end roachpb.Key,
+	iterKind MVCCIterKind,
+	keyTypes IterKeyType,
+	f func(MVCCKeyValue, MVCCRangeKeyStack) error,
+) error {
+	if iterKind == MVCCKeyAndIntentsIterKind {
+		r := wrapReader(p)
+		// Doing defer r.Free() does not inline.
+		err := iterateOnReader(r, start, end, iterKind, keyTypes, f)
+		r.Free()
+		return err
+	}
+	return iterateOnReader(p, start, end, iterKind, keyTypes, f)
+}
+
+// WaitForFileOnly implements the EventuallyFileOnlyReader interface.
+func (p *pebbleEFOS) WaitForFileOnly(ctx context.Context) error {
+	return p.efos.WaitForFileOnlySnapshot(ctx, maxEfosWait)
+}
+
+// NewMVCCIterator implements the Reader interface.
+func (p *pebbleEFOS) NewMVCCIterator(
+	iterKind MVCCIterKind, opts IterOptions,
+) (MVCCIterator, error) {
+	// Check if the bounds fall within the EFOS' keyRanges. We can only do this
+	// check for non-prefix iterators as prefix iterators often don't specify
+	// any bounds.
+	if !opts.Prefix {
+		if opts.LowerBound == nil || opts.UpperBound == nil {
+			return nil, errors.AssertionFailedf("cannot create iterators on EFOS without bounds")
+		}
+		var found bool
+		boundSpan := roachpb.Span{Key: opts.LowerBound, EndKey: opts.UpperBound}
+		for i := range p.keyRanges {
+			if p.keyRanges[i].Contains(boundSpan) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, errors.AssertionFailedf("iterator bounds exceed eventually-file-only-snapshot key ranges: %s", boundSpan.String())
+		}
+	}
+	if iterKind == MVCCKeyAndIntentsIterKind {
+		r := wrapReader(p)
+		// Doing defer r.Free() does not inline.
+		iter, err := r.NewMVCCIterator(iterKind, opts)
+		r.Free()
+		if err != nil {
+			return nil, err
+		}
+		return maybeWrapInUnsafeIter(iter), nil
+	}
+
+	iter, err := newPebbleIterator(p.efos, opts, StandardDurability, p.parent)
+	if err != nil {
+		return nil, err
+	}
+	return maybeWrapInUnsafeIter(MVCCIterator(iter)), nil
+}
+
+// NewEngineIterator implements the Reader interface.
+func (p *pebbleEFOS) NewEngineIterator(opts IterOptions) (EngineIterator, error) {
+	return newPebbleIterator(p.efos, opts, StandardDurability, p.parent)
+}
+
+// ConsistentIterators implements the Reader interface.
+func (p *pebbleEFOS) ConsistentIterators() bool {
+	return true
+}
+
+// PinEngineStateForIterators implements the Reader interface.
+func (p *pebbleEFOS) PinEngineStateForIterators() error {
+	// Snapshot already pins state, so nothing to do.
+	return nil
+}
+
+// ScanInternal implements the Reader interface.
+func (p *pebbleEFOS) ScanInternal(
+	ctx context.Context,
+	lower, upper roachpb.Key,
+	visitPointKey func(key *pebble.InternalKey, value pebble.LazyValue, info pebble.IteratorLevel) error,
+	visitRangeDel func(start []byte, end []byte, seqNum uint64) error,
+	visitRangeKey func(start []byte, end []byte, keys []rangekey.Key) error,
+	visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+) error {
+	rawLower := EngineKey{Key: lower}.Encode()
+	rawUpper := EngineKey{Key: upper}.Encode()
+	return p.efos.ScanInternal(ctx, rawLower, rawUpper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
+}
+
 // ExceedMaxSizeError is the error returned when an export request
 // fails due the export size exceeding the budget. This can be caused
 // by large KVs that have many revisions.
@@ -2762,4 +2919,176 @@ var _ error = &ExceedMaxSizeError{}
 
 func (e *ExceedMaxSizeError) Error() string {
 	return fmt.Sprintf("export size (%d bytes) exceeds max size (%d bytes)", e.reached, e.maxSize)
+}
+
+// noUseAfterClose wraps a vfs.FS and ensures the filesystem is not used after
+// an Engine is closed. It's used only in test builds. It ensures that all files
+// are closed before the Engine is closed and that the vfs.FS is not used after
+// the Engine is closed.
+type noUseAfterClose struct {
+	fs        vfs.FS
+	openFiles atomic.Int32
+	closed    *bool
+}
+
+func (fs *noUseAfterClose) ensureStillOpen() {
+	if *fs.closed {
+		panic(errors.AssertionFailedf("engine is closed; the Engine-provided filesystem cannot be used after Close"))
+	}
+}
+
+type noUseAfterCloseFile struct {
+	file vfs.File
+	fs   *noUseAfterClose
+}
+
+func (f *noUseAfterCloseFile) Close() error {
+	f.fs.ensureStillOpen()
+	f.fs.openFiles.Add(-1)
+	return f.file.Close()
+}
+func (f *noUseAfterCloseFile) Read(p []byte) (n int, err error) {
+	f.fs.ensureStillOpen()
+	return f.file.Read(p)
+}
+func (f *noUseAfterCloseFile) ReadAt(p []byte, off int64) (n int, err error) {
+	f.fs.ensureStillOpen()
+	return f.file.ReadAt(p, off)
+}
+func (f *noUseAfterCloseFile) Write(p []byte) (n int, err error) {
+	f.fs.ensureStillOpen()
+	return f.file.Write(p)
+}
+func (f *noUseAfterCloseFile) WriteAt(p []byte, off int64) (n int, err error) {
+	f.fs.ensureStillOpen()
+	return f.file.WriteAt(p, off)
+}
+func (f *noUseAfterCloseFile) Preallocate(offset, length int64) error {
+	f.fs.ensureStillOpen()
+	return f.file.Preallocate(offset, length)
+}
+func (f *noUseAfterCloseFile) Stat() (os.FileInfo, error) {
+	f.fs.ensureStillOpen()
+	return f.file.Stat()
+}
+func (f *noUseAfterCloseFile) Sync() error {
+	f.fs.ensureStillOpen()
+	return f.file.Sync()
+}
+func (f *noUseAfterCloseFile) SyncTo(length int64) (fullSync bool, err error) {
+	f.fs.ensureStillOpen()
+	return f.file.SyncTo(length)
+}
+func (f *noUseAfterCloseFile) SyncData() error {
+	f.fs.ensureStillOpen()
+	return f.file.SyncData()
+}
+func (f *noUseAfterCloseFile) Prefetch(offset int64, length int64) error {
+	f.fs.ensureStillOpen()
+	return f.file.Prefetch(offset, length)
+}
+func (f *noUseAfterCloseFile) Fd() uintptr { return f.file.Fd() }
+
+var _ vfs.FS = &noUseAfterClose{}
+
+func (fs *noUseAfterClose) Create(name string) (vfs.File, error) {
+	fs.ensureStillOpen()
+	return fs.fs.Create(name)
+}
+
+func (fs *noUseAfterClose) Link(oldname, newname string) error {
+	fs.ensureStillOpen()
+	return fs.fs.Link(oldname, newname)
+}
+
+func (fs *noUseAfterClose) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+	fs.ensureStillOpen()
+	f, err := fs.fs.Open(name, opts...)
+	if err != nil {
+		return nil, err
+	}
+	fs.openFiles.Add(1)
+	return &noUseAfterCloseFile{fs: fs, file: f}, nil
+}
+
+func (fs *noUseAfterClose) OpenReadWrite(name string, opts ...vfs.OpenOption) (vfs.File, error) {
+	fs.ensureStillOpen()
+	f, err := fs.fs.OpenReadWrite(name, opts...)
+	if err != nil {
+		return nil, err
+	}
+	fs.openFiles.Add(1)
+	return &noUseAfterCloseFile{fs: fs, file: f}, nil
+}
+
+func (fs *noUseAfterClose) OpenDir(name string) (vfs.File, error) {
+	fs.ensureStillOpen()
+	f, err := fs.fs.OpenDir(name)
+	if err != nil {
+		return nil, err
+	}
+	fs.openFiles.Add(1)
+	return &noUseAfterCloseFile{fs: fs, file: f}, nil
+}
+
+func (fs *noUseAfterClose) Remove(name string) error {
+	fs.ensureStillOpen()
+	return fs.fs.Remove(name)
+}
+
+func (fs *noUseAfterClose) RemoveAll(name string) error {
+	fs.ensureStillOpen()
+	return fs.fs.RemoveAll(name)
+}
+
+func (fs *noUseAfterClose) Rename(oldname, newname string) error {
+	fs.ensureStillOpen()
+	return fs.fs.Rename(oldname, newname)
+}
+
+func (fs *noUseAfterClose) ReuseForWrite(oldname, newname string) (vfs.File, error) {
+	fs.ensureStillOpen()
+	f, err := fs.fs.ReuseForWrite(oldname, newname)
+	if err != nil {
+		return nil, err
+	}
+	fs.openFiles.Add(1)
+	return &noUseAfterCloseFile{fs: fs, file: f}, nil
+}
+
+func (fs *noUseAfterClose) MkdirAll(dir string, perm os.FileMode) error {
+	fs.ensureStillOpen()
+	return fs.fs.MkdirAll(dir, perm)
+}
+
+func (fs *noUseAfterClose) Lock(name string) (io.Closer, error) {
+	fs.ensureStillOpen()
+	return fs.fs.Lock(name)
+}
+
+func (fs *noUseAfterClose) List(dir string) ([]string, error) {
+	fs.ensureStillOpen()
+	return fs.fs.List(dir)
+}
+
+func (fs *noUseAfterClose) Stat(name string) (os.FileInfo, error) {
+	fs.ensureStillOpen()
+	return fs.fs.Stat(name)
+}
+
+func (fs *noUseAfterClose) PathBase(path string) string {
+	return fs.fs.PathBase(path)
+}
+
+func (fs *noUseAfterClose) PathJoin(elem ...string) string {
+	return fs.fs.PathJoin(elem...)
+}
+
+func (fs *noUseAfterClose) PathDir(path string) string {
+	return fs.fs.PathDir(path)
+}
+
+func (fs *noUseAfterClose) GetDiskUsage(path string) (vfs.DiskUsage, error) {
+	fs.ensureStillOpen()
+	return fs.fs.GetDiskUsage(path)
 }

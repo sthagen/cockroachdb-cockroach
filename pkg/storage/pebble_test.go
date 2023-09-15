@@ -470,7 +470,7 @@ type testValue struct {
 func intent(key roachpb.Key, val string, ts hlc.Timestamp) testValue {
 	var value = roachpb.MakeValueFromString(val)
 	value.InitChecksum(key)
-	tx := roachpb.MakeTransaction(fmt.Sprintf("txn-%v", key), key, isolation.Serializable, roachpb.NormalUserPriority, ts, 1000, 99)
+	tx := roachpb.MakeTransaction(fmt.Sprintf("txn-%v", key), key, isolation.Serializable, roachpb.NormalUserPriority, ts, 1000, 99, 0)
 	var txn = &tx
 	return testValue{key, value, ts, txn}
 }
@@ -1169,6 +1169,10 @@ func TestPebbleReaderMultipleIterators(t *testing.T) {
 	defer snapshot.Close()
 	require.NoError(t, snapshot.PinEngineStateForIterators())
 
+	efos := eng.NewEventuallyFileOnlySnapshot([]roachpb.Span{{Key: keys.MinKey, EndKey: keys.MaxKey}})
+	defer efos.Close()
+	require.NoError(t, efos.PinEngineStateForIterators())
+
 	batch := eng.NewBatch()
 	defer batch.Close()
 	require.NoError(t, batch.PinEngineStateForIterators())
@@ -1182,6 +1186,7 @@ func TestPebbleReaderMultipleIterators(t *testing.T) {
 		"Engine":   eng,
 		"ReadOnly": readOnly,
 		"Snapshot": snapshot,
+		"EFOS":     efos,
 		"Batch":    batch,
 	}
 	for name, r := range testcases {

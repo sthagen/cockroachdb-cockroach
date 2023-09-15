@@ -1,6 +1,9 @@
 # LogicTest: local
 
 statement ok
+SET CLUSTER SETTING sql.txn.read_committed_syntax.enabled = true
+
+statement ok
 CREATE TABLE supermarket (
   person STRING PRIMARY KEY,
   aisle INT NOT NULL,
@@ -94,6 +97,9 @@ project
            ├── flags: force-index=supermarket_starts_with_idx
            └── locking: for-update,durability-guaranteed
 
+statement ok
+SET enable_zigzag_join = true
+
 query T
 EXPLAIN (OPT)
 SELECT aisle
@@ -112,6 +118,9 @@ project
       │         ├── starts_with = 'm'
       │         └── ends_with = 'lda'
       └── filters (true)
+
+statement ok
+RESET enable_zigzag_join
 
 statement ok
 SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE

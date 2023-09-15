@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -42,7 +41,6 @@ import (
 func TestValidationWithProtectedTS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer ccl.TestingEnableEnterprise()()
 
 	skip.UnderStress(t, "test takes too long")
 	skip.UnderRace(t, "test takes too long")
@@ -104,11 +102,6 @@ func TestValidationWithProtectedTS(t *testing.T) {
 		ptp := ts.ExecutorConfig().(sql.ExecutorConfig).ProtectedTimestampProvider
 		require.NoError(t, ptp.Refresh(ctx, asOf))
 	}
-
-	// By default, secondary tenants aren't allowed to muck with the zone
-	// config, so give them this ability if we happened to start the default
-	// test tenant.
-	sql.SecondaryTenantZoneConfigsEnabled.Override(ctx, &tenantSettings.SV, true)
 
 	for _, sql := range []string{
 		"SET CLUSTER SETTING kv.closed_timestamp.target_duration = '10ms'",

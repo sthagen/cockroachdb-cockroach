@@ -61,12 +61,11 @@ const (
 	// minimum total for a single store node must be under 2048 for Windows
 	// compatibility.
 	MinimumMaxOpenFiles = 1700
-	// MaxIntentsPerLockConflictErrorDefault is the default value for maximum
-	// number of intents reported by ExportToSST and Scan operations in
-	// LockConflictError is set to half of the maximum lock table size. This
-	// value is subject to tuning in real environment as we have more data
-	// available.
-	MaxIntentsPerLockConflictErrorDefault = 5000
+	// MaxConflictsPerLockConflictErrorDefault is the default value for maximum
+	// number of locks reported by ExportToSST and Scan operations in
+	// LockConflictError is set to half of the maximum lock table size. This value
+	// is subject to tuning in real environment as we have more data available.
+	MaxConflictsPerLockConflictErrorDefault = 5000
 )
 
 var minWALSyncInterval = settings.RegisterDurationSetting(
@@ -108,15 +107,14 @@ func CanUseMVCCRangeTombstones(ctx context.Context, st *cluster.Settings) bool {
 		MVCCRangeTombstonesEnabledInMixedClusters.Get(&st.SV)
 }
 
-// MaxIntentsPerLockConflictError sets maximum number of intents returned in
-// LockConflictError in operations that return multiple intents per error.
-// Currently it is used in Scan, ReverseScan, and ExportToSST.
-// TODO(nvanbenschoten): rename to MaxLocksPerLockConflictError.
-var MaxIntentsPerLockConflictError = settings.RegisterIntSetting(
+// MaxConflictsPerLockConflictError sets maximum number of locks returned in
+// LockConflictError in operations that return multiple locks per error.
+var MaxConflictsPerLockConflictError = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"storage.mvcc.max_intents_per_error",
-	"maximum number of intents returned in error during export of scan requests",
-	MaxIntentsPerLockConflictErrorDefault,
+	"maximum number of locks returned in errors during evaluation",
+	MaxConflictsPerLockConflictErrorDefault,
+	settings.WithName("storage.mvcc.max_conflicts_per_lock_conflict_error"),
 )
 
 var rocksdbConcurrency = envutil.EnvOrDefaultInt(
@@ -319,7 +317,7 @@ func updateStatsOnPut(
 			if orig.Txn != nil {
 				// If the original value was an intent, we're replacing the
 				// intent. Note that since it's a system key, it doesn't affect
-				// IntentByte, IntentCount, and correspondingly, IntentAge.
+				// IntentByte, IntentCount, and correspondingly, LockAge.
 				ms.SysBytes -= orig.KeyBytes + orig.ValBytes
 			}
 			ms.SysCount--
@@ -332,8 +330,8 @@ func updateStatsOnPut(
 	// Handle non-sys keys. This follows the same scheme: if there was a previous
 	// value, perhaps even an intent, subtract its contributions, and then add the
 	// new contributions. The complexity here is that we need to properly update
-	// GCBytesAge and IntentAge, which don't follow the same semantics. The difference
-	// between them is that an intent accrues IntentAge from its own timestamp on,
+	// GCBytesAge and LockAge, which don't follow the same semantics. The difference
+	// between them is that an intent accrues LockAge from its own timestamp on,
 	// while GCBytesAge is accrued by versions according to the following rules:
 	// 1. a (non-tombstone) value that is shadowed by a newer write accrues age at
 	// 	  the point in time at which it is shadowed (i.e. the newer write's timestamp).
@@ -361,7 +359,7 @@ func updateStatsOnPut(
 			ms.ValCount--
 			ms.IntentBytes -= (orig.KeyBytes + orig.ValBytes)
 			ms.IntentCount--
-			ms.SeparatedIntentCount--
+			ms.LockCount--
 		}
 
 		// If the original intent is a deletion, we're removing the intent. This
@@ -451,7 +449,7 @@ func updateStatsOnPut(
 	if meta.Txn != nil {
 		ms.IntentBytes += meta.KeyBytes + meta.ValBytes
 		ms.IntentCount++
-		ms.SeparatedIntentCount++
+		ms.LockCount++
 	}
 	return ms
 }
@@ -486,7 +484,7 @@ func updateStatsOnResolve(
 
 	// In the main case, we had an old intent at orig.Timestamp, and a new intent
 	// or value at meta.Timestamp. We'll walk through the contributions below,
-	// taking special care for IntentAge and GCBytesAge.
+	// taking special care for LockAge and GCBytesAge.
 	//
 	// Jump into the method below for extensive commentary on their semantics
 	// and "rules one and two".
@@ -512,10 +510,10 @@ func updateStatsOnResolve(
 		ms.LiveBytes -= orig.KeyBytes + orig.ValBytes
 	}
 
-	// IntentAge is always accrued from the intent's own timestamp on.
+	// LockAge is always accrued from the intent's own timestamp on.
 	ms.IntentBytes -= orig.KeyBytes + orig.ValBytes
 	ms.IntentCount--
-	ms.SeparatedIntentCount--
+	ms.LockCount--
 
 	// If there was a previous value (before orig.Timestamp), and it was not a
 	// deletion tombstone, then we have to adjust its GCBytesAge contribution
@@ -556,7 +554,7 @@ func updateStatsOnResolve(
 		// updateStatsOnPut, not this method).
 		ms.IntentBytes += meta.KeyBytes + meta.ValBytes
 		ms.IntentCount++
-		ms.SeparatedIntentCount++
+		ms.LockCount++
 	}
 	return ms
 }
@@ -777,7 +775,7 @@ func updateStatsOnClear(
 	if orig.Txn != nil {
 		ms.IntentBytes -= (orig.KeyBytes + orig.ValBytes)
 		ms.IntentCount--
-		ms.SeparatedIntentCount--
+		ms.LockCount--
 	}
 	return ms
 }
@@ -1587,9 +1585,7 @@ func MVCCPut(
 		}
 		defer iter.Close()
 
-		// TODO(nvanbenschoten): plumb in a maxConflicts value to limit the number
-		// of shared locks that can be returned from the key.
-		ltScanner, err = newLockTableKeyScanner(rw, opts.Txn, lock.Intent, 0 /* maxConflicts */)
+		ltScanner, err = newLockTableKeyScanner(rw, opts.Txn, lock.Intent, opts.MaxLockConflicts)
 		if err != nil {
 			return err
 		}
@@ -1646,9 +1642,7 @@ func MVCCDelete(
 	}
 	defer iter.Close()
 
-	// TODO(nvanbenschoten): plumb in a maxConflicts value to limit the number
-	// of shared locks that can be returned from the key.
-	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, 0 /* maxConflicts */)
+	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, opts.MaxLockConflicts)
 	if err != nil {
 		return false, err
 	}
@@ -2416,7 +2410,7 @@ func MVCCIncrement(
 	}
 	defer iter.Close()
 
-	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, 0 /* maxConflicts */)
+	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, opts.MaxLockConflicts)
 	if err != nil {
 		return 0, err
 	}
@@ -2503,7 +2497,7 @@ func MVCCConditionalPut(
 	}
 	defer iter.Close()
 
-	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, 0 /* maxConflicts */)
+	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, opts.MaxLockConflicts)
 	if err != nil {
 		return err
 	}
@@ -2594,7 +2588,7 @@ func MVCCInitPut(
 	}
 	defer iter.Close()
 
-	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, 0 /* maxConflicts */)
+	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, opts.MaxLockConflicts)
 	if err != nil {
 		return err
 	}
@@ -3223,7 +3217,10 @@ func MVCCDeleteRange(
 		scanTxn = prevSeqTxn
 	}
 	res, err := MVCCScan(ctx, rw, key, endKey, scanTs, MVCCScanOptions{
-		FailOnMoreRecent: failOnMoreRecent, Txn: scanTxn, MaxKeys: max,
+		FailOnMoreRecent: failOnMoreRecent,
+		Txn:              scanTxn,
+		MaxKeys:          max,
+		MaxLockConflicts: opts.MaxLockConflicts,
 	})
 	if err != nil {
 		return nil, nil, 0, err
@@ -3240,7 +3237,7 @@ func MVCCDeleteRange(
 	}
 	defer iter.Close()
 
-	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, 0 /* maxConflicts */)
+	ltScanner, err := newLockTableKeyScanner(rw, opts.Txn, lock.Intent, opts.MaxLockConflicts)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -3274,7 +3271,7 @@ func MVCCDeleteRange(
 //
 // This operation is non-transactional, but will check for existing intents in
 // the target key span, regardless of timestamp, and return a LockConflictError
-// containing up to maxIntents intents.
+// containing up to maxLockConflicts locks.
 //
 // MVCCPredicateDeleteRange will return with a resumeSpan if the number of tombstones
 // written exceeds maxBatchSize or the size of the written tombstones exceeds maxByteSize.
@@ -3307,7 +3304,7 @@ func MVCCPredicateDeleteRange(
 	predicates kvpb.DeleteRangePredicates,
 	maxBatchSize, maxBatchByteSize int64,
 	rangeTombstoneThreshold int64,
-	maxIntents int64,
+	maxLockConflicts int64,
 ) (*roachpb.Span, error) {
 
 	if maxBatchSize == 0 {
@@ -3337,7 +3334,7 @@ func MVCCPredicateDeleteRange(
 	}
 
 	// Check for any overlapping locks, and return them to be resolved.
-	if locks, err := ScanLocks(ctx, rw, startKey, endKey, maxIntents, 0); err != nil {
+	if locks, err := ScanLocks(ctx, rw, startKey, endKey, maxLockConflicts, 0); err != nil {
 		return nil, err
 	} else if len(locks) > 0 {
 		return nil, &kvpb.LockConflictError{Locks: locks}
@@ -3415,7 +3412,7 @@ func MVCCPredicateDeleteRange(
 	}
 	defer pointTombstoneIter.Close()
 
-	ltScanner, err := newLockTableKeyScanner(rw, nil /* txn */, lock.Intent, 0 /* maxConflicts */)
+	ltScanner, err := newLockTableKeyScanner(rw, nil /* txn */, lock.Intent, maxLockConflicts)
 	if err != nil {
 		return nil, err
 	}
@@ -3435,7 +3432,7 @@ func MVCCPredicateDeleteRange(
 			batchByteSize+runByteSize >= maxBatchByteSize {
 			if err := MVCCDeleteRangeUsingTombstone(ctx, rw, ms,
 				runStart, runEnd.Next(), endTime, localTimestamp, leftPeekBound, rightPeekBound,
-				false /* idempotent */, maxIntents, nil); err != nil {
+				false /* idempotent */, maxLockConflicts, nil); err != nil {
 				return err
 			}
 			batchByteSize += int64(MVCCRangeKey{StartKey: runStart, EndKey: runEnd, Timestamp: endTime}.EncodedSize())
@@ -3576,8 +3573,8 @@ func MVCCPredicateDeleteRange(
 // MVCCDeleteRangeUsingTombstone deletes the given MVCC keyspan at the given
 // timestamp using an MVCC range tombstone (rather than MVCC point tombstones).
 // This operation is non-transactional, but will check for existing intents and
-// return a LockConflictError containing up to maxIntents intents. Can't be used
-// across local keyspace.
+// return a LockConflictError containing up to maxLockConflicts locks. Can't be
+// used across local keyspace.
 //
 // The leftPeekBound and rightPeekBound parameters are used when looking for
 // range tombstones that we'll merge or overlap with. These are provided to
@@ -3609,7 +3606,7 @@ func MVCCDeleteRangeUsingTombstone(
 	localTimestamp hlc.ClockTimestamp,
 	leftPeekBound, rightPeekBound roachpb.Key,
 	idempotent bool,
-	maxIntents int64,
+	maxLockConflicts int64,
 	msCovered *enginepb.MVCCStats,
 ) error {
 	// Validate the range key. We must do this first, to catch e.g. any bound violations.
@@ -3642,7 +3639,7 @@ func MVCCDeleteRangeUsingTombstone(
 	}
 
 	// Check for any overlapping locks, and return them to be resolved.
-	if locks, err := ScanLocks(ctx, rw, startKey, endKey, maxIntents, 0); err != nil {
+	if locks, err := ScanLocks(ctx, rw, startKey, endKey, maxLockConflicts, 0); err != nil {
 		return err
 	} else if len(locks) > 0 {
 		return &kvpb.LockConflictError{Locks: locks}
@@ -3955,7 +3952,7 @@ func mvccScanInit(
 		targetBytes:      opts.TargetBytes,
 		allowEmpty:       opts.AllowEmpty,
 		wholeRows:        opts.WholeRowsOfSize > 1, // single-KV rows don't need processing
-		maxIntents:       opts.MaxIntents,
+		maxLockConflicts: opts.MaxLockConflicts,
 		inconsistent:     opts.Inconsistent,
 		skipLocked:       opts.SkipLocked,
 		tombstones:       opts.Tombstones,
@@ -4106,6 +4103,13 @@ type MVCCWriteOptions struct {
 	LocalTimestamp                 hlc.ClockTimestamp
 	Stats                          *enginepb.MVCCStats
 	ReplayWriteTimestampProtection bool
+	// MaxLockConflicts is a maximum number of conflicting locks collected before
+	// returning LockConflictError. Even single-key writes can encounter multiple
+	// conflicting shared locks, so the limit is important to bound the number of
+	// locks returned.
+	//
+	// The zero value indicates no limit.
+	MaxLockConflicts int64
 }
 
 func (opts *MVCCWriteOptions) validate() error {
@@ -4154,12 +4158,12 @@ type MVCCScanOptions struct {
 	// and AllowEmpty is false, in which case the remaining KV pairs of the row
 	// will be fetched and returned too.
 	WholeRowsOfSize int32
-	// MaxIntents is a maximum number of intents collected by scanner in
-	// consistent mode before returning LockConflictError.
+	// MaxLockConflicts is a maximum number of locks (intents) collected by
+	// scanner in consistent mode before returning LockConflictError.
 	//
 	// Not used in inconsistent scans.
 	// The zero value indicates no limit.
-	MaxIntents int64
+	MaxLockConflicts int64
 	// MemoryAccount is used for tracking memory allocations.
 	MemoryAccount *mon.BoundAccount
 	// LockTable is used to determine whether keys are locked in the in-memory
@@ -5415,12 +5419,12 @@ func MVCCCheckForAcquireLock(
 	txn *roachpb.Transaction,
 	str lock.Strength,
 	key roachpb.Key,
-	maxConflicts int64,
+	maxLockConflicts int64,
 ) error {
 	if err := validateLockAcquisition(txn, str); err != nil {
 		return err
 	}
-	ltScanner, err := newLockTableKeyScanner(reader, txn, str, maxConflicts)
+	ltScanner, err := newLockTableKeyScanner(reader, txn, str, maxLockConflicts)
 	if err != nil {
 		return err
 	}
@@ -5440,12 +5444,12 @@ func MVCCAcquireLock(
 	str lock.Strength,
 	key roachpb.Key,
 	ms *enginepb.MVCCStats,
-	maxConflicts int64,
+	maxLockConflicts int64,
 ) error {
 	if err := validateLockAcquisition(txn, str); err != nil {
 		return err
 	}
-	ltScanner, err := newLockTableKeyScanner(rw, txn, str, maxConflicts)
+	ltScanner, err := newLockTableKeyScanner(rw, txn, str, maxLockConflicts)
 	if err != nil {
 		return err
 	}
@@ -6096,8 +6100,8 @@ func MVCCGarbageCollectWholeRange(
 		// information was not accurate.
 		ms.IntentCount -= rangeStats.IntentCount
 		ms.IntentBytes -= rangeStats.IntentBytes
-		ms.IntentAge -= rangeStats.IntentAge
-		ms.SeparatedIntentCount -= rangeStats.SeparatedIntentCount
+		ms.LockAge -= rangeStats.LockAge
+		ms.LockCount -= rangeStats.LockCount
 	}
 	return nil
 }
@@ -6732,8 +6736,8 @@ func computeStatsForIterWithVisitors(
 				if meta.Txn != nil {
 					ms.IntentBytes += totalBytes
 					ms.IntentCount++
-					ms.SeparatedIntentCount++
-					ms.IntentAge += nowNanos/1e9 - meta.Timestamp.WallTime/1e9
+					ms.LockCount++
+					ms.LockAge += nowNanos/1e9 - meta.Timestamp.WallTime/1e9
 				}
 				if meta.KeyBytes != MVCCVersionTimestampSize {
 					return ms, errors.Errorf("expected mvcc metadata key bytes to equal %d; got %d "+
@@ -7254,7 +7258,7 @@ func mvccExportToWriter(
 	// If we do it means this export can't complete and is aborted. We need to loop over remaining data
 	// to collect all matching intents before returning them in an error to the caller.
 	if iter.NumCollectedIntents() > 0 {
-		for uint64(iter.NumCollectedIntents()) < opts.MaxIntents {
+		for uint64(iter.NumCollectedIntents()) < opts.MaxLockConflicts {
 			iter.NextKey()
 			// If we encounter other errors during intent collection, we return our original write intent failure.
 			// We would find this new error again upon retry.
@@ -7328,12 +7332,12 @@ type MVCCExportOptions struct {
 	// to an SST that exceeds maxSize, an error will be returned. This parameter
 	// exists to prevent creating SSTs which are too large to be used.
 	MaxSize uint64
-	// MaxIntents specifies the number of intents to collect and return in a
-	// LockConflictError. The caller will likely resolve the returned intents and
-	// retry the call, which would be quadratic, so this significantly reduces the
-	// overall number of scans. 0 disables batching and returns the first intent,
-	// pass math.MaxUint64 to collect all.
-	MaxIntents uint64
+	// MaxLockConflicts specifies the number of locks (intents) to collect and
+	// return in a LockConflictError. The caller will likely resolve the returned
+	// intents and retry the call, which would be quadratic, so this significantly
+	// reduces the overall number of scans. 0 disables batching and returns the
+	// first intent, pass math.MaxUint64 to collect all.
+	MaxLockConflicts uint64
 	// If StopMidKey is false, once function reaches targetSize it would continue
 	// adding all versions until it reaches next key or end of range. If true, it
 	// would stop immediately when targetSize is reached and return the next versions

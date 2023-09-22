@@ -86,6 +86,12 @@ type Config struct {
 	// Rangefeed scheduler to use for processor. If set, SchedulerProcessor would
 	// be instantiated.
 	Scheduler *Scheduler
+
+	// Priority marks this rangefeed as a priority rangefeed, which will run in a
+	// separate scheduler shard with a dedicated worker pool. Should only be used
+	// for low-volume system ranges, since the worker pool is small (default 2).
+	// Only has an effect when Scheduler is used.
+	Priority bool
 }
 
 // SetDefaults initializes unset fields in Config to values
@@ -511,13 +517,13 @@ func (p *LegacyProcessor) run(
 
 		// Close registrations and exit when signaled.
 		case pErr := <-p.stopC:
-			p.reg.DisconnectWithErr(all, pErr)
+			p.reg.DisconnectAllOnShutdown(pErr)
 			return
 
 		// Exit on stopper.
 		case <-stopper.ShouldQuiesce():
 			pErr := kvpb.NewError(&kvpb.NodeUnavailableError{})
-			p.reg.DisconnectWithErr(all, pErr)
+			p.reg.DisconnectAllOnShutdown(pErr)
 			return
 		}
 	}

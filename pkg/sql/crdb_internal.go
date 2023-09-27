@@ -4518,7 +4518,7 @@ CREATE TABLE crdb_internal.ranges_no_leases (
 				replicaLocalityDatum := tree.DNull
 				nodeDesc, err := p.ExecCfg().NodeDescs.GetNodeDescriptor(replica.NodeID)
 				if err != nil {
-					if !errors.Is(err, &kvpb.DescNotFoundError{}) {
+					if !errors.HasType(err, &kvpb.DescNotFoundError{}) {
 						return nil, err
 					}
 				} else {
@@ -6394,7 +6394,7 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 			endPrefix := p.extendedEvalCtx.Codec.TablePrefix(uint32(endID - 1)).PrefixEnd()
 			b := p.Txn().NewBatch()
 			b.Header.MaxSpanRequestKeys = 1
-			scanRequest := kvpb.NewScan(startPrefix, endPrefix, kvpb.NonLocking).(*kvpb.ScanRequest)
+			scanRequest := kvpb.NewScan(startPrefix, endPrefix).(*kvpb.ScanRequest)
 			scanRequest.ScanFormat = kvpb.BATCH_RESPONSE
 			b.AddRawRequest(scanRequest)
 			err = p.execCfg.DB.Run(ctx, b)

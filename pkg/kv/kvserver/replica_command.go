@@ -640,7 +640,7 @@ func (r *Replica) AdminMerge(
 		// shortly.
 		var rightDesc roachpb.RangeDescriptor
 		rightDescKey := keys.RangeDescriptorKey(origLeftDesc.EndKey)
-		dbRightDescKV, err := txn.GetForUpdate(ctx, rightDescKey)
+		dbRightDescKV, err := txn.GetForUpdate(ctx, rightDescKey, kvpb.BestEffort)
 		if err != nil {
 			return err
 		}
@@ -2814,7 +2814,7 @@ func (r *Replica) sendSnapshotUsingDelegate(
 	}
 
 	snapUUID := uuid.MakeV4()
-	appliedIndex, cleanup := r.addSnapshotLogTruncationConstraint(ctx, snapUUID, snapType == kvserverpb.SnapshotRequest_INITIAL, recipient.StoreID)
+	appliedIndex, cleanup := r.addSnapshotLogTruncationConstraint(ctx, snapUUID, senderQueueName != kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE, recipient.StoreID)
 	// The cleanup function needs to be called regardless of success or failure of
 	// sending to release the log truncation constraint.
 	defer cleanup()
@@ -2831,10 +2831,10 @@ func (r *Replica) sendSnapshotUsingDelegate(
 		RangeID:              r.RangeID,
 		CoordinatorReplica:   sender,
 		RecipientReplica:     recipient,
-		Priority:             priority,
+		DeprecatedPriority:   priority,
 		SenderQueueName:      senderQueueName,
 		SenderQueuePriority:  senderQueuePriority,
-		Type:                 snapType,
+		DeprecatedType:       snapType,
 		Term:                 kvpb.RaftTerm(status.Term),
 		DelegatedSender:      sender,
 		FirstIndex:           appliedIndex,
@@ -3114,10 +3114,9 @@ func (r *Replica) followerSendSnapshot(
 		return nil, err
 	}
 
-	snapType := req.Type
-	snap, err := r.GetSnapshot(ctx, snapType, req.SnapId)
+	snap, err := r.GetSnapshot(ctx, req.SnapId)
 	if err != nil {
-		return nil, errors.Wrapf(err, "%s: failed to generate %s snapshot", r, snapType)
+		return nil, errors.Wrapf(err, "%s: failed to generate snapshot", r)
 	}
 	defer snap.Close()
 	log.Event(ctx, "generated snapshot")
@@ -3159,11 +3158,11 @@ func (r *Replica) followerSendSnapshot(
 			},
 		},
 		RangeSize:           rangeSize,
-		Priority:            req.Priority,
+		DeprecatedPriority:  req.DeprecatedPriority,
 		SenderQueueName:     req.SenderQueueName,
 		SenderQueuePriority: req.SenderQueuePriority,
-		Strategy:            kvserverpb.SnapshotRequest_KV_BATCH,
-		Type:                req.Type,
+		DeprecatedStrategy:  kvserverpb.SnapshotRequest_KV_BATCH,
+		DeprecatedType:      req.DeprecatedType,
 		SharedReplicate:     sharedReplicate,
 	}
 	newBatchFn := func() storage.WriteBatch {
@@ -3183,15 +3182,25 @@ func (r *Replica) followerSendSnapshot(
 		r.store.metrics.RangeSnapshotSentBytes.Inc(inc)
 		r.store.metrics.updateCrossLocalityMetricsOnSnapshotSent(comparisonResult, inc)
 
-		switch header.Priority {
-		case kvserverpb.SnapshotRequest_RECOVERY:
+		// This computation is a little ugly, it is intended for backward
+		// compatibility of stats, but in the future it should be cleaned up.
+		if header.SenderQueueName == kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE {
 			r.store.metrics.RangeSnapshotRecoverySentBytes.Inc(inc)
-		case kvserverpb.SnapshotRequest_REBALANCE:
+		} else if header.SenderQueueName == kvserverpb.SnapshotRequest_OTHER {
+			// OTHER snapshots are sent by Replica.ChangeReplicas but are not used for
+			// recovery, but do have various uses (user, pre-merge, store rebalancer).
+			// They are all bucketed under the Rebalance bucket.
 			r.store.metrics.RangeSnapshotRebalancingSentBytes.Inc(inc)
-		default:
-			// If a snapshot is not a RECOVERY or REBALANCE snapshot, it must be of
-			// type UNKNOWN.
-			r.store.metrics.RangeSnapshotUnknownSentBytes.Inc(inc)
+		} else {
+			// SnapshotRequest_REPLICATE_QUEUE sends both recovery and rebalance
+			// snapshots. Split based on whether the priority is set. Priority 0 means
+			// it is used for rebalance.
+			// See AllocatorAction.Priority
+			if header.SenderQueuePriority > 0 {
+				r.store.metrics.RangeSnapshotRecoverySentBytes.Inc(inc)
+			} else {
+				r.store.metrics.RangeSnapshotRebalancingSentBytes.Inc(inc)
+			}
 		}
 	}
 
@@ -3290,12 +3299,13 @@ func conditionalGetDescValueFromDB(
 	forUpdate bool,
 	check func(*roachpb.RangeDescriptor) (matched, skip bool),
 ) (kvDesc *roachpb.RangeDescriptor, kvDescBytes []byte, skip bool, err error) {
-	get := txn.Get
-	if forUpdate {
-		get = txn.GetForUpdate
-	}
 	descKey := keys.RangeDescriptorKey(startKey)
-	existingDescKV, err := get(ctx, descKey)
+	var existingDescKV kv.KeyValue
+	if forUpdate {
+		existingDescKV, err = txn.GetForUpdate(ctx, descKey, kvpb.BestEffort)
+	} else {
+		existingDescKV, err = txn.Get(ctx, descKey)
+	}
 	if err != nil {
 		return nil, nil, false /* skip */, errors.Wrap(err, "fetching current range descriptor value")
 	}

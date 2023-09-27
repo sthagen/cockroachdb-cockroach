@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 )
 
 // SettingsWatcher is used to watch for cluster settings changes with a
@@ -346,8 +345,6 @@ type settingsValue struct {
 	tombstone bool
 }
 
-const versionSettingKey = "version"
-
 // set the current value of a setting.
 func (s *SettingsWatcher) setLocked(
 	ctx context.Context,
@@ -362,7 +359,7 @@ func (s *SettingsWatcher) setLocked(
 	// bootstrap the initial cluster version on tenant startup. In all other
 	// instances, this code should no-op (either because we're in the system
 	// tenant, or because the new version <= old version).
-	if key == versionSettingKey && !s.codec.ForSystemTenant() {
+	if key == clusterversion.KeyVersionSetting && !s.codec.ForSystemTenant() {
 		var newVersion clusterversion.ClusterVersion
 		oldVersion := s.settings.Version.ActiveVersionOrEmpty(ctx)
 		if err := protoutil.Unmarshal([]byte(val.Value), &newVersion); err != nil {
@@ -388,24 +385,16 @@ func (s *SettingsWatcher) setLocked(
 		return
 	}
 
-	if err := s.mu.updater.Set(ctx, key, val); err != nil {
-		log.Warningf(ctx, "failed to set setting %s to %s: %v", redact.Safe(key), val.Value, err)
+	if err := s.mu.updater.SetFromStorage(ctx, key, val, origin); err != nil {
+		log.Warningf(ctx, "failed to set setting %s to %s: %v", key, val.Value, err)
 	}
-	s.mu.updater.SetValueOrigin(ctx, key, origin)
 }
 
 // setDefaultLocked sets a setting to its default value.
 func (s *SettingsWatcher) setDefaultLocked(ctx context.Context, key settings.InternalKey) {
-	setting, ok := settings.LookupForLocalAccessByKey(key, s.codec.ForSystemTenant())
-	if !ok {
-		log.Warningf(ctx, "failed to find setting %s, skipping update", redact.Safe(key))
-		return
+	if err := s.mu.updater.SetToDefault(ctx, key); err != nil {
+		log.Warningf(ctx, "failed to set setting %s to default: %v", key, err)
 	}
-	val := settings.EncodedValue{
-		Value: setting.EncodedDefault(),
-		Type:  setting.Typ(),
-	}
-	s.setLocked(ctx, key, val, settings.OriginDefault)
 }
 
 // updateOverrides updates the overrides map and updates any settings
@@ -418,7 +407,7 @@ func (s *SettingsWatcher) updateOverrides(ctx context.Context) (updateCh <-chan 
 	defer s.mu.Unlock()
 
 	for key, val := range newOverrides {
-		if key == versionSettingKey {
+		if key == clusterversion.KeyVersionSetting {
 			var newVersion clusterversion.ClusterVersion
 			if err := protoutil.Unmarshal([]byte(val.Value), &newVersion); err != nil {
 				log.Warningf(ctx, "ignoring invalid cluster version: %s - %v\n"+

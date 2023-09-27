@@ -104,6 +104,10 @@ type SSTBatcher struct {
 	mem      *mon.ConcurrentBoundAccount
 	limiter  limit.ConcurrentRequestLimiter
 
+	// priority is the admission priority used for AddSSTable
+	// requests.
+	priority admissionpb.WorkPriority
+
 	// disallowShadowingBelow is described on kvpb.AddSSTableRequest.
 	disallowShadowingBelow hlc.Timestamp
 
@@ -229,6 +233,7 @@ func MakeSSTBatcher(
 		disableScatters:        !scatterSplitRanges,
 		mem:                    mem,
 		limiter:                sendLimiter,
+		priority:               admissionpb.BulkNormalPri,
 	}
 	b.mu.lastFlush = timeutil.Now()
 	b.mu.tracingSpan = tracing.SpanFromContext(ctx)
@@ -254,6 +259,13 @@ func MakeStreamSSTBatcher(
 		ingestAll: true,
 		mem:       mem,
 		limiter:   sendLimiter,
+		// We use NormalPri since anything lower than normal
+		// priority is assumed to be able to handle reduced
+		// throughput. We are OK witht his for now since the
+		// consuming cluster of a replication stream does not
+		// have a latency sensitive workload running against
+		// it.
+		priority: admissionpb.NormalPri,
 	}
 	b.mu.lastFlush = timeutil.Now()
 	b.mu.tracingSpan = tracing.SpanFromContext(ctx)
@@ -280,6 +292,7 @@ func MakeTestingSSTBatcher(
 		ingestAll:      ingestAll,
 		mem:            mem,
 		limiter:        sendLimiter,
+		priority:       admissionpb.BulkNormalPri,
 	}
 	b.Reset(ctx)
 	return b, nil
@@ -797,6 +810,7 @@ func (b *SSTBatcher) addSSTable(
 				if b.settings != nil && int64(len(item.sstBytes)) < tooSmallSSTSize.Get(&b.settings.SV) {
 					log.VEventf(ctx, 3, "ingest data is too small (%d keys/%d bytes) for SSTable, adding via regular batch", item.stats.KeyCount, len(item.sstBytes))
 					ingestAsWriteBatch = true
+					ingestionPerformanceStats.AsWrites++
 				}
 
 				req := &kvpb.AddSSTableRequest{
@@ -815,7 +829,7 @@ func (b *SSTBatcher) addSSTable(
 				ba := &kvpb.BatchRequest{
 					Header: kvpb.Header{Timestamp: batchTS, ClientRangeInfo: roachpb.ClientRangeInfo{ExplicitlyRequested: true}},
 					AdmissionHeader: kvpb.AdmissionHeader{
-						Priority:                 int32(admissionpb.BulkNormalPri),
+						Priority:                 int32(b.priority),
 						CreateTime:               timeutil.Now().UnixNano(),
 						Source:                   kvpb.AdmissionHeader_FROM_SQL,
 						NoMemoryReservedAtSource: true,

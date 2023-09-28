@@ -3784,14 +3784,17 @@ func (cfg *ExecutorConfig) GetRowMetrics(internal bool) *rowinfra.Metrics {
 	return cfg.RowMetrics
 }
 
-// RequireSystemTenantOrClusterSetting returns a setting disabled error if
+// requireSystemTenantOrClusterSetting returns a setting disabled error if
 // executed from inside a secondary tenant that does not have the specified
 // cluster setting.
-func (cfg *ExecutorConfig) RequireSystemTenantOrClusterSetting(
-	setting *settings.BoolSetting,
+func requireSystemTenantOrClusterSetting(
+	codec keys.SQLCodec, settings *cluster.Settings, setting *settings.BoolSetting,
 ) error {
-	if cfg.Codec.ForSystemTenant() || setting.Get(&cfg.Settings.SV) {
+	if codec.ForSystemTenant() || setting.Get(&settings.SV) {
 		return nil
 	}
-	return errors.Newf("tenant cluster setting %s disabled", setting.Name())
+	return errors.WithDetailf(errors.WithHint(
+		errors.New("operation is disabled within a virtual cluster"),
+		"Feature was disabled by the system operator."),
+		"Feature flag: %s", setting.Name())
 }

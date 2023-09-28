@@ -1217,11 +1217,11 @@ type StoreConfig struct {
 	// SpanConfigsDisabled determines whether we're able to use the span configs
 	// infrastructure or not.
 	//
-	// TODO(irfansharif): We can remove this.
+	// TODO(baptist): Don't add any future uses of this. Will be removed soon.
 	SpanConfigsDisabled bool
+
 	// Used to subscribe to span configuration changes, keeping up-to-date a
-	// data structure useful for retrieving span configs. Only available if
-	// SpanConfigsDisabled is unset.
+	// data structure useful for retrieving span configs.
 	SpanConfigSubscriber spanconfig.KVSubscriber
 	// SharedStorageEnabled stores whether this store is configured with a
 	// shared.Storage instance and can accept shared snapshots.
@@ -2225,20 +2225,6 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			s.onSpanConfigUpdate(ctx, update)
 		})
 
-		// When toggling between the system config span and the span
-		// configs infrastructure, we want to re-apply configs on all
-		// replicas from whatever the new source is.
-		spanconfigstore.EnabledSetting.SetOnChange(&s.ClusterSettings().SV, func(ctx context.Context) {
-			enabled := spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV)
-			if enabled {
-				s.applyAllFromSpanConfigStore(ctx)
-			} else if scp := s.cfg.SystemConfigProvider; scp != nil {
-				if sc := scp.GetSystemConfig(); sc != nil {
-					s.systemGossipUpdate(sc)
-				}
-			}
-		})
-
 		// We also want to do it when the fallback config setting is changed.
 		spanconfigstore.FallbackConfigOverride.SetOnChange(&s.ClusterSettings().SV, func(ctx context.Context) {
 			s.applyAllFromSpanConfigStore(ctx)
@@ -2284,10 +2270,7 @@ func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, erro
 		return s.cfg.TestingKnobs.ConfReaderInterceptor(), nil
 	}
 
-	if s.cfg.SpanConfigsDisabled ||
-		!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) ||
-		s.TestingKnobs().UseSystemConfigSpanForQueues {
-
+	if s.cfg.SpanConfigsDisabled || s.TestingKnobs().UseSystemConfigSpanForQueues {
 		sysCfg := s.cfg.SystemConfigProvider.GetSystemConfig()
 		if sysCfg == nil {
 			return nil, errSpanConfigsUnavailable
@@ -2487,10 +2470,6 @@ func (s *Store) removeReplicaWithRangefeed(rangeID roachpb.RangeID) {
 // onSpanConfigUpdate is the callback invoked whenever this store learns of a
 // span config update.
 func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
-	if !spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) {
-		return
-	}
-
 	sp, err := keys.SpanAddr(updated)
 	if err != nil {
 		log.Errorf(ctx, "skipped applying update (%s), unexpected error resolving span address: %v",
@@ -3497,7 +3476,7 @@ func (s *Store) ReplicateQueueDryRun(
 		s.cfg.AmbientCtx.Tracer, "replicate queue dry run",
 	)
 	defer collectAndFinish()
-	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica, conf roachpb.SpanConfig) bool {
+	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica, conf *roachpb.SpanConfig) bool {
 		return true
 	}
 	desc := repl.Desc()
@@ -3561,7 +3540,7 @@ func (s *Store) AllocatorCheckRange(
 		storePool = s.cfg.StorePool
 	}
 
-	action, _ := s.allocator.ComputeAction(ctx, storePool, conf, desc)
+	action, _ := s.allocator.ComputeAction(ctx, storePool, &conf, desc)
 
 	// In the case that the action does not require a target, return immediately.
 	if !(action.Add() || action.Replace()) {
@@ -3575,7 +3554,7 @@ func (s *Store) AllocatorCheckRange(
 		return action, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
-	target, _, err := s.allocator.AllocateTarget(ctx, storePool, conf,
+	target, _, err := s.allocator.AllocateTarget(ctx, storePool, &conf,
 		filteredVoters, filteredNonVoters, replacing, action.ReplicaStatus(), action.TargetReplicaType(),
 	)
 	if err == nil {
@@ -3586,7 +3565,7 @@ func (s *Store) AllocatorCheckRange(
 		fragileQuorumErr := s.allocator.CheckAvoidsFragileQuorum(
 			ctx,
 			storePool,
-			conf,
+			&conf,
 			desc.Replicas().VoterDescriptors(),
 			filteredVoters,
 			action.ReplicaStatus(),

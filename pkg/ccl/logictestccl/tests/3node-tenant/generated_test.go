@@ -968,6 +968,13 @@ func TestTenantLogic_hash_sharded_index(
 	runLogicTest(t, "hash_sharded_index")
 }
 
+func TestTenantLogic_hash_sharded_index_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "hash_sharded_index_read_committed")
+}
+
 func TestTenantLogic_hidden_columns(
 	t *testing.T,
 ) {
@@ -2590,6 +2597,20 @@ func TestTenantLogicCCL_zone_config_secondary_tenants_disallowed(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "zone_config_secondary_tenants_disallowed")
+}
+
+func TestTenantLogicCCL_zone_configs_secondary_tenants_restricted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "zone_configs_secondary_tenants_restricted")
+}
+
+func TestTenantLogicCCL_zone_configs_secondary_tenants_unrestricted(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "zone_configs_secondary_tenants_unrestricted")
 }
 
 func TestTenantExecBuild_distsql_tenant(

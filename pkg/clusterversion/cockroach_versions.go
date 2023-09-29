@@ -19,8 +19,8 @@ import (
 type Key int
 
 // Version constants. These drive compatibility between versions as well as
-// migrations. Before you add a version or consider removing one, please
-// familiarize yourself with the rules below.
+// upgrades (formerly "migrations"). Before you add a version or consider
+// removing one, please familiarize yourself with the rules below.
 //
 // # Adding Versions
 //
@@ -40,7 +40,7 @@ type Key int
 //			// this feature.
 //		}
 //
-//	Authors of migrations need to be careful in ensuring that end-users
+//	Authors of upgrades need to be careful in ensuring that end-users
 //	aren't able to enable feature gates before they're active. This is fine:
 //
 //		func handleSomeNewStatement() error {
@@ -114,38 +114,45 @@ type Key int
 //	    two.
 //	(3) Add it at the end of the `versionsSingleton` block below.
 //
-// # Migrations
+// # Upgrades
 //
-// Migrations are idempotent functions that can be attached to versions and will
+// Upgrades are idempotent functions that can be attached to versions and will
 // be rolled out before the respective cluster version gets rolled out. They are
-// primarily a means to remove legacy state from the cluster. For example, a
-// migration might scan the cluster for an outdated type of table descriptor and
-// rewrite it into a new format. Migrations are tricky to get right and they have
-// their own documentation in ./pkg/upgrade, which you should peruse should you
-// feel that a migration is necessary for your use case.
+// primarily a means to remove legacy state from the cluster. For example, an
+// upgrade might scan the cluster for an outdated type of table descriptor and
+// rewrite it into a new format. Upgrade are tricky to get right and have their
+// own documentation in ./pkg/upgrade, which you should peruse should you feel
+// that an upgrade is necessary for your use case.
 //
-// # Phasing out Versions and Migrations
+// ## Permanent upgrades
 //
-// Versions and Migrations can be removed once they are no longer going to be
-// exercised. This is primarily driven by the BinaryMinSupportedVersion, which
-// declares the oldest *cluster* (not binary) version of CockroachDB that may
-// interface with the running node. It typically trails the current version by
-// one release. For example, if the current branch is a `21.1.x` release, you
-// will have a BinaryMinSupportedVersion of `21.0`, meaning that the versions
-// 20.2.0-1, 20.2.0-2, etc are always going to be active on any peer and thus
-// can be "baked in"; similarly all migrations attached to any of these versions
-// can be assumed to have run (or not having been necessary due to the cluster
-// having been initialized at a higher version in the first place). Note that
-// this implies that all peers will have a *binary* version of at least the
-// MinSupportedVersion as well, as this is a prerequisite for running at that
-// cluster version. Finally, note that even when all cluster versions known
-// to the current binary are active (i.e. most of the time), you still need
-// to be able to inter-op with older *binary* and/or *cluster* versions. This
-// is because *tenants* are allowed to run at any binary version compatible
-// with (i.e. greater than or equal to) the MinSupportedVersion. To give a
-// concrete example, a fully up-to-date v21.1 KV host cluster can have tenants
-// running against it that use the v21.0 binary and any cluster version known
-// to that binary (v20.2-0 ... v20.2-50 or thereabouts).
+// Permanent upgrades are upgrades that double as initialization steps when
+// bootstrapping a new cluster. As such, they cannot be removed even as the
+// version they are tied to becomes unsupported.
+//
+// # Phasing out Versions and Upgrades
+//
+// Versions and non-permanent upgrades can be removed once they are no longer
+// going to be exercised. This is primarily driven by the
+// BinaryMinSupportedVersion, which declares the oldest *cluster* (not binary)
+// version of CockroachDB that may interface with the running node. It typically
+// trails the current version by one release. For example, if the current branch
+// is a `21.1.x` release, you will have a BinaryMinSupportedVersion of `21.0`,
+// meaning that the versions 20.2.0-1, 20.2.0-2, etc are always going to be
+// active on any peer and thus can be "baked in"; similarly all upgrades
+// attached to any of these versions can be assumed to have run (or not having
+// been necessary due to the cluster having been initialized at a higher version
+// in the first place). Note that this implies that all peers will have a
+// *binary* version of at least the MinSupportedVersion as well, as this is a
+// prerequisite for running at that cluster version. Finally, note that even
+// when all cluster versions known to the current binary are active (i.e. most
+// of the time), you still need to be able to inter-op with older *binary*
+// and/or *cluster* versions. This is because *tenants* are allowed to run at
+// any binary version compatible with (i.e. greater than or equal to) the
+// MinSupportedVersion. To give a concrete example, a fully up-to-date v21.1 KV
+// host cluster can have tenants running against it that use the v21.0 binary
+// and any cluster version known to that binary (v20.2-0 ... v20.2-50 or
+// thereabouts).
 //
 // You'll want to delete versions from this list after cutting a major release.
 // Once the development for 21.1 begins, after step (ii) from above, all
@@ -156,11 +163,19 @@ type Key int
 // All "is active" checks for the key will always evaluate to true. You'll also
 // want to delete the constant and remove its entry in the `versionsSingleton`
 // block below.
+//
+// Permanent upgrades and their associated version key cannot be removed (even
+// if it is below the BinaryMinSupportedVersion). The version key should start
+// with `Permanent_` to make this more explicit. The version numbers should not
+// be changed - we want all nodes in a mixed-version cluster to agree on what
+// version a certain upgrade step is tied to (in the unlikely scenario that we
+// have mixed-version nodes while bootstrapping a cluster).
 const (
 	invalidVersionKey Key = iota - 1 // want first named one to start at zero
 
-	// VPrimordial versions are used by upgrades below BinaryMinSupportedVersion,
-	// for whom the exact version they were associated with no longer matters.
+	// VPrimordial versions are associated with permanent upgrades that exist for
+	// historical reasons; no new primordial versions should be added, and no new
+	// upgrades should be tied to existing primordial versions.
 
 	VPrimordial1
 	VPrimordial2
@@ -168,106 +183,17 @@ const (
 	VPrimordial4
 	VPrimordial5
 	VPrimordial6
-	// NOTE(andrei): Do not introduce new upgrades corresponding to VPrimordial
-	// versions. Old-version nodes might try to run the jobs created for such
-	// upgrades, but they won't know about the respective upgrade, causing the job
-	// to succeed without actually performing the update.
-	VPrimordialMax
 
-	// TODODelete_V22_1 is CockroachDB v22.1. It's used for all v22.1.x patch releases.
-	TODODelete_V22_1
+	// No new VPrimordial versions should be added.
+
+	VPrimordialMax
 
 	// v22.2 versions.
 	//
-	// TODODelete_V22_2Start demarcates work towards CockroachDB v22.2.
-	TODODelete_V22_2Start
-
-	// TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted updates the Pebble format
-	// version that recombines all user keys that may be split across multiple
-	// files into a single table.
-	TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted
-	// TODODelete_V22_2EnsurePebbleFormatVersionRangeKeys is the first step of a two-part
-	// migration that bumps Pebble's format major version to a version that
-	// supports range keys.
-	TODODelete_V22_2EnsurePebbleFormatVersionRangeKeys
-	// TODODelete_V22_2EnablePebbleFormatVersionRangeKeys is the second of a two-part migration
-	// and is used as the feature gate for use of range keys. Any node at this
-	// version is guaranteed to reside in a cluster where all nodes support range
-	// keys at the Pebble layer.
-	TODODelete_V22_2EnablePebbleFormatVersionRangeKeys
-	// TODODelete_V22_2RemoveGrantPrivilege is the last step to migrate from the GRANT privilege to WITH GRANT OPTION.
-	TODODelete_V22_2RemoveGrantPrivilege
-	// TODODelete_V22_2MVCCRangeTombstones enables the use of MVCC range tombstones.
-	TODODelete_V22_2MVCCRangeTombstones
-	// TODODelete_V22_2SystemPrivilegesTable adds system.privileges table.
-	TODODelete_V22_2SystemPrivilegesTable
-	// TODODelete_V22_2EnablePredicateProjectionChangefeed indicates that changefeeds support
-	// predicates and projections.
-	TODODelete_V22_2EnablePredicateProjectionChangefeed
-	// TODODelete_V22_2SystemExternalConnectionsTable adds system.external_connections table.
-	TODODelete_V22_2SystemExternalConnectionsTable
-	// TODODelete_V22_2RoleIDSequence is the version where the system.role_id_sequence exists.
-	TODODelete_V22_2RoleIDSequence
-	// TODODelete_V22_2AddSystemUserIDColumn is the version where the system.users table has
-	// a user_id column for writes only.
-	TODODelete_V22_2AddSystemUserIDColumn
-	// TODODelete_V22_2SystemUsersIDColumnIsBackfilled is the version where all users in the system.users table
-	// have ids.
-	TODODelete_V22_2SystemUsersIDColumnIsBackfilled
-	// TODODelete_V22_2SetSystemUsersUserIDColumnNotNull sets the user_id column in system.users to not null.
-	TODODelete_V22_2SetSystemUsersUserIDColumnNotNull
 	// Permanent_V22_2SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
 	// telemetry logging jobs.
-	//
 	// This is a permanent migration which should exist forever.
 	Permanent_V22_2SQLSchemaTelemetryScheduledJobs
-	// TODODelete_V22_2SchemaChangeSupportsCreateFunction adds support of CREATE FUNCTION
-	// statement.
-	TODODelete_V22_2SchemaChangeSupportsCreateFunction
-	// TODODelete_V22_2PebbleFormatPrePebblev1Marked performs a Pebble-level migration and
-	// upgrades the Pebble format major version to FormatPrePebblev1Marked. This
-	// migration occurs at the per-store level and is twofold:
-	//  - Each store is first bumped to a Pebble format major version that raises
-	//  the minimum supported sstable format to (Pebble,v1) (block properties). New
-	//  tables generated by Pebble (via compactions / flushes), and tables written
-	//  for ingestion will be at table format version (Pebble,v1).
-	//  - Each store is then instructed to mark all existing tables that are
-	//  pre-Pebblev1 for a low-priority compaction. In a future release of
-	//  Cockroach (likely 23.1), a blocking migration will be run to
-	//  rewrite-compact on any remaining marked tables.
-	TODODelete_V22_2PebbleFormatPrePebblev1Marked
-	// TODODelete_V22_2RoleOptionsTableHasIDColumn is the version where the role options table
-	// has ids.
-	TODODelete_V22_2RoleOptionsTableHasIDColumn
-	// TODODelete_V22_2RoleOptionsIDColumnIsBackfilled is the version where ids in the role options
-	// table are backfilled.
-	TODODelete_V22_2RoleOptionsIDColumnIsBackfilled
-	// TODODelete_V22_2SetRoleOptionsUserIDColumnNotNull is the version where the role
-	// options table id column cannot be null. This is the final step
-	// of the system.role_options table migration.
-	TODODelete_V22_2SetRoleOptionsUserIDColumnNotNull
-	// TODODelete_V22_2RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
-	TODODelete_V22_2RangefeedUseOneStreamPerNode
-	// TODODelete_V22_2TTLDistSQL uses DistSQL to distribute TTL SELECT/DELETE statements to
-	// leaseholder nodes.
-	TODODelete_V22_2TTLDistSQL
-	// TODODelete_V22_2PrioritizeSnapshots adds prioritization to sender snapshots. When this
-	// version is enabled, the receiver will look at the priority of snapshots
-	// using the fields added in 22.2.
-	TODODelete_V22_2PrioritizeSnapshots
-	// TODODelete_V22_2EnableLeaseUpgrade version gates a change in the lease transfer protocol
-	// whereby we only ever transfer expiration-based leases (and have
-	// recipients later upgrade them to the more efficient epoch based ones).
-	// This was done to limit the effects of ill-advised lease transfers since
-	// the incoming leaseholder would need to recognize itself as such within a
-	// few seconds. This needs version gating so that in mixed-version clusters,
-	// as part of lease transfers, we don't start sending out expiration based
-	// leases to nodes that (i) don't expect them for certain keyspans, and (ii)
-	// don't know to upgrade them to efficient epoch-based ones.
-	TODODelete_V22_2EnableLeaseUpgrade
-	// TODODelete_V22_2SupportAssumeRoleAuth is the version where assume role authorization is
-	// supported in cloud storage and KMS.
-	TODODelete_V22_2SupportAssumeRoleAuth
 
 	// V22_2 is CockroachDB v22.2. It's used for all v22.2.x patch releases.
 	V22_2
@@ -348,8 +274,9 @@ const (
 	// chagnefeeds created prior to this version.
 	V23_1_ChangefeedExpressionProductionReady
 
-	// V23_1KeyVisualizerTablesAndJobs adds the system tables that support the key visualizer.
-	V23_1KeyVisualizerTablesAndJobs
+	// Permanent_V23_1KeyVisualizerTablesAndJobs adds the system tables that
+	// support the key visualizer.
+	Permanent_V23_1KeyVisualizerTablesAndJobs
 
 	// V23_1_KVDirectColumnarScans introduces the support of the "direct"
 	// columnar scans in the KV layer.
@@ -357,9 +284,9 @@ const (
 
 	V23_1_DeleteDroppedFunctionDescriptors
 
-	// V23_1_CreateJobsMetricsPollingJob creates the permanent job
+	// Permanent_V23_1_CreateJobsMetricsPollingJob creates the permanent job
 	// responsible for polling the jobs table for metrics.
-	V23_1_CreateJobsMetricsPollingJob
+	Permanent_V23_1_CreateJobsMetricsPollingJob
 
 	// V23_1AllocatorCPUBalancing adds balancing CPU usage among stores using
 	// the allocator and store rebalancer. It assumes that at this version,
@@ -480,9 +407,9 @@ const (
 	// task_payloads and tenant_tasks have been created.
 	V23_1_TaskSystemTables
 
-	// V23_1_CreateAutoConfigRunnerJob is the version where the auto
+	// Permanent_V23_1_CreateAutoConfigRunnerJob is the version where the auto
 	// config runner persistent job has been created.
-	V23_1_CreateAutoConfigRunnerJob
+	Permanent_V23_1_CreateAutoConfigRunnerJob
 
 	// V23_1AddSQLStatsComputedIndexes is the version at which Cockroach adds new
 	// computed columns and indexes to the statement_statistics and
@@ -500,18 +427,18 @@ const (
 	// payload and progress columns are no longer written to system.jobs.
 	V23_1StopWritingPayloadAndProgressToSystemJobs
 
-	// V23_1ChangeSQLStatsTTL is the version where the gc TTL was updated to all
-	// SQL Stats tables.
-	V23_1ChangeSQLStatsTTL
+	// Permanent_V23_1ChangeSQLStatsTTL is the version where the gc TTL was
+	// updated to all SQL Stats tables.
+	Permanent_V23_1ChangeSQLStatsTTL
 
 	// V23_1_TenantIDSequence is the version where system.tenant_id_seq
 	// was introduced.
 	V23_1_TenantIDSequence
 
-	// V23_1CreateSystemActivityUpdateJob is the version at which Cockroach adds a
-	// job that periodically updates the statement_activity and transaction_activity.
-	// tables.
-	V23_1CreateSystemActivityUpdateJob
+	// Permanent_V23_1CreateSystemActivityUpdateJob is the version at which
+	// Cockroach adds a job that periodically updates the statement_activity and
+	// transaction_activity tables.
+	Permanent_V23_1CreateSystemActivityUpdateJob
 
 	// V23_1 is CockroachDB v23.1. It's used for all v23.1.x patch releases.
 	V23_1
@@ -635,107 +562,11 @@ var rawVersionsSingleton = keyedVersions{
 		Key:     VPrimordialMax,
 		Version: roachpb.Version{Major: 0, Minor: 0, Internal: 424242},
 	},
-	{
-		Key:     TODODelete_V22_1,
-		Version: roachpb.Version{Major: 22, Minor: 1},
-	},
 
 	// v22.2 versions. Internal versions must be even.
 	{
-		Key:     TODODelete_V22_2Start,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 2},
-	},
-	{
-		Key:     TODODelete_V22_2PebbleFormatSplitUserKeysMarkedCompacted,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 6},
-	},
-	{
-		Key:     TODODelete_V22_2EnsurePebbleFormatVersionRangeKeys,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 8},
-	},
-	{
-		Key:     TODODelete_V22_2EnablePebbleFormatVersionRangeKeys,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 10},
-	},
-	{
-		Key:     TODODelete_V22_2RemoveGrantPrivilege,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 14},
-	},
-	{
-		Key:     TODODelete_V22_2MVCCRangeTombstones,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 16},
-	},
-	{
-		Key:     TODODelete_V22_2SystemPrivilegesTable,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 24},
-	},
-	{
-		Key:     TODODelete_V22_2EnablePredicateProjectionChangefeed,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 26},
-	},
-	{
-		Key:     TODODelete_V22_2SystemExternalConnectionsTable,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 30},
-	},
-	{
-		Key:     TODODelete_V22_2RoleIDSequence,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 34},
-	},
-	{
-		Key:     TODODelete_V22_2AddSystemUserIDColumn,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 36},
-	},
-	{
-		Key:     TODODelete_V22_2SystemUsersIDColumnIsBackfilled,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 38},
-	},
-	{
-		Key:     TODODelete_V22_2SetSystemUsersUserIDColumnNotNull,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 40},
-	},
-	{
 		Key:     Permanent_V22_2SQLSchemaTelemetryScheduledJobs,
 		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 42},
-	},
-	{
-		Key:     TODODelete_V22_2SchemaChangeSupportsCreateFunction,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 44},
-	},
-	{
-		Key:     TODODelete_V22_2PebbleFormatPrePebblev1Marked,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 48},
-	},
-	{
-		Key:     TODODelete_V22_2RoleOptionsTableHasIDColumn,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 50},
-	},
-	{
-		Key:     TODODelete_V22_2RoleOptionsIDColumnIsBackfilled,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 52},
-	},
-	{
-		Key:     TODODelete_V22_2SetRoleOptionsUserIDColumnNotNull,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 54},
-	},
-	{
-		Key:     TODODelete_V22_2RangefeedUseOneStreamPerNode,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
-	},
-	{
-		Key:     TODODelete_V22_2TTLDistSQL,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 68},
-	},
-	{
-		Key:     TODODelete_V22_2PrioritizeSnapshots,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 70},
-	},
-	{
-		Key:     TODODelete_V22_2EnableLeaseUpgrade,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 72},
-	},
-	{
-		Key:     TODODelete_V22_2SupportAssumeRoleAuth,
-		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 74},
 	},
 	{
 		Key:     V22_2,
@@ -802,7 +633,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 30},
 	},
 	{
-		Key:     V23_1KeyVisualizerTablesAndJobs,
+		Key:     Permanent_V23_1KeyVisualizerTablesAndJobs,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 32},
 	},
 	{
@@ -814,7 +645,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 36},
 	},
 	{
-		Key:     V23_1_CreateJobsMetricsPollingJob,
+		Key:     Permanent_V23_1_CreateJobsMetricsPollingJob,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 38},
 	},
 	{
@@ -918,7 +749,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 88},
 	},
 	{
-		Key:     V23_1_CreateAutoConfigRunnerJob,
+		Key:     Permanent_V23_1_CreateAutoConfigRunnerJob,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 90},
 	},
 	{
@@ -934,7 +765,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 96},
 	},
 	{
-		Key:     V23_1ChangeSQLStatsTTL,
+		Key:     Permanent_V23_1ChangeSQLStatsTTL,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 98},
 	},
 	{
@@ -942,7 +773,7 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 100},
 	},
 	{
-		Key:     V23_1CreateSystemActivityUpdateJob,
+		Key:     Permanent_V23_1CreateSystemActivityUpdateJob,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 102},
 	},
 	{

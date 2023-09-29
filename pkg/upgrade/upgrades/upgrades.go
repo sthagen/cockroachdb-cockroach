@@ -85,19 +85,11 @@ var upgrades = []upgradebase.Upgrade{
 		updateSystemLocationData,
 		"update system.locations with default location data", // v22_2StartupMigrationName
 	),
-	// Introduced in v2.1.
-	// TODO(knz): bake this migration into v19.1.
 	upgrade.NewPermanentTenantUpgrade(
 		"create default databases",
 		toCV(clusterversion.VPrimordial6),
 		createDefaultDbs,
 		"create default databases", // v22_2StartupMigrationName
-	),
-	upgrade.NewTenantUpgrade(
-		"add the system.external_connections table",
-		toCV(clusterversion.TODODelete_V22_2SystemExternalConnectionsTable),
-		upgrade.NoPrecondition,
-		systemExternalConnectionsTableMigration,
 	),
 	upgrade.NewPermanentTenantUpgrade(
 		"add default SQL schema telemetry schedule",
@@ -163,7 +155,7 @@ var upgrades = []upgradebase.Upgrade{
 		alterSystemSQLInstancesAddSqlAddr,
 	),
 	upgrade.NewPermanentSystemUpgrade("add tables and jobs to support persisting key visualizer samples",
-		toCV(clusterversion.V23_1KeyVisualizerTablesAndJobs),
+		toCV(clusterversion.Permanent_V23_1KeyVisualizerTablesAndJobs),
 		keyVisualizerTablesMigration,
 		"initialize key visualizer tables and jobs",
 	),
@@ -173,7 +165,7 @@ var upgrades = []upgradebase.Upgrade{
 		deleteDescriptorsOfDroppedFunctions,
 	),
 	upgrade.NewPermanentTenantUpgrade("create jobs metrics polling job",
-		toCV(clusterversion.V23_1_CreateJobsMetricsPollingJob),
+		toCV(clusterversion.Permanent_V23_1_CreateJobsMetricsPollingJob),
 		createJobsMetricsPollingJob,
 		"create jobs metrics polling job",
 	),
@@ -266,7 +258,7 @@ var upgrades = []upgradebase.Upgrade{
 		createTaskSystemTables,
 	),
 	upgrade.NewPermanentTenantUpgrade("create auto config runner job",
-		toCV(clusterversion.V23_1_CreateAutoConfigRunnerJob),
+		toCV(clusterversion.Permanent_V23_1_CreateAutoConfigRunnerJob),
 		createAutoConfigRunnerJob,
 		"create auto config runner job",
 	),
@@ -284,7 +276,7 @@ var upgrades = []upgradebase.Upgrade{
 	),
 	upgrade.NewPermanentSystemUpgrade(
 		"change TTL for SQL Stats system tables",
-		toCV(clusterversion.V23_1ChangeSQLStatsTTL),
+		toCV(clusterversion.Permanent_V23_1ChangeSQLStatsTTL),
 		sqlStatsTTLChange,
 		"change TTL for SQL Stats system tables",
 	),
@@ -301,7 +293,7 @@ var upgrades = []upgradebase.Upgrade{
 	),
 	upgrade.NewPermanentTenantUpgrade(
 		"create sql activity updater job",
-		toCV(clusterversion.V23_1CreateSystemActivityUpdateJob),
+		toCV(clusterversion.Permanent_V23_1CreateSystemActivityUpdateJob),
 		createActivityUpdateJobMigration,
 		"create statement_activity and transaction_activity job",
 	),

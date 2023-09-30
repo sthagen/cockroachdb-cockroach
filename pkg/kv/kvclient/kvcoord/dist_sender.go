@@ -250,7 +250,7 @@ const (
 )
 
 var rangeDescriptorCacheSize = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"kv.range_descriptor_cache.size",
 	"maximum number of entries in the range descriptor cache",
 	1e6,
@@ -261,7 +261,7 @@ var rangeDescriptorCacheSize = settings.RegisterIntSetting(
 // senderConcurrencyLimit controls the maximum number of asynchronous send
 // requests.
 var senderConcurrencyLimit = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"kv.dist_sender.concurrency_limit",
 	"maximum number of asynchronous send requests",
 	max(defaultSenderConcurrency, int64(64*runtime.GOMAXPROCS(0))),
@@ -2653,10 +2653,10 @@ func (ds *DistSender) getLocalityComparison(
 
 	comparisonResult, regionErr, zoneErr := gatewayNodeDesc.Locality.CompareWithLocality(destinationNodeDesc.Locality)
 	if regionErr != nil {
-		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross region %v", regionErr)
+		log.VInfof(ctx, 5, "unable to determine if the given nodes are cross region %v", regionErr)
 	}
 	if zoneErr != nil {
-		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross zone %v", zoneErr)
+		log.VInfof(ctx, 5, "unable to determine if the given nodes are cross zone %v", zoneErr)
 	}
 	return comparisonResult
 }

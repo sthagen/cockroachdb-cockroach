@@ -100,6 +100,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scjob" // register jobs declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionprotectedts"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/ttl/ttljob"      // register jobs declared outside of pkg/sql
 	_ "github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlschedule" // register schedules declared outside of pkg/sql
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -665,6 +666,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 			jobsprotectedts.GetMetaType(jobsprotectedts.Schedules): jobsprotectedts.MakeStatusFunc(
 				jobRegistry, jobsprotectedts.Schedules,
 			),
+			sessionprotectedts.SessionMetaType: sessionprotectedts.MakeStatusFunc(),
 		},
 	})
 	if err != nil {
@@ -1110,6 +1112,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 			spanConfigKVAccessor:     spanConfig.kvAccessorForTenantRecords,
 			kvStoresIterator:         kvserver.MakeStoresIterator(node.stores),
 			inspectzServer:           inspectzServer,
+
+			notifyChangeToSystemVisibleSettings: tenantSettingsWatcher.SetAlternateDefaults,
 		},
 		SQLConfig:                &cfg.SQLConfig,
 		BaseConfig:               &cfg.BaseConfig,
@@ -2143,8 +2147,16 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		return err
 	}
 
-	if err := s.node.tenantSettingsWatcher.Start(workersCtx, s.sqlServer.execCfg.SystemTableIDResolver); err != nil {
-		return errors.Wrap(err, "failed to initialize the tenant settings watcher")
+	startSettingsWatcher := true
+	if serverKnobs := s.cfg.TestingKnobs.Server; serverKnobs != nil {
+		if serverKnobs.(*TestingKnobs).DisableSettingsWatcher {
+			startSettingsWatcher = false
+		}
+	}
+	if startSettingsWatcher {
+		if err := s.node.tenantSettingsWatcher.Start(workersCtx, s.sqlServer.execCfg.SystemTableIDResolver); err != nil {
+			return errors.Wrap(err, "failed to initialize the tenant settings watcher")
+		}
 	}
 	if err := s.tenantCapabilitiesWatcher.Start(ctx); err != nil {
 		return errors.Wrap(err, "initializing tenant capabilities")

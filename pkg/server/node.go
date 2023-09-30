@@ -218,7 +218,7 @@ This metric is thus not an indicator of KV health.`,
 var (
 	// graphiteEndpoint is host:port, if any, of Graphite metrics server.
 	graphiteEndpoint = settings.RegisterStringSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		"external.graphite.endpoint",
 		"if nonempty, push server metrics to the Graphite or Carbon server at the specified host:port",
 		"",
@@ -226,7 +226,7 @@ var (
 
 	// graphiteInterval is how often metrics are pushed to Graphite, if enabled.
 	graphiteInterval = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		graphiteIntervalKey,
 		"the interval at which metrics are pushed to Graphite (if enabled)",
 		10*time.Second,
@@ -1385,23 +1385,23 @@ func (n *Node) getLocalityComparison(
 ) roachpb.LocalityComparisonType {
 	gossip := n.storeCfg.Gossip
 	if gossip == nil {
-		log.VEventf(ctx, 2, "gossip is not configured")
+		log.VInfof(ctx, 2, "gossip is not configured")
 		return roachpb.LocalityComparisonType_UNDEFINED
 	}
 
 	gatewayNodeDesc, err := gossip.GetNodeDescriptor(gatewayNodeID)
 	if err != nil {
-		log.VEventf(ctx, 2,
+		log.VInfof(ctx, 2,
 			"failed to perform look up for node descriptor %v", err)
 		return roachpb.LocalityComparisonType_UNDEFINED
 	}
 
 	comparisonResult, regionErr, zoneErr := n.Descriptor.Locality.CompareWithLocality(gatewayNodeDesc.Locality)
 	if regionErr != nil {
-		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross region %v", regionErr)
+		log.VInfof(ctx, 5, "unable to determine if the given nodes are cross region %v", regionErr)
 	}
 	if zoneErr != nil {
-		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross zone %v", zoneErr)
+		log.VInfof(ctx, 5, "unable to determine if the given nodes are cross zone %v", zoneErr)
 	}
 
 	return comparisonResult

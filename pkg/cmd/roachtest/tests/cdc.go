@@ -981,6 +981,10 @@ func runCDCKafkaAuth(ctx context.Context, t test.Test, c cluster.Cluster) {
 			"create changefeed with TLS transport and SASL/SCRAM-SHA-512",
 			fmt.Sprintf("%s?tls_enabled=true&ca_cert=%s&sasl_enabled=true&sasl_user=scram512&sasl_password=scram512-secret&sasl_mechanism=SCRAM-SHA-512", saslURL, caCert),
 		},
+		{
+			"create changefeed with confluent-cloud scheme",
+			fmt.Sprintf("%s&api_key=plain&api_secret=plain-secret", kafka.sinkURLAsConfluentCloudUrl(ctx)),
+		},
 	}
 
 	for _, f := range feeds {
@@ -1064,6 +1068,11 @@ func registerCDC(r registry.Registry) {
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			vmoduleLevel = 1
+			defer func() {
+				vmoduleLevel = 0
+			}()
+
 			ct := newCDCTester(ctx, t, c)
 			defer ct.Close()
 
@@ -2286,6 +2295,20 @@ func (k kafkaManager) sinkURLSASL(ctx context.Context) string {
 		k.t.Fatal(err)
 	}
 	return `kafka://` + ips[0] + `:9094`
+}
+
+// sinkURLAsConfluentCloudUrl allows the test to connect to the kafka brokers
+// as if it was connecting to kafka hosted in confluent cloud.
+func (k kafkaManager) sinkURLAsConfluentCloudUrl(ctx context.Context) string {
+	ips, err := k.c.InternalIP(ctx, k.t.L(), k.nodes)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	// Confluent cloud does not use TLS 1.2 and instead uses PLAIN username/password
+	// authentication (see https://docs.confluent.io/platform/current/security/security_tutorial.html#overview).
+	// Because the kafka manager has certs configured, connecting without a ca_cert will raise an error.
+	// To connect without a cert, we set insecure_tls_skip_verify=true.
+	return `confluent-cloud://` + ips[0] + `:9094?insecure_tls_skip_verify=true`
 }
 
 func (k kafkaManager) sinkURLOAuth(ctx context.Context, creds clientcredentials.Config) string {

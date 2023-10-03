@@ -1338,6 +1338,13 @@ func TestLogic_pgoidtype(
 	runLogicTest(t, "pgoidtype")
 }
 
+func TestLogic_plpgsql_builtins(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "plpgsql_builtins")
+}
+
 func TestLogic_plpgsql_cursor(
 	t *testing.T,
 ) {
@@ -1399,6 +1406,13 @@ func TestLogic_procedure_plpgsql(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "procedure_plpgsql")
+}
+
+func TestLogic_procedure_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure_privileges")
 }
 
 func TestLogic_propagate_input_ordering(

@@ -176,6 +176,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.RetryOptions = params.RetryOptions
 	cfg.Locality = params.Locality
 	cfg.StartDiagnosticsReporting = params.StartDiagnosticsReporting
+	cfg.DisableSQLServer = params.DisableSQLServer
 	if params.TraceDir != "" {
 		if err := initTraceDir(params.TraceDir); err == nil {
 			cfg.InflightTraceDirName = params.TraceDir
@@ -583,6 +584,10 @@ func (ts *testServer) maybeStartDefaultTestTenant(ctx context.Context) error {
 	// it here.
 	if ts.params.DefaultTestTenant.TestTenantAlwaysDisabled() {
 		return nil
+	}
+
+	if ts.params.DisableSQLServer {
+		return serverutils.PreventDisableSQLForTenantError()
 	}
 
 	tenantSettings := cluster.MakeTestingClusterSettings()
@@ -1154,7 +1159,6 @@ func (ts *testServer) StartSharedProcessTenant(
 	}
 	tenantExists := tenantRow != nil
 
-	justCreated := false
 	var tenantID roachpb.TenantID
 	if tenantExists {
 		// A tenant with the given name already exists; let's check that
@@ -1167,7 +1171,6 @@ func (ts *testServer) StartSharedProcessTenant(
 		tenantID = roachpb.MustMakeTenantID(id)
 	} else {
 		// The tenant doesn't exist; let's create it.
-		justCreated = true
 		if args.TenantID.IsSet() {
 			// Create with name and ID.
 			_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
@@ -1200,19 +1203,17 @@ func (ts *testServer) StartSharedProcessTenant(
 		}
 	}
 
-	if justCreated {
-		// Also mark it for shared-process execution.
-		_, err := ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
-			ctx,
-			"start-tenant-shared-service",
-			nil, /* txn */
-			sessiondata.NodeUserSessionDataOverride,
-			"ALTER TENANT $1 START SERVICE SHARED",
-			args.TenantName,
-		)
-		if err != nil {
-			return nil, nil, err
-		}
+	// Also mark it for shared-process execution.
+	_, err = ts.InternalExecutor().(*sql.InternalExecutor).ExecEx(
+		ctx,
+		"start-tenant-shared-service",
+		nil, /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		"ALTER TENANT $1 START SERVICE SHARED",
+		args.TenantName,
+	)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Wait for the rangefeed to catch up.

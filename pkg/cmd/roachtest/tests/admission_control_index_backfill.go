@@ -37,6 +37,7 @@ func registerIndexBackfill(r registry.Registry) {
 		spec.Cloud(spec.GCE),
 	)
 	clusterSpec.InstanceType = "n2-standard-8"
+	clusterSpec.GCEMinCPUPlatform = "Intel Ice Lake"
 	clusterSpec.GCEVolumeType = "pd-ssd"
 
 	r.Add(registry.TestSpec{
@@ -45,11 +46,14 @@ func registerIndexBackfill(r registry.Registry) {
 		Owner:            registry.OwnerAdmissionControl,
 		Benchmark:        true,
 		CompatibleClouds: registry.AllExceptAWS,
-		Suites:           registry.Suites(registry.Weekly),
-		Tags:             registry.Tags(`weekly`),
-		Cluster:          clusterSpec,
-		RequiresLicense:  true,
-		SnapshotPrefix:   "index-backfill-tpce-100k",
+		Suites:           registry.ManualOnly,
+		Tags:             registry.Tags(`manual`),
+		// TODO(aaditya): Revisit this as part of #111614.
+		//Suites:           registry.Suites(registry.Weekly),
+		//Tags:             registry.Tags(`weekly`),
+		Cluster:         clusterSpec,
+		RequiresLicense: true,
+		SnapshotPrefix:  "index-backfill-tpce-100k",
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			crdbNodes := c.Spec().NodeCount - 1
 			workloadNode := c.Spec().NodeCount

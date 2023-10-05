@@ -1317,13 +1317,6 @@ func TestLogic_pg_extension(
 	runLogicTest(t, "pg_extension")
 }
 
-func TestLogic_pg_lsn_mixed(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "pg_lsn_mixed")
-}
-
 func TestLogic_pgcrypto_builtins(
 	t *testing.T,
 ) {
@@ -1420,13 +1413,6 @@ func TestLogic_propagate_input_ordering(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "propagate_input_ordering")
-}
-
-func TestLogic_raise(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "raise")
 }
 
 func TestLogic_reassign_owned_by(

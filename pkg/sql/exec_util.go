@@ -127,7 +127,7 @@ import (
 
 // ClusterOrganization is the organization name.
 var ClusterOrganization = settings.RegisterStringSetting(
-	settings.ApplicationLevel,
+	settings.SystemVisible,
 	"cluster.organization",
 	"organization name",
 	"",
@@ -144,11 +144,22 @@ func ClusterIsInternal(sv *settings.Values) bool {
 var ClusterSecret = settings.RegisterStringSetting(
 	settings.ApplicationLevel,
 	"cluster.secret",
-	"cluster specific secret",
+	"cluster specific secret, used to anonymize telemetry reports",
 	"",
 	// Even though string settings are non-reportable by default, we
 	// still mark them explicitly in case a future code change flips the
 	// default.
+	settings.WithReportable(false),
+)
+
+// ClusterLabel is an application-level free-form string that is not
+// used by CockroachDB. It can be used by end-users to label their
+// clusters.
+var _ = settings.RegisterStringSetting(
+	settings.ApplicationLevel,
+	"cluster.label",
+	"cluster specific free-form label",
+	"",
 	settings.WithReportable(false),
 )
 
@@ -1603,8 +1614,9 @@ type ExecutorTestingKnobs struct {
 	// DistSQLReceiverPushCallbackFactory, if set, will be called every time a
 	// DistSQLReceiver is created for a new query execution, and it should
 	// return, possibly nil, a callback that will be called every time
-	// DistSQLReceiver.Push or DistSQLReceiver.PushBatch is called.
-	DistSQLReceiverPushCallbackFactory func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata)
+	// DistSQLReceiver.Push or DistSQLReceiver.PushBatch is called. Possibly
+	// updated arguments are returned.
+	DistSQLReceiverPushCallbackFactory func(query string) func(rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata) (rowenc.EncDatumRow, coldata.Batch, *execinfrapb.ProducerMetadata)
 
 	// OnTxnRetry, if set, will be called if there is a transaction retry.
 	OnTxnRetry func(autoRetryReason error, evalCtx *eval.Context)

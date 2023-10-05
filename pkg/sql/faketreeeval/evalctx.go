@@ -338,6 +338,18 @@ func (*DummyEvalPlanner) GenUniqueCursorName() tree.Name {
 	return ""
 }
 
+// PLpgSQLCloseCursor is part of the eval.Planner interface.
+func (*DummyEvalPlanner) PLpgSQLCloseCursor(_ tree.Name) error {
+	return errors.WithStack(errEvalPlanner)
+}
+
+// PLpgSQLFetchCursor is part of the Planner interface.
+func (*DummyEvalPlanner) PLpgSQLFetchCursor(
+	context.Context, *tree.CursorStmt,
+) (tree.Datums, error) {
+	return nil, errors.WithStack(errEvalPlanner)
+}
+
 var _ eval.Planner = &DummyEvalPlanner{}
 
 var errEvalPlanner = pgerror.New(pgcode.ScalarOperationCannotRunWithoutFullSessionContext,
@@ -523,6 +535,11 @@ func (ep *DummyEvalPlanner) GetDetailsForSpanStats(
 
 // MaybeReallocateAnnotations is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
+}
+
+// AutoCommit is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) AutoCommit() bool {
+	return false
 }
 
 // DummyPrivilegedAccessor implements the tree.PrivilegedAccessor interface by returning errors.

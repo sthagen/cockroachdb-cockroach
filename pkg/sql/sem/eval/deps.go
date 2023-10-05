@@ -415,6 +415,20 @@ type Planner interface {
 	// the current list of cursors and portals. It is used to implement PLpgSQL
 	// OPEN statements when used with an unnamed cursor.
 	GenUniqueCursorName() tree.Name
+
+	// PLpgSQLCloseCursor closes the cursor with the given name, returning an
+	// error if the cursor doesn't exist. It is used to implement the PLpgSQL
+	// CLOSE statement.
+	PLpgSQLCloseCursor(cursorName tree.Name) error
+
+	// PLpgSQLFetchCursor returns the next row from the cursor with the given
+	// name, if any. It returns nil if no such row exists. Used to implement the
+	// PLpgSQL FETCH statement.
+	PLpgSQLFetchCursor(ctx context.Context, cursor *tree.CursorStmt) (res tree.Datums, err error)
+
+	// AutoCommit indicates whether the Planner has flagged the current statement
+	// as eligible for transaction auto-commit.
+	AutoCommit() bool
 }
 
 // InternalRows is an iterator interface that's exposed by the internal

@@ -404,6 +404,7 @@ func newInternalPlanner(
 	p.semaCtx.NameResolver = p
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
+	p.semaCtx.UnsupportedTypeChecker = eval.NewUnsupportedTypeChecker(execCfg.Settings.Version)
 
 	plannerMon := mon.NewMonitor(redact.Sprintf("internal-planner.%s.%s", user, opName),
 		mon.MemoryResource,
@@ -903,6 +904,7 @@ func (p *planner) resetPlanner(
 	p.semaCtx.NameResolver = p
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
+	p.semaCtx.UnsupportedTypeChecker = eval.NewUnsupportedTypeChecker(p.execCfg.Settings.Version)
 
 	p.autoCommit = false
 
@@ -980,4 +982,9 @@ func (p *planner) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) 
 // Optimizer is part of the eval.Planner interface.
 func (p *planner) Optimizer() interface{} {
 	return p.optPlanningCtx.Optimizer()
+}
+
+// AutoCommit is part of the eval.Planner interface.
+func (p *planner) AutoCommit() bool {
+	return p.autoCommit
 }

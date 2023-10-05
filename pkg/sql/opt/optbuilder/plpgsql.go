@@ -528,11 +528,6 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			// This is handled by calling the plpgsql_open_cursor internal builtin
 			// function in a separate body statement that returns no results, similar
 			// to the RAISE implementation.
-			if b.hasExceptionBlock {
-				panic(unimplemented.New("open with exception block",
-					"opening a cursor in a routine with an exception block is not yet supported",
-				))
-			}
 			if t.Scroll == tree.Scroll {
 				panic(unimplemented.NewWithIssue(77102, "DECLARE SCROLL CURSOR"))
 			}
@@ -580,6 +575,100 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			nameScope := b.buildCursorNameGen(&nameCon, t.CurVar)
 			b.appendBodyStmt(&nameCon, b.callContinuation(&openCon, nameScope))
 			return b.callContinuation(&nameCon, s)
+
+		case *ast.Close:
+			// CLOSE statements close the cursor with the name supplied by a PLpgSQL
+			// variable. The crdb_internal.plpgsql_close builtin function handles
+			// closing the cursor. Build a volatile (non-inlinable) continuation
+			// that calls the builtin function.
+			closeCon := b.makeContinuation("_stmt_close")
+			closeCon.def.Volatility = volatility.Volatile
+			const closeFnName = "crdb_internal.plpgsql_close"
+			props, overloads := builtinsregistry.GetBuiltinProperties(closeFnName)
+			if len(overloads) != 1 {
+				panic(errors.AssertionFailedf("expected one overload for %s", closeFnName))
+			}
+			_, source, _, err := closeCon.s.FindSourceProvidingColumn(b.ob.ctx, t.CurVar)
+			if err != nil {
+				if pgerror.GetPGCode(err) == pgcode.UndefinedColumn {
+					panic(pgerror.Newf(pgcode.Syntax, "\"%s\" is not a known variable", t.CurVar))
+				}
+				panic(err)
+			}
+			if !source.(*scopeColumn).typ.Equivalent(types.String) {
+				panic(pgerror.Newf(pgcode.DatatypeMismatch,
+					"variable \"%s\" must be of type cursor or refcursor", t.CurVar,
+				))
+			}
+			closeCall := b.ob.factory.ConstructFunction(
+				memo.ScalarListExpr{b.ob.factory.ConstructVariable(source.(*scopeColumn).id)},
+				&memo.FunctionPrivate{
+					Name:       closeFnName,
+					Typ:        types.Int,
+					Properties: props,
+					Overload:   &overloads[0],
+				},
+			)
+			closeColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_close"))
+			closeScope := closeCon.s.push()
+			b.ensureScopeHasExpr(closeScope)
+			b.ob.synthesizeColumn(closeScope, closeColName, types.Int, nil /* expr */, closeCall)
+			b.ob.constructProjectForScope(closeCon.s, closeScope)
+			b.appendBodyStmt(&closeCon, closeScope)
+			b.appendPlpgSQLStmts(&closeCon, stmts[i+1:])
+			return b.callContinuation(&closeCon, s)
+
+		case *ast.Fetch:
+			// FETCH and MOVE statements are used to shift the position of a SQL
+			// cursor and (for FETCH statements) retrieve a row from the cursor and
+			// assign it to one or more PLpgSQL variables. MOVE statements have no
+			// result, only side effects, so they are built into a separate body
+			// statement. FETCH statements can mutate PLpgSQL variables, so they are
+			// handled similarly to SELECT ... INTO statements - see above.
+			//
+			// All cursor interactions are handled by the crdb_internal.plpgsql_fetch
+			// builtin function.
+			if !t.IsMove {
+				if t.Cursor.FetchType == tree.FetchAll || t.Cursor.FetchType == tree.FetchBackwardAll {
+					panic(pgerror.New(
+						pgcode.FeatureNotSupported, "FETCH statement cannot return multiple rows",
+					))
+				}
+			}
+			fetchCon := b.makeContinuation("_stmt_fetch")
+			fetchCon.def.Volatility = volatility.Volatile
+			fetchScope := b.buildFetch(fetchCon.s, t)
+			if t.IsMove {
+				b.appendBodyStmt(&fetchCon, fetchScope)
+				b.appendPlpgSQLStmts(&fetchCon, stmts[i+1:])
+				return b.callContinuation(&fetchCon, s)
+			}
+			// crdb_internal.plpgsql_fetch will return a tuple with the results of the
+			// FETCH call. Project each element as a PLpgSQL variable. The number of
+			// elements returned is equal to the length of the target list
+			// (padded with NULLs), so we can assume each target variable has a
+			// corresponding element.
+			fetchCol := fetchScope.cols[0].id
+			intoScope := fetchScope.push()
+			for j := range t.Target {
+				typ := b.resolveVariableForAssign(t.Target[j])
+				colName := scopeColName(t.Target[j])
+				scalar := b.ob.factory.ConstructColumnAccess(
+					b.ob.factory.ConstructVariable(fetchCol),
+					memo.TupleOrdinal(j),
+				)
+				b.ob.synthesizeColumn(intoScope, colName, typ, nil /* expr */, scalar)
+			}
+			b.ob.constructProjectForScope(fetchScope, intoScope)
+
+			// Call a continuation for the remaining PLpgSQL statements from the newly
+			// built statement that has updated variables. Then, call the fetch
+			// continuation from the parent scope.
+			retCon := b.makeContinuation("_stmt_exec_ret")
+			b.appendPlpgSQLStmts(&retCon, stmts[i+1:])
+			intoScope = b.callContinuation(&retCon, intoScope)
+			b.appendBodyStmt(&fetchCon, intoScope)
+			return b.callContinuation(&fetchCon, s)
 
 		default:
 			panic(unimplemented.New(
@@ -998,6 +1087,65 @@ func (b *plpgsqlBuilder) buildEndOfFunctionRaise(inScope *scope) *scope {
 	b.ob.synthesizeColumn(eofScope, eofColName, b.returnType, nil /* expr */, memo.NullSingleton)
 	b.ob.constructProjectForScope(inScope, eofScope)
 	return b.callContinuation(&con, inScope)
+}
+
+// buildFetch projects a call to the crdb_internal.plpgsql_fetch builtin
+// function, which handles cursors for the PLpgSQL FETCH and MOVE statements.
+func (b *plpgsqlBuilder) buildFetch(s *scope, fetch *ast.Fetch) *scope {
+	const fetchFnName = "crdb_internal.plpgsql_fetch"
+	props, overloads := builtinsregistry.GetBuiltinProperties(fetchFnName)
+	if len(overloads) != 1 {
+		panic(errors.AssertionFailedf("expected one overload for %s", fetchFnName))
+	}
+	_, source, _, err := s.FindSourceProvidingColumn(b.ob.ctx, fetch.Cursor.Name)
+	if err != nil {
+		if pgerror.GetPGCode(err) == pgcode.UndefinedColumn {
+			panic(pgerror.Newf(pgcode.Syntax, "\"%s\" is not a known variable", fetch.Cursor.Name))
+		}
+		panic(err)
+	}
+	makeConst := func(val tree.Datum, typ *types.T) opt.ScalarExpr {
+		return b.ob.factory.ConstructConstVal(val, typ)
+	}
+	// For a FETCH statement, we have to pass the expected result types.
+	var typs []*types.T
+	var elems []opt.ScalarExpr
+	if !fetch.IsMove {
+		typs = make([]*types.T, len(fetch.Target))
+		elems = make([]opt.ScalarExpr, len(fetch.Target))
+		for i := range fetch.Target {
+			typ := b.resolveVariableForAssign(fetch.Target[i])
+			typs[i] = typ
+			elems[i] = b.ob.factory.ConstructConstVal(tree.DNull, typ)
+		}
+	}
+	returnType := types.MakeTuple(typs)
+
+	// The arguments are:
+	//   1. The name of the cursor (resolved at runtime).
+	//   2. The direction of the cursor (FIRST, RELATIVE).
+	//   3. The count of the cursor direction (FORWARD 1, RELATIVE 5).
+	//   4. The types of the columns to return (can be empty).
+	// The result of the fetch will be cast to strings and returned as an array.
+	fetchCall := b.ob.factory.ConstructFunction(
+		memo.ScalarListExpr{
+			b.ob.factory.ConstructVariable(source.(*scopeColumn).id),
+			makeConst(tree.NewDInt(tree.DInt(fetch.Cursor.FetchType)), types.Int),
+			makeConst(tree.NewDInt(tree.DInt(fetch.Cursor.Count)), types.Int),
+			b.ob.factory.ConstructTuple(elems, returnType),
+		},
+		&memo.FunctionPrivate{
+			Name:       fetchFnName,
+			Typ:        returnType,
+			Properties: props,
+			Overload:   &overloads[0],
+		},
+	)
+	fetchColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_fetch"))
+	fetchScope := s.push()
+	b.ob.synthesizeColumn(fetchScope, fetchColName, returnType, nil /* expr */, fetchCall)
+	b.ob.constructProjectForScope(s, fetchScope)
+	return fetchScope
 }
 
 // makeContinuation allocates a new continuation routine with an uninitialized

@@ -1465,13 +1465,6 @@ func TestTenantLogic_propagate_input_ordering(
 	runLogicTest(t, "propagate_input_ordering")
 }
 
-func TestTenantLogic_raise(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "raise")
-}
-
 func TestTenantLogic_read_committed(
 	t *testing.T,
 ) {
@@ -1498,6 +1491,13 @@ func TestTenantLogic_redact_descriptor(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "redact_descriptor")
+}
+
+func TestTenantLogic_refcursor(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "refcursor")
 }
 
 func TestTenantLogic_rename_atomic(

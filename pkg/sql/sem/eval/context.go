@@ -442,6 +442,18 @@ func (p *fakePlannerWithMonitor) Optimizer() interface{} {
 	return nil
 }
 
+// PLpgSQLFetchCursor is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) PLpgSQLFetchCursor(
+	ctx context.Context, cursorStmt *tree.CursorStmt,
+) (res tree.Datums, err error) {
+	return nil, nil
+}
+
+// AutoCommit is part of the eval.Planner interface.
+func (p *fakePlannerWithMonitor) AutoCommit() bool {
+	return false
+}
+
 type fakeStreamManagerFactory struct {
 	StreamManagerFactory
 }

@@ -1879,7 +1879,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-index.html`,
 					// Also fill in indoption for each column to indicate if the index
 					// is ASC/DESC and if nulls appear first/last.
 					collationOids := tree.NewDArray(types.Oid)
-					indoption := tree.NewDArray(types.Int)
+					indoption := tree.NewDArray(types.Int2)
 
 					colAttNums := make([]descpb.ColumnID, 0, index.NumKeyColumns())
 					exprs := make([]string, 0, index.NumKeyColumns())
@@ -2696,7 +2696,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 				if funcdesc.IsOIDUserDefinedFunc(ooid) {
 					fnDesc, err := p.Descriptors().ByID(p.Txn()).WithoutNonPublic().Get().Function(ctx, funcdesc.UserDefinedFunctionOIDToID(ooid))
 					if err != nil {
-						if errors.Is(err, tree.ErrFunctionUndefined) {
+						if errors.Is(err, tree.ErrRoutineUndefined) {
 							return false, nil //nolint:returnerrcheck
 						}
 						return false, err
@@ -2719,7 +2719,7 @@ https://www.postgresql.org/docs/9.5/catalog-pg-proc.html`,
 				} else {
 					name, _, err := p.ResolveFunctionByOID(ctx, ooid)
 					if err != nil {
-						if errors.Is(err, tree.ErrFunctionUndefined) {
+						if errors.Is(err, tree.ErrRoutineUndefined) {
 							return false, nil //nolint:returnerrcheck
 						}
 						return false, err

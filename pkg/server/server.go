@@ -1221,6 +1221,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		&systemServerWrapper{server: lateBoundServer},
 		systemTenantNameContainer,
 		pgPreServer.SendRoutingError,
+		tenantCapabilitiesWatcher,
 	)
 	drain.serverCtl = sc
 
@@ -1552,7 +1553,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
 	pgL, loopbackPgL, rpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(
-		ctx, workersCtx, s.cfg.BaseConfig, s.stopper, s.grpc, true /* enableSQLListener */)
+		ctx, workersCtx, s.cfg.BaseConfig,
+		s.stopper, s.grpc, ListenAndUpdateAddrs, true /* enableSQLListener */)
 	if err != nil {
 		return err
 	}

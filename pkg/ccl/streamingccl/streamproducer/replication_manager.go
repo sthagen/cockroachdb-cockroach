@@ -34,9 +34,9 @@ type replicationStreamManagerImpl struct {
 
 // StartReplicationStream implements streaming.ReplicationStreamManager interface.
 func (r *replicationStreamManagerImpl) StartReplicationStream(
-	ctx context.Context, tenantName roachpb.TenantName,
+	ctx context.Context, tenantName roachpb.TenantName, req streampb.ReplicationProducerRequest,
 ) (streampb.ReplicationProducerSpec, error) {
-	return startReplicationProducerJob(ctx, r.evalCtx, r.txn, tenantName)
+	return startReplicationProducerJob(ctx, r.evalCtx, r.txn, tenantName, req)
 }
 
 // HeartbeatReplicationStream implements streaming.ReplicationStreamManager interface.
@@ -94,7 +94,7 @@ func newReplicationStreamManagerWithPrivilegesCheck(
 		execCfg.Settings, execCfg.NodeInfo.LogicalClusterID(), "REPLICATION")
 	if enterpriseCheckErr != nil {
 		return nil, pgerror.Wrap(enterpriseCheckErr,
-			pgcode.InsufficientPrivilege, "physical replication requires an enterprise license on the primary (and secondary) cluster")
+			pgcode.CCLValidLicenseRequired, "physical replication requires an enterprise license on the primary (and secondary) cluster")
 	}
 
 	return &replicationStreamManagerImpl{evalCtx: evalCtx, txn: txn, sessionID: sessionID}, nil

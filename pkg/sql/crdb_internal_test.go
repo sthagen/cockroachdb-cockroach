@@ -950,6 +950,7 @@ func TestTxnContentionEventsTableWithRangeDescriptor(t *testing.T) {
 		WaitingTxnFingerprintID:  9002,
 		WaitingStmtID:            clusterunique.ID{Uint128: uint128.Uint128{Lo: 9003, Hi: 1004}},
 		WaitingStmtFingerprintID: 9004,
+		ContentionType:           contentionpb.ContentionType_LOCK_WAIT,
 	})
 
 	// Contention flush can take some time to flush
@@ -1293,7 +1294,7 @@ func TestExecutionInsights(t *testing.T) {
 				}()
 
 				// Connect to the cluster as the test user.
-				tdb := s.SQLConnForUser(t, "testuser", "")
+				tdb := s.SQLConn(t, serverutils.User("testuser"))
 
 				// Try to read the virtual table, and see that we can or cannot as expected.
 				rows, err := tdb.Query(fmt.Sprintf("SELECT count(*) FROM crdb_internal.%s", table))

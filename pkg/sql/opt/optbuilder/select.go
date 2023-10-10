@@ -146,6 +146,16 @@ func (b *Builder) buildDataSource(
 		switch t := ds.(type) {
 		case cat.Table:
 			tabMeta := b.addTable(t, &resName)
+			locking := lockCtx.locking
+			if locking.isSet() {
+				lb := newLockBuilder(tabMeta)
+				for _, item := range locking {
+					item.builders = append(item.builders, lb)
+				}
+			}
+			if b.shouldBuildLockOp() {
+				locking = nil
+			}
 			return b.buildScan(
 				tabMeta,
 				tableOrdinals(t, columnKinds{
@@ -153,7 +163,7 @@ func (b *Builder) buildDataSource(
 					includeSystem:    true,
 					includeInverted:  false,
 				}),
-				indexFlags, lockCtx.locking, inScope,
+				indexFlags, locking, inScope,
 				false, /* disableNotVisibleIndex */
 			)
 
@@ -459,7 +469,15 @@ func (b *Builder) buildScanFromTableRef(
 
 	tn := tree.MakeUnqualifiedTableName(tab.Name())
 	tabMeta := b.addTable(tab, &tn)
-
+	if locking.isSet() {
+		lb := newLockBuilder(tabMeta)
+		for _, item := range locking {
+			item.builders = append(item.builders, lb)
+		}
+	}
+	if b.shouldBuildLockOp() {
+		locking = nil
+	}
 	return b.buildScan(
 		tabMeta, ordinals, indexFlags, locking, inScope, false, /* disableNotVisibleIndex */
 	)
@@ -700,19 +718,23 @@ func (b *Builder) buildScan(
 	}
 	if locking.isSet() {
 		private.Locking = locking.get()
-		// Under weaker isolation levels we use fully-durable locks for SELECT FOR
-		// UPDATE statements, SELECT FOR SHARE statements, and constraint checks
-		// (e.g. FK checks), regardless of locking strength and wait policy. Unlike
-		// mutation statements, SELECT FOR UPDATE statements do not lay down
-		// intents, so we cannot rely on the durability of intents to guarantee
-		// exclusion until commit as we do for mutation statements. And unlike
-		// serializable isolation, weaker isolation levels do not perform read
-		// refreshing, so we cannot rely on read refreshing to guarantee exclusion.
-		//
-		// We set guaranteed durability here and then remove it in execbuilder if
-		// necessary, to allow for preparing and execution of statements in
-		// different isolation levels.
-		private.Locking.Durability = tree.LockDurabilityGuaranteed
+		if b.shouldUseGuaranteedDurability() {
+			// Under weaker isolation levels we use fully-durable locks for SELECT FOR
+			// UPDATE statements, SELECT FOR SHARE statements, and constraint checks
+			// (e.g. FK checks), regardless of locking strength and wait policy.
+			// Unlike mutation statements, SELECT FOR UPDATE statements do not lay
+			// down intents, so we cannot rely on the durability of intents to
+			// guarantee exclusion until commit as we do for mutation statements. And
+			// unlike serializable isolation, weaker isolation levels do not perform
+			// read refreshing, so we cannot rely on read refreshing to guarantee
+			// exclusion.
+			//
+			// Under serializable isolation we only use fully-durable locks if
+			// enable_durable_locking_for_serializable is set. (Serializable isolation
+			// does not require locking for correctness, so by default we use
+			// best-effort locks for better performance.)
+			private.Locking.Durability = tree.LockDurabilityGuaranteed
+		}
 		if private.Locking.WaitPolicy == tree.LockWaitSkipLocked && tab.FamilyCount() > 1 {
 			// TODO(rytaft): We may be able to support this if enough columns are
 			// pruned that only a single family is scanned.
@@ -1150,11 +1172,15 @@ func (b *Builder) buildSelectStmtWithoutParens(
 		b.buildLimit(limit, inScope, outScope)
 	}
 
-	// Remove locking items from scope, and validate that they were found within
-	// the FROM clause.
+	// Remove locking items from scope, validate that they were found within the
+	// FROM clause, and build them.
 	for range lockingClause {
 		item := lockCtx.pop()
 		item.validate()
+		if b.shouldBuildLockOp() {
+			// TODO(michae2): Combine multiple buildLock calls for the same table.
+			b.buildLocking(item, outScope)
+		}
 	}
 
 	// TODO(rytaft): Support FILTER expression.
@@ -1195,6 +1221,7 @@ func (b *Builder) buildSelectClause(
 	orderByScope := b.analyzeOrderBy(orderBy, fromScope, projectionsScope,
 		exprKindOrderBy, tree.RejectGenerators)
 	distinctOnScope := b.analyzeDistinctOnArgs(sel.DistinctOn, fromScope, projectionsScope)
+	lockScope := b.analyzeLockArgs(lockCtx, fromScope, projectionsScope)
 
 	var having opt.ScalarExpr
 	needsAgg := b.needsAggregation(sel, fromScope)
@@ -1209,6 +1236,7 @@ func (b *Builder) buildSelectClause(
 	b.buildProjectionList(fromScope, projectionsScope)
 	b.buildOrderBy(fromScope, projectionsScope, orderByScope)
 	b.buildDistinctOnArgs(fromScope, projectionsScope, distinctOnScope)
+	b.buildLockArgs(fromScope, projectionsScope, lockScope)
 	b.buildProjectSet(fromScope)
 
 	if needsAgg {

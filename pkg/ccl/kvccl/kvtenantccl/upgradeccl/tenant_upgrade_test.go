@@ -11,6 +11,7 @@ package upgradeccl_test
 import (
 	"context"
 	gosql "database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -21,17 +22,232 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTenantAutoUpgradeRespectsAutoUpgradeEnabledSetting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t)
+
+	// v0 is hard-coded because at clusterversion.TestingBinaryMinSupportedVersion is `v22.2` at the
+	// time of typing and it does not support shared process tenants. We should update v0 to be
+	// clusterversion.TestingBinaryMinSupportedVersion when it is bumped to `v23.1`.
+	v0 := clusterversion.V23_1
+	ctx := context.Background()
+	settings := cluster.MakeTestingClusterSettingsWithVersions(
+		clusterversion.TestingBinaryVersion,
+		clusterversion.ByKey(v0),
+		false, // initializeVersion
+	)
+	// Initialize the version to v0.
+	require.NoError(t, clusterversion.Initialize(ctx,
+		clusterversion.ByKey(v0), &settings.SV))
+
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		Settings:          settings,
+		Knobs: base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				DisableAutomaticVersionUpgrade: make(chan struct{}),
+				BinaryVersionOverride:          clusterversion.ByKey(v0),
+				BootstrapVersionKeyOverride:    v0,
+			},
+			SQLEvalContext: &eval.TestingKnobs{
+				// When the host binary version is not equal to its cluster version, tenant logical version is set
+				// to the host's minimum supported binary version. We need this override to ensure that the tenant is
+				// created at v0.
+				TenantLogicalVersionKeyOverride: v0,
+			},
+		},
+	})
+	defer ts.Stopper().Stop(ctx)
+	sysDB := sqlutils.MakeSQLRunner(ts.SQLConn(t, serverutils.DBName("")))
+
+	expectedInitialTenantVersion := clusterversion.ByKey(v0)
+
+	tenantSettings := cluster.MakeTestingClusterSettingsWithVersions(
+		clusterversion.TestingBinaryVersion,
+		clusterversion.ByKey(v0),
+		false, // initializeVersion
+	)
+	require.NoError(t, clusterversion.Initialize(ctx,
+		expectedInitialTenantVersion, &tenantSettings.SV))
+
+	upgradeInfoCh := make(chan struct {
+		Status    int
+		UpgradeTo roachpb.Version
+	}, 1)
+	mkTenant := func(t *testing.T, name string) (tenantDB *gosql.DB) {
+		tenantArgs := base.TestSharedProcessTenantArgs{
+			TenantName: roachpb.TenantName(name),
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					TenantAutoUpgradeInfo:       upgradeInfoCh,
+					BootstrapVersionKeyOverride: v0,
+					BinaryVersionOverride:       clusterversion.ByKey(v0),
+				},
+			},
+		}
+		_, tenantDB, err := ts.TenantController().StartSharedProcessTenant(ctx, tenantArgs)
+		require.NoError(t, err)
+		return tenantDB
+	}
+
+	// Create a shared process tenant and its SQL server.
+	const tenantName = "marhaba-crdb"
+	tenantDB := mkTenant(t, tenantName)
+	tenantRunner := sqlutils.MakeSQLRunner(tenantDB)
+
+	// Ensure that the tenant works.
+	tenantRunner.Exec(t, "CREATE TABLE t (i INT PRIMARY KEY)")
+	tenantRunner.Exec(t, "INSERT INTO t VALUES (1), (2)")
+
+	// Disable cluster.auto_upgrade.enabled setting for the tenant to prevent auto upgrade.
+	tenantRunner.Exec(t, fmt.Sprintf("SET CLUSTER SETTING %s = false", clusterversion.AutoUpgradeEnabled.Name()))
+
+	// Upgrade the host cluster.
+	sysDB.Exec(t,
+		"SET CLUSTER SETTING version = $1",
+		clusterversion.TestingBinaryVersion.String())
+
+	// Ensure that the tenant still works.
+	tenantRunner.CheckQueryResults(t, "SELECT * FROM t", [][]string{{"1"}, {"2"}})
+
+	// Wait for auto upgrade status to be received by the testing knob.
+	succeedsSoon := 20 * time.Second
+	for {
+		select {
+		case upgradeInfo := <-upgradeInfoCh:
+			if int(server.UpgradeDisabledByConfiguration) == upgradeInfo.Status {
+				return
+			}
+		case <-time.After(succeedsSoon):
+			t.Fatalf("failed to receive the right auto upgrade status after %d seconds", int(succeedsSoon.Seconds()))
+		}
+	}
+}
+
+func TestTenantAutoUpgrade(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t)
+
+	// v0 is hard-coded because at clusterversion.TestingBinaryMinSupportedVersion is `v22.2` at the
+	// time of typing and it does not support shared process tenants. We should update v0 to be
+	// clusterversion.TestingBinaryMinSupportedVersion when it is bumped to `v23.1`.
+	v0 := clusterversion.V23_1
+	ctx := context.Background()
+	settings := cluster.MakeTestingClusterSettingsWithVersions(
+		clusterversion.TestingBinaryVersion,
+		clusterversion.ByKey(v0),
+		false, // initializeVersion
+	)
+	// Initialize the version to v0.
+	require.NoError(t, clusterversion.Initialize(ctx,
+		clusterversion.ByKey(v0), &settings.SV))
+
+	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		Settings:          settings,
+		Knobs: base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				DisableAutomaticVersionUpgrade: make(chan struct{}),
+				BinaryVersionOverride:          clusterversion.ByKey(v0),
+				BootstrapVersionKeyOverride:    v0,
+			},
+			SQLEvalContext: &eval.TestingKnobs{
+				// When the host binary version is not equal to its cluster version, tenant logical version is set
+				// to the host's minimum supported binary version. We need this override to ensure that the tenant is
+				// created at v0.
+				TenantLogicalVersionKeyOverride: v0,
+			},
+		},
+	})
+	defer ts.Stopper().Stop(ctx)
+	sysDB := sqlutils.MakeSQLRunner(ts.SQLConn(t, serverutils.DBName("")))
+
+	expectedInitialTenantVersion := clusterversion.ByKey(v0)
+	expectedFinalTenantVersion := clusterversion.TestingBinaryVersion
+
+	tenantSettings := cluster.MakeTestingClusterSettingsWithVersions(
+		clusterversion.TestingBinaryVersion,
+		clusterversion.ByKey(v0),
+		false, // initializeVersion
+	)
+	require.NoError(t, clusterversion.Initialize(ctx,
+		expectedInitialTenantVersion, &tenantSettings.SV))
+
+	upgradeInfoCh := make(chan struct {
+		Status    int
+		UpgradeTo roachpb.Version
+	}, 1)
+	mkTenant := func(t *testing.T, name string) (tenantDB *gosql.DB) {
+		tenantArgs := base.TestSharedProcessTenantArgs{
+			TenantName: roachpb.TenantName(name),
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					TenantAutoUpgradeInfo:                          upgradeInfoCh,
+					AllowTenantAutoUpgradeOnInternalVersionChanges: true,
+					BootstrapVersionKeyOverride:                    v0,
+					BinaryVersionOverride:                          clusterversion.ByKey(v0),
+				},
+			},
+		}
+		_, tenantDB, err := ts.TenantController().StartSharedProcessTenant(ctx, tenantArgs)
+		require.NoError(t, err)
+		return tenantDB
+	}
+
+	// Create a shared process tenant and its SQL server.
+	const tenantName = "hola-crdb"
+	tenantDB := mkTenant(t, tenantName)
+	tenantRunner := sqlutils.MakeSQLRunner(tenantDB)
+
+	// Ensure that the tenant works.
+	tenantRunner.Exec(t, "CREATE TABLE t (i INT PRIMARY KEY)")
+	tenantRunner.Exec(t, "INSERT INTO t VALUES (1), (2)")
+
+	// Upgrade the host cluster.
+	sysDB.Exec(t,
+		"SET CLUSTER SETTING version = $1",
+		expectedFinalTenantVersion.String())
+
+	// Ensure that the tenant still works.
+	tenantRunner.CheckQueryResults(t, "SELECT * FROM t", [][]string{{"1"}, {"2"}})
+
+	var upgradeInfo struct {
+		Status    int
+		UpgradeTo roachpb.Version
+	}
+	succeedsSoon := 20 * time.Second
+	if util.RaceEnabled {
+		succeedsSoon = 60 * time.Second
+	}
+	// Wait for auto upgrade status to be received by the testing knob.
+	for {
+		select {
+		case upgradeInfo = <-upgradeInfoCh:
+			if upgradeInfo.UpgradeTo == expectedFinalTenantVersion && upgradeInfo.Status == int(server.UpgradeAllowed) {
+				return
+			}
+		case <-time.After(succeedsSoon):
+			t.Fatalf("failed to receive the right auto upgrade status after %d seconds", int(succeedsSoon.Seconds()))
+		}
+	}
+}
 
 // TestTenantUpgrade exercises the case where a system tenant is in a
 // non-finalized version state and creates a tenant. The test ensures
@@ -48,6 +264,7 @@ import (
 func TestTenantUpgrade(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t)
 	ctx := context.Background()
 
 	v1 := clusterversion.TestingBinaryMinSupportedVersion
@@ -76,7 +293,7 @@ func TestTenantUpgrade(t *testing.T) {
 		},
 	})
 	defer ts.Stopper().Stop(ctx)
-	sysDB := sqlutils.MakeSQLRunner(ts.SQLConn(t, ""))
+	sysDB := sqlutils.MakeSQLRunner(ts.SQLConn(t))
 
 	expectedInitialTenantVersion, _, _ := v0v1v2()
 	startAndConnectToTenant := func(t *testing.T, id uint64) (tenant serverutils.ApplicationLayerInterface, tenantDB *gosql.DB) {
@@ -93,12 +310,15 @@ func TestTenantUpgrade(t *testing.T) {
 			TestingKnobs: base.TestingKnobs{
 				// Make the upgrade faster by accelerating jobs.
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+				Server: &server.TestingKnobs{
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+				},
 			},
 			Settings: settings,
 		}
 		tenant, err := ts.TenantController().StartTenant(ctx, tenantArgs)
 		require.NoError(t, err)
-		return tenant, tenant.SQLConn(t, "")
+		return tenant, tenant.SQLConn(t)
 	}
 
 	t.Run("upgrade tenant", func(t *testing.T) {
@@ -129,10 +349,15 @@ func TestTenantUpgrade(t *testing.T) {
 		t.Log("restart the tenant")
 		tenantServer.AppStopper().Stop(ctx)
 		tenantServer, err := ts.TenantController().StartTenant(ctx, base.TestTenantArgs{
+			TestingKnobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+				},
+			},
 			TenantID: roachpb.MustMakeTenantID(initialTenantID),
 		})
 		require.NoError(t, err)
-		conn = tenantServer.SQLConn(t, "")
+		conn = tenantServer.SQLConn(t)
 		db = sqlutils.MakeSQLRunner(conn)
 
 		t.Log("ensure that the version is still at v2")
@@ -156,7 +381,7 @@ func TestTenantUpgrade(t *testing.T) {
 			TenantID: roachpb.MustMakeTenantID(postUpgradeTenantID),
 		})
 		require.NoError(t, err)
-		conn = tenant.SQLConn(t, "")
+		conn = tenant.SQLConn(t)
 
 		t.Log("verify it still is at v2")
 		sqlutils.MakeSQLRunner(conn).CheckQueryResults(t,
@@ -217,7 +442,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 		},
 	})
 	defer ts.Stopper().Stop(ctx)
-	sysDB := sqlutils.MakeSQLRunner(ts.SQLConn(t, ""))
+	sysDB := sqlutils.MakeSQLRunner(ts.SQLConn(t))
 
 	// Channel for stopping a tenant.
 	tenantStopperChannel := make(chan struct{})
@@ -245,6 +470,9 @@ func TestTenantUpgradeFailure(t *testing.T) {
 				// the upgrade interlock.
 				SpanConfig: &spanconfig.TestingKnobs{
 					ManagerDisableJobCreation: true,
+				},
+				Server: &server.TestingKnobs{
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 				},
 				UpgradeManager: &upgradebase.TestingKnobs{
 					DontUseJobs: true,
@@ -293,7 +521,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 		}
 		tenant, err := ts.TenantController().StartTenant(ctx, tenantArgs)
 		require.NoError(t, err)
-		tenantDB := tenant.SQLConn(t, "")
+		tenantDB := tenant.SQLConn(t)
 		return tenant, tenantDB
 	}
 

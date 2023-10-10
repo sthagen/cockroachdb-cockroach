@@ -1472,6 +1472,13 @@ func TestTenantLogic_procedure_privileges(
 	runLogicTest(t, "procedure_privileges")
 }
 
+func TestTenantLogic_procedure_schema_change(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure_schema_change")
+}
+
 func TestTenantLogic_propagate_input_ordering(
 	t *testing.T,
 ) {
@@ -1715,6 +1722,13 @@ func TestTenantLogic_select_for_update(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "select_for_update")
+}
+
+func TestTenantLogic_select_for_update_read_committed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "select_for_update_read_committed")
 }
 
 func TestTenantLogic_select_index(
@@ -2079,6 +2093,13 @@ func TestTenantLogic_tenant_from_tenant(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "tenant_from_tenant")
+}
+
+func TestTenantLogic_tenant_from_tenant_hint(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "tenant_from_tenant_hint")
 }
 
 func TestTenantLogic_tenant_slow_repro(

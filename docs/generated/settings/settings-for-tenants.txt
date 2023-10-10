@@ -27,6 +27,7 @@ changefeed.sink_io_workers	integer	0	the number of workers used by changefeeds w
 cloudstorage.azure.concurrent_upload_buffers	integer	1	controls the number of concurrent buffers that will be used by the Azure client when uploading chunks.Each buffer can buffer up to cloudstorage.write_chunk.size of memory during an upload	application
 cloudstorage.http.custom_ca	string		custom root CA (appended to system's default CAs) for verifying certificates when interacting with HTTPS storage	application
 cloudstorage.timeout	duration	10m0s	the timeout for import/export storage operations	application
+cluster.auto_upgrade.enabled	boolean	true	disable automatic cluster version upgrade until reset	application
 cluster.organization	string		organization name	system-visible
 cluster.preserve_downgrade_option	string		disable (automatic or manual) cluster version upgrade from the specified version until reset	application
 diagnostics.forced_sql_stat_reset.interval	duration	2h0m0s	interval after which the reported SQL Stats are reset even if not collected by telemetry reporter. It has a max value of 24H.	application
@@ -71,6 +72,7 @@ server.eventlog.ttl	duration	2160h0m0s	if nonzero, entries in system.eventlog ol
 server.host_based_authentication.configuration	string		host-based authentication configuration to use during connection authentication	application
 server.hot_ranges_request.node.timeout	duration	5m0s	the duration allowed for a single node to return hot range data before the request is cancelled; if set to 0, there is no timeout	application
 server.hsts.enabled	boolean	false	if true, HSTS headers will be sent along with all HTTP requests. The headers will contain a max-age setting of one year. Browsers honoring the header will always use HTTPS to access the DB Console. Ensure that TLS is correctly configured prior to enabling.	application
+server.http.base_path	string	/	path to redirect the user to upon succcessful login	application
 server.identity_map.configuration	string		system-identity to database-username mappings	application
 server.log_gc.max_deletions_per_cycle	integer	1000	the maximum number of entries to delete on each purge of log-like system tables	application
 server.log_gc.period	duration	1h0m0s	the period at which log-like system tables are checked for old entries	application
@@ -317,4 +319,4 @@ trace.snapshot.rate	duration	0s	if non-zero, interval at which background trace 
 trace.span_registry.enabled	boolean	true	if set, ongoing traces can be seen at https://<ui>/#/debug/tracez	application
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.	application
 ui.display_timezone	enumeration	etc/utc	the timezone used to format timestamps in the ui [etc/utc = 0, america/new_york = 1]	application
-version	version	1000023.1-34	set the active cluster version in the format '<major>.<minor>'	application
+version	version	1000023.1-36	set the active cluster version in the format '<major>.<minor>'	application

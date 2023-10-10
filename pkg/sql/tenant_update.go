@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -157,7 +158,7 @@ func (p *planner) UpdateTenantResourceLimits(
 		return err
 	}
 
-	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, op); err != nil {
+	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, op, p.execCfg.Settings); err != nil {
 		return err
 	}
 	if err := rejectIfSystemTenant(tenantID, op); err != nil {
@@ -183,7 +184,7 @@ func ActivateTenant(
 	serviceMode mtinfopb.TenantServiceMode,
 ) error {
 	const op = "activate"
-	if err := rejectIfCantCoordinateMultiTenancy(codec, op); err != nil {
+	if err := rejectIfCantCoordinateMultiTenancy(codec, op, settings); err != nil {
 		return err
 	}
 	if err := rejectIfSystemTenant(tenID, op); err != nil {
@@ -216,7 +217,7 @@ func (p *planner) setTenantService(
 	if err := CanManageTenant(ctx, p); err != nil {
 		return err
 	}
-	if err := rejectIfCantCoordinateMultiTenancy(p.ExecCfg().Codec, "set tenant service"); err != nil {
+	if err := rejectIfCantCoordinateMultiTenancy(p.ExecCfg().Codec, "set tenant service", p.ExecCfg().Settings); err != nil {
 		return err
 	}
 	if err := rejectIfSystemTenant(info.ID, "set tenant service"); err != nil {
@@ -236,6 +237,7 @@ func (p *planner) setTenantService(
 	}
 
 	info.ServiceMode = newMode
+	info.LastRevertTenantTimestamp = hlc.Timestamp{}
 	return UpdateTenantRecord(ctx, p.ExecCfg().Settings, p.InternalSQLTxn(), info)
 }
 
@@ -245,7 +247,7 @@ func (p *planner) renameTenant(
 	if p.EvalContext().TxnReadOnly {
 		return readOnlyError("ALTER VIRTUAL CLUSTER RENAME TO")
 	}
-	if err := rejectIfCantCoordinateMultiTenancy(p.ExecCfg().Codec, "rename tenant"); err != nil {
+	if err := rejectIfCantCoordinateMultiTenancy(p.ExecCfg().Codec, "rename tenant", p.ExecCfg().Settings); err != nil {
 		return err
 	}
 	if err := rejectIfSystemTenant(info.ID, "rename"); err != nil {

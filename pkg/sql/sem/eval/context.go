@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -286,6 +287,12 @@ type Context struct {
 	// execution until control returns to the parent routine. It is only valid
 	// during local execution. It may be unset.
 	RoutineSender DeferredRoutineSender
+
+	// RoleExistsCache is a cache of role existence checks. This is used because
+	// role existence checks are made when checking privileges, which can happen
+	// multiple times during the execution of a single query. Only positive
+	// values are cached. This cache is populated from the extraTxnState.
+	RoleExistsCache map[username.SQLUsername]struct{}
 }
 
 // JobsProfiler is the interface used to fetch job specific execution details
@@ -825,7 +832,7 @@ type StreamManagerFactory interface {
 type ReplicationStreamManager interface {
 	// StartReplicationStream starts a stream replication job for the specified
 	// tenant on the producer side.
-	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName) (streampb.ReplicationProducerSpec, error)
+	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName, req streampb.ReplicationProducerRequest) (streampb.ReplicationProducerSpec, error)
 
 	// SetupSpanConfigsStream creates and plans a replication stream to stream the span config updates for a specific tenant.
 	SetupSpanConfigsStream(ctx context.Context, tenantName roachpb.TenantName) (ValueGenerator, error)

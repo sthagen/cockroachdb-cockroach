@@ -242,30 +242,6 @@ const (
 	// inverted index on table system.statement_statistics.
 	TODO_Delete_V23_1_AlterSystemStatementStatisticsAddIndexesUsage
 
-	// TODO_Delete_V23_1EnsurePebbleFormatSSTableValueBlocks upgrades the Pebble
-	// format major version to FormatSSTableValueBlocks, which supports writing
-	// sstables in a new format containing value blocks
-	// (sstable.TableFormatPebblev3).
-	//
-	// Only a Pebble version that has upgraded to FormatSSTableValueBlocks can
-	// read sstables with format sstable.TableFormatPebblev3 -- i.e., it is
-	// insufficient for the Pebble code to be recent enough. Hence, this is the
-	// first step of a two-part migration, and we cannot do this in a single
-	// step. With a single step migration, consider a cluster with nodes N1 and
-	// N2: once both are on TODO_Delete_V23_1EnsurePebbleFormatSSTableValueBlocks,
-	// N1 is notified of the change and upgrades the format major version in
-	// Pebble and starts constructing sstables (say for range snapshot ingestion)
-	// in this new format. This sstable could be sent to N2 before N2 has been
-	// notified about TODO_Delete_V23_1EnsurePebbleFormatSSTableValueBlocks, which
-	// will cause the sstable ingestion to fail.
-	TODO_Delete_V23_1EnsurePebbleFormatSSTableValueBlocks
-
-	// TODO_Delete_V23_1EnablePebbleFormatSSTableValueBlocks is the second step of
-	// the two-part migration. When this starts we are sure that all Pebble
-	// instances in the cluster have already upgraded to format major version
-	// FormatSSTableValueBlocks.
-	TODO_Delete_V23_1EnablePebbleFormatSSTableValueBlocks
-
 	// TODO_Delete_V23_1AlterSystemSQLInstancesAddSQLAddr adds a sql_addr column
 	// to the system.sql_instances table.
 	TODO_Delete_V23_1AlterSystemSQLInstancesAddSQLAddr
@@ -333,15 +309,6 @@ const (
 	// been backfilled.
 	TODO_Delete_V23_1DatabaseRoleSettingsRoleIDColumnBackfilled
 
-	// TODO_Delete_V23_1_MVCCRangeTombstonesUnconditionallyEnabled is a version
-	// gate after which Cockroach will always write MVCC Range Tombstones,
-	// regardless of the value of the storage.mvcc.range_tombstones.enabled
-	// cluster setting. Prior to this version, it was possible for a cluster to be
-	// writing MVCC Range Tombstones, but only if the cluster had been opted in
-	// manually, under a specific set of circumstances (i.e. appropriate 22.2.x
-	// version, Cockroach Cloud cluster, etc.).
-	TODO_Delete_V23_1_MVCCRangeTombstonesUnconditionallyEnabled
-
 	// TODO_Delete_V23_1TenantCapabilities is the version where tenant
 	// capabilities can be set.
 	TODO_Delete_V23_1TenantCapabilities
@@ -349,10 +316,6 @@ const (
 	// TODO_Delete_V23_1DeprecateClusterVersionKey is the version where we no
 	// longer write cluster version keys to engines.
 	TODO_Delete_V23_1DeprecateClusterVersionKey
-
-	// TODO_Delete_V23_1SetPebbleCreatorID is a version gate after which we set
-	// the Creator ID on Pebble stores that have shared storage configured.
-	TODO_Delete_V23_1SetPebbleCreatorID
 
 	// TODO_Delete_V23_1_SystemRbrDualWrite indicates regional by row compatible
 	// system tables should write to the old and new indexes. See
@@ -532,6 +495,23 @@ const (
 	// V23_2_UDFMutations is the version where UDFs with mutations are enabled.
 	V23_2_UDFMutations
 
+	// ***************************************************************************
+	//            WHERE TO ADD VERSION GATES DURING 23.2 STABILITY?
+	// ---------------------------------------------------------------------------
+	// If version gate is for 23.2 (to be backported to release-23.2):
+	//    Then add new gate above this comment (immediately above this comment).
+	// If version gate is for 24.1 (upcoming 24.1 development):
+	//    Then add new gate at the end (immediately above the "Add new versions
+	//    here" comment).
+	// ***************************************************************************
+
+	// V23_2 is CockroachDB v23.2. It's used for all v23.2.x patch releases.
+	V23_2
+
+	// V24_1Start demarcates the start of cluster versions stepped through during
+	// the process of upgrading from previous supported releases to 24.1.
+	V24_1Start
+
 	// *************************************************
 	// Step (1) Add new versions here.
 	// Do not add new versions to a patch release.
@@ -541,7 +521,7 @@ const (
 // VCurrent_Start is an alias for last Start version key (i.e the first internal
 // version of the release in development). Tests should use this constant so
 // they don't need to be updated when the versions change.
-const VCurrent_Start = V23_2Start
+const VCurrent_Start = V24_1Start
 
 func (k Key) String() string {
 	return ByKey(k).String()
@@ -655,14 +635,6 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 22},
 	},
 	{
-		Key:     TODO_Delete_V23_1EnsurePebbleFormatSSTableValueBlocks,
-		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 24},
-	},
-	{
-		Key:     TODO_Delete_V23_1EnablePebbleFormatSSTableValueBlocks,
-		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 26},
-	},
-	{
 		Key:     TODO_Delete_V23_1AlterSystemSQLInstancesAddSQLAddr,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 28},
 	},
@@ -723,20 +695,12 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 56},
 	},
 	{
-		Key:     TODO_Delete_V23_1_MVCCRangeTombstonesUnconditionallyEnabled,
-		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 58},
-	},
-	{
 		Key:     TODO_Delete_V23_1TenantCapabilities,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 60},
 	},
 	{
 		Key:     TODO_Delete_V23_1DeprecateClusterVersionKey,
 		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 62},
-	},
-	{
-		Key:     TODO_Delete_V23_1SetPebbleCreatorID,
-		Version: roachpb.Version{Major: 22, Minor: 2, Internal: 64},
 	},
 	{
 		Key:     TODO_Delete_V23_1_SystemRbrDualWrite,
@@ -895,6 +859,16 @@ var rawVersionsSingleton = keyedVersions{
 		Version: roachpb.Version{Major: 23, Minor: 1, Internal: 38},
 	},
 
+	{
+		Key:     V23_2,
+		Version: roachpb.Version{Major: 23, Minor: 2, Internal: 0},
+	},
+
+	{
+		Key:     V24_1Start,
+		Version: roachpb.Version{Major: 23, Minor: 2, Internal: 2},
+	},
+
 	// *************************************************
 	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.
@@ -963,16 +937,17 @@ var versionsSingleton = func() keyedVersions {
 	return rawVersionsSingleton
 }()
 
-// V23_2 is a placeholder that will eventually be replaced by the actual 23.2
+// V24_1 is a placeholder that will eventually be replaced by the actual 24.1
 // version Key, but in the meantime it points to the latest Key. The placeholder
 // is defined so that it can be referenced in code that simply wants to check if
-// a cluster is running 23.2 and has completed all associated migrations; most
+// a cluster is running 24.1 and has completed all associated migrations; most
 // version gates can use this instead of defining their own version key if all
-// simply need to check is that the cluster has upgraded to 23.2.
-var V23_2 = versionsSingleton[len(versionsSingleton)-1].Key
+// simply need to check is that the cluster has upgraded to 24.1.
+var V24_1 = versionsSingleton[len(versionsSingleton)-1].Key
 
 const (
 	BinaryMinSupportedVersionKey = V23_1
+	PreviousReleaseVersionKey    = V23_1
 )
 
 // TODO(irfansharif): clusterversion.binary{,MinimumSupported}Version
@@ -986,7 +961,7 @@ var (
 	// comment).
 	binaryMinSupportedVersion = ByKey(BinaryMinSupportedVersionKey)
 
-	BinaryVersionKey = V23_2
+	BinaryVersionKey = V24_1
 	// binaryVersion is the version of this binary.
 	//
 	// This is the version that a new cluster will use when created.

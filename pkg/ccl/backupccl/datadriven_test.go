@@ -81,10 +81,8 @@ var localityCfgs = map[string]roachpb.Locality{
 }
 
 var clusterVersionKeys = map[string]clusterversion.Key{
-	"23_1_Start":          clusterversion.TODO_Delete_V23_1Start,
-	"23_1_MVCCTombstones": clusterversion.TODO_Delete_V23_1_MVCCRangeTombstonesUnconditionallyEnabled,
-	"23_2_Start":          clusterversion.V23_2Start,
-	"23_2":                clusterversion.V23_2,
+	"23_2_Start": clusterversion.V23_2Start,
+	"23_2":       clusterversion.V23_2,
 }
 
 type sqlDBKey struct {
@@ -181,7 +179,6 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 		params.ServerArgs.Knobs.Server = &server.TestingKnobs{
 			BinaryVersionOverride:          clusterversion.ByKey(beforeKey),
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BootstrapVersionKeyOverride:    clusterversion.BinaryMinSupportedVersionKey,
 		}
 	}
 

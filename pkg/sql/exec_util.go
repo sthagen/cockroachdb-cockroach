@@ -3636,6 +3636,10 @@ func (m *sessionDataMutator) SetStreamerEnabled(val bool) {
 	m.data.StreamerEnabled = val
 }
 
+func (m *sessionDataMutator) SetStreamerAlwaysMaintainOrdering(val bool) {
+	m.data.StreamerAlwaysMaintainOrdering = val
+}
+
 func (m *sessionDataMutator) SetMultipleActivePortalsEnabled(val bool) {
 	m.data.MultipleActivePortalsEnabled = val
 }
@@ -3670,6 +3674,10 @@ func (m *sessionDataMutator) SetUnsafeSettingInterlockKey(val string) {
 
 func (m *sessionDataMutator) SetOptimizerUseLockOpForSerializable(val bool) {
 	m.data.OptimizerUseLockOpForSerializable = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseProvidedOrderingFix(val bool) {
+	m.data.OptimizerUseProvidedOrderingFix = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

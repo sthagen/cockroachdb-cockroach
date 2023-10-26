@@ -103,7 +103,7 @@ func TestCompositeSensitive(t *testing.T) {
 		if err != nil {
 			d.Fatalf(t, "error building: %v", err)
 		}
-		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(md, scalar))
+		return fmt.Sprintf("%v", memo.CanBeCompositeSensitive(scalar))
 	})
 }
 
@@ -416,6 +416,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.TxnIsoLevel = isolation.ReadCommitted
 	stale()
 	evalCtx.TxnIsoLevel = isolation.Serializable
+	notStale()
+
+	// Stale optimizer_use_provided_ordering_fix.
+	evalCtx.SessionData().OptimizerUseProvidedOrderingFix = true
+	stale()
+	evalCtx.SessionData().OptimizerUseProvidedOrderingFix = false
 	notStale()
 
 	// User no longer has access to view.

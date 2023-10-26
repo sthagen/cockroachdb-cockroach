@@ -98,7 +98,7 @@ func init() {
 				),
 				JoinOnIndexID(from, to, "table-id", "index-id"),
 				StatusesToPublicOrTransient(from, scpb.Status_VALIDATED, to, scpb.Status_PUBLIC),
-				rel.And(isPotentialSecondaryIndexSwap("index-id", "table-id")...),
+				rel.And(IsPotentialSecondaryIndexSwap("index-id", "table-id")...),
 			}
 		},
 	)
@@ -114,7 +114,7 @@ func init() {
 					(*scpb.SecondaryIndex)(nil),
 				),
 				JoinOnIndexID(from, to, "table-id", "index-id"),
-				isNotPotentialSecondaryIndexSwap("table-id", "index-id"),
+				IsNotPotentialSecondaryIndexSwap("table-id", "index-id"),
 				StatusesToPublicOrTransient(from, scpb.Status_PUBLIC, to, scpb.Status_VALIDATED),
 			}
 		},

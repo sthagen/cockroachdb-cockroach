@@ -445,6 +445,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 		AmbientContext:   r.AmbientContext,
 		Clock:            r.Clock(),
 		Stopper:          r.store.stopper,
+		Settings:         r.store.ClusterSettings(),
 		RangeID:          r.RangeID,
 		Span:             desc.RSpan(),
 		TxnPusher:        &tp,
@@ -714,7 +715,7 @@ func (r *Replica) handleLogicalOpLogRaftMuLocked(
 		}
 		if err != nil {
 			r.disconnectRangefeedWithErr(p, kvpb.NewErrorf(
-				"error consuming %T for key %v @ ts %v: %v", op, key, ts, err,
+				"error consuming %T for key %s @ ts %v: %v", op.GetValue(), roachpb.Key(key), ts, err,
 			))
 			return
 		}

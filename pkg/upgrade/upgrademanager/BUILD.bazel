@@ -32,7 +32,6 @@ go_library(
         "//pkg/util/log",
         "//pkg/util/startup",
         "//pkg/util/stop",
-        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_cockroachdb_redact//:redact",
@@ -46,7 +45,6 @@ go_test(
         "main_test.go",
         "manager_external_test.go",
     ],
-    args = ["-test.timeout=295s"],
     deps = [
         ":upgrademanager",
         "//pkg/base",

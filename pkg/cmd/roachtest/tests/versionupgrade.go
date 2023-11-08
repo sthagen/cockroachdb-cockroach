@@ -275,22 +275,6 @@ func uploadAndStartFromCheckpointFixture(
 		}
 		binary := uploadVersion(ctx, t, u.c, nodes, v)
 		startOpts := option.DefaultStartOpts()
-		// NB: can't start sequentially since cluster already bootstrapped.
-		startOpts.RoachprodOpts.Sequential = false
-		if err := clusterupgrade.StartWithSettings(
-			ctx, t.L(), u.c, nodes, startOpts, install.BinaryOption(binary),
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func uploadAndStart(nodes option.NodeListOption, v *clusterupgrade.Version) versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		binary := uploadVersion(ctx, t, u.c, nodes, v)
-		startOpts := option.DefaultStartOpts()
-		// NB: can't start sequentially since cluster already bootstrapped.
-		startOpts.RoachprodOpts.Sequential = false
 		if err := clusterupgrade.StartWithSettings(
 			ctx, t.L(), u.c, nodes, startOpts, install.BinaryOption(binary),
 		); err != nil {

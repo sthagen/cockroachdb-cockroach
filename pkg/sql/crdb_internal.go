@@ -1081,7 +1081,7 @@ func populateSystemJobsTableRows(
 		params...,
 	)
 	if err != nil {
-		return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err)
+		return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err, p.execCfg.Settings.Version)
 	}
 
 	cleanup := func(ctx context.Context) {
@@ -1094,7 +1094,7 @@ func populateSystemJobsTableRows(
 	for {
 		hasNext, err := it.Next(ctx)
 		if !hasNext || err != nil {
-			return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err)
+			return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err, p.execCfg.Settings.Version)
 		}
 
 		currentRow := it.Cur()
@@ -1619,7 +1619,7 @@ func decodeMetaFieldsForSchedules(
 	decodedMeta = tree.NewDJSON(decodedMetaJSON)
 
 	schedEnv := scheduledjobs.ProdJobSchedulerEnv
-	sched, err := jobs.ScheduledJobTxn(p.InternalSQLTxn()).Load(ctx, schedEnv, schedID)
+	sched, err := jobs.ScheduledJobTxn(p.InternalSQLTxn()).Load(ctx, schedEnv, jobspb.ScheduleID(schedID))
 	if err != nil {
 		return nil, nil, err
 	}

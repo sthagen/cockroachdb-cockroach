@@ -43,8 +43,8 @@ func TestFirstUpgrade(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var (
-		v0 = clusterversion.TestingBinaryMinSupportedVersion
-		v1 = clusterversion.ByKey(clusterversion.BinaryVersionKey)
+		v0 = clusterversion.MinSupported.Version()
+		v1 = clusterversion.Latest.Version()
 	)
 
 	ctx := context.Background()
@@ -148,8 +148,8 @@ func TestFirstUpgradeRepair(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var (
-		v0 = clusterversion.TestingBinaryMinSupportedVersion
-		v1 = clusterversion.ByKey(clusterversion.BinaryVersionKey)
+		v0 = clusterversion.MinSupported.Version()
+		v1 = clusterversion.Latest.Version()
 	)
 
 	ctx := context.Background()

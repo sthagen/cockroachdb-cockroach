@@ -61,7 +61,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	bulkutil "github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -90,14 +89,6 @@ var restoreStatsInsertionConcurrency = settings.RegisterIntSetting(
 	"bulkio.restore.insert_stats_workers",
 	"number of concurrent workers that will restore backed up table statistics",
 	5,
-	settings.PositiveInt,
-)
-
-var onlineRestoreLinkWorkers = settings.RegisterByteSizeSetting(
-	settings.ApplicationLevel,
-	"backup.restore.online_worker_count",
-	"workers to use for online restore worker phase",
-	8,
 	settings.PositiveInt,
 )
 
@@ -3220,168 +3211,6 @@ func (r *restoreResumer) cleanupTempSystemTables(ctx context.Context) error {
 		return errors.Wrap(err, "dropping temporary system db")
 	}
 	return nil
-}
-
-func sendAddRemoteSSTWorker(
-	execCtx sql.JobExecContext,
-	uris []string,
-	urisForDirs map[string]string,
-	restoreSpanEntriesCh <-chan execinfrapb.RestoreSpanEntry,
-) func(context.Context) error {
-	return func(ctx context.Context) error {
-		remainingBytesInTargetRange := int64(512 << 20)
-
-		for entry := range restoreSpanEntriesCh {
-			for _, file := range entry.Files {
-				restoringSubspan := file.BackupFileEntrySpan.Intersect(entry.Span)
-				log.Infof(ctx, "Experimental restore: sending span %s of file (path: %s, span: %s), with intersecting subspan %s",
-					file.BackupFileEntrySpan, file.Path, file.BackupFileEntrySpan, restoringSubspan)
-
-				if !restoringSubspan.Valid() {
-					log.Warningf(ctx, "backup file does not intersect with the restoring span")
-					continue
-				}
-
-				// NB: Since the restored span is a subset of the BackupFileEntrySpan,
-				// these counts may be an overestimate of what actually gets restored.
-				counts := file.BackupFileEntryCounts
-
-				if counts.DataSize > remainingBytesInTargetRange {
-					log.Infof(ctx, "Experimental restore: need to split since %d > %d",
-						counts.DataSize, remainingBytesInTargetRange,
-					)
-					expiration := execCtx.ExecCfg().Clock.Now().AddDuration(time.Hour)
-					if err := execCtx.ExecCfg().DB.AdminSplit(ctx, restoringSubspan.Key, expiration); err != nil {
-						log.Warningf(ctx, "failed to split during experimental restore: %v", err)
-					}
-					if _, err := execCtx.ExecCfg().DB.AdminScatter(ctx, restoringSubspan.Key, 4<<20); err != nil {
-						log.Warningf(ctx, "failed to scatter during experimental restore: %v", err)
-					}
-				}
-
-				if file.BackingFileSize == 0 {
-					// This backup is from <23.2. Just make up a number.
-					file.BackingFileSize = 16 << 20
-				}
-				uri, ok := urisForDirs[file.Dir.String()]
-				if !ok {
-					return errors.AssertionFailedf("URI not found for %s", file.Dir.String())
-				}
-
-				loc := kvpb.AddSSTableRequest_RemoteFile{
-					Locator:         uri,
-					Path:            file.Path,
-					BackingFileSize: file.BackingFileSize,
-				}
-				// TODO(dt): see if KV has any better ideas for making these up.
-				fileStats := &enginepb.MVCCStats{
-					ContainsEstimates: 1,
-					KeyBytes:          counts.DataSize / 2,
-					ValBytes:          counts.DataSize / 2,
-					LiveBytes:         counts.DataSize,
-					KeyCount:          counts.Rows + counts.IndexEntries,
-					LiveCount:         counts.Rows + counts.IndexEntries,
-				}
-				var err error
-				_, remainingBytesInTargetRange, err = execCtx.ExecCfg().DB.AddRemoteSSTable(ctx,
-					restoringSubspan, loc,
-					fileStats)
-				if err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-}
-
-// sendAddRemoteSSTs is a stubbed out, very simplisitic version of restore used
-// to test out ingesting "remote" SSTs. It will be replaced with a real distsql
-// plan and processors in the future.
-func sendAddRemoteSSTs(
-	ctx context.Context,
-	execCtx sql.JobExecContext,
-	job *jobs.Job,
-	dataToRestore restorationData,
-	encryption *jobspb.BackupEncryptionOptions,
-	uris []string,
-	backupLocalityInfo []jobspb.RestoreDetails_BackupLocalityInfo,
-	progCh chan *execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
-	tracingAggCh chan *execinfrapb.TracingAggregatorEvents,
-	genSpan func(ctx context.Context, spanCh chan execinfrapb.RestoreSpanEntry) error,
-) error {
-	defer close(progCh)
-	defer close(tracingAggCh)
-
-	if encryption != nil {
-		return errors.AssertionFailedf("encryption not supported with online restore")
-	}
-	if len(uris) > 1 {
-		return errors.AssertionFailedf("online restore can only restore data from a full backup")
-	}
-
-	// We lost the string URIs for the backup storage locations very early in the
-	// process of planning the restore, when the backups were resolved, and the
-	// parsed proto versions -- which we usually prefer -- were attached to the
-	// backup manifests and the individual files during span generation. However
-	// for telling pebble the locations of the files we need those raw string URIs
-	// again. We could plumb them side-by-side with the proto versions, but for
-	// now we'll just reverse engineer them: we'll make a map that has the proto
-	// version of every URI we might have parsed -- all the default backup URIs
-	// and any locality bucket URIs -- to the raw URI that produces that proto.
-	// We can then look in this map using the proto attached to each file to find
-	// the URI for that file.
-	// TODO(dt/butler): should we plumb the original string instead?
-	urisForDirs := make(map[string]string)
-	for _, u := range uris {
-		dir, err := cloud.ExternalStorageConfFromURI(u, username.SQLUsername{})
-		if err != nil {
-			return err
-		}
-		urisForDirs[dir.String()] = u
-	}
-	for _, loc := range backupLocalityInfo {
-		for _, u := range loc.URIsByOriginalLocalityKV {
-			dir, err := cloud.ExternalStorageConfFromURI(u, username.SQLUsername{})
-			if err != nil {
-				return err
-			}
-			urisForDirs[dir.String()] = u
-		}
-	}
-
-	restoreSpanEntriesCh := make(chan execinfrapb.RestoreSpanEntry, 1)
-
-	grp := ctxgroup.WithContext(ctx)
-	grp.GoCtx(func(ctx context.Context) error {
-		return genSpan(ctx, restoreSpanEntriesCh)
-	})
-
-	restoreWorkers := int(onlineRestoreLinkWorkers.Get(&execCtx.ExecCfg().Settings.SV))
-	for i := 0; i < restoreWorkers; i++ {
-		grp.GoCtx(sendAddRemoteSSTWorker(execCtx, uris, urisForDirs, restoreSpanEntriesCh))
-	}
-
-	if err := grp.Wait(); err != nil {
-		return errors.Wrap(err, "failed to generate and send remote file spans")
-	}
-
-	downloadSpans := dataToRestore.getSpans()
-
-	log.Infof(ctx, "creating job to track downloads in %d spans", len(downloadSpans))
-	downloadJobRecord := jobs.Record{
-		Description: fmt.Sprintf("Background Data Download for %s", job.Payload().Description),
-		Username:    job.Payload().UsernameProto.Decode(),
-		Details:     jobspb.RestoreDetails{DownloadSpans: downloadSpans},
-		Progress:    jobspb.RestoreProgress{},
-	}
-
-	return execCtx.ExecCfg().InternalDB.DescsTxn(ctx, func(
-		ctx context.Context, txn descs.Txn,
-	) error {
-		_, err := execCtx.ExecCfg().JobRegistry.CreateJobWithTxn(ctx, downloadJobRecord, job.ID()+1, txn)
-		return err
-	})
 }
 
 var _ jobs.Resumer = &restoreResumer{}

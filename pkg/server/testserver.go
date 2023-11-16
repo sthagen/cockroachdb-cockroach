@@ -26,7 +26,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/base/serverident"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -646,27 +645,29 @@ func (ts *testServer) startDefaultTestTenant(
 	return ts.StartTenant(ctx, params)
 }
 
-func (ts *testServer) startSharedProcessDefaultTestTenant(
-	ctx context.Context,
-) (serverutils.ApplicationLayerInterface, error) {
-	params := base.TestSharedProcessTenantArgs{
+func (ts *testServer) getSharedProcessDefaultTenantArgs() base.TestSharedProcessTenantArgs {
+	args := base.TestSharedProcessTenantArgs{
 		TenantName:  "test-tenant",
 		TenantID:    serverutils.TestTenantID(),
 		Knobs:       ts.params.Knobs,
 		UseDatabase: ts.params.UseDatabase,
 	}
 	// See comment above on separate process tenant regarding the testing knobs.
-	params.Knobs.Server = &TestingKnobs{}
+	args.Knobs.Server = &TestingKnobs{}
 	if ts.params.Knobs.Server != nil {
-		params.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs = ts.params.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
+		args.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs = ts.params.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
 	}
+	return args
+}
 
-	tenant, _, err := ts.StartSharedProcessTenant(ctx, params)
+func (ts *testServer) startSharedProcessDefaultTestTenant(
+	ctx context.Context,
+) (serverutils.ApplicationLayerInterface, error) {
+	tenant, _, err := ts.StartSharedProcessTenant(ctx, ts.getSharedProcessDefaultTenantArgs())
 	if err != nil {
 		return nil, err
 	}
-
-	return tenant, err
+	return tenant, nil
 }
 
 // maybeStartDefaultTestTenant might start a test tenant. This can then be used
@@ -764,8 +765,7 @@ func (ts *testServer) grantDefaultTenantCapabilities(
 	// configured an ExternalIODir since nodelocal storage only works with that
 	// configured.
 	shouldGrantNodelocalCap := ts.params.ExternalIODir != ""
-	canGrantNodelocalCap := ts.ClusterSettings().Version.IsActive(ctx, clusterversion.TODO_Delete_V23_1TenantCapabilities)
-	if canGrantNodelocalCap && shouldGrantNodelocalCap {
+	if shouldGrantNodelocalCap {
 		_, err := ie.Exec(ctx, "testserver-alter-tenant-cap", nil,
 			"ALTER TENANT [$1] GRANT CAPABILITY can_use_nodelocal_storage", tenantID.ToUint64())
 		if err != nil {
@@ -790,6 +790,18 @@ func (ts *testServer) grantDefaultTenantCapabilities(
 // The caller is responsible for calling .Stopper().Stop() even
 // when PreStart() returns an error.
 func (ts *testServer) PreStart(ctx context.Context) error {
+	// In case we'll need to start the shared-process default test tenant later
+	// down the line, make sure that we set the correct arguments. This matters
+	// in multi-node clusters where we need this to happen before the first call
+	// to Activate in order to prevent the race between testServer.Activate
+	// explicitly starting the shared-process tenant with the correct args and
+	// the server controller realizing that it's missing a tenant and starting
+	// one with no test args.
+	func(args base.TestSharedProcessTenantArgs) {
+		ts.topLevelServer.serverController.mu.Lock()
+		defer ts.topLevelServer.serverController.mu.Unlock()
+		ts.topLevelServer.serverController.mu.testArgs[args.TenantName] = args
+	}(ts.getSharedProcessDefaultTenantArgs())
 	return ts.topLevelServer.PreStart(ctx)
 }
 

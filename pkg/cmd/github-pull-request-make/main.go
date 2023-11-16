@@ -173,8 +173,8 @@ func chooseFiveTestsPerPackage(pkgs map[string]pkg) map[string]pkg {
 	croppedPkgs := make(map[string]pkg)
 	for pkgName, tests := range pkgs {
 		randomOrderTests := scrambleTestOrder(tests)
-		cropIdx := 5
-		if len(randomOrderTests) < 5 {
+		cropIdx := 4
+		if len(randomOrderTests) < cropIdx {
 			cropIdx = len(randomOrderTests)
 		}
 		croppedPkgs[pkgName] = makePkg(randomOrderTests[:cropIdx])
@@ -289,7 +289,7 @@ func main() {
 			}
 			// Use a timeout shorter than the duration so that hanging tests don't
 			// get a free pass.
-			timeout := (3 * duration) / 4
+			timeout := (9 * duration) / 10
 
 			// The stress -p flag defaults to the number of CPUs, which is too
 			// aggressive on big machines and can cause tests to fail. Under nightly
@@ -358,7 +358,8 @@ func main() {
 				args = append(args, fmt.Sprintf("--test_timeout=%d", int((duration+1*time.Minute).Seconds())))
 				args = append(args, "--test_output", "streamed")
 
-				args = append(args, "--run_under", fmt.Sprintf("%s -bazel -shardable-artifacts 'XML_OUTPUT_FILE=%s merge-test-xmls' -stderr -maxfails 1 -maxtime %s -p %d -timeout %s", bazelStressTarget, bazciPath, duration, parallelism, timeout))
+				args = append(args, "--run_under", fmt.Sprintf("%s -bazel -shardable-artifacts 'XML_OUTPUT_FILE=%s merge-test-xmls' -stderr -maxfails 1 -maxtime %s -p %d", bazelStressTarget, bazciPath, duration, parallelism))
+				args = append(args, "--test_arg", "-test.timeout", "--test_arg", timeout.String())
 				cmd := exec.Command("bazci", args...)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr

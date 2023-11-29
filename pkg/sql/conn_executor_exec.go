@@ -44,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/regions"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -629,7 +630,10 @@ func (ex *connExecutor) execStmtInOpenState(
 	if !isPausablePortal() || portal.pauseInfo.execStmtInOpenState.ihWrapper == nil {
 		ctx = ih.Setup(
 			ctx, ex.server.cfg, ex.statsCollector, p, ex.stmtDiagnosticsRecorder,
-			stmt.StmtNoConstants, os.ImplicitTxn.Get(), ex.state.priority,
+			stmt.StmtNoConstants, os.ImplicitTxn.Get(),
+			// This goroutine is the only one that can modify
+			// txnState.mu.priority, so we don't need to get a mutex here.
+			ex.state.mu.priority,
 			ex.extraTxnState.shouldCollectTxnExecutionStats,
 		)
 	} else {
@@ -805,7 +809,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			ctx,
 			ex.executorType,
 			int(ex.state.mu.autoRetryCounter),
-			ex.extraTxnState.txnCounter,
+			int(ex.extraTxnState.txnCounter.Load()),
 			0, /* rowsAffected */
 			ex.state.mu.stmtCount,
 			0, /* bulkJobId */
@@ -1040,7 +1044,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.autoCommit = canAutoCommit &&
 		!ex.server.cfg.TestingKnobs.DisableAutoCommitDuringExec && ex.extraTxnState.numDDL == 0
 	p.extendedEvalCtx.TxnIsSingleStmt = canAutoCommit && !ex.extraTxnState.firstStmtExecuted
-	ex.extraTxnState.firstStmtExecuted = true
+	defer func() { ex.extraTxnState.firstStmtExecuted = true }()
 
 	var stmtThresholdSpan *tracing.Span
 	alreadyRecording := ex.transitionCtx.sessionTracing.Enabled()
@@ -1328,12 +1332,17 @@ func (ex *connExecutor) checkDescriptorTwoVersionInvariant(ctx context.Context) 
 	if knobs := ex.server.cfg.SchemaChangerTestingKnobs; knobs != nil {
 		inRetryBackoff = knobs.TwoVersionLeaseViolation
 	}
-
+	regionCache, err := regions.NewCachedDatabaseRegions(ctx, ex.server.cfg.DB, ex.server.cfg.LeaseManager)
+	if err != nil {
+		return err
+	}
 	return descs.CheckTwoVersionInvariant(
 		ctx,
 		ex.server.cfg.Clock,
-		ex.server.cfg.InternalDB.Executor(),
+		ex.server.cfg.InternalDB,
 		ex.extraTxnState.descCollection,
+		regionCache,
+		ex.server.cfg.Settings,
 		ex.state.mu.txn,
 		inRetryBackoff,
 	)
@@ -1740,7 +1749,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 						ctx,
 						ex.executorType,
 						int(ex.state.mu.autoRetryCounter),
-						ex.extraTxnState.txnCounter,
+						int(ex.extraTxnState.txnCounter.Load()),
 						ppInfo.dispatchToExecutionEngine.rowsAffected,
 						ex.state.mu.stmtCount,
 						bulkJobId,
@@ -1767,7 +1776,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 				ctx,
 				ex.executorType,
 				int(ex.state.mu.autoRetryCounter),
-				ex.extraTxnState.txnCounter,
+				int(ex.extraTxnState.txnCounter.Load()),
 				nonBulkJobNumRows,
 				ex.state.mu.stmtCount,
 				bulkJobId,
@@ -2192,22 +2201,41 @@ func (ex *connExecutor) handleTxnRowsWrittenReadLimits(ctx context.Context) erro
 	return errors.CombineErrors(writtenErr, readErr)
 }
 
-// makeExecPlan creates an execution plan and populates planner.curPlan using
-// the cost-based optimizer.
-func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) error {
-	if tree.CanModifySchema(planner.stmt.AST) {
-		if planner.Txn().IsoLevel().ToleratesWriteSkew() {
-			if planner.extendedEvalCtx.TxnIsSingleStmt && planner.extendedEvalCtx.TxnImplicit {
+// maybeUpgradeToSerializable checks if the statement is a schema change, and
+// upgrades the transaction to serializable isolation if it is. If the
+// transaction contains multiple statements, and an upgrade was attempted, an
+// error is returned.
+func (ex *connExecutor) maybeUpgradeToSerializable(ctx context.Context, stmt Statement) error {
+	p := &ex.planner
+	if ex.extraTxnState.upgradedToSerializable && ex.extraTxnState.firstStmtExecuted {
+		return pgerror.Newf(
+			pgcode.FeatureNotSupported, "multi-statement transaction involving a schema change needs to be SERIALIZABLE",
+		)
+	}
+	if tree.CanModifySchema(stmt.AST) {
+		if ex.state.mu.txn.IsoLevel().ToleratesWriteSkew() {
+			if !ex.extraTxnState.firstStmtExecuted {
 				if err := ex.state.setIsolationLevel(isolation.Serializable); err != nil {
 					return err
 				}
-				planner.BufferClientNotice(ctx, pgnotice.Newf("setting implicit transaction isolation level to SERIALIZABLE due to schema change"))
+				ex.extraTxnState.upgradedToSerializable = true
+				p.BufferClientNotice(ctx, pgnotice.Newf("setting transaction isolation level to SERIALIZABLE due to schema change"))
 			} else {
 				return pgerror.Newf(
-					pgcode.FeatureNotSupported, "explicit transaction involving a schema change needs to be SERIALIZABLE",
+					pgcode.FeatureNotSupported, "multi-statement transaction involving a schema change needs to be SERIALIZABLE",
 				)
 			}
 		}
+	}
+	return nil
+}
+
+// makeExecPlan creates an execution plan and populates planner.curPlan using
+// the cost-based optimizer. This is used to create the plan when executing a
+// query in the "simple" pgwire protocol.
+func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) error {
+	if err := ex.maybeUpgradeToSerializable(ctx, planner.stmt); err != nil {
+		return err
 	}
 
 	if err := planner.makeOptimizerPlan(ctx); err != nil {
@@ -2429,12 +2457,12 @@ func (ex *connExecutor) execStmtInNoTxnState(
 			ctx,
 			ex.executorType,
 			int(ex.state.mu.autoRetryCounter),
-			ex.extraTxnState.txnCounter,
+			int(ex.extraTxnState.txnCounter.Load()),
 			0, /* rowsAffected */
 			0, /* stmtCount */
 			0, /* bulkJobId */
 			execErr,
-			ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
+			ex.phaseTimes.GetSessionPhaseTime(sessionphase.SessionQueryReceived),
 			&ex.extraTxnState.hasAdminRoleCache,
 			ex.server.TelemetryLoggingMetrics,
 			stmtFingerprintID,
@@ -3210,7 +3238,7 @@ func (ex *connExecutor) recordTransactionFinish(
 		RowsRead:                ex.extraTxnState.rowsRead,
 		RowsWritten:             ex.extraTxnState.rowsWritten,
 		BytesRead:               ex.extraTxnState.bytesRead,
-		Priority:                ex.state.priority,
+		Priority:                ex.state.mu.priority,
 		// TODO(107318): add isolation level
 		// TODO(107318): add qos
 		// TODO(107318): add asoftime or ishistorical

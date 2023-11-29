@@ -493,7 +493,7 @@ func bootstrapCluster(
 				Codec:                   keys.SystemSQLCodec,
 			}
 			for _, v := range bootstrap.VersionsWithInitialValues() {
-				if initCfg.latestVersion == clusterversion.ByKey(v) {
+				if initCfg.latestVersion == v.Version() {
 					initialValuesOpts.OverrideKey = v
 					break
 				}
@@ -1990,6 +1990,7 @@ func (n *Node) ResetQuorum(
 	// replicas from this fresh snapshot.
 	if err := kvserver.SendEmptySnapshot(
 		ctx,
+		n.clusterID.Get(),
 		n.storeCfg.Settings,
 		n.storeCfg.Tracer(),
 		conn,

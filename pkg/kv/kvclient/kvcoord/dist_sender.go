@@ -46,7 +46,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -229,7 +228,6 @@ This counts the number of ranges with an active rangefeed that are performing ca
 // followerreadsccl code to inject logic to check if follower reads are enabled.
 // By default, without CCL code, this function returns false.
 var CanSendToFollower = func(
-	_ uuid.UUID,
 	_ *cluster.Settings,
 	_ *hlc.Clock,
 	_ roachpb.RangeClosedTimestampPolicy,
@@ -288,13 +286,6 @@ var sortByLocalityFirst = settings.RegisterBoolSetting(
 	"sort followers by locality before sorting by latency",
 	true,
 )
-
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
 
 // DistSenderMetrics is the set of metrics for a given distributed sender.
 type DistSenderMetrics struct {
@@ -564,7 +555,7 @@ type DistSender struct {
 	latencyFunc LatencyFunc
 
 	// HealthFunc returns true if the node is alive and not draining.
-	healthFunc atomic.Pointer[HealthFunc]
+	healthFunc HealthFunc
 
 	onRangeSpanningNonTxnalBatch func(ba *kvpb.BatchRequest) *kvpb.Error
 
@@ -637,6 +628,8 @@ type DistSenderConfig struct {
 	KVInterceptor multitenant.TenantSideKVInterceptor
 
 	TestingKnobs ClientTestingKnobs
+
+	HealthFunc HealthFunc
 }
 
 // NewDistSender returns a batch.Sender instance which connects to the
@@ -663,6 +656,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 		metrics:       makeDistSenderMetrics(),
 		kvInterceptor: cfg.KVInterceptor,
 		locality:      cfg.Locality,
+		healthFunc:    cfg.HealthFunc,
 	}
 	if ds.st == nil {
 		ds.st = cluster.MakeTestingClusterSettings()
@@ -741,22 +735,14 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 		ds.onRangeSpanningNonTxnalBatch = cfg.TestingKnobs.OnRangeSpanningNonTxnalBatch
 	}
 
-	// Placeholder function until we inject the real health function in using
-	// SetHealthFunc.
-	// TODO(baptist): Restructure the code to allow injecting the correct
-	// HealthFunc at construction time.
-	healthFunc := HealthFunc(func(id roachpb.NodeID) bool {
-		return true
-	})
-	ds.healthFunc.Store(&healthFunc)
+	// Some tests don't set the healthFunc.
+	if ds.healthFunc == nil {
+		ds.healthFunc = func(id roachpb.NodeID) bool {
+			return true
+		}
+	}
 
 	return ds
-}
-
-// SetHealthFunc is called after construction due to the circular dependency
-// between DistSender and NodeLiveness.
-func (ds *DistSender) SetHealthFunc(healthFn HealthFunc) {
-	ds.healthFunc.Store(&healthFn)
 }
 
 // LatencyFunc returns the LatencyFunc of the DistSender.
@@ -766,7 +752,7 @@ func (ds *DistSender) LatencyFunc() LatencyFunc {
 
 // HealthFunc returns the HealthFunc of the DistSender.
 func (ds *DistSender) HealthFunc() HealthFunc {
-	return *ds.healthFunc.Load()
+	return ds.healthFunc
 }
 
 // DisableFirstRangeUpdates disables updates of the first range via
@@ -2252,7 +2238,7 @@ func (ds *DistSender) sendToReplicas(
 	// otherwise, we may send a request to a remote region unnecessarily.
 	if ba.RoutingPolicy == kvpb.RoutingPolicy_LEASEHOLDER &&
 		CanSendToFollower(
-			ds.logicalClusterID.Get(), ds.st, ds.clock,
+			ds.st, ds.clock,
 			routing.ClosedTimestampPolicy(defaultSendClosedTimestampPolicy), ba,
 		) {
 		ba = ba.ShallowCopy()
@@ -2285,7 +2271,7 @@ func (ds *DistSender) sendToReplicas(
 		// First order by latency, then move the leaseholder to the front of the
 		// list, if it is known.
 		if !ds.dontReorderReplicas {
-			replicas.OptimizeReplicaOrder(ds.st, ds.nodeIDGetter(), ds.HealthFunc(), ds.latencyFunc, ds.locality)
+			replicas.OptimizeReplicaOrder(ds.st, ds.nodeIDGetter(), ds.healthFunc, ds.latencyFunc, ds.locality)
 		}
 
 		idx := -1
@@ -2304,7 +2290,7 @@ func (ds *DistSender) sendToReplicas(
 	case kvpb.RoutingPolicy_NEAREST:
 		// Order by latency.
 		log.VEvent(ctx, 2, "routing to nearest replica; leaseholder not required")
-		replicas.OptimizeReplicaOrder(ds.st, ds.nodeIDGetter(), ds.HealthFunc(), ds.latencyFunc, ds.locality)
+		replicas.OptimizeReplicaOrder(ds.st, ds.nodeIDGetter(), ds.healthFunc, ds.latencyFunc, ds.locality)
 
 	default:
 		log.Fatalf(ctx, "unknown routing policy: %s", ba.RoutingPolicy)

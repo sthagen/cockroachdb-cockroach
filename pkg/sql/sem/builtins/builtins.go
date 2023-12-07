@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
-	cryptorand "crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -235,6 +234,34 @@ var regularBuiltins = map[string]builtinDefinition{
 			},
 			types.Int,
 			"Calculates the number of bits used to represent `val`.",
+			volatility.Immutable,
+		),
+	),
+
+	"bit_count": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
+		bytesOverload1(
+			func(_ context.Context, _ *eval.Context, s string) (tree.Datum, error) {
+				total := int64(0)
+				for _, b := range []byte(s) {
+					total += int64(bits.OnesCount8(b))
+				}
+				return tree.NewDInt(tree.DInt(total)), nil
+			},
+			types.Int,
+			"Calculates the number of bits set used to represent `val`.",
+			volatility.Immutable,
+		),
+		bitsOverload1(
+			func(_ context.Context, _ *eval.Context, s *tree.DBitArray) (tree.Datum, error) {
+				total := int64(0)
+				parts, _ := s.BitArray.EncodingParts()
+				for _, b := range parts {
+					total += int64(bits.OnesCount64(b))
+				}
+				return tree.NewDInt(tree.DInt(total)), nil
+			},
+			types.Int,
+			"Calculates the number of bits set used to represent `val`.",
 			volatility.Immutable,
 		),
 	),
@@ -790,9 +817,8 @@ var regularBuiltins = map[string]builtinDefinition{
 		tree.Overload{
 			Types:      tree.ParamTypes{},
 			ReturnType: tree.FixedReturnType(types.Uuid),
-			Fn: func(_ context.Context, _ *eval.Context, _ tree.Datums) (tree.Datum, error) {
-				entropy := ulid.Monotonic(cryptorand.Reader, 0)
-				uv := ulid.MustNew(ulid.Now(), entropy)
+			Fn: func(_ context.Context, evalCtx *eval.Context, _ tree.Datums) (tree.Datum, error) {
+				uv := ulid.MustNew(ulid.Now(), evalCtx.ULIDEntropy)
 				return tree.NewDUuid(tree.DUuid{UUID: uuid.UUID(uv)}), nil
 			},
 			Info:       "Generates a random ULID and returns it as a value of UUID type.",

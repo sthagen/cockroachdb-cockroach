@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	crypto_rand "crypto/rand"
 	"fmt"
 	"io"
 	"math"
@@ -85,6 +86,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tochar"
+	"github.com/cockroachdb/cockroach/pkg/util/ulid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -3006,7 +3008,12 @@ func (ex *connExecutor) execCopyIn(
 	}()
 
 	// When we're done, unblock the network connection.
-	defer cmd.CopyDone.Done()
+	defer func() {
+		// We've seen cases where this deferred function is executed multiple
+		// times for the same CopyIn command (#112095), so we protect the wait
+		// group to be decremented exactly once via sync.Once.
+		cmd.CopyDone.Once.Do(cmd.CopyDone.WaitGroup.Done)
+	}()
 
 	// The connExecutor state machine has already set us up with a txn at this
 	// point.
@@ -3571,6 +3578,7 @@ func (ex *connExecutor) initEvalCtx(ctx context.Context, evalCtx *extendedEvalCo
 			DescIDGenerator:                ex.getDescIDGenerator(),
 			RangeStatsFetcher:              p.execCfg.RangeStatsFetcher,
 			JobsProfiler:                   p,
+			ULIDEntropy:                    ulid.Monotonic(crypto_rand.Reader, 0),
 		},
 		Tracing:              &ex.sessionTracing,
 		MemMetrics:           &ex.memMetrics,

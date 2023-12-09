@@ -142,6 +142,20 @@ const (
 	ProcedureRoutine
 )
 
+// String returns the string representation of the routine type.
+func (t RoutineType) String() string {
+	switch t {
+	case BuiltinRoutine:
+		return "builtin"
+	case UDFRoutine:
+		return "udf"
+	case ProcedureRoutine:
+		return "procedure"
+	default:
+		panic(errors.AssertionFailedf("unexpected routine type %d", t))
+	}
+}
+
 // Overload is one of the overloads of a built-in function.
 // Each FunctionDefinition may contain one or more overloads.
 type Overload struct {
@@ -430,9 +444,6 @@ func (p ParamTypes) MatchAt(typ *types.T, i int) bool {
 
 // MatchAtIdentical is part of the TypeList interface.
 func (p ParamTypes) MatchAtIdentical(typ *types.T, i int) bool {
-	if typ.Family() == types.TupleFamily {
-		typ = types.AnyTuple
-	}
 	return i < len(p) && (typ.Family() == types.UnknownFamily || p[i].Typ.Identical(typ))
 }
 

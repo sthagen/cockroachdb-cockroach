@@ -76,6 +76,8 @@ func TestCancelQueryOtherNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderRaceWithIssue(t, 116031, "likely OOM")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	args := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
@@ -190,7 +192,7 @@ func TestCancelCopyTo(t *testing.T) {
 
 	g := ctxgroup.WithContext(ctx)
 	g.GoCtx(func(ctx context.Context) error {
-		_, err = conn.Exec(ctx, "COPY (SELECT pg_sleep(1) FROM ROWS FROM (generate_series(1, 60)) AS i) TO STDOUT")
+		_, err := conn.Exec(ctx, "COPY (SELECT pg_sleep(1) FROM ROWS FROM (generate_series(1, 60)) AS i) TO STDOUT")
 		return err
 	})
 

@@ -147,6 +147,7 @@ func runTPCE(ctx context.Context, t test.Test, c cluster.Cluster, opts tpceOptio
 			t.Status("installing cockroach")
 			startOpts := option.DefaultStartOpts()
 			startOpts.RoachprodOpts.StoreCount = opts.ssds
+			roachtestutil.SetDefaultSQLPort(c, startOpts.RoachprodOpts)
 			settings := install.MakeClusterSettings(install.NumRacksOption(racks))
 			c.Start(ctx, t.L(), startOpts, settings, crdbNodes)
 		}
@@ -272,7 +273,6 @@ func registerTPCE(r registry.Registry) {
 		Benchmark:        true,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Weekly),
-		Tags:             registry.Tags("weekly"),
 		Timeout:          36 * time.Hour,
 		Cluster:          r.MakeClusterSpec(largeWeekly.nodes+1, spec.CPU(largeWeekly.cpus), spec.SSD(largeWeekly.ssds)),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

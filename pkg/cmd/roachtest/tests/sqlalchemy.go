@@ -42,7 +42,6 @@ func registerSQLAlchemy(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.ORM),
-		Tags:             registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runSQLAlchemy(ctx, t, c)
 		},
@@ -147,7 +146,7 @@ func runSQLAlchemy(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// will fail. And it is safe to swallow it here.
 	result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
 		`source venv/bin/activate && cd /mnt/data1/sqlalchemy-cockroachdb/ && pytest --maxfail=0 \
-		--dburi='cockroachdb://root@localhost:26257/defaultdb?sslmode=disable&disable_cockroachdb_telemetry=true' \
+		--dburi='cockroachdb://root@localhost:{pgport:1}/defaultdb?sslmode=disable&disable_cockroachdb_telemetry=true' \
 		test/test_suite_sqlalchemy.py
 	`)
 

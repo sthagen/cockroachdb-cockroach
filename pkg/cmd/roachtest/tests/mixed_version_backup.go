@@ -852,6 +852,7 @@ func (sc *systemTableContents) loadShowResults(
 	showCmd := roachtestutil.NewCommand("%s sql", test.DefaultCockroachPath).
 		Flag("certs-dir", "certs").
 		Flag("e", fmt.Sprintf("%q", query)).
+		Flag("port", fmt.Sprintf("{pgport:%d}", sc.roachNode)).
 		String()
 
 	node := sc.cluster.Node(sc.roachNode)
@@ -2668,6 +2669,9 @@ type CommonTestUtils struct {
 	}
 }
 
+// newCommonTestUtils creates a connection to each node (given that the nodes list is not empty)
+// and puts these connections in a cache for reuse. The caller should remember to close all connections
+// once done with them to prevent any goroutine leaks (CloseConnections).
 func newCommonTestUtils(
 	ctx context.Context, t test.Test, c cluster.Cluster, nodes option.NodeListOption, mock bool,
 ) (*CommonTestUtils, error) {

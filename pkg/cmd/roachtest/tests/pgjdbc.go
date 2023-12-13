@@ -229,7 +229,6 @@ func registerPgjdbc(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.Driver),
-		Tags:             registry.Tags(`default`, `driver`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPgjdbc(ctx, t, c)
 		},
@@ -238,7 +237,7 @@ func registerPgjdbc(r registry.Registry) {
 
 const pgjdbcDatabaseParams = `
 server=localhost
-port=26257
+port={pgport:1}
 secondaryServer=localhost
 secondaryPort=5433
 secondaryServer2=localhost

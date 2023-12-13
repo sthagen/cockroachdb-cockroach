@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -345,7 +346,6 @@ func registerKV(r registry.Registry) {
 		} else if !opts.weekly && (opts.readPercent == 95 || opts.readPercent == 0) {
 			// All the kv0|95 tests should run on AWS.
 			clouds = registry.AllClouds
-			tags = registry.Tags("aws")
 		} else {
 			clouds = registry.AllExceptAWS
 		}
@@ -366,7 +366,6 @@ func registerKV(r registry.Registry) {
 			},
 			CompatibleClouds:  clouds,
 			Suites:            suites,
-			Tags:              tags,
 			EncryptionSupport: encryption,
 		})
 	}
@@ -556,7 +555,12 @@ func registerKVGracefulDraining(r registry.Registry) {
 			// Initialize the database with a lot of ranges so that there are
 			// definitely a large number of leases on the node that we shut down
 			// before it starts draining.
-			c.Run(ctx, c.Node(1), "./cockroach workload init kv --splits 100")
+			pgurl, err := roachtestutil.DefaultPGUrl(ctx, c, t.L(), c.Nodes(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Run(ctx, c.Node(1),
+				fmt.Sprintf("./cockroach workload init kv --splits 100 '%s'", pgurl))
 
 			m := c.NewMonitor(ctx, c.Nodes(1, nodes))
 			m.ExpectDeath()
@@ -964,7 +968,6 @@ func registerKVRestartImpact(r registry.Registry) {
 		// This test is expensive (104vcpu), we run it weekly.
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Weekly),
-		Tags:             registry.Tags(`weekly`),
 		Owner:            registry.OwnerKV,
 		Cluster:          r.MakeClusterSpec(13, spec.CPU(8)),
 		Leases:           registry.MetamorphicLeases,

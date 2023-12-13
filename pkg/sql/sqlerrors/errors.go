@@ -168,9 +168,14 @@ func NewUndefinedRelationError(name tree.NodeFormatter) error {
 		"relation %q does not exist", tree.ErrString(name))
 }
 
-// NewColumnAlreadyExistsError creates an error for a preexisting column.
-func NewColumnAlreadyExistsError(name, relation string) error {
+// NewColumnAlreadyExistsInRelationError creates an error for a preexisting column in relation.
+func NewColumnAlreadyExistsInRelationError(name, relation string) error {
 	return pgerror.Newf(pgcode.DuplicateColumn, "column %q of relation %q already exists", name, relation)
+}
+
+// NewColumnAlreadyExistsInIndexError creates an error for a  preexisting column in index.
+func NewColumnAlreadyExistsInIndexError(idxName, colName string) error {
+	return pgerror.Newf(pgcode.DuplicateColumn, "index %q already contains column %q", idxName, colName)
 }
 
 // NewDatabaseAlreadyExistsError creates an error for a preexisting database.
@@ -446,3 +451,13 @@ func IsDistSQLRetryableError(err error) bool {
 	// `(*DistSQLPlanner).Run`.
 	return strings.Contains(errStr, `rpc error`)
 }
+
+var (
+	ErrEmptyDatabaseName = pgerror.New(pgcode.Syntax, "empty database name")
+	ErrNoDatabase        = pgerror.New(pgcode.InvalidName, "no database specified")
+	ErrNoSchema          = pgerror.Newf(pgcode.InvalidName, "no schema specified")
+	ErrNoTable           = pgerror.New(pgcode.InvalidName, "no table specified")
+	ErrNoType            = pgerror.New(pgcode.InvalidName, "no type specified")
+	ErrNoFunction        = pgerror.New(pgcode.InvalidName, "no function specified")
+	ErrNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
+)

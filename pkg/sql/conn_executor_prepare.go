@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 )
 
@@ -47,7 +48,7 @@ func (ex *connExecutor) execPrepare(
 		// information about the previous transaction. We expect to execute
 		// this command in NoTxn.
 		if _, ok := parseCmd.AST.(*tree.ShowCommitTimestamp); !ok {
-			return ex.beginImplicitTxn(ctx, parseCmd.AST)
+			return ex.beginImplicitTxn(ctx, parseCmd.AST, ex.QualityOfService())
 		}
 	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
 		if !ex.isAllowedInAbortedTxn(parseCmd.AST) {
@@ -285,7 +286,7 @@ func (ex *connExecutor) prepare(
 		} else {
 			f := tree.NewFmtCtx(tree.FmtMarkRedactionNode | tree.FmtSimple)
 			f.FormatNode(stmt.AST)
-			redactableStmt := f.CloseAndGetString()
+			redactableStmt := redact.SafeString(f.CloseAndGetString())
 			log.Warningf(ctx, "could not prepare statement during session migration (%s): %v", redactableStmt, err)
 		}
 	}
@@ -382,7 +383,7 @@ func (ex *connExecutor) execBind(
 		// executing SHOW COMMIT TIMESTAMP as it would destroy the information
 		// about the previously committed transaction.
 		if _, ok := ps.AST.(*tree.ShowCommitTimestamp); !ok {
-			return ex.beginImplicitTxn(ctx, ps.AST)
+			return ex.beginImplicitTxn(ctx, ps.AST, ex.QualityOfService())
 		}
 	} else if _, isAbortedTxn := ex.machine.CurState().(stateAborted); isAbortedTxn {
 		if !ex.isAllowedInAbortedTxn(ps.AST) {

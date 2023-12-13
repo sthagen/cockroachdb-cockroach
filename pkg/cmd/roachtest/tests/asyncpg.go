@@ -26,7 +26,7 @@ import (
 const asyncpgRunTestCmd = `
 source venv/bin/activate && 
 cd /mnt/data1/asyncpg && 
-PGPORT=26257 PGHOST=localhost PGUSER=root PGDATABASE=defaultdb python3 setup.py test > asyncpg.stdout
+PGPORT={pgport:1} PGHOST=localhost PGUSER=root PGDATABASE=defaultdb python3 setup.py test > asyncpg.stdout
 `
 
 var asyncpgReleaseTagRegex = regexp.MustCompile(`^(?P<major>v\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
@@ -163,7 +163,6 @@ func registerAsyncpg(r registry.Registry) {
 		Cluster:          r.MakeClusterSpec(1, spec.CPU(16), spec.UbuntuVersion(vm.FocalFossa)),
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.ORM),
-		Tags:             registry.Tags(`default`, `orm`),
 		Leases:           registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runAsyncpg(ctx, t, c)

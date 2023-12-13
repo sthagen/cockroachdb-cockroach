@@ -93,7 +93,7 @@ func registerJasyncSQL(r registry.Registry) {
 		_ = c.RunE(
 			ctx,
 			node,
-			`cd /mnt/data1/jasync-sql && PGUSER=root PGHOST=localhost PGPORT=26257 PGDATABASE=defaultdb ./gradlew :postgresql-async:test`,
+			`cd /mnt/data1/jasync-sql && PGUSER=root PGHOST=localhost PGPORT={pgport:1} PGDATABASE=defaultdb ./gradlew :postgresql-async:test`,
 		)
 
 		_ = c.RunE(ctx, node, `mkdir -p ~/logs/report/jasyncsql-results`)
@@ -145,7 +145,6 @@ func registerJasyncSQL(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.ORM),
-		Tags:             registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runJasyncSQL(ctx, t, c)
 		},

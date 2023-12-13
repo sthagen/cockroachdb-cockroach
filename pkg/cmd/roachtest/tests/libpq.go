@@ -104,7 +104,7 @@ func registerLibPQ(r registry.Registry) {
 		result, err := c.RunWithDetailsSingleNode(
 			ctx, t.L(),
 			node,
-			fmt.Sprintf(`cd %s && PGPORT=26257 PGUSER=root PGSSLMODE=disable PGDATABASE=postgres go test -list "%s"`, libPQPath, testListRegex),
+			fmt.Sprintf(`cd %s && PGPORT={pgport:1} PGUSER=root PGSSLMODE=disable PGDATABASE=postgres go test -list "%s"`, libPQPath, testListRegex),
 		)
 		require.NoError(t, err)
 
@@ -131,7 +131,7 @@ func registerLibPQ(r registry.Registry) {
 		_ = c.RunE(
 			ctx,
 			node,
-			fmt.Sprintf("cd %s && PGPORT=26257 PGUSER=root PGSSLMODE=disable PGDATABASE=postgres go test -run %s -v 2>&1 | %s/bin/go-junit-report > %s",
+			fmt.Sprintf("cd %s && PGPORT={pgport:1} PGUSER=root PGSSLMODE=disable PGDATABASE=postgres go test -run %s -v 2>&1 | %s/bin/go-junit-report > %s",
 				libPQPath, allowedTestsRegExp, goPath, resultsPath),
 		)
 
@@ -148,7 +148,6 @@ func registerLibPQ(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.Driver),
-		Tags:             registry.Tags(`default`, `driver`),
 		Run:              runLibPQ,
 	})
 }

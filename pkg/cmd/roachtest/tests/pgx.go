@@ -117,7 +117,7 @@ func registerPgx(r registry.Registry) {
 			ctx, c, t, node,
 			"run pgx test suite",
 			"cd /mnt/data1/pgx && "+
-				"PGX_TEST_DATABASE='postgresql://root:@localhost:26257/pgx_test' go test -v 2>&1 | "+
+				"PGX_TEST_DATABASE='postgresql://root:@localhost:{pgport:1}/pgx_test' go test -v 2>&1 | "+
 				"`go env GOPATH`/bin/go-junit-report",
 		)
 
@@ -144,7 +144,6 @@ func registerPgx(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.Driver),
-		Tags:             registry.Tags(`default`, `driver`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPgx(ctx, t, c)
 		},

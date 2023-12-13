@@ -1356,9 +1356,17 @@ func (ex *connExecutor) resetTransactionOnSchemaChangeRetry(ctx context.Context)
 	ex.state.mu.Lock()
 	defer ex.state.mu.Unlock()
 	userPriority := ex.state.mu.txn.UserPriority()
-	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db,
+	omitInRangefeeds := ex.state.mu.txn.GetOmitInRangefeeds()
+	newTxn := kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db,
 		ex.transitionCtx.nodeIDOrZero, ex.QualityOfService())
-	return ex.state.mu.txn.SetUserPriority(userPriority)
+	if err := newTxn.SetUserPriority(userPriority); err != nil {
+		return err
+	}
+	if omitInRangefeeds {
+		newTxn.SetOmitInRangefeeds()
+	}
+	ex.state.mu.txn = newTxn
+	return nil
 }
 
 // commitSQLTransaction executes a commit after the execution of a
@@ -2494,6 +2502,7 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				ex.transitionCtx,
 				ex.QualityOfService(),
 				ex.txnIsolationLevelToKV(ctx, s.Modes.Isolation),
+				ex.omitInRangefeeds(),
 			)
 	case *tree.ShowCommitTimestamp:
 		return ex.execShowCommitTimestampInNoTxnState(ctx, s, res)
@@ -2520,6 +2529,7 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				ex.transitionCtx,
 				ex.QualityOfService(),
 				ex.txnIsolationLevelToKV(ctx, tree.UnspecifiedIsolation),
+				ex.omitInRangefeeds(),
 			)
 	}
 }
@@ -2532,7 +2542,7 @@ func (ex *connExecutor) execStmtInNoTxnState(
 // an AOST clause. In these cases the clause is evaluated and applied
 // when the command is executed again.
 func (ex *connExecutor) beginImplicitTxn(
-	ctx context.Context, ast tree.Statement,
+	ctx context.Context, ast tree.Statement, qos sessiondatapb.QoSLevel,
 ) (fsm.Event, fsm.EventPayload) {
 	// NB: Implicit transactions are created with the session's default
 	// historical timestamp even though the statement itself might contain
@@ -2550,8 +2560,9 @@ func (ex *connExecutor) beginImplicitTxn(
 			sqlTs,
 			historicalTs,
 			ex.transitionCtx,
-			ex.QualityOfService(),
+			qos,
 			ex.txnIsolationLevelToKV(ctx, tree.UnspecifiedIsolation),
+			ex.omitInRangefeeds(),
 		)
 }
 

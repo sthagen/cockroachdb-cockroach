@@ -290,90 +290,6 @@ func fingerprint(ctx context.Context, conn *gosql.DB, db, table string) (string,
 	return b.String(), rows.Err()
 }
 
-// disableJobAdoptionStep writes the sentinel file to prevent a node's
-// registry from adopting a job.
-//
-// TODO(renato): remove this duplicated function once
-// `declarative_schema_changer/job-compatibility-mixed-version` is
-// migrated to the new mixed-version testing framework.
-func disableJobAdoptionStep(c cluster.Cluster, nodeIDs option.NodeListOption) versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		for _, nodeID := range nodeIDs {
-			result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(nodeID), "echo", "-n", "{store-dir}")
-			if err != nil {
-				t.L().Printf("Failed to retrieve store directory from node %d: %v\n", nodeID, err.Error())
-			}
-			storeDirectory := result.Stdout
-			disableJobAdoptionSentinelFilePath := filepath.Join(storeDirectory, jobs.PreventAdoptionFile)
-			cmd := fmt.Sprintf("touch %s", disableJobAdoptionSentinelFilePath)
-			c.Run(ctx, nodeIDs, cmd)
-			t.L().Printf("Disabling job adoption on node %v: > %v\n", nodeID, cmd)
-
-			// Wait for no jobs to be running on the node that we have halted
-			// adoption on.
-			testutils.SucceedsSoon(t, func() error {
-				gatewayDB := c.Conn(ctx, t.L(), nodeID)
-				defer gatewayDB.Close()
-
-				var runningJobIDs []jobspb.JobID
-				row, err := gatewayDB.Query(fmt.Sprintf(`SELECT job_id FROM [SHOW JOBS] WHERE status = 'running' AND coordinator_id = %d`, nodeID))
-				require.NoError(t, err)
-				for row.Next() {
-					var jobID int64
-					require.NoError(t, row.Scan(&jobID))
-					runningJobIDs = append(runningJobIDs, jobspb.JobID(jobID))
-				}
-				require.NoError(t, row.Close())
-
-				if len(runningJobIDs) != 0 {
-					return errors.Newf("node is still running %d jobs: %v", len(runningJobIDs), runningJobIDs)
-				}
-				return nil
-			})
-		}
-
-		// TODO(adityamaru): This is unfortunate and can be deleted once
-		// https://github.com/cockroachdb/cockroach/pull/79666 is backported to
-		// 21.2 and the mixed version map for roachtests is bumped to the 21.2
-		// patch release with the backport.
-		//
-		// The bug above means that nodes for which we have disabled adoption may
-		// still lay claim on the job, and then not clear their claim on realizing
-		// that adoption is disabled. To get around this we set the env variable
-		// to disable the registries from even laying claim on the jobs.
-		_, err := c.RunWithDetails(ctx, t.L(), nodeIDs, "export COCKROACH_JOB_ADOPTIONS_PER_PERIOD=0")
-		require.NoError(t, err)
-	}
-}
-
-// enableJobAdoptionStep clears the sentinel file that prevents a node's
-// registry from adopting a job.
-//
-// TODO(renato): remove this duplicated function once
-// `declarative_schema_changer/job-compatibility-mixed-version` is
-// migrated to the new mixed-version testing framework.
-func enableJobAdoptionStep(c cluster.Cluster, nodeIDs option.NodeListOption) versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		for _, nodeID := range nodeIDs {
-			result, err := c.RunWithDetailsSingleNode(ctx, t.L(),
-				c.Node(nodeID), "echo", "-n", "{store-dir}")
-			if err != nil {
-				t.L().Printf("Failed to retrieve store directory from node %d: %v\n", nodeID, err.Error())
-			}
-			storeDirectory := result.Stdout
-			disableJobAdoptionSentinelFilePath := filepath.Join(storeDirectory, jobs.PreventAdoptionFile)
-			cmd := fmt.Sprintf("rm -f %s", disableJobAdoptionSentinelFilePath)
-			c.Run(ctx, nodeIDs, cmd)
-			t.L().Printf("Enabling job adoption on node %v: > %v\n", nodeID, cmd)
-		}
-
-		// Reset the env variable that controls how many jobs are claimed by the
-		// registry.
-		_, err := c.RunWithDetails(ctx, t.L(), nodeIDs, "export COCKROACH_JOB_ADOPTIONS_PER_PERIOD=10")
-		require.NoError(t, err)
-	}
-}
-
 // initBulkJobPerfArtifacts registers a histogram, creates a performance
 // artifact directory and returns a method that when invoked records a tick.
 func initBulkJobPerfArtifacts(testName string, timeout time.Duration) (func(), *bytes.Buffer) {
@@ -419,11 +335,15 @@ func registerBackup(r registry.Registry) {
 			m := c.NewMonitor(ctx)
 			m.Go(func(ctx context.Context) error {
 				t.Status(`running backup`)
+				pgurl, err := roachtestutil.DefaultPGUrl(ctx, c, t.L(), c.Node(1))
+				if err != nil {
+					return err
+				}
 				// Tick once before starting the backup, and once after to capture the
 				// total elapsed time. This is used by roachperf to compute and display
 				// the average MB/sec per node.
 				tick()
-				c.Run(ctx, c.Node(1), `./cockroach sql --insecure -e "
+				c.Run(ctx, c.Node(1), `./cockroach sql --insecure --url=`+pgurl+` -e "
 				BACKUP bank.bank TO 'gs://`+backupTestingBucket+`/`+dest+`?AUTH=implicit'"`)
 				tick()
 
@@ -535,10 +455,9 @@ func registerBackup(r registry.Registry) {
 		kmsProvider string
 		machine     string
 		clouds      registry.CloudSet
-		tags        map[string]struct{}
 	}{
 		{kmsProvider: "GCS", machine: spec.GCE, clouds: registry.AllExceptAWS},
-		{kmsProvider: "AWS", machine: spec.AWS, clouds: registry.OnlyAWS, tags: registry.Tags("aws")},
+		{kmsProvider: "AWS", machine: spec.AWS, clouds: registry.OnlyAWS},
 	} {
 		item := item
 		r.Add(registry.TestSpec{
@@ -549,7 +468,6 @@ func registerBackup(r registry.Registry) {
 			Leases:            registry.MetamorphicLeases,
 			CompatibleClouds:  item.clouds,
 			Suites:            registry.Suites(registry.Nightly),
-			Tags:              item.tags,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				if c.Cloud() != item.machine {
 					t.Skip("backupKMS roachtest is only configured to run on "+item.machine, "")

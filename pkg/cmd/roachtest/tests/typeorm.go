@@ -217,7 +217,6 @@ echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.co
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.ORM),
-		Tags:             registry.Tags(`default`, `orm`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTypeORM(ctx, t, c)
 		},
@@ -295,7 +294,7 @@ const typeORMConfigJSON = `
     "name": "cockroachdb",
     "type": "cockroachdb",
     "host": "localhost",
-    "port": 26257,
+    "port": {pgport:1},
     "username": "root",
     "password": "",
     "database": "defaultdb"

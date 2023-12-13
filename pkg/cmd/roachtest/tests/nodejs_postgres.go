@@ -50,12 +50,12 @@ func registerNodeJSPostgres(r registry.Registry) {
 
 		err = repeatRunE(ctx, t, c, node, "create sql user",
 			fmt.Sprintf(
-				`./cockroach sql --certs-dir certs -e "CREATE USER %s CREATEDB"`, user,
+				`./cockroach sql --certs-dir certs --port={pgport:1} -e "CREATE USER %s CREATEDB"`, user,
 			))
 		require.NoError(t, err)
 
 		err = repeatRunE(ctx, t, c, node, "create test database",
-			`./cockroach sql --certs-dir certs -e "CREATE DATABASE postgres_node_test"`,
+			`./cockroach sql --certs-dir certs --port={pgport:1} -e "CREATE DATABASE postgres_node_test"`,
 		)
 		require.NoError(t, err)
 
@@ -148,7 +148,7 @@ echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.co
 		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
 			fmt.Sprintf(
 				`cd /mnt/data1/node-postgres/ && sudo \
-PGPORT=26257 PGUSER=%s PGSSLMODE=require PGDATABASE=postgres_node_test \
+PGPORT={pgport:1} PGUSER=%s PGSSLMODE=require PGDATABASE=postgres_node_test \
 PGSSLCERT=$HOME/certs/client.%s.crt PGSSLKEY=$HOME/certs/client.%s.key PGSSLROOTCERT=$HOME/certs/ca.crt yarn test`,
 				user, user, user,
 			),
@@ -185,7 +185,6 @@ PGSSLCERT=$HOME/certs/client.%s.crt PGSSLKEY=$HOME/certs/client.%s.key PGSSLROOT
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.Driver),
-		Tags:             registry.Tags(`default`, `driver`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runNodeJSPostgres(ctx, t, c)
 		},

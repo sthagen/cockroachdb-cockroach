@@ -112,7 +112,7 @@ func registerPsycopg(r registry.Registry) {
 			`cd /mnt/data1/psycopg/ &&
 			export PSYCOPG2_TESTDB=defaultdb &&
 			export PSYCOPG2_TESTDB_USER=root &&
-			export PSYCOPG2_TESTDB_PORT=26257 &&
+			export PSYCOPG2_TESTDB_PORT={pgport:1} &&
 			export PSYCOPG2_TESTDB_HOST=localhost &&
 			make check PYTHON_VERSION=3`,
 		)
@@ -145,7 +145,6 @@ func registerPsycopg(r registry.Registry) {
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.AllExceptAWS,
 		Suites:           registry.Suites(registry.Nightly, registry.Driver),
-		Tags:             registry.Tags(`default`, `driver`),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPsycopg(ctx, t, c)
 		},

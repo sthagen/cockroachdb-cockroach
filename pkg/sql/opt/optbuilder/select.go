@@ -268,6 +268,13 @@ func (b *Builder) buildDataSource(
 
 		lockCtx.filter(source.As.Alias)
 		if lockCtx.locking.isSet() {
+			// If this table was on the null-extended side of an outer join, we are not
+			// allowed to lock it.
+			if lockCtx.isNullExtended {
+				panic(pgerror.Newf(
+					pgcode.FeatureNotSupported, "%s cannot be applied to the nullable side of an outer join",
+					lockCtx.locking.get().Strength))
+			}
 			// SELECT ... FOR [KEY] UPDATE/SHARE also requires UPDATE privileges.
 			b.checkPrivilege(depName, ds, privilege.UPDATE)
 		}
@@ -825,7 +832,7 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 	numChecks := tab.CheckCount()
 	chkIdx := 0
 	for ; chkIdx < numChecks; chkIdx++ {
-		if tab.Check(chkIdx).Validated {
+		if tab.Check(chkIdx).Validated() {
 			break
 		}
 	}
@@ -852,10 +859,10 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 		checkConstraint := tab.Check(chkIdx)
 
 		// Only add validated check constraints to the table's metadata.
-		if !checkConstraint.Validated {
+		if !checkConstraint.Validated() {
 			continue
 		}
-		expr, err := parser.ParseExpr(checkConstraint.Constraint)
+		expr, err := parser.ParseExpr(checkConstraint.Constraint())
 		if err != nil {
 			panic(err)
 		}

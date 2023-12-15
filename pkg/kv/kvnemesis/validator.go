@@ -770,6 +770,7 @@ func (v *validator) processOp(op Operation) {
 		v.failIfError(
 			op, t.Result,
 			exceptRollback, exceptAmbiguous, exceptSharedLockPromotionError, exceptSkipLockedReplayError,
+			exceptSkipLockedUnsupportedError,
 		)
 
 		ops := t.Ops
@@ -1058,8 +1059,10 @@ func (v *validator) checkAtomicCommitted(
 					panic(err)
 				}
 			} else { // ranged write
+				key := storage.EngineKey{Key: o.Key}.Encode()
+				endKey := storage.EngineKey{Key: o.EndKey}.Encode()
 				suffix := storage.EncodeMVCCTimestampSuffix(o.Timestamp)
-				if err := batch.RangeKeyUnset(o.Key, o.EndKey, suffix, nil); err != nil {
+				if err := batch.RangeKeyUnset(key, endKey, suffix, nil); err != nil {
 					panic(err)
 				}
 			}
@@ -1103,8 +1106,10 @@ func (v *validator) checkAtomicCommitted(
 					panic(err)
 				}
 			} else {
+				key := storage.EngineKey{Key: o.Key}.Encode()
+				endKey := storage.EngineKey{Key: o.EndKey}.Encode()
 				suffix := storage.EncodeMVCCTimestampSuffix(writeTS)
-				if err := batch.RangeKeySet(o.Key, o.EndKey, suffix, o.Value.RawBytes, nil); err != nil {
+				if err := batch.RangeKeySet(key, endKey, suffix, o.Value.RawBytes, nil); err != nil {
 					panic(err)
 				}
 			}
@@ -1273,6 +1278,7 @@ func (v *validator) checkError(
 		exceptDelRangeUsingTombstoneStraddlesRangeBoundary,
 		exceptSharedLockPromotionError,
 		exceptSkipLockedReplayError,
+		exceptSkipLockedUnsupportedError,
 	}
 	sl = append(sl, extraExceptions...)
 	return v.failIfError(op, r, sl...)

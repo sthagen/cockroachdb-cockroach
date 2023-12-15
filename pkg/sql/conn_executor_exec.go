@@ -1881,10 +1881,6 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		panic(err)
 	}
 
-	if !planner.ExecCfg().Codec.ForSystemTenant() {
-		planner.curPlan.flags.Set(planFlagTenant)
-	}
-
 	switch distributePlan {
 	case physicalplan.FullyDistributedPlan:
 		planner.curPlan.flags.Set(planFlagFullyDistributed)
@@ -2479,6 +2475,9 @@ func (ex *connExecutor) execStmtInNoTxnState(
 		)
 	}()
 
+	// We're in the NoTxn state, so no statements were executed earlier. Bump the
+	// txn counter for logging.
+	ex.extraTxnState.txnCounter.Add(1)
 	ast := parserStmt.AST
 	switch s := ast.(type) {
 	case *tree.BeginTransaction:

@@ -8556,87 +8556,6 @@ func TestRedactedSchemaRegistry(t *testing.T) {
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
-type echoResolver struct {
-	result []roachpb.Spans
-	pos    int
-}
-
-func (r *echoResolver) getRangesForSpans(
-	_ context.Context, _ []roachpb.Span,
-) (spans []roachpb.Span, _ error) {
-	spans = r.result[r.pos]
-	r.pos++
-	return spans, nil
-}
-
-func TestPartitionSpans(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	partitions := func(p ...sql.SpanPartition) []sql.SpanPartition {
-		return p
-	}
-	mkPart := func(n base.SQLInstanceID, spans ...roachpb.Span) sql.SpanPartition {
-		return sql.SpanPartition{SQLInstanceID: n, Spans: spans}
-	}
-	mkSpan := func(start, end string) roachpb.Span {
-		return roachpb.Span{Key: []byte(start), EndKey: []byte(end)}
-	}
-	spans := func(s ...roachpb.Span) roachpb.Spans {
-		return s
-	}
-	const sensitivity = 0.01
-
-	for i, tc := range []struct {
-		input   []sql.SpanPartition
-		resolve []roachpb.Spans
-		expect  []sql.SpanPartition
-	}{
-		{
-			input: partitions(
-				mkPart(1, mkSpan("a", "j")),
-				mkPart(2, mkSpan("j", "q")),
-				mkPart(3, mkSpan("q", "z")),
-			),
-			// 6 total ranges, 2 per node.
-			resolve: []roachpb.Spans{
-				spans(mkSpan("a", "c"), mkSpan("c", "e"), mkSpan("e", "j")),
-				spans(mkSpan("j", "q")),
-				spans(mkSpan("q", "y"), mkSpan("y", "z")),
-			},
-			expect: partitions(
-				mkPart(1, mkSpan("a", "e")),
-				mkPart(2, mkSpan("e", "q")),
-				mkPart(3, mkSpan("q", "z")),
-			),
-		},
-		{
-			input: partitions(
-				mkPart(1, mkSpan("a", "c"), mkSpan("e", "p"), mkSpan("r", "z")),
-				mkPart(2),
-				mkPart(3, mkSpan("c", "e"), mkSpan("p", "r")),
-			),
-			// 5 total ranges -- on 2 nodes; target should be 1 per node.
-			resolve: []roachpb.Spans{
-				spans(mkSpan("a", "c"), mkSpan("e", "p"), mkSpan("r", "z")),
-				spans(),
-				spans(mkSpan("c", "e"), mkSpan("p", "r")),
-			},
-			expect: partitions(
-				mkPart(1, mkSpan("a", "c"), mkSpan("e", "p")),
-				mkPart(2, mkSpan("r", "z")),
-				mkPart(3, mkSpan("c", "e"), mkSpan("p", "r")),
-			),
-		},
-	} {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			sp, err := rebalanceSpanPartitions(context.Background(),
-				&echoResolver{result: tc.resolve}, sensitivity, tc.input)
-			require.NoError(t, err)
-			require.Equal(t, tc.expect, sp)
-		})
-	}
-}
-
 func TestChangefeedMetricsScopeNotice(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -9105,7 +9024,7 @@ func TestBatchSizeMetric(t *testing.T) {
 		  INSERT INTO foo (key) VALUES (1), (2), (3);
 		`)
 
-		numSamples, sum := batchSizeHist.TotalWindowed()
+		numSamples, sum := batchSizeHist.WindowedSnapshot().Total()
 		require.Equal(t, int64(0), numSamples)
 		require.Equal(t, 0.0, sum)
 
@@ -9113,7 +9032,7 @@ func TestBatchSizeMetric(t *testing.T) {
 		require.NoError(t, err)
 
 		testutils.SucceedsSoon(t, func() error {
-			numSamples, sum = batchSizeHist.TotalWindowed()
+			numSamples, sum = batchSizeHist.WindowedSnapshot().Total()
 			if numSamples <= 0 && sum <= 0.0 {
 				return errors.Newf("waiting for metric %d %d", numSamples, sum)
 			}
@@ -9171,7 +9090,7 @@ func TestParallelIOMetrics(t *testing.T) {
 		require.NoError(t, err)
 
 		testutils.SucceedsSoon(t, func() error {
-			numSamples, sum := metrics.ParallelIOPendingQueueNanos.TotalWindowed()
+			numSamples, sum := metrics.ParallelIOPendingQueueNanos.WindowedSnapshot().Total()
 			if numSamples <= 0 && sum <= 0.0 {
 				return errors.Newf("waiting for queue nanos: %d %f", numSamples, sum)
 			}
@@ -9194,7 +9113,7 @@ func TestParallelIOMetrics(t *testing.T) {
 			return errors.New("waiting for in-flight keys")
 		})
 		testutils.SucceedsSoon(t, func() error {
-			numSamples, sum := metrics.ParallelIOResultQueueNanos.TotalWindowed()
+			numSamples, sum := metrics.ParallelIOResultQueueNanos.WindowedSnapshot().Total()
 			if numSamples <= 0 && sum <= 0.0 {
 				return errors.Newf("waiting for result queue nanos: %d %f", numSamples, sum)
 			}

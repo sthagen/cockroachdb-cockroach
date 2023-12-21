@@ -19,7 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -510,12 +509,8 @@ type FirstRangeProvider interface {
 type DistSender struct {
 	log.AmbientContext
 
-	st *cluster.Settings
-	// nodeDescriptor, if set, holds the descriptor of the node the
-	// DistSender lives on. It should be accessed via getNodeDescriptor(),
-	// which tries to obtain the value from the Gossip network if the
-	// descriptor is unknown.
-	nodeDescriptor unsafe.Pointer
+	st      *cluster.Settings
+	stopper *stop.Stopper
 	// clock is used to set time for some calls. E.g. read-only ops
 	// which span ranges and don't require read consistency.
 	clock *hlc.Clock
@@ -535,15 +530,10 @@ type DistSender struct {
 	// This is not required if a RangeDescriptorDB is supplied.
 	firstRangeProvider FirstRangeProvider
 	transportFactory   TransportFactory
-	rpcContext         *rpc.Context
 	// nodeDialer allows RPC calls from the SQL layer to the KV layer.
 	nodeDialer      *nodedialer.Dialer
 	rpcRetryOptions retry.Options
 	asyncSenderSem  *quotapool.IntPool
-	// clusterID is the logical cluster ID used to verify access to enterprise features.
-	// It is copied out of the rpcContext at construction time and used in
-	// testing.
-	logicalClusterID *base.ClusterIDContainer
 
 	// batchInterceptor is set for tenants; when set, information about all
 	// BatchRequests and BatchResponses are passed through this interceptor, which
@@ -594,18 +584,14 @@ type DistSenderConfig struct {
 	AmbientCtx log.AmbientContext
 
 	Settings  *cluster.Settings
+	Stopper   *stop.Stopper
 	Clock     *hlc.Clock
 	NodeDescs NodeDescStore
 	// NodeIDGetter, if set, provides non-gossip based implementation for
 	// obtaining the local KV node ID. The DistSender uses the node ID to
 	// preferentially route requests to a local replica (if one exists).
-	NodeIDGetter func() roachpb.NodeID
-	// nodeDescriptor, if provided, is used to describe which node the
-	// DistSender lives on, for instance when deciding where to send RPCs.
-	// Usually it is filled in from the Gossip network on demand.
-	nodeDescriptor  *roachpb.NodeDescriptor
+	NodeIDGetter    func() roachpb.NodeID
 	RPCRetryOptions *retry.Options
-	RPCContext      *rpc.Context
 	// NodeDialer is the dialer from the SQL layer to the KV layer.
 	NodeDialer *nodedialer.Dialer
 
@@ -638,6 +624,8 @@ type DistSenderConfig struct {
 	TestingKnobs ClientTestingKnobs
 
 	HealthFunc HealthFunc
+
+	LatencyFunc LatencyFunc
 }
 
 // NewDistSender returns a batch.Sender instance which connects to the
@@ -658,6 +646,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	}
 	ds := &DistSender{
 		st:            cfg.Settings,
+		stopper:       cfg.Stopper,
 		clock:         cfg.Clock,
 		nodeDescs:     cfg.NodeDescs,
 		nodeIDGetter:  nodeIDGetter,
@@ -665,6 +654,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 		kvInterceptor: cfg.KVInterceptor,
 		locality:      cfg.Locality,
 		healthFunc:    cfg.HealthFunc,
+		latencyFunc:   cfg.LatencyFunc,
 	}
 	if ds.st == nil {
 		ds.st = cluster.MakeTestingClusterSettings()
@@ -675,9 +665,6 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 		panic("no tracer set in AmbientCtx")
 	}
 
-	if cfg.nodeDescriptor != nil {
-		atomic.StorePointer(&ds.nodeDescriptor, unsafe.Pointer(cfg.nodeDescriptor))
-	}
 	var rdb rangecache.RangeDescriptorDB
 	if cfg.FirstRangeProvider != nil {
 		ds.firstRangeProvider = cfg.FirstRangeProvider
@@ -692,7 +679,7 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	getRangeDescCacheSize := func() int64 {
 		return rangeDescriptorCacheSize.Get(&ds.st.SV)
 	}
-	ds.rangeCache = rangecache.NewRangeCache(ds.st, rdb, getRangeDescCacheSize, cfg.RPCContext.Stopper)
+	ds.rangeCache = rangecache.NewRangeCache(ds.st, rdb, getRangeDescCacheSize, cfg.Stopper)
 	if tf := cfg.TestingKnobs.TransportFactory; tf != nil {
 		ds.transportFactory = tf
 	} else {
@@ -706,21 +693,16 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 	if cfg.RPCRetryOptions != nil {
 		ds.rpcRetryOptions = *cfg.RPCRetryOptions
 	}
-	if cfg.RPCContext == nil {
-		panic("no RPCContext set in DistSenderConfig")
-	}
-	ds.rpcContext = cfg.RPCContext
 	ds.nodeDialer = cfg.NodeDialer
 	if ds.rpcRetryOptions.Closer == nil {
-		ds.rpcRetryOptions.Closer = ds.rpcContext.Stopper.ShouldQuiesce()
+		ds.rpcRetryOptions.Closer = cfg.Stopper.ShouldQuiesce()
 	}
-	ds.logicalClusterID = cfg.RPCContext.LogicalClusterID
 	ds.asyncSenderSem = quotapool.NewIntPool("DistSender async concurrency",
 		uint64(senderConcurrencyLimit.Get(&ds.st.SV)))
 	senderConcurrencyLimit.SetOnChange(&ds.st.SV, func(ctx context.Context) {
 		ds.asyncSenderSem.UpdateCapacity(uint64(senderConcurrencyLimit.Get(&ds.st.SV)))
 	})
-	ds.rpcContext.Stopper.AddCloser(ds.asyncSenderSem.Closer("stopper"))
+	cfg.Stopper.AddCloser(ds.asyncSenderSem.Closer("stopper"))
 
 	if ds.firstRangeProvider != nil {
 		ctx := ds.AnnotateCtx(context.Background())
@@ -735,8 +717,12 @@ func NewDistSender(cfg DistSenderConfig) *DistSender {
 
 	if cfg.TestingKnobs.LatencyFunc != nil {
 		ds.latencyFunc = cfg.TestingKnobs.LatencyFunc
-	} else {
-		ds.latencyFunc = ds.rpcContext.RemoteClocks.Latency
+	}
+	// Some tests don't set the latencyFunc.
+	if ds.latencyFunc == nil {
+		ds.latencyFunc = func(roachpb.NodeID) (time.Duration, bool) {
+			return time.Millisecond, true
+		}
 	}
 
 	if cfg.TestingKnobs.OnRangeSpanningNonTxnalBatch != nil {
@@ -1246,9 +1232,9 @@ func (ds *DistSender) divideAndSendParallelCommit(
 	qiBatchIdx := batchIdx + 1
 	qiResponseCh := make(chan response, 1)
 
-	runTask := ds.rpcContext.Stopper.RunAsyncTask
+	runTask := ds.stopper.RunAsyncTask
 	if ds.disableParallelBatches {
-		runTask = ds.rpcContext.Stopper.RunTask
+		runTask = ds.stopper.RunTask
 	}
 	if err := runTask(ctx, "kv.DistSender: sending pre-commit query intents", func(ctx context.Context) {
 		// Map response index to the original un-swapped batch index.
@@ -1789,7 +1775,7 @@ func (ds *DistSender) sendPartialBatchAsync(
 	responseCh chan response,
 	positions []int,
 ) bool {
-	if err := ds.rpcContext.Stopper.RunAsyncTaskEx(
+	if err := ds.stopper.RunAsyncTaskEx(
 		ctx,
 		stop.TaskOpts{
 			TaskName:   "kv.DistSender: sending partial batch",

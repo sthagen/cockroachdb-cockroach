@@ -90,9 +90,8 @@ func NewDistSenderForLocalTestCluster(
 		Settings:           st,
 		Clock:              clock,
 		NodeDescs:          g,
-		RPCContext:         rpcContext,
+		Stopper:            stopper,
 		RPCRetryOptions:    &retryOpts,
-		nodeDescriptor:     nodeDesc,
 		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(g)),
 		FirstRangeProvider: g,
 		TestingKnobs: ClientTestingKnobs{

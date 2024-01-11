@@ -193,11 +193,11 @@ func restoreWithRetry(
 			break
 		}
 
-		if errors.HasType(err, &kvpb.InsufficientSpaceError{}) {
+		if errors.HasType(err, &kvpb.InsufficientSpaceError{}) || errors.Is(err, restoreProcError) {
 			return roachpb.RowCount{}, jobs.MarkPauseRequestError(errors.UnwrapAll(err))
 		}
 
-		if joberror.IsPermanentBulkJobError(err) {
+		if joberror.IsPermanentBulkJobError(err) && !errors.Is(err, retryableRestoreProcError) {
 			return roachpb.RowCount{}, err
 		}
 
@@ -2214,6 +2214,14 @@ func (r *restoreResumer) publishDescriptors(
 	// accessed.
 	for i := range details.TableDescs {
 		mutTable := all.LookupDescriptor(details.TableDescs[i].GetID()).(*tabledesc.Mutable)
+
+		if details.ExperimentalOnline {
+			// We disable automatic stats refresh on all restored tables until the
+			// download job finishes.
+			boolean := false
+			mutTable.AutoStatsSettings = &catpb.AutoStatsSettings{Enabled: &boolean}
+		}
+
 		// Note that we don't need to worry about the re-validated indexes for descriptors
 		// with a declarative schema change job.
 		if mutTable.GetDeclarativeSchemaChangerState() != nil {

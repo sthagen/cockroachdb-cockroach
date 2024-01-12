@@ -256,7 +256,9 @@ func (*DummyEvalPlanner) ExternalWriteFile(ctx context.Context, uri string, cont
 }
 
 // DecodeGist is part of the Planner interface.
-func (*DummyEvalPlanner) DecodeGist(gist string, external bool) ([]string, error) {
+func (*DummyEvalPlanner) DecodeGist(
+	ctx context.Context, gist string, external bool,
+) ([]string, error) {
 	return nil, errors.WithStack(errEvalPlanner)
 }
 
@@ -589,6 +591,13 @@ func (ep *DummySessionAccessor) SetSessionVar(
 	ctx context.Context, settingName, newValue string, isLocal bool,
 ) error {
 	return errors.WithStack(errEvalSessionVar)
+}
+
+// HasGlobalPrivilegeOrRoleOption is part of the eval.SessionAccessor interface.
+func (ep *DummySessionAccessor) HasGlobalPrivilegeOrRoleOption(
+	ctx context.Context, privilege privilege.Kind,
+) (bool, error) {
+	return false, nil
 }
 
 // HasAdminRole is part of the eval.SessionAccessor interface.

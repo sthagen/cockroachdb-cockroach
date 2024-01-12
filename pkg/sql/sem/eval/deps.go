@@ -299,7 +299,7 @@ type Planner interface {
 	ExternalWriteFile(ctx context.Context, uri string, content []byte) error
 
 	// DecodeGist exposes gist functionality to the builtin functions.
-	DecodeGist(gist string, external bool) ([]string, error)
+	DecodeGist(ctx context.Context, gist string, external bool) ([]string, error)
 
 	// SerializeSessionState serializes the variables in the current session
 	// and returns a state, in bytes form.
@@ -497,6 +497,10 @@ type SessionAccessor interface {
 
 	// GetSessionVar retrieves the current value of a session variable.
 	GetSessionVar(ctx context.Context, settingName string, missingOk bool) (bool, string, error)
+
+	// HasGlobalPrivilegeOrRoleOption checks if the current user has the
+	// given global privilege, or the equivalent role option if one exists.
+	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
 
 	// HasAdminRole returns true iff the current session user has the admin role.
 	HasAdminRole(ctx context.Context) (bool, error)

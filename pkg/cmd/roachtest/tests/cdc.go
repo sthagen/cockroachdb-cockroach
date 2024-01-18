@@ -492,7 +492,6 @@ func (f *enumFeatureFlag) enabled(r enthropy, choose func(enthropy) string) (str
 // cdcFeatureFlags describes various cdc feature flags.
 // zero value cdcFeatureFlags uses metamorphic settings for features.
 type cdcFeatureFlags struct {
-	RangeFeedScheduler   featureFlag
 	SchemaLockTables     featureFlag
 	DistributionStrategy enumFeatureFlag
 }
@@ -1629,8 +1628,8 @@ func registerCDC(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:             "cdc/kafka-azure",
 		Owner:            `cdc`,
-		CompatibleClouds: registry.AllExceptAWS,
-		Cluster:          r.MakeClusterSpec(2, spec.GCEZones("us-east1-b")),
+		CompatibleClouds: registry.OnlyAzure,
+		Cluster:          r.MakeClusterSpec(2),
 		Leases:           registry.MetamorphicLeases,
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

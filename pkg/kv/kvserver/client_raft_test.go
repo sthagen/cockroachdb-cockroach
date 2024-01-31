@@ -1564,7 +1564,7 @@ func TestReceiveSnapshotLogging(t *testing.T) {
 		chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(receiverNodeIdx))
 
 		testStartTs := timeutil.Now()
-		_, pErr := repl.ChangeReplicas(ctx, rngDesc, kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
+		_, pErr := repl.ChangeReplicas(ctx, rngDesc, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
 
 		// When ready, flush logs and check messages from store_raft.go since
 		// call to repl.ChangeReplicas(..).
@@ -2138,7 +2138,7 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 
 	addReplica := func(storeNum int, desc *roachpb.RangeDescriptor) error {
 		chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(storeNum))
-		_, err := repl.ChangeReplicas(ctx, desc, kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
+		_, err := repl.ChangeReplicas(ctx, desc, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
 		return err
 	}
 
@@ -3208,7 +3208,7 @@ func TestRemovePlaceholderRace(t *testing.T) {
 		for _, action := range []roachpb.ReplicaChangeType{roachpb.REMOVE_VOTER, roachpb.ADD_VOTER} {
 			for {
 				chgs := kvpb.MakeReplicationChanges(action, tc.Target(1))
-				if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonUnknown, "", chgs); err != nil {
+				if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.ReasonUnknown, "", chgs); err != nil {
 					if kvserver.IsRetriableReplicationChangeError(err) ||
 						kvserver.IsReplicationChangeInProgressError(err) {
 						continue
@@ -3310,7 +3310,7 @@ func TestReplicaGCRace(t *testing.T) {
 		NodeID:  toStore.Ident.NodeID,
 		StoreID: toStore.Ident.StoreID,
 	})
-	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs); err != nil {
+	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.ReasonRangeUnderReplicated, "", chgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3359,7 +3359,7 @@ func TestReplicaGCRace(t *testing.T) {
 
 	// Remove the victim replica and manually GC it.
 	chgs[0].ChangeType = roachpb.REMOVE_VOTER
-	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeOverReplicated, "", chgs); err != nil {
+	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.ReasonRangeOverReplicated, "", chgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -6130,10 +6130,10 @@ func TestRaftPreVote(t *testing.T) {
 				// We install a proposal filter which rejects proposals to the range
 				// during the partition (typically txn record cleanup via GC requests,
 				// but also e.g. lease extensions).
-				var partitioned atomic.Bool
+				var partitioned, blocked atomic.Bool
 				var rangeID roachpb.RangeID
 				propFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
-					if partitioned.Load() && args.Req.RangeID == rangeID {
+					if blocked.Load() && args.Req.RangeID == rangeID {
 						t.Logf("r%d proposal rejected: %s", rangeID, args.Req)
 						return kvpb.NewError(errors.New("rejected"))
 					}
@@ -6206,13 +6206,45 @@ func TestRaftPreVote(t *testing.T) {
 				tc.WaitForValues(t, key, []int64{2, 2, 2})
 				t.Logf("n1 has lease")
 
-				// Wait for the range to quiesce, if enabled.
+				// Block new proposals to the range.
+				blocked.Store(true)
+				t.Logf("n1 proposals blocked")
+
+				// Wait for the range to quiesce, if enabled. Otherwise, wait for the
+				// range to stabilize such that the leader's log does not change for a
+				// second, and has been replicated to all followers.
 				if quiesce {
 					require.Eventually(t, repl3.IsQuiescent, 10*time.Second, 100*time.Millisecond)
 					t.Logf("n3 quiesced")
 				} else {
 					require.False(t, repl3.IsQuiescent())
 					t.Logf("n3 not quiesced")
+
+					var lastIndex uint64
+					var lastChanged time.Time
+					require.Eventually(t, func() bool {
+						status := repl1.RaftStatus()
+						require.Equal(t, raft.StateLeader, status.RaftState)
+						if i := status.Progress[1].Match; i > lastIndex {
+							t.Logf("n1 last index changed: %d -> %d", lastIndex, i)
+							lastIndex, lastChanged = i, time.Now()
+							return false
+						}
+						for i, pr := range status.Progress {
+							if pr.Match != lastIndex {
+								t.Logf("n%d match %d not at n1 last index %d, waiting", i, pr.Match, lastIndex)
+								return false
+							}
+						}
+						if since := time.Since(lastChanged); since < time.Second {
+							t.Logf("n1 last index %d changed %s ago, waiting",
+								lastIndex, since.Truncate(time.Millisecond))
+							return false
+						}
+						return true
+					}, 10*time.Second, 200*time.Millisecond)
+					t.Logf("n1 stabilized range")
+					logStatus(repl1.RaftStatus())
 				}
 
 				// Partition n3.
@@ -6266,7 +6298,9 @@ func TestRaftPreVote(t *testing.T) {
 				}
 				t.Logf("n1 is still leader")
 
-				// Heal the partition, and wait for the replica to become a follower.
+				// Heal the partition and unblock proposals, then wait for the replica
+				// to become a follower.
+				blocked.Store(false)
 				partitioned.Store(false)
 				t.Logf("n3 partition healed")
 

@@ -416,6 +416,12 @@ func NewServer(
 	metrics := makeMetrics(false /* internal */)
 	serverMetrics := makeServerMetrics(cfg)
 	insightsProvider := insights.New(cfg.Settings, serverMetrics.InsightsMetrics, eventsExporter)
+	// TODO(117690): Unify StmtStatsEnable and TxnStatsEnable into a single cluster setting.
+	sqlstats.TxnStatsEnable.SetOnChange(&cfg.Settings.SV, func(ctx context.Context) {
+		if !sqlstats.TxnStatsEnable.Get(&cfg.Settings.SV) {
+			insightsProvider.Writer(false /*internal*/).Clear(ctx)
+		}
+	})
 	reportedSQLStats := sslocal.New(
 		cfg.Settings,
 		sqlstats.MaxMemReportedSQLStatsStmtFingerprints,
@@ -2703,7 +2709,7 @@ func (ex *connExecutor) updateTxnRewindPosMaybe(
 // All statements with lower position in stmtBuf (if any) are removed, as we
 // won't ever need them again.
 func (ex *connExecutor) setTxnRewindPos(ctx context.Context, pos CmdPos) error {
-	if pos <= ex.extraTxnState.txnRewindPos {
+	if pos < ex.extraTxnState.txnRewindPos {
 		panic(errors.AssertionFailedf("can only move the  txnRewindPos forward. "+
 			"Was: %d; new value: %d", ex.extraTxnState.txnRewindPos, pos))
 	}
@@ -3950,8 +3956,12 @@ func (ex *connExecutor) handleWaitingForConcurrentSchemaChanges(
 func (ex *connExecutor) initStatementResult(
 	ctx context.Context, res RestrictedCommandResult, ast tree.Statement, cols colinfo.ResultColumns,
 ) error {
-	for _, c := range cols {
-		if err := checkResultType(c.Typ); err != nil {
+	for i, c := range cols {
+		fmtCode, err := res.GetFormatCode(i)
+		if err != nil {
+			return err
+		}
+		if err = checkResultType(c.Typ, fmtCode); err != nil {
 			return err
 		}
 	}

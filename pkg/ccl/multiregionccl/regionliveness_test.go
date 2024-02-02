@@ -20,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -27,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/regionliveness"
@@ -36,15 +39,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
 const (
+	// Use a low probe timeout number, but intentionally only manipulate to
+	// this value when *failures* are expected.
 	testingRegionLivenessProbeTimeout = time.Second * 2
+	// Use a long probe timeout by default when running this test (since CI
+	// can easily hit query timeouts).
+	testingRegionLivenessProbeTimeoutLong = time.Minute
+	// Use a reduced liveness TTL for region liveness infrastructure.
+	testingRegionLivenessTTL = time.Second * 10
 )
 
 func TestRegionLivenessProber(t *testing.T) {
@@ -53,7 +66,7 @@ func TestRegionLivenessProber(t *testing.T) {
 	// This test forces the SQL liveness TTL be a small number,
 	// which makes the heartbeats even more critical. Under stress and
 	// race environments this test becomes even more sensitive, if
-	// we can't send heartbeats within 10 seconds.
+	// we can't send heartbeats within 20 seconds.
 	skip.UnderStress(t)
 	skip.UnderRace(t)
 	skip.UnderDeadlock(t)
@@ -65,10 +78,10 @@ func TestRegionLivenessProber(t *testing.T) {
 	makeSettings := func() *cluster.Settings {
 		cs := cluster.MakeTestingClusterSettings()
 		instancestorage.ReclaimLoopInterval.Override(ctx, &cs.SV, 150*time.Millisecond)
-		slbase.DefaultTTL.Override(ctx, &cs.SV, 10*time.Second)
 		regionliveness.RegionLivenessEnabled.Override(ctx, &cs.SV, true)
 		return cs
 	}
+	defer regionliveness.TestingSetUnavailableAtTTLOverride(testingRegionLivenessTTL)()
 
 	expectedRegions := []string{
 		"us-east",
@@ -88,11 +101,11 @@ func TestRegionLivenessProber(t *testing.T) {
 	var tenants []serverutils.ApplicationLayerInterface
 	var tenantSQL []*gosql.DB
 	blockProbeQuery := atomic.Bool{}
-	defer regionliveness.TestingSetProbeLivenessTimeout(500*time.Millisecond,
+	defer regionliveness.TestingSetProbeLivenessTimeout(
 		func() {
 			// Timeout attempts to probe intentionally.
 			if blockProbeQuery.Swap(false) {
-				time.Sleep(2 * time.Second)
+				time.Sleep(testingRegionLivenessProbeTimeout)
 			}
 		})()
 
@@ -148,6 +161,11 @@ func TestRegionLivenessProber(t *testing.T) {
 	liveRegions, err = regionProber.QueryLiveness(ctx, testTxn)
 	require.NoError(t, err)
 	checkExpectedRegions(expectedRegions, liveRegions)
+	// Override the table timeout probe for testing to ensure timeout failures
+	// happen now.
+	for _, ts := range tenants {
+		regionliveness.RegionLivenessProbeTimeout.Override(ctx, &ts.ClusterSettings().SV, testingRegionLivenessProbeTimeout)
+	}
 	// Probe the liveness of the region, but timeout the query
 	// intentionally to make it seem dead.
 	blockProbeQuery.Store(true)
@@ -185,7 +203,7 @@ func TestRegionLivenessProber(t *testing.T) {
 				return errors.AssertionFailedf("removed region detected %s", expectedRegions[1])
 			}
 			// Similarly query the unavailable physcial regions
-			unavailablePhysicalRegions, err := regionProber.QueryUnavailablePhysicalRegions(ctx, txn)
+			unavailablePhysicalRegions, err := regionProber.QueryUnavailablePhysicalRegions(ctx, txn, true /*filterAvailable*/)
 			if err != nil {
 				return err
 			}
@@ -213,7 +231,7 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 	// This test forces the SQL liveness TTL be a small number,
 	// which makes the heartbeats even more critical. Under stress and
 	// race environments this test becomes even more sensitive, if
-	// we can't send heartbeats within 10 seconds.
+	// we can't send heartbeats within 20 seconds.
 	skip.UnderStress(t)
 	skip.UnderRace(t)
 	skip.UnderDeadlock(t)
@@ -225,10 +243,10 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 	makeSettings := func() *cluster.Settings {
 		cs := cluster.MakeTestingClusterSettings()
 		instancestorage.ReclaimLoopInterval.Override(ctx, &cs.SV, 150*time.Millisecond)
-		slbase.DefaultTTL.Override(ctx, &cs.SV, 10*time.Second)
 		regionliveness.RegionLivenessEnabled.Override(ctx, &cs.SV, true)
 		return cs
 	}
+	defer regionliveness.TestingSetUnavailableAtTTLOverride(testingRegionLivenessTTL)()
 
 	expectedRegions := []string{
 		"us-east",
@@ -239,25 +257,52 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 	targetCount := atomic.Int64{}
 	var tenants []serverutils.ApplicationLayerInterface
 	var tenantSQL []*gosql.DB
-	defer regionliveness.TestingSetProbeLivenessTimeout(1*time.Second, func() {
+	defer regionliveness.TestingSetProbeLivenessTimeout(func() {
 		if !detectLeaseWait.Load() {
 			return
 		}
-		time.Sleep(time.Second * 2)
+		time.Sleep(testingRegionLivenessProbeTimeout)
 		targetCount.Swap(0)
 		detectLeaseWait.Swap(false)
 	})()
 
+	var keyToBlockMu syncutil.Mutex
+	var keyToBlock roachpb.Key
+	recoveryBlock := make(chan struct{})
+	recoveryStart := make(chan struct{})
+	clusterKnobs := base.TestingKnobs{
+		Store: &kvserver.StoreTestingKnobs{
+			TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+				// Slow any deletes to the regionliveness table, so that the recovery
+				// protocol on heartbeat never succeeds.
+				deleteRequest := request.Requests[0].GetDelete()
+				if deleteRequest == nil {
+					return nil
+				}
+				keyToBlockMu.Lock()
+				keyPrefix := keyToBlock
+				keyToBlockMu.Unlock()
+				if keyPrefix == nil || !deleteRequest.Key[:len(keyPrefix)].Equal(keyPrefix) {
+					return nil
+				}
+				recoveryStart <- struct{}{}
+				<-recoveryBlock
+				return nil
+			},
+		},
+	}
 	testCluster, _, cleanup := multiregionccltestutils.TestingCreateMultiRegionClusterWithRegionList(t,
 		expectedRegions,
 		1,
-		base.TestingKnobs{},
+		clusterKnobs,
 		multiregionccltestutils.WithSettings(makeSettings()))
 	defer cleanup()
 
 	id, err := roachpb.MakeTenantID(11)
 	require.NoError(t, err)
 	for i, s := range testCluster.Servers {
+		var tenant serverutils.ApplicationLayerInterface
+		var tenantDB *gosql.DB
 		tenantArgs := base.TestTenantArgs{
 			Settings: makeSettings(),
 			TenantID: id,
@@ -274,13 +319,16 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 							if targetCount.Add(1) != 1 {
 								return
 							}
-							time.Sleep(time.Second * 2)
+							keyToBlockMu.Lock()
+							keyToBlock = tenant.Codec().TablePrefix(uint32(systemschema.RegionLivenessTable.GetID()))
+							keyToBlockMu.Unlock()
+							time.Sleep(testingRegionLivenessProbeTimeout)
 						}
 					},
 				},
 			},
 		}
-		tenant, tenantDB := serverutils.StartTenant(t, s, tenantArgs)
+		tenant, tenantDB = serverutils.StartTenant(t, s, tenantArgs)
 		tenantSQL = append(tenantSQL, tenantDB)
 		tenants = append(tenants, tenant)
 		// Before the other tenants are added we need to configure the system database,
@@ -298,12 +346,11 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	// Override the table timeout probe for testing.
-	for _, ts := range tenants {
-		regionliveness.RegionLivenessProbeTimeout.Override(ctx, &ts.ClusterSettings().SV, testingRegionLivenessProbeTimeout)
-	}
+
 	// Create a new table and have it used on all nodes.
 	_, err = tenantSQL[0].Exec("CREATE TABLE t1(j int)")
+	require.NoError(t, err)
+	_, err = tenantSQL[0].Exec("CREATE TABLE t2(j int)")
 	require.NoError(t, err)
 	for _, c := range tenantSQL {
 		_, err = c.Exec("SELECT * FROM t1")
@@ -312,6 +359,11 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 	row := tenantSQL[0].QueryRow("SELECT 't1'::REGCLASS::OID")
 	var tableID int
 	require.NoError(t, row.Scan(&tableID))
+	// Override the table timeout probe for testing to ensure timeout failures
+	// happen now.
+	for _, ts := range tenants {
+		regionliveness.RegionLivenessProbeTimeout.Override(ctx, &ts.ClusterSettings().SV, testingRegionLivenessProbeTimeout)
+	}
 	// Issue a schema change which should mark this region as dead, and fail
 	// out because our probe query will time out.
 	detectLeaseWait.Swap(true)
@@ -334,11 +386,8 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 		}
 		return nil
 	})
-
-	require.NoError(t, tx.Rollback())
-
 	// Validate we can have a "dropped" region and the query won't fail.
-	lm := tenants[0].LeaseManager().(*lease.Manager)
+	lm := tenants[1].LeaseManager().(*lease.Manager)
 	cachedDatabaseRegions, err := regions.NewCachedDatabaseRegions(ctx, tenants[0].DB(), lm)
 	require.NoError(t, err)
 	regions.TestingModifyRegionEnum(cachedDatabaseRegions, func(descriptor catalog.TypeDescriptor) catalog.TypeDescriptor {
@@ -350,5 +399,47 @@ func TestRegionLivenessProberForLeases(t *testing.T) {
 		})
 		return builder.BuildExistingMutableType()
 	})
+	// Restore the override to reduce the risk of failing on overloaded systems.
+	for _, ts := range tenants {
+		regionliveness.RegionLivenessProbeTimeout.Override(ctx, &ts.ClusterSettings().SV, testingRegionLivenessProbeTimeoutLong)
+	}
 	require.NoError(t, lm.WaitForNoVersion(ctx, descpb.ID(tableID), cachedDatabaseRegions, retry.Options{}))
+	grp := ctxgroup.WithContext(ctx)
+	grp.GoCtx(func(ctx context.Context) error {
+		_, err = tx.Exec("INSERT INTO t2 VALUES(5)")
+		return err
+	})
+	// Add a new region which will execute a recovery and clean up dead rows.
+	keyToBlockMu.Lock()
+	keyToBlock = nil
+	keyToBlockMu.Unlock()
+	tenantArgs := base.TestTenantArgs{
+		Settings: makeSettings(),
+		TenantID: id,
+		Locality: testCluster.Servers[0].Locality(),
+	}
+	_, newRegionSQL := serverutils.StartTenant(t, testCluster.Servers[0], tenantArgs)
+	tr := sqlutils.MakeSQLRunner(newRegionSQL)
+	// Validate everything was cleaned bringing up a new node in the down region.
+	require.Equalf(t,
+		tr.QueryStr(t, "SELECT * FROM system.region_liveness"),
+		[][]string{},
+		"expected no unavaialble regions.")
+	require.Equalf(t,
+		tr.QueryStr(t, "SELECT count(*) FROM system.sql_instances WHERE session_id IS NOT NULL"),
+		[][]string{{"3"}},
+		"extra sql instances are being used.")
+	require.Equalf(t,
+		tr.QueryStr(t, "SELECT count(*) FROM system.sqlliveness"),
+		[][]string{{"3"}},
+		"extra sql sessions detected.")
+	require.NoError(t, err)
+	// Validate that the stuck query will fail once we recover.
+	<-recoveryStart
+	time.Sleep(slbase.DefaultTTL.Default())
+	recoveryBlock <- struct{}{}
+	require.NoError(t, grp.Wait())
+	_, err = tx.Exec("INSERT INTO t2 VALUES(5)")
+	require.ErrorContainsf(t, grp.Wait(), "context canceled", "connection should have been dropped, node is dead.")
+	require.ErrorContainsf(t, tx.Commit(), "TransactionRetryWithProtoRefreshError: TransactionRetryError: retry txn", "connection should have been dropped, node is dead.")
 }

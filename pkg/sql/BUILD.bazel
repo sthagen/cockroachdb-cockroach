@@ -211,7 +211,6 @@ go_library(
         "scrub_fk.go",
         "scrub_index.go",
         "scrub_unique_constraint.go",
-        "select_name_resolution.go",
         "sequence.go",
         "sequence_select.go",
         "serial.go",
@@ -743,8 +742,8 @@ go_test(
     ],
     embed = [":sql"],
     exec_properties = select({
-        "//build/toolchains:is_heavy": {"Pool": "heavy"},
-        "//conditions:default": {"Pool": "large"},
+        "//build/toolchains:is_heavy": {"test.Pool": "heavy"},
+        "//conditions:default": {"test.Pool": "large"},
     }),
     shard_count = 16,
     deps = [

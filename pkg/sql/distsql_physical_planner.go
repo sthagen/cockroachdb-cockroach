@@ -2311,9 +2311,11 @@ func (dsp *DistSQLPlanner) addAggregators(
 		}
 		aggregations[i].Arguments = make([]execinfrapb.Expression, len(fholder.arguments))
 		argumentsColumnTypes[i] = make([]*types.T, len(fholder.arguments))
+		var ef physicalplan.ExprFactory
+		ef.Init(ctx, planCtx, nil /* indexVarMap */)
 		for j, argument := range fholder.arguments {
 			var err error
-			aggregations[i].Arguments[j], err = physicalplan.MakeExpression(ctx, argument, planCtx, nil)
+			aggregations[i].Arguments[j], err = ef.Make(argument)
 			if err != nil {
 				return err
 			}
@@ -2817,11 +2819,13 @@ func (dsp *DistSQLPlanner) planAggregators(
 		if needRender {
 			// Build rendering expressions.
 			renderExprs := make([]execinfrapb.Expression, len(info.aggregations))
-			h := tree.MakeTypesOnlyIndexedVarHelper(finalPreRenderTypes)
+			h := tree.MakeIndexedVarHelperWithTypes(finalPreRenderTypes)
 			// finalIdx is an index inside finalAggs. It is used to
 			// keep track of the finalAggs results that correspond
 			// to each aggregation.
 			finalIdx := 0
+			var ef physicalplan.ExprFactory
+			ef.Init(ctx, planCtx, nil /* indexVarMap */)
 			for i, e := range info.aggregations {
 				info := physicalplan.DistAggregationTable[e.Func]
 				if info.FinalRendering == nil {
@@ -2833,9 +2837,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 					// across and within stages.
 					mappedIdx := int(finalIdxMap[finalIdx])
 					var err error
-					renderExprs[i], err = physicalplan.MakeExpression(
-						ctx, h.IndexedVar(mappedIdx), planCtx, nil, /* indexVarMap */
-					)
+					renderExprs[i], err = ef.Make(h.IndexedVar(mappedIdx))
 					if err != nil {
 						return err
 					}
@@ -2854,9 +2856,7 @@ func (dsp *DistSQLPlanner) planAggregators(
 					if err != nil {
 						return err
 					}
-					renderExprs[i], err = physicalplan.MakeExpression(
-						ctx, expr, planCtx, nil, /* indexVarMap */
-					)
+					renderExprs[i], err = ef.Make(expr)
 					if err != nil {
 						return err
 					}
@@ -3174,12 +3174,13 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 		}
 	}
 
+	var ef physicalplan.ExprFactory
+	ef.Init(ctx, planCtx, nil /* indexVarMap */)
+
 	// Set the lookup condition.
 	if n.lookupExpr != nil {
 		var err error
-		joinReaderSpec.LookupExpr, err = physicalplan.MakeExpression(
-			ctx, n.lookupExpr, planCtx, nil, /* indexVarMap */
-		)
+		joinReaderSpec.LookupExpr, err = ef.Make(n.lookupExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -3189,9 +3190,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 			return nil, errors.AssertionFailedf("remoteLookupExpr is set but lookupExpr is not")
 		}
 		var err error
-		joinReaderSpec.RemoteLookupExpr, err = physicalplan.MakeExpression(
-			ctx, n.remoteLookupExpr, planCtx, nil, /* indexVarMap */
-		)
+		joinReaderSpec.RemoteLookupExpr, err = ef.Make(n.remoteLookupExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -3200,9 +3199,7 @@ func (dsp *DistSQLPlanner) createPlanForLookupJoin(
 	// Set the ON condition.
 	if n.onCond != nil {
 		var err error
-		joinReaderSpec.OnExpr, err = physicalplan.MakeExpression(
-			ctx, n.onCond, planCtx, nil, /* indexVarMap */
-		)
+		joinReaderSpec.OnExpr, err = ef.Make(n.onCond)
 		if err != nil {
 			return nil, err
 		}
@@ -3267,16 +3264,14 @@ func (dsp *DistSQLPlanner) createPlanForInvertedJoin(
 		invertedJoinerSpec.PrefixEqualityColumns[i] = uint32(plan.PlanToStreamColMap[col])
 	}
 
-	if invertedJoinerSpec.InvertedExpr, err = physicalplan.MakeExpression(
-		ctx, n.invertedExpr, planCtx, nil, /* indexVarMap */
-	); err != nil {
+	var ef physicalplan.ExprFactory
+	ef.Init(ctx, planCtx, nil /* indexVarMap */)
+	if invertedJoinerSpec.InvertedExpr, err = ef.Make(n.invertedExpr); err != nil {
 		return nil, err
 	}
 	// Set the ON condition.
 	if n.onExpr != nil {
-		if invertedJoinerSpec.OnExpr, err = physicalplan.MakeExpression(
-			ctx, n.onExpr, planCtx, nil, /* indexVarMap */
-		); err != nil {
+		if invertedJoinerSpec.OnExpr, err = ef.Make(n.onExpr); err != nil {
 			return nil, err
 		}
 	}
@@ -4201,9 +4196,12 @@ func createProjectSetSpec(
 		GeneratedColumnLabels: make([]string, len(n.columns)-n.numColsInSource),
 		NumColsPerGen:         make([]uint32, len(n.exprs)),
 	}
+	var ef physicalplan.ExprFactory
+	ef.Init(ctx, planCtx, indexVarMap)
+	// TODO(mgartner): Consider using ef.IndexedVarsHint here.
 	for i, expr := range n.exprs {
 		var err error
-		spec.Exprs[i], err = physicalplan.MakeExpression(ctx, expr, planCtx, indexVarMap)
+		spec.Exprs[i], err = ef.Make(expr)
 		if err != nil {
 			return nil, err
 		}
@@ -4889,7 +4887,7 @@ func (dsp *DistSQLPlanner) NewPlanningCtxWithOracle(
 		if planner == nil ||
 			evalCtx.SessionData().Internal ||
 			planner.curPlan.flags.IsSet(planFlagContainsMutation) ||
-			planner.curPlan.flags.IsSet(planFlagContainsNonDefaultLocking) {
+			planner.curPlan.flags.IsSet(planFlagContainsLocking) {
 			// Don't parallelize the scans if we have a local plan if
 			// - we don't have a planner which is the case when we are not on
 			// the main query path;
@@ -4900,7 +4898,7 @@ func (dsp *DistSQLPlanner) NewPlanningCtxWithOracle(
 			// any synchronization (see #116039);
 			// - the plan contains a mutation operation - we currently don't
 			// support any parallelism when mutations are present;
-			// - the plan uses non-default key locking strength (see #94290).
+			// - the plan uses locking (see #94290).
 			return planCtx
 		}
 		prohibitParallelization, hasScanNodeToParallelize := checkScanParallelizationIfLocal(ctx, &planner.curPlan.planComponents)

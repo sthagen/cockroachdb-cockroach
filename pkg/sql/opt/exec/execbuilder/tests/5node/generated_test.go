@@ -62,6 +62,9 @@ func TestMain(m *testing.M) {
 
 func runExecBuildLogicTest(t *testing.T, file string) {
 	defer sql.TestingOverrideExplainEnvVersion("CockroachDB execbuilder test version")()
+	if file == "distsql_tenant_locality" {
+		skip.UnderDuressWithIssue(t, 118627)
+	}
 	skip.UnderDeadlock(t, "times out and/or hangs")
 	serverArgs := logictest.TestServerArgs{
 		DisableWorkmemRandomization: true,
@@ -284,11 +287,4 @@ func TestExecBuild_scan_parallel(
 ) {
 	defer leaktest.AfterTest(t)()
 	runExecBuildLogicTest(t, "scan_parallel")
-}
-
-func TestExecBuild_stats(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runExecBuildLogicTest(t, "stats")
 }

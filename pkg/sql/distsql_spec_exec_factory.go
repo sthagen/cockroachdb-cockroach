@@ -286,7 +286,7 @@ func (e *distSQLSpecExecFactory) ConstructScan(
 			spans:             spans,
 			reverse:           params.Reverse,
 			parallelize:       params.Parallelize,
-			estimatedRowCount: uint64(params.EstimatedRowCount),
+			estimatedRowCount: params.EstimatedRowCount,
 			reqOrdering:       ReqOrdering(reqOrdering),
 		},
 	)
@@ -481,9 +481,11 @@ func populateAggFuncSpec(
 	if len(constArgs) > 0 {
 		spec.Arguments = make([]execinfrapb.Expression, len(constArgs))
 		argumentsColumnTypes = make([]*types.T, len(constArgs))
+		var ef physicalplan.ExprFactory
+		ef.Init(ctx, planCtx, nil /* indexVarMap */)
 		for k, argument := range constArgs {
 			var err error
-			spec.Arguments[k], err = physicalplan.MakeExpression(ctx, argument, planCtx, nil)
+			spec.Arguments[k], err = ef.Make(argument)
 			if err != nil {
 				return nil, err
 			}
@@ -873,6 +875,7 @@ func (e *distSQLSpecExecFactory) ConstructPlan(
 	cascades []exec.Cascade,
 	checks []exec.Node,
 	rootRowCount int64,
+	flags exec.PlanFlags,
 ) (exec.Plan, error) {
 	if len(subqueries) != 0 {
 		return nil, unimplemented.NewWithIssue(47473, "experimental opt-driven distsql planning: subqueries")
@@ -888,7 +891,7 @@ func (e *distSQLSpecExecFactory) ConstructPlan(
 	} else {
 		p.physPlan.onClose = e.planCtx.getCleanupFunc()
 	}
-	return constructPlan(e.planner, root, subqueries, cascades, checks, rootRowCount)
+	return constructPlan(e.planner, root, subqueries, cascades, checks, rootRowCount, flags)
 }
 
 func (e *distSQLSpecExecFactory) ConstructExplainOpt(

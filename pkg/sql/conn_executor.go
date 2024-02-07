@@ -66,6 +66,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
@@ -89,6 +90,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
+	"github.com/petermattis/goid"
 )
 
 var maxNumNonAdminConnections = settings.RegisterIntSetting(
@@ -1080,7 +1082,7 @@ func (s *Server) newConnExecutor(
 
 		// ctxHolder will be reset at the start of run(). We only define
 		// it here so that an early call to close() doesn't panic.
-		ctxHolder:                 ctxHolder{connCtx: ctx},
+		ctxHolder:                 ctxHolder{connCtx: ctx, goroutineID: goid.Get()},
 		phaseTimes:                sessionphase.NewTimes(),
 		rng:                       rand.New(rand.NewSource(timeutil.Now().UnixNano())),
 		executorType:              executorTypeExec,
@@ -1101,6 +1103,9 @@ func (s *Server) newConnExecutor(
 	}
 	ex.dataMutatorIterator.onTempSchemaCreation = func() {
 		ex.hasCreatedTemporarySchema = true
+	}
+	ex.dataMutatorIterator.upgradedIsolationLevel = func() {
+		ex.metrics.ExecutedStatementCounters.TxnUpgradedCount.Inc(1)
 	}
 
 	ex.applicationName.Store(ex.sessionData().ApplicationName)
@@ -1219,7 +1224,7 @@ func (ex *connExecutor) close(ctx context.Context, closeType closeType) {
 	ex.extraTxnState.prepStmtsNamespaceAtTxnRewindPos.closeAllPortals(
 		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 	)
-	if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
+	if err := ex.extraTxnState.sqlCursors.closeAll(cursorCloseForExplicitClose); err != nil {
 		log.Warningf(ctx, "error closing cursors: %v", err)
 	}
 
@@ -1464,10 +1469,12 @@ type connExecutor struct {
 		// connExecutor's closure.
 		prepStmtsNamespaceMemAcc mon.BoundAccount
 
-		// sqlCursors contains the list of SQL CURSORs the session currently has
+		// sqlCursors contains the list of SQL cursors the session currently has
 		// access to.
-		// Cursors are bound to an explicit transaction and they're all destroyed
-		// once the transaction finishes.
+		//
+		// Cursors declared WITH HOLD belong to the session, and can outlive their
+		// parent transaction. Otherwise, cursors are bound to their transaction,
+		// and are destroyed when the transaction finishes.
 		sqlCursors cursorMap
 
 		// shouldExecuteOnTxnFinish indicates that ex.onTxnFinish will be called
@@ -1701,6 +1708,7 @@ type connExecutor struct {
 type ctxHolder struct {
 	connCtx           context.Context
 	sessionTracingCtx context.Context
+	goroutineID       int64
 }
 
 // timeout wraps a Timer returned by time.AfterFunc. This interface
@@ -2000,8 +2008,12 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent, pay
 		ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc,
 	)
 
-	// Close all cursors.
-	if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
+	// Close all (non HOLD) cursors.
+	closeReason := cursorCloseForTxnCommit
+	if ev.eventType != txnCommit {
+		closeReason = cursorCloseForTxnRollback
+	}
+	if err := ex.extraTxnState.sqlCursors.closeAll(closeReason); err != nil {
 		log.Warningf(ctx, "error closing cursors: %v", err)
 	}
 
@@ -2465,7 +2477,7 @@ func (ex *connExecutor) execCmd() (retErr error) {
 			// txnState.finishSQLTxn() is being called, as the underlying resources of
 			// pausable portals hasn't been cleared yet.
 			ex.extraTxnState.prepStmtsNamespace.closeAllPausablePortals(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc)
-			if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
+			if err := ex.extraTxnState.sqlCursors.closeAll(cursorCloseForTxnRollback); err != nil {
 				log.Warningf(ctx, "error closing cursors: %v", err)
 			}
 		}
@@ -3448,6 +3460,7 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 	if level == tree.UnspecifiedIsolation {
 		level = tree.IsolationLevel(ex.sessionData().DefaultTxnIsolationLevel)
 	}
+	upgraded := false
 	allowLevelCustomization := ex.server.cfg.Settings.Version.IsActive(ctx, clusterversion.V23_2)
 	ret := isolation.Serializable
 	if allowLevelCustomization {
@@ -3455,6 +3468,7 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 		case tree.ReadUncommittedIsolation:
 			// READ UNCOMMITTED is mapped to READ COMMITTED. PostgreSQL also does
 			// this: https://www.postgresql.org/docs/current/transaction-iso.html.
+			upgraded = true
 			fallthrough
 		case tree.ReadCommittedIsolation:
 			// READ COMMITTED is only allowed if the cluster setting is enabled.
@@ -3463,10 +3477,12 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 			if allowReadCommitted {
 				ret = isolation.ReadCommitted
 			} else {
+				upgraded = true
 				ret = isolation.Serializable
 			}
 		case tree.RepeatableReadIsolation:
 			// REPEATABLE READ is mapped to SNAPSHOT.
+			upgraded = true
 			fallthrough
 		case tree.SnapshotIsolation:
 			// SNAPSHOT is only allowed if the cluster setting is enabled. Otherwise
@@ -3475,6 +3491,7 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 			if allowSnapshot {
 				ret = isolation.Snapshot
 			} else {
+				upgraded = true
 				ret = isolation.Serializable
 			}
 		case tree.SerializableIsolation:
@@ -3482,6 +3499,13 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 		default:
 			log.Fatalf(context.Background(), "unknown isolation level: %s", level)
 		}
+	}
+	if upgraded {
+		ex.metrics.ExecutedStatementCounters.TxnUpgradedCount.Inc(1)
+		telemetry.Inc(sqltelemetry.IsolationLevelUpgradedCounter(ctx, level))
+	}
+	if ret != isolation.Serializable {
+		telemetry.Inc(sqltelemetry.IsolationLevelCounter(ctx, ret))
 	}
 	return ret
 }
@@ -3709,7 +3733,7 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 func (ex *connExecutor) resetPlanner(
 	ctx context.Context, p *planner, txn *kv.Txn, stmtTS time.Time,
 ) {
-	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData(), ex.state.mon)
+	p.resetPlanner(ctx, txn, stmtTS, ex.sessionData(), ex.state.mon, ex.sessionMon)
 	autoRetryReason := ex.state.mu.autoRetryReason
 	// If we are retrying due to an unsatisfiable timestamp bound which is
 	// retriable, it means we were unable to serve the previous minimum timestamp
@@ -4174,6 +4198,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 		TotalActiveTime:            sessionActiveTime,
 		PGBackendPID:               ex.planner.extendedEvalCtx.QueryCancelKey.GetPGBackendPID(),
 		TraceID:                    uint64(ex.planner.extendedEvalCtx.Tracing.connSpan.TraceID()),
+		GoroutineID:                ex.ctxHolder.goroutineID,
 	}
 }
 
@@ -4280,6 +4305,7 @@ type StatementCounters struct {
 	TxnBeginCount    telemetry.CounterWithMetric
 	TxnCommitCount   telemetry.CounterWithMetric
 	TxnRollbackCount telemetry.CounterWithMetric
+	TxnUpgradedCount *metric.Counter
 
 	// Savepoint operations. SavepointCount is for real SQL savepoints;
 	// the RestartSavepoint variants are for the
@@ -4316,6 +4342,8 @@ func makeStartedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaTxnCommitStarted, internal)),
 		TxnRollbackCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaTxnRollbackStarted, internal)),
+		TxnUpgradedCount: metric.NewCounter(
+			getMetricMeta(MetaTxnUpgradedFromWeakIsolation, internal)),
 		RestartSavepointCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaRestartSavepointStarted, internal)),
 		ReleaseRestartSavepointCount: telemetry.NewCounterWithMetric(
@@ -4357,6 +4385,8 @@ func makeExecutedStatementCounters(internal bool) StatementCounters {
 			getMetricMeta(MetaTxnCommitExecuted, internal)),
 		TxnRollbackCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaTxnRollbackExecuted, internal)),
+		TxnUpgradedCount: metric.NewCounter(
+			getMetricMeta(MetaTxnUpgradedFromWeakIsolation, internal)),
 		RestartSavepointCount: telemetry.NewCounterWithMetric(
 			getMetricMeta(MetaRestartSavepointExecuted, internal)),
 		ReleaseRestartSavepointCount: telemetry.NewCounterWithMetric(

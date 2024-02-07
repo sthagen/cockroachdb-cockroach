@@ -744,7 +744,7 @@ CREATE TABLE crdb_internal.table_row_statistics (
             GROUP BY s."tableID"`, statsAsOfTimeClusterMode.String(&p.ExecCfg().Settings.SV))
 		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalDB.Executor().QueryBufferedEx(
 			ctx, "crdb-internal-statistics-table", nil,
-			sessiondata.RootUserSessionDataOverride,
+			sessiondata.NodeUserSessionDataOverride,
 			query)
 		if err != nil {
 			// This query is likely to cause errors due to SHOW TABLES being run less
@@ -1042,7 +1042,7 @@ func populateSystemJobsTableRows(
 	it, err := p.InternalSQLTxn().QueryIteratorEx(ctx,
 		"system-jobs-scan",
 		p.Txn(),
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.NodeUserSessionDataOverride,
 		query,
 		params...,
 	)
@@ -2812,7 +2812,8 @@ CREATE TABLE crdb_internal.%s (
   status             STRING,         -- the status of the session (open, closed)
   session_end        TIMESTAMPTZ,    -- the time when the session was closed
   pg_backend_pid     INT,            -- the numerical ID attached to the session which is used to mimic a Postgres backend PID
-  trace_id           INT             -- the ID of the trace of the session
+  trace_id           INT,            -- the ID of the trace of the session
+  goroutine_id       INT             -- the ID of the goroutine of the session
 )
 `
 
@@ -2915,6 +2916,7 @@ func populateSessionsTable(
 			endTSDatum,
 			tree.NewDInt(tree.DInt(session.PGBackendPID)),
 			tree.NewDInt(tree.DInt(session.TraceID)),
+			tree.NewDInt(tree.DInt(session.GoroutineID)),
 		); err != nil {
 			return err
 		}
@@ -2943,6 +2945,7 @@ func populateSessionsTable(
 				tree.DNull,                             // session_end
 				tree.DNull,                             // pg_backend_pid
 				tree.DNull,                             // trace_id
+				tree.DNull,                             // goroutine_id
 			); err != nil {
 				return err
 			}
@@ -5958,7 +5961,7 @@ SELECT id, status, payload, progress FROM "".crdb_internal.system_jobs
 `
 	it, err := p.InternalSQLTxn().QueryIteratorEx(
 		ctx, "crdb-internal-jobs-table", p.Txn(),
-		sessiondata.RootUserSessionDataOverride,
+		sessiondata.NodeUserSessionDataOverride,
 		query)
 	if err != nil {
 		return nil, err

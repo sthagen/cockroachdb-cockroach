@@ -182,7 +182,11 @@ func (j *compressionCodec) UnmarshalText(b []byte) error {
 	return nil
 }
 
+// saramaConfig is a custom struct which contains a selection of options chosen
+// from sarama.Config. This facilitates users with limited sarama
+// configurations.
 type saramaConfig struct {
+	ClientID string `json:",omitempty"`
 	// These settings mirror ones in sarama config.
 	// We just tag them w/ JSON annotations.
 	// Flush describes settings specific to producer flushing.
@@ -247,7 +251,7 @@ func defaultSaramaConfig() *saramaConfig {
 	// this workaround is the one that's been running in roachtests and I'd want
 	// to test this one more before changing it.
 	config.Flush.MaxMessages = 1000
-
+	config.ClientID = "CockroachDB"
 	return config
 }
 
@@ -834,6 +838,8 @@ func (c *saramaConfig) Apply(kafka *sarama.Config) error {
 	kafka.Producer.Flush.Messages = c.Flush.Messages
 	kafka.Producer.Flush.Frequency = time.Duration(c.Flush.Frequency)
 	kafka.Producer.Flush.MaxMessages = c.Flush.MaxMessages
+	kafka.ClientID = c.ClientID
+
 	if c.Version != "" {
 		parsedVersion, err := sarama.ParseKafkaVersion(c.Version)
 		if err != nil {
@@ -1089,7 +1095,6 @@ func buildKafkaConfig(
 		return nil, err
 	}
 	config := sarama.NewConfig()
-	config.ClientID = `CockroachDB`
 	config.Producer.Return.Successes = true
 	config.Producer.Partitioner = newChangefeedPartitioner
 	// Do not fetch metadata for all topics but just for the necessary ones.
@@ -1157,12 +1162,20 @@ func buildKafkaConfig(
 			"failed to parse sarama config; check %s option", changefeedbase.OptKafkaSinkConfig)
 	}
 
+	// Note that the sarama.Config.Validate() below only logs an error in some
+	// cases, so we explicitly validate sarama config from our side.
 	if err := saramaCfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, "invalid sarama configuration")
 	}
 
+	// Apply configures config based on saramaCfg.
 	if err := saramaCfg.Apply(config); err != nil {
 		return nil, errors.Wrap(err, "failed to apply kafka client configuration")
+	}
+
+	// Validate sarama.Config using sarama's own exported validation function.
+	if err := config.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid sarama configuration")
 	}
 	return config, nil
 }

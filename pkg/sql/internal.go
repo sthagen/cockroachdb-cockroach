@@ -831,10 +831,6 @@ func applyInternalExecutorSessionExceptions(sd *sessiondata.SessionData) {
 	// DisableBuffering is not supported by the InternalExecutor
 	// which uses streamingCommandResults.
 	sd.LocalOnlySessionData.AvoidBuffering = false
-	// At the moment, we disable the usage of the Streamer API in the internal
-	// executor to avoid possible concurrency with the "outer" query (which
-	// might be using the RootTxn).
-	sd.LocalOnlySessionData.StreamerEnabled = false
 	// If the internal executor creates a new transaction, then it runs in
 	// SERIALIZABLE. If it's used in an existing transaction, then it inherits the
 	// isolation level of the existing transaction.
@@ -893,6 +889,18 @@ var rowsAffectedResultColumns = colinfo.ResultColumns{
 		Name: "rows_affected",
 		Typ:  types.Int,
 	},
+}
+
+const opNameKey = "intExec"
+
+// GetInternalOpName returns the "opName" parameter that was specified when
+// issuing a query via the Internal Executor.
+func GetInternalOpName(ctx context.Context) (opName string, ok bool) {
+	tag, ok := logtags.FromContext(ctx).GetTag(opNameKey)
+	if !ok {
+		return "", false
+	}
+	return tag.ValueStr(), true
 }
 
 // execInternal is the main entry point for executing a statement via the
@@ -1008,7 +1016,7 @@ func (ie *InternalExecutor) execInternal(
 		return nil, err
 	}
 
-	ctx = logtags.AddTag(ctx, "intExec", opName)
+	ctx = logtags.AddTag(ctx, opNameKey, opName)
 
 	var sd *sessiondata.SessionData
 	if ie.sessionDataStack != nil {
@@ -1020,6 +1028,14 @@ func (ie *InternalExecutor) execInternal(
 
 	applyInternalExecutorSessionExceptions(sd)
 	applyOverrides(sessionDataOverride, sd)
+	if !rw.async() && (txn != nil && txn.Type() == kv.RootTxn) {
+		// If the "outer" query uses the RootTxn and the sync result channel is
+		// requested, then we must disable both DistSQL and Streamer to ensure
+		// that the "inner" query doesn't use the LeafTxn (which could result in
+		// illegal concurrency).
+		sd.DistSQLMode = sessiondatapb.DistSQLOff
+		sd.StreamerEnabled = false
+	}
 	sd.Internal = true
 	if sd.User().Undefined() {
 		return nil, errors.AssertionFailedf("no user specified for internal query")

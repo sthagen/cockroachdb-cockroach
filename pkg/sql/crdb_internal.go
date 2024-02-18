@@ -856,9 +856,14 @@ CREATE TABLE crdb_internal.schema_changes (
 	},
 }
 
+type crdbInternalLeasesTableEntry struct {
+	desc         catalog.Descriptor
+	takenOffline bool
+	expiration   tree.DTimestamp
+}
+
 // TODO(tbg): prefix with node_.
 var crdbInternalLeasesTable = virtualSchemaTable{
-	comment: `acquired table leases (RAM; local node only)`,
 	schema: `
 CREATE TABLE crdb_internal.leases (
   node_id     INT NOT NULL,
@@ -868,33 +873,45 @@ CREATE TABLE crdb_internal.leases (
   expiration  TIMESTAMP NOT NULL,
   deleted     BOOL NOT NULL
 )`,
+	comment: `acquired table leases (RAM; local node only)`,
 	populate: func(
 		ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
 	) error {
 		nodeID, _ := p.execCfg.NodeInfo.NodeID.OptionalNodeID() // zero if not available
-		var iterErr error
+		var leaseEntries []crdbInternalLeasesTableEntry
 		p.LeaseMgr().VisitLeases(func(desc catalog.Descriptor, takenOffline bool, _ int, expiration tree.DTimestamp) (wantMore bool) {
-			if ok, err := p.HasAnyPrivilege(ctx, desc); err != nil {
-				iterErr = err
-				return false
-			} else if !ok {
-				return true
-			}
-
-			if err := addRow(
-				tree.NewDInt(tree.DInt(nodeID)),
-				tree.NewDInt(tree.DInt(int64(desc.GetID()))),
-				tree.NewDString(desc.GetName()),
-				tree.NewDInt(tree.DInt(int64(desc.GetParentID()))),
-				&expiration,
-				tree.MakeDBool(tree.DBool(takenOffline)),
-			); err != nil {
-				iterErr = err
-				return false
-			}
+			// Because we have locked the lease manager while visiting every lease,
+			// it not safe to *acquire* or *release* any leases in the process. As
+			// a result, build an in memory cache of entries and process them after
+			// all the locks have been released. Previously we would check privileges,
+			// which would need to get the lease on the role_member table. Simply skipping
+			// this check on that table will not be sufficient since any active lease
+			// on it could expire or need an renewal and cause the sample problem.
+			leaseEntries = append(leaseEntries, crdbInternalLeasesTableEntry{
+				desc:         desc,
+				takenOffline: takenOffline,
+				expiration:   expiration,
+			})
 			return true
 		})
-		return iterErr
+		for _, entry := range leaseEntries {
+			if ok, err := p.HasAnyPrivilege(ctx, entry.desc); err != nil {
+				return err
+			} else if !ok {
+				continue
+			}
+			if err := addRow(
+				tree.NewDInt(tree.DInt(nodeID)),
+				tree.NewDInt(tree.DInt(int64(entry.desc.GetID()))),
+				tree.NewDString(entry.desc.GetName()),
+				tree.NewDInt(tree.DInt(int64(entry.desc.GetParentID()))),
+				&entry.expiration,
+				tree.MakeDBool(tree.DBool(entry.takenOffline)),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
 	},
 }
 
@@ -921,7 +938,7 @@ const (
 WITH
 	latestpayload AS (SELECT job_id, value FROM system.job_info AS payload WHERE info_key = 'legacy_payload' ORDER BY written DESC),
 	latestprogress AS (SELECT job_id, value FROM system.job_info AS progress WHERE info_key = 'legacy_progress' ORDER BY written DESC)
-	SELECT 
+	SELECT
 		DISTINCT(id), status, created, payload.value AS payload, progress.value AS progress,
 		created_by_type, created_by_id, claim_session_id, claim_instance_id, num_runs, last_run, job_type
 	FROM system.jobs AS j
@@ -1101,6 +1118,7 @@ const (
 	// user is not allowed to see.
 	jobsQFrom        = ` FROM crdb_internal.system_jobs`
 	jobsBackoffArgs  = `(SELECT $1::FLOAT AS initial_delay, $2::FLOAT AS max_delay) args`
+	jobIDFilter      = ` WHERE id = $3`
 	jobsStatusFilter = ` WHERE status = $3`
 	jobsTypeFilter   = ` WHERE job_type = $3`
 	jobsQuery        = jobsQSelect + `, last_run::timestamptz, COALESCE(num_runs, 0), ` + jobs.NextRunClause +
@@ -1133,11 +1151,18 @@ CREATE TABLE crdb_internal.jobs (
   num_runs              INT,
   execution_errors      STRING[],
   execution_events      JSONB,
+  INDEX(job_id),
   INDEX(status),
   INDEX(job_type)
 )`,
 	comment: `decoded job metadata from crdb_internal.system_jobs (KV scan)`,
 	indexes: []virtualIndex{{
+		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
+			q := jobsQuery + jobIDFilter
+			targetID := tree.MustBeDInt(unwrappedConstraint)
+			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetID)
+		},
+	}, {
 		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
 			q := jobsQuery + jobsStatusFilter
 			targetStatus := tree.MustBeDString(unwrappedConstraint)
@@ -1146,8 +1171,8 @@ CREATE TABLE crdb_internal.jobs (
 	}, {
 		populate: func(ctx context.Context, unwrappedConstraint tree.Datum, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) (matched bool, err error) {
 			q := jobsQuery + jobsTypeFilter
-			targetStatus := tree.MustBeDString(unwrappedConstraint)
-			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetStatus)
+			targetType := tree.MustBeDString(unwrappedConstraint)
+			return makeJobsTableRows(ctx, p, addRow, q, p.execCfg.JobRegistry.RetryInitialDelay(), p.execCfg.JobRegistry.RetryMaxDelay(), targetType)
 		},
 	}},
 	populate: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {

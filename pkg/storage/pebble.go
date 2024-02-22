@@ -1025,15 +1025,21 @@ func (p *Pebble) GetStoreID() (int32, error) {
 	return storeID, nil
 }
 
-func (p *Pebble) Download(ctx context.Context, span roachpb.Span) error {
-	ctx, sp := tracing.ChildSpan(ctx, "pebble.Download")
+func (p *Pebble) Download(ctx context.Context, span roachpb.Span, copy bool) error {
+	const copySpanName, rewriteSpanName = "pebble.Download", "pebble.DownloadRewrite"
+	spanName := rewriteSpanName
+	if copy {
+		spanName = copySpanName
+	}
+	ctx, sp := tracing.ChildSpan(ctx, spanName)
 	defer sp.Finish()
 	if p == nil {
 		return nil
 	}
 	downloadSpan := pebble.DownloadSpan{
-		StartKey: span.Key,
-		EndKey:   span.EndKey,
+		StartKey:               span.Key,
+		EndKey:                 span.EndKey,
+		ViaBackingFileDownload: copy,
 	}
 	return p.db.Download(ctx, []pebble.DownloadSpan{downloadSpan})
 }
@@ -2477,14 +2483,10 @@ func (p *Pebble) CreateCheckpoint(dir string, spans []roachpb.Span) error {
 // map the persisted cluster version to the corresponding format major version,
 // ratcheting Pebble's format major version if necessary.
 //
-// Note that when introducing a new Pebble format version that relies on _all_
-// engines in a cluster being at the same, newer format major version, two
-// cluster versions should be used. The first is used to enable the feature in
-// Pebble, and should control the version ratchet below. The second is used as a
-// feature flag. The use of two cluster versions relies on a guarantee provided
-// by the migration framework (see pkg/migration) that if a node is at a version
-// X+1, it is guaranteed that all nodes have already ratcheted their store
-// version to the version X that enabled the feature at the Pebble level.
+// The pebble versions are advanced when nodes enter the "fence" version for the
+// named cluster version, if there is one, so that if *any* node moves into the
+// named version, it can be assumed all *nodes* have ratcheted to the pebble
+// version associated with it, since they did so during the fence version.
 var pebbleFormatVersionMap = map[clusterversion.Key]pebble.FormatMajorVersion{
 	clusterversion.V23_1: pebble.FormatFlushableIngest,
 	clusterversion.V23_2_PebbleFormatDeleteSizedAndObsolete: pebble.FormatDeleteSizedAndObsolete,
@@ -2510,7 +2512,7 @@ func pebbleFormatVersion(clusterVersion roachpb.Version) pebble.FormatMajorVersi
 	// pebbleFormatVersionKeys are sorted in descending order; find the first one
 	// that is not newer than clusterVersion.
 	for _, k := range pebbleFormatVersionKeys {
-		if clusterVersion.AtLeast(k.Version()) {
+		if clusterVersion.AtLeast(k.FenceVersion()) {
 			return pebbleFormatVersionMap[k]
 		}
 	}

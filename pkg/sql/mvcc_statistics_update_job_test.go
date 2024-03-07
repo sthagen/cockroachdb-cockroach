@@ -49,7 +49,7 @@ func TestTenantGlobalAggregatedLivebytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStressRace(t, "test is too slow to run under stressrace")
+	skip.UnderRace(t, "test is too slow to run under race")
 
 	ctx := context.Background()
 	jobID := jobs.MVCCStatisticsJobID
@@ -180,7 +180,7 @@ func TestTenantGlobalAggregatedLivebytes(t *testing.T) {
 		val, _ := scrapeMetric(t, r, "sql_aggregated_livebytes", tenant.name)
 
 		if math.Abs(float64(exp-val))/float64(exp) > confidenceLevel {
-			return errors.Newf("expected within +/-%.2f of %d, but got %d, testVal=%d", exp, val)
+			return errors.Newf("expected within +/-%.2f of %d, but got %d", confidenceLevel, exp, val)
 		}
 		if val <= 0 {
 			return errors.New("livebytes must be greater than 0")

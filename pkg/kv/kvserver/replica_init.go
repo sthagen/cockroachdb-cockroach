@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -133,6 +134,7 @@ func newUninitializedReplicaWithoutRaftGroup(
 			DisableTxnPushing:  store.TestingKnobs().DontPushOnLockConflictError,
 			TxnWaitKnobs:       store.TestingKnobs().TxnWaitKnobs,
 		}),
+		allocatorToken: &plan.AllocatorToken{},
 	}
 	r.sideTransportClosedTimestamp.init(store.cfg.ClosedTimestampReceiver, rangeID)
 

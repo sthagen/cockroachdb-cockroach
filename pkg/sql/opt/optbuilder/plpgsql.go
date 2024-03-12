@@ -166,11 +166,10 @@ type plpgsqlBuilder struct {
 	// variables from a parent block can be referenced in a child block.
 	blocks []plBlock
 
-	identCounter int
+	// outParams is the set of OUT parameters for the routine.
+	outParams []ast.Variable
 
-	// hasOutParam indicates whether the routine has at least one OUT / INOUT
-	// parameter.
-	hasOutParam bool
+	identCounter int
 }
 
 // routineParam is similar to tree.RoutineParam but stores the resolved type.
@@ -209,7 +208,7 @@ func newPLpgSQLBuilder(
 			b.addVariable(param.name, param.typ)
 		}
 		if tree.IsOutParamClass(param.class) {
-			b.hasOutParam = true
+			b.outParams = append(b.outParams, param.name)
 		}
 	}
 	return b
@@ -223,6 +222,9 @@ type plBlock struct {
 	label string
 
 	// vars is an ordered list of variables declared in a PL/pgSQL block.
+	//
+	// INVARIANT: the variables of a parent (ancestor) block *always* form a
+	// prefix of the variables of a child (descendant) block.
 	vars []ast.Variable
 
 	// varTypes maps from the name of each variable in the scope to its type.
@@ -281,11 +283,6 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 	if astBlock.Label != "" {
 		panic(blockLabelErr)
 	}
-	if b.block().hasExceptionHandler {
-		// The parent block has an exception handler. Exception handlers and nested
-		// blocks are not yet compatible.
-		panic(nestedBlockExceptionErr)
-	}
 	b.ensureScopeHasExpr(s)
 	block := b.pushBlock(plBlock{
 		label:     astBlock.Label,
@@ -295,6 +292,15 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 		cursors:   make(map[ast.Variable]ast.CursorDeclaration),
 	})
 	defer b.popBlock()
+	if len(astBlock.Exceptions) > 0 || b.hasExceptionHandler() {
+		// If the current block or some ancestor block has an exception handler, it
+		// is necessary to maintain the BlockState with a reference to the parent
+		// BlockState (if any).
+		block.state = &tree.BlockState{}
+		if parent := b.parentBlock(); parent != nil {
+			block.state.Parent = parent.state
+		}
+	}
 	// First, handle the variable declarations.
 	for i := range astBlock.Decls {
 		switch dec := astBlock.Decls[i].(type) {
@@ -332,13 +338,12 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 			block.cursors[dec.Name] = *dec
 		}
 	}
-	// Perform type-checking for RECORD-returning routines. This happens after
-	// building the variable declarations, so that expressions that reference
-	// those variables can be type-checked.
-	if types.IsRecordType(b.returnType) {
-		// Infer the concrete type by examining the RETURN statements. This has to
-		// happen after building the declaration block because RETURN statements can
-		// reference declared variables.
+	if types.IsRecordType(b.returnType) && !b.hasOutParam() {
+		// For a RECORD-returning routine, infer the concrete type by examining the
+		// RETURN statements. This has to happen after building the declaration
+		// block because RETURN statements can reference declared variables. Only
+		// perform this step if there are no OUT parameters, since OUT parameters
+		// will have already determined the return type.
 		recordVisitor := newRecordTypeVisitor(b.ob.ctx, b.ob.semaCtx, s, astBlock)
 		ast.Walk(recordVisitor, astBlock)
 		b.returnType = recordVisitor.typ
@@ -353,7 +358,6 @@ func (b *plpgsqlBuilder) buildBlock(astBlock *ast.Block, s *scope) *scope {
 		// The routine is volatile to prevent inlining. Only the block and
 		// variable-assignment routines need to be volatile; see the buildExceptions
 		// comment for details.
-		block.state = &tree.BlockState{}
 		block.hasExceptionHandler = true
 		blockCon := b.makeContinuation("exception_block")
 		blockCon.def.ExceptionBlock = exceptions
@@ -387,14 +391,27 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			return b.buildBlock(t, s)
 
 		case *ast.Return:
-			if b.hasOutParam && !t.Implicit {
-				// TODO(yuzefovich): we should not error out here if we have an
-				// empty RETURN (which is currently not supported by parser).
-				panic(returnWithOUTParameterErr)
+			// If the routine has OUT-parameters or a VOID return type, the RETURN
+			// statement must have no expression. Otherwise, the RETURN statement must
+			// have a non-empty expression.
+			expr := t.Expr
+			if b.hasOutParam() {
+				if expr != nil {
+					panic(returnWithOUTParameterErr)
+				}
+				expr = b.makeReturnForOutParams()
+			} else if b.returnType.Family() == types.VoidFamily {
+				if expr != nil {
+					panic(returnWithVoidParameterErr)
+				}
+				expr = tree.DNull
+			}
+			if expr == nil {
+				panic(emptyReturnErr)
 			}
 			// RETURN is handled by projecting a single column with the expression
 			// that is being returned.
-			returnScalar := b.buildPLpgSQLExpr(t.Expr, b.returnType, s)
+			returnScalar := b.buildPLpgSQLExpr(expr, b.returnType, s)
 			b.addBarrierIfVolatile(s, returnScalar)
 			returnColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_return"))
 			returnScope := s.push()
@@ -784,6 +801,10 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			intoScope = b.callContinuation(&retCon, intoScope)
 			b.appendBodyStmt(&fetchCon, intoScope)
 			return b.callContinuation(&fetchCon, s)
+
+		case *ast.Null:
+			// PL/pgSQL NULL statements are a no-op.
+			continue
 
 		default:
 			panic(unsupportedPLStmtErr)
@@ -1217,10 +1238,24 @@ func (b *plpgsqlBuilder) buildExceptions(block *ast.Block) *memo.ExceptionBlock 
 	}
 }
 
-// buildEndOfFunctionRaise builds a RAISE statement that throws an error when
-// control reaches the end of a PLpgSQL routine without reaching a RETURN
-// statement.
-func (b *plpgsqlBuilder) buildEndOfFunctionRaise(inScope *scope) *scope {
+// handleEndOfFunction handles the case when control flow reaches the end of a
+// PL/pgSQL routine without reaching a RETURN statement.
+func (b *plpgsqlBuilder) handleEndOfFunction(inScope *scope) *scope {
+	if b.hasOutParam() || b.returnType.Family() == types.VoidFamily {
+		// Routines with OUT-parameters and VOID return types need not explicitly
+		// specify a RETURN statement.
+		var returnExpr tree.Expr = tree.DNull
+		if b.hasOutParam() {
+			returnExpr = b.makeReturnForOutParams()
+		}
+		returnScope := inScope.push()
+		colName := scopeColName("_implicit_return")
+		returnScalar := b.buildPLpgSQLExpr(returnExpr, b.returnType, inScope)
+		b.ob.synthesizeColumn(returnScope, colName, b.returnType, nil /* expr */, returnScalar)
+		b.ob.constructProjectForScope(inScope, returnScope)
+		return returnScope
+	}
+	// Build a RAISE statement which throws an end-of-function error if executed.
 	makeConstStr := func(str string) opt.ScalarExpr {
 		return b.ob.factory.ConstructConstVal(tree.NewDString(str), types.String)
 	}
@@ -1424,7 +1459,7 @@ func (b *plpgsqlBuilder) appendPlpgSQLStmts(con *continuation, stmts []ast.State
 // given continuation function.
 func (b *plpgsqlBuilder) callContinuation(con *continuation, s *scope) *scope {
 	if con == nil {
-		return b.buildEndOfFunctionRaise(s)
+		return b.handleEndOfFunction(s)
 	}
 	args := make(memo.ScalarListExpr, 0, len(con.def.Params))
 	addArg := func(name ast.Variable) {
@@ -1550,6 +1585,32 @@ func (b *plpgsqlBuilder) makeIdentifier(id string) string {
 	return fmt.Sprintf("%s_%d", id, b.identCounter)
 }
 
+func (b *plpgsqlBuilder) hasOutParam() bool {
+	return len(b.outParams) > 0
+}
+
+// makeReturnForOutParams builds the implicit RETURN expression for a routine
+// with OUT-parameters.
+func (b *plpgsqlBuilder) makeReturnForOutParams() tree.Expr {
+	if len(b.outParams) == 0 {
+		panic(errors.AssertionFailedf("expected at least one out param"))
+	}
+	exprs := make(tree.Exprs, len(b.outParams))
+	for i, param := range b.outParams {
+		if param != "" {
+			exprs[i] = tree.NewUnresolvedName(string(param))
+		} else {
+			// TODO(100962): this logic will likely need to be
+			// changed.
+			exprs[i] = tree.DNull
+		}
+	}
+	if len(exprs) == 1 {
+		return exprs[0]
+	}
+	return &tree.Tuple{Exprs: exprs}
+}
+
 // continuation holds the information necessary to pick up execution from some
 // branching point in the control flow.
 type continuation struct {
@@ -1628,6 +1689,15 @@ func (b *plpgsqlBuilder) addVariable(name ast.Variable, typ *types.T) {
 // block returns the block for the current PL/pgSQL block.
 func (b *plpgsqlBuilder) block() *plBlock {
 	return &b.blocks[len(b.blocks)-1]
+}
+
+// parentBlock returns the parent block for the current PL/pgSQL block. It
+// returns nil if the current block does not have a parent.
+func (b *plpgsqlBuilder) parentBlock() *plBlock {
+	if len(b.blocks) <= 1 {
+		return nil
+	}
+	return &b.blocks[len(b.blocks)-2]
 }
 
 // pushBlock puts the given block on the stack. It is used when entering the
@@ -1790,10 +1860,11 @@ var (
 	nonCompositeErr = pgerror.New(pgcode.DatatypeMismatch,
 		"cannot return non-composite value from function returning composite type",
 	)
-	nestedBlockExceptionErr = unimplemented.New("exception handler for nested blocks",
-		"PL/pgSQL blocks cannot yet be nested within a block that has an exception handler",
-	)
 	returnWithOUTParameterErr = pgerror.New(pgcode.DatatypeMismatch,
 		"RETURN cannot have a parameter in function with OUT parameters",
 	)
+	returnWithVoidParameterErr = pgerror.New(pgcode.DatatypeMismatch,
+		"RETURN cannot have a parameter in function returning void",
+	)
+	emptyReturnErr = pgerror.New(pgcode.Syntax, "missing expression at or near \"RETURN;\"")
 )

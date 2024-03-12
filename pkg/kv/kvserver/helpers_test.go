@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -156,6 +157,12 @@ func (s *Store) ReplicateQueuePurgatoryLength() int {
 // queue purgatory.
 func (s *Store) SplitQueuePurgatoryLength() int {
 	return s.splitQueue.PurgatoryLength()
+}
+
+// LeaseQueuePurgatoryLength returns the number of replicas in lease queue
+// purgatory.
+func (s *Store) LeaseQueuePurgatoryLength() int {
+	return s.leaseQueue.PurgatoryLength()
 }
 
 // SetRaftLogQueueActive enables or disables the raft log queue.
@@ -465,6 +472,13 @@ func (r *Replica) LargestPreviousMaxRangeSizeBytes() int64 {
 // assist load-based split (and merge) decisions.
 func (r *Replica) LoadBasedSplitter() *split.Decider {
 	return &r.loadBasedSplitter
+}
+
+// AllocatorToken returns the replica's allocator token, which should be
+// acquired before planning and executing allocator lease transfers or replica
+// changes for the range on the leaseholder.
+func (r *Replica) AllocatorToken() *plan.AllocatorToken {
+	return r.allocatorToken
 }
 
 func MakeSSTable(

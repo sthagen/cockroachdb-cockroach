@@ -819,7 +819,6 @@ func (ex *connExecutor) execStmtInOpenState(
 		f.FormatNode(ast)
 		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
-			execErr != nil,
 			ex.implicitTxn(),
 			p.CurrentDatabase(),
 		)
@@ -2049,7 +2048,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	if ex.server.cfg.TestingKnobs.AfterExecute != nil {
-		ex.server.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), res.Err())
+		ex.server.cfg.TestingKnobs.AfterExecute(ctx, stmt.String(), ex.executorType == executorTypeInternal, res.Err())
 	}
 
 	if limitsErr := ex.handleTxnRowsWrittenReadLimits(ctx); limitsErr != nil && res.Err() == nil {
@@ -2557,7 +2556,6 @@ func (ex *connExecutor) execStmtInNoTxnState(
 		f.FormatNode(stmt.AST)
 		stmtFingerprintID := appstatspb.ConstructStatementFingerprintID(
 			f.CloseAndGetString(),
-			execErr != nil,
 			ex.implicitTxn(),
 			p.CurrentDatabase(),
 		)

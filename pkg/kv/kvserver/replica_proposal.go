@@ -660,7 +660,15 @@ func addSSTablePreApply(
 		)
 
 		start := storage.EngineKey{Key: sst.Span.Key}
-		end := storage.EngineKey{Key: sst.Span.EndKey}
+		// NB: sst.Span.EndKey may be nil if the span represents a single key. In
+		// that case, we produce an inclusive end bound equal to the start.
+		// Otherwise we produce an exclusive end bound.
+		end := start
+		endInclusive := true
+		if sst.Span.EndKey != nil {
+			end = storage.EngineKey{Key: sst.Span.EndKey}
+			endInclusive = false
+		}
 		var syntheticSuffix []byte
 		if sst.RemoteRewriteTimestamp.IsSet() {
 			syntheticSuffix = storage.EncodeMVCCTimestampSuffix(sst.RemoteRewriteTimestamp)
@@ -671,13 +679,13 @@ func addSSTablePreApply(
 		}
 
 		externalFile := pebble.ExternalFile{
-			Locator: remote.Locator(sst.RemoteFileLoc),
-			ObjName: sst.RemoteFilePath,
-			Size:    sst.ApproximatePhysicalSize,
-			Bounds: pebble.KeyRange{
-				Start: start.Encode(),
-				End:   end.Encode(),
-			},
+			Locator:           remote.Locator(sst.RemoteFileLoc),
+			ObjName:           sst.RemoteFilePath,
+			Size:              sst.ApproximatePhysicalSize,
+			StartKey:          start.Encode(),
+			EndKey:            end.Encode(),
+			EndKeyIsInclusive: endInclusive,
+
 			SyntheticSuffix: syntheticSuffix,
 			SyntheticPrefix: syntheticPrefix,
 			// TODO(dt): pass pebble the backing file size to avoid a stat call.
@@ -736,7 +744,7 @@ func addSSTablePreApply(
 	// filesystem supports it, rather than writing a new copy of it. We cannot
 	// pass it the path in the sideload store as the engine deletes the passed
 	// path on success.
-	if linkErr := env.eng.Link(path, ingestPath); linkErr != nil {
+	if linkErr := env.eng.Env().Link(path, ingestPath); linkErr != nil {
 		// We're on a weird file system that doesn't support Link. This is unlikely
 		// to happen in any "normal" deployment but we have a fallback path anyway.
 		log.Eventf(ctx, "copying SSTable for ingestion at index %d, term %d: %s", index, term, ingestPath)
@@ -773,19 +781,19 @@ func ingestViaCopy(
 ) error {
 	// TODO(tschottdorf): remove this once sideloaded storage guarantees its
 	// existence.
-	if err := eng.MkdirAll(filepath.Dir(ingestPath), os.ModePerm); err != nil {
+	if err := eng.Env().MkdirAll(filepath.Dir(ingestPath), os.ModePerm); err != nil {
 		panic(err)
 	}
-	if _, err := eng.Stat(ingestPath); err == nil {
+	if _, err := eng.Env().Stat(ingestPath); err == nil {
 		// The file we want to ingest exists. This can happen since the
 		// ingestion may apply twice (we ingest before we mark the Raft
 		// command as committed). Just unlink the file (the storage engine
 		// created a hard link); after that we're free to write it again.
-		if err := eng.Remove(ingestPath); err != nil {
+		if err := eng.Env().Remove(ingestPath); err != nil {
 			return errors.Wrapf(err, "while removing existing file during ingestion of %s", ingestPath)
 		}
 	}
-	if err := kvserverbase.WriteFileSyncing(ctx, ingestPath, sst.Data, eng, 0600, st, limiter); err != nil {
+	if err := kvserverbase.WriteFileSyncing(ctx, ingestPath, sst.Data, eng.Env(), 0600, st, limiter); err != nil {
 		return errors.Wrapf(err, "while ingesting %s", ingestPath)
 	}
 	if err := eng.IngestLocalFiles(ctx, []string{ingestPath}); err != nil {

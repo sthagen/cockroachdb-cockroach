@@ -1812,24 +1812,15 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   failure_count INT NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		shouldRedactError := false
-		// Check if the user is admin.
-		if isAdmin, err := p.HasAdminRole(ctx); err != nil {
+		// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
+		// privileges.
+		hasPriv, shouldRedactError, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
 			return err
-		} else if !isAdmin {
-			// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
-			// privileges.
-			if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
-				return err
-			} else if hasViewActivityRedacted {
-				shouldRedactError = true
-			} else if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
-				return err
-			} else if !hasViewActivity {
-				// If the user is not admin and does not have VIEWACTIVITY or VIEWACTIVITYREDACTED,
-				// return insufficient privileges error.
-				return noViewActivityOrViewActivityRedactedRoleError(p.User())
-			}
+		} else if !hasPriv {
+			// If the user is not admin and does not have VIEWACTIVITY or VIEWACTIVITYREDACTED,
+			// return insufficient privileges error.
+			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
 		var alloc tree.DatumAlloc
@@ -2592,20 +2583,12 @@ func (p *planner) makeSessionsRequest(
 		ExcludeClosedSessions: excludeClosed,
 		IncludeInternal:       true,
 	}
-	hasAdmin, err := p.HasAdminRole(ctx)
+	hasViewActivityOrhasViewActivityRedacted, _, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
 	if err != nil {
 		return serverpb.ListSessionsRequest{}, err
 	}
-	if hasAdmin {
+	if hasViewActivityOrhasViewActivityRedacted {
 		req.Username = ""
-	} else {
-		hasViewActivityOrhasViewActivityRedacted, _, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
-		if err != nil {
-			return serverpb.ListSessionsRequest{}, err
-		}
-		if hasViewActivityOrhasViewActivityRedacted {
-			req.Username = ""
-		}
 	}
 	return req, nil
 }
@@ -2687,18 +2670,14 @@ func populateQueriesTable(
 	} else if !isAdmin {
 		// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
 		// privileges.
-		if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
+		if hasPriv, shouldRedact, err := p.HasViewActivityOrViewActivityRedactedRole(ctx); err != nil {
 			return err
-		} else if hasViewActivityRedacted {
-			// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
-			// over VIEWACTIVITY.
-			shouldRedactOtherUserQuery = true
+		} else if hasPriv {
 			canViewOtherUser = true
-		} else if !hasViewActivityRedacted {
-			if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
-				return err
-			} else if hasViewActivity {
-				canViewOtherUser = true
+			if shouldRedact {
+				// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
+				// over VIEWACTIVITY.
+				shouldRedactOtherUserQuery = true
 			}
 		}
 	}
@@ -2907,20 +2886,16 @@ func populateSessionsTable(
 	} else if isAdmin {
 		canViewOtherUser = true
 	} else if !isAdmin {
-		// If the user is not admin, check the VIEWACTIVITYREDACTED privilege to
-		// see if constants need to be redacted.
-		if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
+		// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
+		// privileges.
+		if hasPriv, shouldRedact, err := p.HasViewActivityOrViewActivityRedactedRole(ctx); err != nil {
 			return err
-		} else if hasViewActivityRedacted {
-			// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
-			// over VIEWACTIVITY.
-			shouldRedactOtherUserQuery = true
+		} else if hasPriv {
 			canViewOtherUser = true
-		} else if !hasViewActivityRedacted {
-			if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
-				return err
-			} else if hasViewActivity {
-				canViewOtherUser = true
+			if shouldRedact {
+				// If the user has VIEWACTIVITYREDACTED, redact the query as it takes precedence
+				// over VIEWACTIVITY.
+				shouldRedactOtherUserQuery = true
 			}
 		}
 	}
@@ -7207,20 +7182,20 @@ CREATE VIEW crdb_internal.statement_statistics_persisted_v22_2 AS
 
 var crdbInternalActiveRangeFeedsTable = virtualSchemaTable{
 	comment: `node-level table listing all currently running range feeds`,
-	// NB: startTS is exclusive; consider renaming to startAfter.
 	schema: `
 CREATE TABLE crdb_internal.active_range_feeds (
   id INT,
   tags STRING,
-  startTS STRING,
+  start_after DECIMAL,
   diff BOOL,
   node_id INT,
   range_id INT,
   created INT,
   range_start STRING,
   range_end STRING,
-  resolved STRING,
-  last_event_utc INT,
+  resolved DECIMAL,
+	resolved_age INTERVAL,
+  last_event TIMESTAMPTZ,
   catchup BOOL,
   num_errs INT,
   last_err STRING
@@ -7232,7 +7207,11 @@ CREATE TABLE crdb_internal.active_range_feeds (
 				if rf.LastValueReceived.IsZero() {
 					lastEvent = tree.DNull
 				} else {
-					lastEvent = tree.NewDInt(tree.DInt(rf.LastValueReceived.UTC().UnixNano()))
+					e, err := tree.MakeDTimestampTZ(rf.LastValueReceived, time.Microsecond)
+					if err != nil {
+						return err
+					}
+					lastEvent = e
 				}
 				var lastErr tree.Datum
 				if rf.LastErr == nil {
@@ -7244,14 +7223,17 @@ CREATE TABLE crdb_internal.active_range_feeds (
 				return addRow(
 					tree.NewDInt(tree.DInt(rfCtx.ID)),
 					tree.NewDString(rfCtx.CtxTags),
-					tree.NewDString(rf.StartAfter.AsOfSystemTime()),
+					eval.TimestampToDecimalDatum(rf.StartAfter),
 					tree.MakeDBool(tree.DBool(rfCtx.WithDiff)),
 					tree.NewDInt(tree.DInt(rf.NodeID)),
 					tree.NewDInt(tree.DInt(rf.RangeID)),
 					tree.NewDInt(tree.DInt(rf.CreatedTime.UTC().UnixNano())),
 					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rf.Span.Key)),
 					tree.NewDString(keys.PrettyPrint(nil /* valDirs */, rf.Span.EndKey)),
-					tree.NewDString(rf.Resolved.AsOfSystemTime()),
+					eval.TimestampToDecimalDatum(rf.Resolved),
+					tree.NewDInterval(duration.Age(
+						p.EvalContext().GetStmtTimestamp(), rf.Resolved.GoTime()), types.DefaultIntervalTypeMetadata,
+					),
 					lastEvent,
 					tree.MakeDBool(tree.DBool(rf.InCatchup)),
 					tree.NewDInt(tree.DInt(rf.NumErrs)),

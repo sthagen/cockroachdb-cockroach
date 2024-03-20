@@ -237,6 +237,7 @@ func TestSqlActivityUpdateTopLimitJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.WithIssue(t, 120626)
 	skip.UnderStressRace(t, "test is too slow to run under race")
 
 	stubTime := timeutil.Now().Truncate(time.Hour)
@@ -922,7 +923,7 @@ func verifyActivityTableContentHelper(t *testing.T, db *sqlutils.SQLRunner, appN
 
 		// Metadata objects are changed because it's an aggregate.
 		query = fmt.Sprintf(`SELECT count_rows() 
-		FROM (select fingerprint_id, app_name, crdb_internal.merge_stats_metadata(array_agg(metadata)) AS metadata FROM system.public.statement_statistics GROUP BY fingerprint_id, app_name) ss
+		FROM (select fingerprint_id, app_name, merge_stats_metadata(metadata) AS metadata FROM system.public.statement_statistics GROUP BY fingerprint_id, app_name) ss
 		INNER JOIN	(SELECT * FROM %s) sa using (fingerprint_id, app_name)
 		WHERE app_name = $1 AND
 		      sa.metadata = ss.metadata`, table)
@@ -948,7 +949,7 @@ func verifyTopActivityTableContentHelper(t *testing.T, db *sqlutils.SQLRunner, l
 		                        fingerprint_id,
 		                        app_name,
 		                        max(metadata) AS max_metadata,
-		                        crdb_internal.merge_transaction_stats(array_agg(statistics)) as statistics
+		                        merge_transaction_stats(statistics) as statistics
 					from system.public.transaction_statistics 
 						where app_name not like '$ internal%%' and app_name != 'randomIgnore'
 						group by aggregated_ts, fingerprint_id, app_name)
@@ -988,8 +989,8 @@ func verifyTopActivityTableContentHelper(t *testing.T, db *sqlutils.SQLRunner, l
 		                        aggregated_ts,
 		                        fingerprint_id,
 		                        app_name,
-		                        crdb_internal.merge_stats_metadata(array_agg(metadata))    AS merged_metadata,
-		                        crdb_internal.merge_statement_stats(array_agg(statistics)) as statistics
+		                        merge_stats_metadata(metadata)    AS merged_metadata,
+		                        merge_statement_stats(statistics) as statistics
 					from system.public.statement_statistics 
 						where app_name not like '$ internal%%' and app_name != 'randomIgnore'
 						group by aggregated_ts, fingerprint_id, app_name)

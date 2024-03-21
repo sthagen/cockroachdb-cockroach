@@ -1268,6 +1268,11 @@ func TestSchemaChangeComparator_privileges_table(t *testing.T) {
 	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/privileges_table"
 	runSchemaChangeComparatorTest(t, logicTestFile)
 }
+func TestSchemaChangeComparator_proc_invokes_proc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/proc_invokes_proc"
+	runSchemaChangeComparatorTest(t, logicTestFile)
+}
 func TestSchemaChangeComparator_procedure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/procedure"
@@ -2021,6 +2026,11 @@ func TestSchemaChangeComparator_update_from(t *testing.T) {
 func TestSchemaChangeComparator_upgrade_skip_version(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/upgrade_skip_version"
+	runSchemaChangeComparatorTest(t, logicTestFile)
+}
+func TestSchemaChangeComparator_upgrade_system_table_changes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	var logicTestFile = "pkg/sql/logictest/testdata/logic_test/upgrade_system_table_changes"
 	runSchemaChangeComparatorTest(t, logicTestFile)
 }
 func TestSchemaChangeComparator_upsert(t *testing.T) {

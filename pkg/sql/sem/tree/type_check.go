@@ -136,6 +136,11 @@ func (s *SemaProperties) Restore(orig SemaProperties) {
 	*s = orig
 }
 
+// Context returns the required context string set by Require.
+func (s *SemaProperties) Context() string {
+	return s.required.context
+}
+
 // SemaRejectFlags contains flags to filter out certain kinds of
 // expressions.
 type SemaRejectFlags int
@@ -229,10 +234,6 @@ const (
 	// checking condition expressions CASE, COALESCE, and IF. Used to reject
 	// set-returning functions within conditional expressions.
 	ConditionalAncestor
-
-	// CallAncestor is added to ScalarAncestors while type checking children of
-	// a CALL statement. Used to print sensible error messages for procedures.
-	CallAncestor
 )
 
 // Push adds the given ancestor to s.
@@ -1165,10 +1166,12 @@ func (expr *FuncExpr) TypeCheck(
 
 	def, err := expr.Func.Resolve(ctx, searchPath, resolver)
 	if err != nil {
-		if errors.Is(err, ErrRoutineUndefined) {
-			if procErr := procedureDoesNotExistErr(expr.Func.String(), semaCtx, nil /* typeNames */); procErr != nil {
-				return nil, procErr
-			}
+		if errors.Is(err, ErrRoutineUndefined) && expr.InCall {
+			return nil, errors.WithHint(
+				pgerror.Newf(pgcode.UndefinedFunction, "procedure %s does not exist", expr.Func),
+				"No procedure matches the given name and argument types. "+
+					"You might need to add explicit type casts.",
+			)
 		}
 		return nil, err
 	}
@@ -1178,14 +1181,63 @@ func (expr *FuncExpr) TypeCheck(
 			"%s()", def.Name)
 	}
 
+	typeNames := func(typedExprs []TypedExpr) string {
+		var sb strings.Builder
+		sb.WriteByte('(')
+		for i := range typedExprs {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(typedExprs[i].ResolvedType().Name())
+		}
+		sb.WriteByte(')')
+		return sb.String()
+	}
+
 	s := getOverloadTypeChecker(
 		(*qualifiedOverloads)(&def.Overloads), expr.Exprs...,
 	)
 	defer s.release()
 
 	if err = expr.typeCheckWithFuncAncestor(semaCtx, func() error {
-		if err := s.typeCheckOverloadedExprs(ctx, semaCtx, desired, false); err != nil {
+		if err := s.typeCheckOverloadedExprs(ctx, semaCtx, desired, false /* inBinOp */); err != nil {
 			return pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
+		}
+		if expr.InCall && len(s.overloadIdxs) == 0 {
+			// Since we didn't find the overload, let's see whether the user
+			// made a mistake and attempted to call a UDF. We attempt this by
+			// temporarily adjusting the RoutineType of each UDF to be
+			// Procedure, then running type-checking on adjusted overloads, and
+			// resetting the UDF overloads to their original state.
+			var functionIdxs []int
+			var functionOverloads []QualifiedOverload
+			for idx, o := range def.Overloads {
+				if o.Type == UDFRoutine {
+					o.Type = ProcedureRoutine
+					functionIdxs = append(functionIdxs, idx)
+					functionOverloads = append(functionOverloads, o)
+				}
+			}
+			if len(functionIdxs) > 0 {
+				defer func() {
+					for _, idx := range functionIdxs {
+						def.Overloads[idx].Type = UDFRoutine
+					}
+				}()
+				s2 := getOverloadTypeChecker((*qualifiedOverloads)(&functionOverloads), expr.Exprs...)
+				defer s2.release()
+				err2 := s2.typeCheckOverloadedExprs(ctx, semaCtx, desired, false /* inBinOp */)
+				if err2 == nil && len(s2.overloadIdxs) > 0 {
+					// This time we found a match, so return the proper error.
+					return errors.WithHint(
+						pgerror.Newf(
+							pgcode.WrongObjectType,
+							"%s%s is not a procedure", def.Name, typeNames(s2.typedExprs),
+						),
+						"To call a function, use SELECT.",
+					)
+				}
+			}
 		}
 		return nil
 	}); err != nil {
@@ -1246,17 +1298,14 @@ func (expr *FuncExpr) TypeCheck(
 		s.overloadIdxs = truncated
 	}
 
-	typeNames := func() string {
-		ns := make([]string, len(s.typedExprs))
-		for i, t := range s.typedExprs {
-			ns[i] = t.ResolvedType().Name()
-		}
-		return strings.Join(ns, ", ")
-	}
-
 	if len(s.overloadIdxs) == 0 {
-		if procErr := procedureDoesNotExistErr(def.Name, semaCtx, typeNames); procErr != nil {
-			return nil, procErr
+		if expr.InCall {
+			return nil, errors.WithHint(
+				pgerror.Newf(pgcode.UndefinedFunction, "procedure %s%s does not exist",
+					def.Name, typeNames(s.typedExprs)),
+				"No procedure matches the given name and argument types. "+
+					"You might need to add explicit type casts.",
+			)
 		}
 		return nil, errors.WithHint(
 			pgerror.Newf(pgcode.UndefinedFunction, "unknown signature: %s", getFuncSig(expr, s.typedExprs, desired)),
@@ -1272,7 +1321,7 @@ func (expr *FuncExpr) TypeCheck(
 	// type-checking.
 	if len(s.overloadIdxs) > 0 && calledOnNullInputFns.Len() == 0 && funcCls != GeneratorClass &&
 		funcCls != AggregateClass && !hasUDFOverload &&
-		semaCtx != nil && !semaCtx.Properties.Ancestors.Has(CallAncestor) {
+		semaCtx != nil && !expr.InCall {
 		for _, expr := range s.typedExprs {
 			if expr.ResolvedType().Family() == types.UnknownFamily {
 				return DNull, nil
@@ -1411,31 +1460,6 @@ func (expr *FuncExpr) TypeCheck(
 		overloadImpl.OnTypeCheck()
 	}
 	return expr, nil
-}
-
-// procedureDoesNotExistErr returns a "procedure does not exist" error if the
-// current ancestors indicate that type checking is occurring at the top-level
-// child of a CALL statement.
-//
-// TODO(#111139): We'll need to reconsider how we determine that we're looking
-// for a procedure once we support calling procedures from within UDFs.
-func procedureDoesNotExistErr(
-	funcName string, semaCtx *SemaContext, typeNames func() string,
-) error {
-	if semaCtx != nil &&
-		semaCtx.Properties.Ancestors.Has(CallAncestor) &&
-		!semaCtx.Properties.Ancestors.Has(FuncExprAncestor) {
-		var typeNamesSuffix string
-		if typeNames != nil {
-			typeNamesSuffix = "(" + typeNames() + ")"
-		}
-		return errors.WithHint(
-			pgerror.Newf(pgcode.UndefinedFunction, "procedure %s%s does not exist", funcName, typeNamesSuffix),
-			"No procedure matches the given name and argument types. "+
-				"You might need to add explicit type casts.",
-		)
-	}
-	return nil
 }
 
 // TypeCheck implements the Expr interface.
@@ -3423,6 +3447,9 @@ func getMostSignificantOverload(
 	getFuncSig func() string,
 ) (QualifiedOverload, error) {
 	ambiguousError := func() error {
+		if expr.InCall {
+			return pgerror.Newf(pgcode.AmbiguousFunction, "procedure %s is not unique", getFuncSig())
+		}
 		return pgerror.Newf(
 			pgcode.AmbiguousFunction,
 			"ambiguous call: %s, candidates are:\n%s",

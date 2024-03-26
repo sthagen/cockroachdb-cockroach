@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	hlc "github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -40,8 +41,9 @@ type sstSinkConf struct {
 }
 
 type fileSSTSink struct {
-	dest cloud.ExternalStorage
-	conf sstSinkConf
+	dest  cloud.ExternalStorage
+	conf  sstSinkConf
+	pacer *admission.Pacer
 
 	sst     storage.SSTWriter
 	ctx     context.Context
@@ -76,8 +78,10 @@ type fileSSTSink struct {
 	}
 }
 
-func makeFileSSTSink(conf sstSinkConf, dest cloud.ExternalStorage) *fileSSTSink {
-	return &fileSSTSink{conf: conf, dest: dest}
+func makeFileSSTSink(
+	conf sstSinkConf, dest cloud.ExternalStorage, pacer *admission.Pacer,
+) *fileSSTSink {
+	return &fileSSTSink{conf: conf, dest: dest, pacer: pacer}
 }
 
 func (s *fileSSTSink) Close() error {
@@ -248,7 +252,7 @@ func (s *fileSSTSink) write(ctx context.Context, resp exportedSpan) error {
 	//
 	// TODO(msbutler): investigate using single a single iterator that surfaces
 	// all point keys first and then all range keys
-	if err := s.copyPointKeys(resp.dataSST); err != nil {
+	if err := s.copyPointKeys(ctx, resp.dataSST); err != nil {
 		return err
 	}
 	if err := s.copyRangeKeys(resp.dataSST); err != nil {
@@ -290,7 +294,7 @@ func (s *fileSSTSink) write(ctx context.Context, resp exportedSpan) error {
 	return nil
 }
 
-func (s *fileSSTSink) copyPointKeys(dataSST []byte) error {
+func (s *fileSSTSink) copyPointKeys(ctx context.Context, dataSST []byte) error {
 	iterOpts := storage.IterOptions{
 		KeyTypes:   storage.IterKeyTypePointsOnly,
 		LowerBound: keys.LocalMax,
@@ -302,7 +306,12 @@ func (s *fileSSTSink) copyPointKeys(dataSST []byte) error {
 	}
 	defer iter.Close()
 
+	var valueBuf []byte
+
 	for iter.SeekGE(storage.MVCCKey{Key: keys.MinKey}); ; iter.Next() {
+		if err := s.pacer.Pace(ctx); err != nil {
+			return err
+		}
 		if valid, err := iter.Valid(); !valid || err != nil {
 			if err != nil {
 				return err
@@ -316,16 +325,35 @@ func (s *fileSSTSink) copyPointKeys(dataSST []byte) error {
 		}
 		k.Key = suffix
 
-		v, err := iter.UnsafeValue()
+		raw, err := iter.UnsafeValue()
 		if err != nil {
 			return err
 		}
+
+		valueBuf = append(valueBuf[:0], raw...)
+		v, err := storage.DecodeValueFromMVCCValue(valueBuf)
+		if err != nil {
+			return errors.Wrapf(err, "decoding mvcc value %s", k)
+		}
+
+		// Checksums include the key, but *exported* keys no longer live at that key
+		// once they are exported, and could be restored as some other key, so zero
+		// out the checksum.
+		v.ClearChecksum()
+
+		// NB: DecodeValueFromMVCCValue does not decode the MVCCValueHeader, which
+		// we need to back up. In other words, if we passed v.RawBytes to the put
+		// call below, we would lose data. By putting valueBuf, we pass the value
+		// header and the cleared checksum.
+		//
+		// TODO(msbutler): create a ClearChecksum() method that can act on raw value
+		// bytes, and remove this hacky code.
 		if k.Timestamp.IsEmpty() {
-			if err := s.sst.PutUnversioned(k.Key, v); err != nil {
+			if err := s.sst.PutUnversioned(k.Key, valueBuf); err != nil {
 				return err
 			}
 		} else {
-			if err := s.sst.PutRawMVCC(k, v); err != nil {
+			if err := s.sst.PutRawMVCC(k, valueBuf); err != nil {
 				return err
 			}
 		}

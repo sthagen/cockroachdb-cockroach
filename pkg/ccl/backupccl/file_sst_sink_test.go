@@ -567,7 +567,7 @@ func TestFileSSTSinkCopyPointKeys(t *testing.T) {
 					withKVs(kvs).
 					withRangeKeys([]rangeKeyAndTS{{"a", "z", 10}}).
 					build()
-				err := sink.copyPointKeys(es.dataSST)
+				err := sink.copyPointKeys(ctx, es.dataSST)
 				if input.expectErr != "" {
 					// Do not compare resulting SSTs if we expect errors.
 					require.ErrorContains(t, err, input.expectErr)
@@ -587,6 +587,10 @@ func TestFileSSTSinkCopyPointKeys(t *testing.T) {
 			for _, input := range tt.inputs {
 				for i := range input.input {
 					input.input[i].key = string(s2k(input.input[i].key))
+					v := roachpb.Value{}
+					v.SetBytes(input.input[i].value)
+
+					input.input[i].value = v.RawBytes
 				}
 				expected = append(expected, input.input...)
 
@@ -883,10 +887,13 @@ func (b *exportedSpanBuilder) build() exportedSpan {
 	buf := &bytes.Buffer{}
 	sst := storage.MakeBackupSSTWriter(ctx, settings, buf)
 	for _, d := range b.keyValues {
+		v := roachpb.Value{}
+		v.SetBytes(d.value)
+		v.InitChecksum(nil)
 		err := sst.Put(storage.MVCCKey{
 			Key:       s2k(d.key),
 			Timestamp: hlc.Timestamp{WallTime: d.timestamp},
-		}, d.value)
+		}, v.RawBytes)
 		if err != nil {
 			panic(err)
 		}
@@ -927,7 +934,7 @@ func fileSSTSinkTestSetUp(
 		settings: &settings.SV,
 	}
 
-	sink := makeFileSSTSink(sinkConf, store)
+	sink := makeFileSSTSink(sinkConf, store, nil /* pacer */)
 	return sink, store
 }
 

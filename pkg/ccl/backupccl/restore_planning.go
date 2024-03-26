@@ -1346,8 +1346,8 @@ func restorePlanHook(
 		}
 	}
 
-	if restoreStmt.Options.ExperimentalOnline && restoreStmt.Targets.TenantID.IsSet() {
-		return nil, nil, nil, false, errors.New("cannot run Online Restore on a tenant")
+	if restoreStmt.Options.ExperimentalOnline && restoreStmt.Options.VerifyData {
+		return nil, nil, nil, false, errors.New("cannot run online restore with verify_backup_table_data")
 	}
 
 	var newTenantID *roachpb.TenantID

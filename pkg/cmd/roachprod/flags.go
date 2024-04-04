@@ -94,6 +94,8 @@ var (
 		"user-password": install.AuthUserPassword,
 		"user-cert":     install.AuthUserCert,
 	}
+
+	sshKeyUser string
 )
 
 func initFlags() {
@@ -281,6 +283,10 @@ func initFlags() {
 	grafanaDumpCmd.Flags().StringVar(&grafanaDumpDir, "dump-dir", "",
 		"the absolute path to dump prometheus data to (use the contained 'prometheus-docker-run.sh' to visualize")
 
+	sshKeysAddCmd.Flags().StringVar(&sshKeyUser, "user", config.OSUser.Username,
+		"the user to be associated with the new key",
+	)
+
 	jaegerStartCmd.Flags().StringVar(&jaegerConfigNodes, "configure-nodes", "",
 		"the nodes on which to set the relevant CRDB cluster settings")
 
@@ -374,11 +380,11 @@ func initFlags() {
 		cmd.Flags().StringVarP(&config.Binary,
 			"binary", "b", config.Binary, "the remote cockroach binary to use")
 	}
-	for _, cmd := range []*cobra.Command{startCmd, startInstanceCmd, stopInstanceCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd, jaegerStartCmd, grafanaAnnotationCmd} {
+	for _, cmd := range []*cobra.Command{startCmd, startInstanceCmd, stopInstanceCmd, loadBalanceCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd, jaegerStartCmd, grafanaAnnotationCmd} {
 		cmd.Flags().BoolVar(&secure,
 			"secure", false, "use a secure cluster")
 	}
-	for _, cmd := range []*cobra.Command{pgurlCmd, sqlCmd, adminurlCmd, stopInstanceCmd, jaegerStartCmd} {
+	for _, cmd := range []*cobra.Command{pgurlCmd, sqlCmd, adminurlCmd, stopInstanceCmd, loadBalanceCmd, jaegerStartCmd} {
 		cmd.Flags().StringVar(&virtualClusterName,
 			"cluster", "", "specific virtual cluster to connect to")
 		cmd.Flags().IntVar(&sqlInstance,

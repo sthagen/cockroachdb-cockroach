@@ -61,6 +61,14 @@ statement error pgcode 0A000 cannot rename function \"lower_hello\" because othe
 ALTER FUNCTION lower_hello rename to lower_hello_new
 
 statement ok
+CREATE SCHEMA sc2;
+
+# Validate that function schema changes are blocked.
+statement error pgcode 0A000 cannot set schema for function \"lower_hello\" because other functions \(\[test.public.upper_hello, test.public.concat_hello\]\) still depend on it
+ALTER FUNCTION lower_hello SET SCHEMA sc2;
+
+
+statement ok
 CREATE FUNCTION f() RETURNS INT LANGUAGE SQL AS $$
   SELECT 1;
 $$
@@ -167,3 +175,28 @@ CREATE OR REPLACE FUNCTION self_cycle(a INT, b INT) RETURNS INT LANGUAGE SQL AS 
 
 statement ok
 DROP FUNCTION self_cycle;
+
+# Regression test for #121316 - nested routines in a data source.
+statement ok
+CREATE TYPE typ AS (x INT, y INT);
+
+statement ok
+CREATE FUNCTION f_nested(a INT) RETURNS typ AS $$
+  SELECT a * 2;
+  SELECT ROW(1, 2)::typ;
+$$ LANGUAGE SQL;
+
+statement ok
+CREATE FUNCTION f(a INT) RETURNS INT AS $$
+  SELECT (f_nested(a)).y;
+$$ LANGUAGE SQL;
+
+query I
+SELECT f(2);
+----
+2
+
+query I
+SELECT * FROM f(2);
+----
+2

@@ -172,6 +172,9 @@ type BaseConfig struct {
 	// run-time metrics instead of constructing a fresh one.
 	RuntimeStatSampler *status.RuntimeStatSampler
 
+	// DiskWriteStatsCollector will be used to categorically track disk write metrics.
+	DiskWriteStatsCollector *vfs.DiskWriteStatsCollector
+
 	// GoroutineDumpDirName is the directory name for goroutine dumps using
 	// goroutinedumper. Only used if DisableRuntimeStatsMonitor is false.
 	GoroutineDumpDirName string
@@ -330,6 +333,7 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.InitTestingKnobs()
 	cfg.EarlyBootExternalStorageAccessor = cloud.NewEarlyBootExternalStorageAccessor(st, cfg.ExternalIODirConfig)
 	cfg.DiskMonitorManager = disk.NewMonitorManager(vfs.Default)
+	cfg.DiskWriteStatsCollector = vfs.NewDiskWriteStatsCollector()
 }
 
 // InitTestingKnobs sets up any testing knobs based on e.g. envvars.
@@ -763,13 +767,13 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		stickyRegistry = serverKnobs.StickyVFSRegistry
 	}
 
-	storeEnvs, err := fs.InitEnvsFromStoreSpecs(ctx, cfg.Stores.Specs, fs.ReadWrite, stickyRegistry)
+	storeEnvs, err := fs.InitEnvsFromStoreSpecs(ctx, cfg.Stores.Specs, fs.ReadWrite, stickyRegistry, cfg.DiskWriteStatsCollector)
 	if err != nil {
 		return Engines{}, err
 	}
 	defer storeEnvs.CloseAll()
 
-	walFailoverConfig := storage.WALFailover(cfg.WALFailover, storeEnvs, vfs.Default)
+	walFailoverConfig := storage.WALFailover(cfg.WALFailover, storeEnvs, vfs.Default, cfg.DiskWriteStatsCollector)
 
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
@@ -778,6 +782,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			walFailoverConfig,
 			storage.Attributes(spec.Attributes),
 			storage.If(storeKnobs.SmallEngineBlocks, storage.BlockSize(1)),
+			storage.DiskWriteStatsCollector(cfg.DiskWriteStatsCollector),
 		}
 		if len(storeKnobs.EngineKnobs) > 0 {
 			storageConfigOpts = append(storageConfigOpts, storeKnobs.EngineKnobs...)
@@ -820,6 +825,10 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				return Engines{}, errors.Errorf("%f%% of %s's total free space is only %s bytes, which is below the minimum requirement of %s",
 					spec.Size.Percent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
+			monitor, err := cfg.DiskMonitorManager.Monitor(spec.Path)
+			if err != nil {
+				return Engines{}, errors.Wrap(err, "creating disk monitor")
+			}
 
 			detail(redact.Sprintf("store %d: max size %s, max open file limit %d", i, humanizeutil.IBytes(sizeInBytes), openFileLimitPerStore))
 
@@ -834,6 +843,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				addCfgOpt(storage.SharedStorage(sharedStorage))
 			}
 			addCfgOpt(storage.SecondaryCache(storage.SecondaryCacheBytes(cfg.SecondaryCache, du)))
+			addCfgOpt(storage.DiskMonitor(monitor))
 			// If the spec contains Pebble options, set those too.
 			if spec.PebbleOptions != "" {
 				addCfgOpt(storage.PebbleOptions(spec.PebbleOptions, &pebble.ParseHooks{

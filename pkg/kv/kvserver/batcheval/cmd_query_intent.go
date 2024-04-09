@@ -102,7 +102,7 @@ func QueryIntent(
 	if args.StrengthOrDefault() == lock.Intent {
 		// Read from the lock table to see if an intent exists.
 		var err error
-		intent, err = storage.GetIntent(ctx, reader, args.Key, storage.BatchEvalReadCategory)
+		intent, err = storage.GetIntent(ctx, reader, args.Key)
 		if err != nil {
 			return result.Result{}, err
 		}
@@ -150,7 +150,7 @@ func QueryIntent(
 			log.VEventf(ctx, 2, "found no intent")
 		}
 	} else {
-		found, err := storage.VerifyLock(
+		found, err := storage.MVCCVerifyLock(
 			ctx, reader, &args.Txn, args.Strength, args.Key, args.IgnoredSeqNums,
 		)
 		if err != nil {

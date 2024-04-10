@@ -1,4 +1,4 @@
-// Copyright 2023 The Cockroach Authors.
+// Copyright 2024 The Cockroach Authors.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt.
@@ -25,8 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestExecSystemInsights(t *testing.T) {
-	clusterversion.SkipWhenMinSupportedVersionIsAtLeast(t, 23, 2)
+func TestAddSpanCounts(t *testing.T) {
+	clusterversion.SkipWhenMinSupportedVersionIsAtLeast(t, 24, 1)
 
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -42,29 +42,13 @@ func TestExecSystemInsights(t *testing.T) {
 		},
 	}
 
-	var (
-		ctx = context.Background()
-
-		tc    = testcluster.StartTestCluster(t, 1, clusterArgs)
-		s     = tc.Server(0)
-		sqlDB = tc.ServerConn(0)
-	)
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 1, clusterArgs)
 	defer tc.Stopper().Stop(ctx)
+	s, sqlDB := tc.Server(0), tc.ServerConn(0)
+
 	require.True(t, s.ExecutorConfig().(sql.ExecutorConfig).Codec.ForSystemTenant())
-
-	// Introduce the sequence.
-	upgrades.Upgrade(
-		t,
-		sqlDB,
-		clusterversion.V23_2_AddSystemExecInsightsTable,
-		nil,
-		false,
-	)
-
-	_, err := sqlDB.Exec("SELECT * FROM system.public.statement_execution_insights")
-	require.NoError(t, err, "system.public.statement_execution_insights exists")
-
-	_, err = sqlDB.Exec("SELECT * FROM system.public.transaction_execution_insights")
-	require.NoError(t, err, "system.public.transaction_execution_insights exists")
-
+	upgrades.Upgrade(t, sqlDB, clusterversion.V24_1_AddSpanCounts, nil, false)
+	_, err := sqlDB.Exec("SELECT * FROM system.public.span_count")
+	require.NoError(t, err, "system.public.span_count exists")
 }

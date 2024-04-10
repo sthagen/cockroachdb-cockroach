@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -2992,6 +2993,18 @@ func archForTest(ctx context.Context, l *logger.Logger, testSpec registry.TestSp
 	} else {
 		arch = vm.ArchAMD64
 	}
+	if roachtestflags.Cloud == spec.GCE && arch == vm.ArchARM64 {
+		// N.B. T2A support is rather limited, both in terms of supported regions and no local SSDs. Thus, we must
+		// fall back to AMD64 in those cases. See #122035.
+		if !gce.IsSupportedT2AZone(strings.Split(testSpec.Cluster.GCE.Zones, ",")) {
+			l.PrintfCtx(ctx, "%q specified one or more GCE regions unsupported by T2A, falling back to AMD64; see #122035", testSpec.Name)
+			return vm.ArchAMD64
+		}
+		if roachtestflags.PreferLocalSSD && testSpec.Cluster.VolumeSize == 0 && testSpec.Cluster.SSDs > 1 {
+			l.PrintfCtx(ctx, "%q specified multiple _local_ SSDs unsupported by T2A, falling back to AMD64; see #122035", testSpec.Name)
+			return vm.ArchAMD64
+		}
+	}
 	l.PrintfCtx(ctx, "Using randomly chosen arch=%q, %s", arch, testSpec.Name)
 
 	return arch
@@ -3005,27 +3018,28 @@ func (c *clusterImpl) GetPreemptedVMs(
 		return nil, nil
 	}
 
-	pattern := "^" + regexp.QuoteMeta(c.name) + "$" // exact match of the cluster name
-	cloudClusters, err := roachprod.List(l, false, pattern, vm.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	cDetails, ok := cloudClusters.Clusters[c.name]
+	cachedCluster, ok := roachprod.CachedCluster(c.name)
 	if !ok {
-		return nil, errors.Wrapf(errClusterNotFound, "%q", c.name)
+		var availableClusters []string
+		roachprod.CachedClusters(func(name string, _ int) {
+			availableClusters = append(availableClusters, name)
+		})
+
+		err := errors.Wrapf(errClusterNotFound, "%q", c.name)
+		return nil, errors.WithHintf(err, "\nAvailable clusters:\n%s", strings.Join(availableClusters, "\n"))
 	}
-	// Bucket cDetails.vms by provider
+
+	// Bucket cachedCluster.VMs by provider.
 	providerToVMs := make(map[string][]vm.VM)
-	for _, vm := range cDetails.VMs {
+	for _, vm := range cachedCluster.VMs {
 		providerToVMs[vm.Provider] = append(providerToVMs[vm.Provider], vm)
 	}
 
-	// Iterate through providerToVMs and call preemptedVMs for each provider
 	var allPreemptedVMs []vm.PreemptedVM
 	for provider, vms := range providerToVMs {
 		p := vm.Providers[provider]
 		if p.SupportsSpotVMs() {
-			preemptedVMS, err := p.GetPreemptedSpotVMs(l, vms, cDetails.CreatedAt)
+			preemptedVMS, err := p.GetPreemptedSpotVMs(l, vms, cachedCluster.CreatedAt)
 			if err != nil {
 				l.Errorf("failed to get preempted VMs for provider %s: %s", provider, err)
 				continue

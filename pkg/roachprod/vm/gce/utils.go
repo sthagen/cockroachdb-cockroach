@@ -161,7 +161,10 @@ sudo sh -c 'echo "MaxStartups 64:30:128" >> /etc/ssh/sshd_config'
 # Crank up the logging for issues such as:
 # https://github.com/cockroachdb/cockroach/issues/36929
 sudo sed -i'' 's/LogLevel.*$/LogLevel DEBUG3/' /etc/ssh/sshd_config
+# FIPS is still on Ubuntu 20.04 however, so don't enable if using FIPS.
+{{ if not .EnableFIPS }}
 sudo sh -c 'echo "PubkeyAcceptedAlgorithms +ssh-rsa" >> /etc/ssh/sshd_config'
+{{ end }}
 sudo service sshd restart
 # increase the default maximum number of open file descriptors for
 # root and non-root users. Load generators running a lot of concurrent
@@ -171,8 +174,10 @@ sudo sh -c 'echo "root - nofile 1048576\n* - nofile 1048576" > /etc/security/lim
 # N.B. Ubuntu 22.04 changed the location of tcpdump to /usr/bin. Since existing tooling, e.g.,
 # jepsen uses /usr/sbin, we create a symlink.
 # See https://ubuntu.pkgs.org/22.04/ubuntu-main-amd64/tcpdump_4.99.1-3build2_amd64.deb.html
-#
+# FIPS is still on Ubuntu 20.04 however, so don't enable if using FIPS.
+{{ if .EnableFIPS }}
 sudo ln -s /usr/bin/tcpdump /usr/sbin/tcpdump
+{{ end }}
 
 # Send TCP keepalives every minute since GCE will terminate idle connections
 # after 10m. Note that keepalives still need to be requested by the application
@@ -190,8 +195,10 @@ sudo apt-get install -qy chrony
 systemctl stop unattended-upgrades
 apt-get purge -y unattended-upgrades
 
+{{ if not .EnableCron }}
 systemctl stop cron
 systemctl mask cron
+{{ end }}
 
 # Override the chrony config. In particular,
 # log aggressively when clock is adjusted (0.01s)
@@ -266,7 +273,7 @@ sudo touch /mnt/data1/.roachprod-initialized
 // extraMountOpts, if not empty, is appended to the default mount options. It is
 // a comma-separated list of options for the "mount -o" flag.
 func writeStartupScript(
-	extraMountOpts string, fileSystem string, useMultiple bool, enableFIPS bool,
+	extraMountOpts string, fileSystem string, useMultiple bool, enableFIPS bool, enableCron bool,
 ) (string, error) {
 	type tmplParams struct {
 		ExtraMountOpts   string
@@ -275,6 +282,7 @@ func writeStartupScript(
 		EnableFIPS       bool
 		SharedUser       string
 		PublicKey        string
+		EnableCron       bool
 	}
 
 	publicKey, err := config.SSHPublicKey()
@@ -289,6 +297,7 @@ func writeStartupScript(
 		EnableFIPS:       enableFIPS,
 		SharedUser:       config.SharedUser,
 		PublicKey:        publicKey,
+		EnableCron:       enableCron,
 	}
 
 	tmpfile, err := os.CreateTemp("", "gce-startup-script")

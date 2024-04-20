@@ -716,7 +716,7 @@ type harness struct {
 func newHarness(tb testing.TB, query benchQuery, schemas []string) *harness {
 	h := &harness{
 		ctx:     context.Background(),
-		semaCtx: tree.MakeSemaContext(),
+		semaCtx: tree.MakeSemaContext(nil /* resolver */),
 		evalCtx: eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
 
@@ -733,6 +733,7 @@ func newHarness(tb testing.TB, query benchQuery, schemas []string) *harness {
 	h.evalCtx.SessionData().OptimizerUseVirtualComputedColumnStats = true
 	h.evalCtx.SessionData().OptimizerUseTrigramSimilarityOptimization = true
 	h.evalCtx.SessionData().OptimizerUseImprovedDistinctOnLimitHintCosting = true
+	h.evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity = true
 
 	// Set up the test catalog.
 	h.testCat = testcat.New()

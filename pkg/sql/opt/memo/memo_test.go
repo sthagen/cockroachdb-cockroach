@@ -67,7 +67,7 @@ func TestStatsQuality(t *testing.T) {
 
 func TestCompositeSensitive(t *testing.T) {
 	datadriven.RunTest(t, datapathutils.TestDataPath(t, "composite_sensitive"), func(t *testing.T, d *datadriven.TestData) string {
-		semaCtx := tree.MakeSemaContext()
+		semaCtx := tree.MakeSemaContext(nil /* resolver */)
 		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		var f norm.Factory
@@ -452,6 +452,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerUseImprovedDistinctOnLimitHintCosting = true
 	stale()
 	evalCtx.SessionData().OptimizerUseImprovedDistinctOnLimitHintCosting = false
+	notStale()
+
+	// Stale optimizer_use_distinct_on_limit_hint_costing.
+	evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedTrigramSimilaritySelectivity = false
 	notStale()
 
 	// Stale pg_trgm.similarity_threshold.

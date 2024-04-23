@@ -117,6 +117,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -1797,7 +1798,7 @@ type StreamingTestingKnobs struct {
 
 	// BeforeClientSubscribe allows observation of parameters about to be passed
 	// to a streaming client
-	BeforeClientSubscribe func(addr string, token string, startTime hlc.Timestamp)
+	BeforeClientSubscribe func(addr string, token string, frontier span.Frontier)
 
 	// BeforeIngestionStart allows blocking the stream ingestion job
 	// before a stream ingestion happens.
@@ -3759,6 +3760,14 @@ func (m *sessionDataMutator) SetOptimizerUseImprovedDistinctOnLimitHintCosting(v
 
 func (m *sessionDataMutator) SetOptimizerUseImprovedTrigramSimilaritySelectivity(val bool) {
 	m.data.OptimizerUseImprovedTrigramSimilaritySelectivity = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseImprovedZigzagJoinCosting(val bool) {
+	m.data.OptimizerUseImprovedZigzagJoinCosting = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseImprovedMultiColumnSelectivityEstimate(val bool) {
+	m.data.OptimizerUseImprovedMultiColumnSelectivityEstimate = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

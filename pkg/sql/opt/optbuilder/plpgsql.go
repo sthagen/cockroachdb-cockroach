@@ -285,6 +285,15 @@ func (b *plpgsqlBuilder) buildRootBlock(
 		var tc transactionControlVisitor
 		ast.Walk(&tc, astBlock)
 		if tc.foundTxnControlStatement {
+			if b.ob.insideNestedPLpgSQLCall {
+				// Disallow transaction control statements in nested routines for now.
+				// TODO(#122266): once we support this, make sure to validate that
+				// transaction control statements are only allowed in a nested procedure
+				// when all ancestors are procedures or DO blocks.
+				panic(unimplemented.NewWithIssue(122266,
+					"transaction control statements in nested routines",
+				))
+			}
 			// Disable stable folding, since different parts of the routine can be run
 			// in different transactions.
 			b.ob.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
@@ -420,6 +429,7 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			}
 			b.appendPlpgSQLStmts(&blockCon, stmts[i+1:])
 			b.pushContinuation(blockCon)
+			defer b.popContinuation()
 			return b.buildBlock(t, s)
 
 		case *ast.Return:
@@ -935,14 +945,12 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			callScope := callCon.s.push()
 			proc, def := b.ob.resolveProcedureDefinition(callScope, t.Proc)
 			overload := proc.ResolvedOverload()
-			if len(proc.Exprs) != len(overload.RoutineParams) {
-				panic(errors.AssertionFailedf("expected arguments and parameters to be the same length"))
-			}
 			procTyp := proc.ResolvedType()
 			colName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_call"))
 			col := b.ob.synthesizeColumn(callScope, colName, procTyp, nil /* expr */, nil /* scalar */)
-			procScalar := b.ob.buildRoutine(proc, def, callCon.s, callScope, b.colRefs)
-			col.scalar = procScalar
+			b.ob.withinNestedPLpgSQLCall(func() {
+				col.scalar = b.ob.buildRoutine(proc, def, callCon.s, callScope, b.colRefs)
+			})
 			b.ob.constructProjectForScope(callCon.s, callScope)
 
 			// Collect any target variables in OUT-parameter position. The result of
@@ -950,14 +958,18 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(stmts []ast.Statement, s *scope)
 			var target []ast.Variable
 			for j := range overload.RoutineParams {
 				if overload.RoutineParams[j].IsOutParam() {
-					if arg, ok := proc.Exprs[j].(*scopeColumn); ok {
-						target = append(target, arg.name.refName)
-						continue
+					if j < len(proc.Exprs) {
+						// j can be greater or equal to number of arguments when
+						// the default argument is used.
+						if arg, ok := proc.Exprs[j].(*scopeColumn); ok {
+							target = append(target, arg.name.refName)
+							continue
+						}
 					}
 					panic(pgerror.Newf(pgcode.Syntax,
 						"procedure parameter \"%s\" is an output parameter "+
 							"but corresponding argument is not writable",
-						proc.Exprs[j],
+						string(overload.RoutineParams[j].Name),
 					))
 				}
 			}

@@ -98,6 +98,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
+	"github.com/prometheus/client_golang/prometheus"
 	prometheusgo "github.com/prometheus/client_model/go"
 	"golang.org/x/time/rate"
 )
@@ -3443,7 +3444,7 @@ func (s *Store) checkpoint(tag string, spans []roachpb.Span) (string, error) {
 }
 
 // computeMetrics is a common metric computation that is used by
-// ComputeMetricsPeriodically and ComputeMetrics to compute metrics
+// ComputeMetricsPeriodically and ComputeMetrics to compute metrics.
 func (s *Store) computeMetrics(ctx context.Context) (m storage.Metrics, err error) {
 	ctx = s.AnnotateCtx(ctx)
 	if err = s.updateCapacityGauges(ctx); err != nil {
@@ -3473,17 +3474,11 @@ func (s *Store) computeMetrics(ctx context.Context) (m storage.Metrics, err erro
 		s.metrics.RdbCheckpoints.Update(int64(len(dirs)))
 	}
 
-	// Get disk stats for the disk associated with this store.
-	if s.diskMonitor != nil {
-		rollingStats := s.diskMonitor.IncrementalStats()
-		s.metrics.updateDiskStats(rollingStats)
-	}
-
 	return m, nil
 }
 
 // ComputeMetricsPeriodically computes metrics that need to be computed
-// periodically along with the regular metrics
+// periodically along with the regular metrics.
 func (s *Store) ComputeMetricsPeriodically(
 	ctx context.Context, prevMetrics *storage.MetricsForInterval, tick int,
 ) (m storage.Metrics, err error) {
@@ -3491,8 +3486,31 @@ func (s *Store) ComputeMetricsPeriodically(
 	if err != nil {
 		return m, err
 	}
+
+	// Get disk stats for the disk associated with this store.
+	if s.diskMonitor != nil {
+		rollingStats := s.diskMonitor.IncrementalStats()
+		s.metrics.updateDiskStats(rollingStats)
+	}
+
 	wt := m.Flush.WriteThroughput
 
+	updateWindowedHistogram := func(
+		prevCum prometheusgo.Metric, curCum prometheus.Histogram, wh *metric.ManualWindowHistogram) error {
+		// The current cumulative latency histogram is subtracted from the
+		// previous cumulative value producing a delta that represent the change
+		// between the two points in time. Since the prometheus.Histogram does not
+		// expose any of the data it collects, the current metrics need to be
+		// written to an intermediate struct to facilitate the calculation.
+		windowedHist := &prometheusgo.Metric{}
+		err := curCum.Write(windowedHist)
+		if err != nil {
+			return err
+		}
+		metric.SubtractPrometheusHistograms(windowedHist.GetHistogram(), prevCum.GetHistogram())
+		wh.Update(curCum, windowedHist.Histogram)
+		return nil
+	}
 	if prevMetrics != nil {
 		// The following code is subtracting previous and current metrics from the
 		// storage engine in order to expose windowed metrics. This calculation is
@@ -3505,23 +3523,16 @@ func (s *Store) ComputeMetricsPeriodically(
 		// two points in time.
 		wt.Subtract(prevMetrics.FlushWriteThroughput)
 
-		// Here the current cumulative WAL Fsync latency is subtracted from the
-		// previous cumulative value producing a delta that represent the change
-		// between the two points in time. Since the prometheus.Histogram does not
-		// expose any of the data it collects, the current metrics need to be
-		// written to an intermediate struct to facilitate the calculation.
-		prevFsync := prevMetrics.WALFsyncLatency
-		windowFsyncLatency := &prometheusgo.Metric{}
-		err := m.LogWriter.FsyncLatency.Write(windowFsyncLatency)
-		if err != nil {
+		if err := updateWindowedHistogram(
+			prevMetrics.WALFsyncLatency, m.LogWriter.FsyncLatency, s.metrics.FsyncLatency); err != nil {
 			return m, err
 		}
-		metric.SubtractPrometheusHistograms(
-			windowFsyncLatency.GetHistogram(),
-			prevFsync.GetHistogram(),
-		)
-
-		s.metrics.FsyncLatency.Update(m.LogWriter.FsyncLatency, windowFsyncLatency.Histogram)
+		if m.WAL.Failover.FailoverWriteAndSyncLatency != nil {
+			if err := updateWindowedHistogram(prevMetrics.WALFailoverWriteAndSyncLatency,
+				m.WAL.Failover.FailoverWriteAndSyncLatency, s.metrics.WALFailoverWriteAndSyncLatency); err != nil {
+				return m, err
+			}
+		}
 	}
 
 	flushUtil := 0.0

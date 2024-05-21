@@ -47,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 )
 
@@ -230,6 +231,11 @@ func (c *conn) processCommands(
 	// Signal the connection was established to the authenticator.
 	ac.AuthOK(ctx)
 	ac.LogAuthOK(ctx)
+	ac.LogAuthInfof(ctx, redact.Sprintf(
+		"session created with SessionDefaults=%s and CustomOptions=%s",
+		c.sessionArgs.SessionDefaults,
+		c.sessionArgs.CustomOptionSessionDefaults,
+	))
 
 	// We count the connection establish latency until we are ready to
 	// serve a SQL query. It includes the time it takes to authenticate and
@@ -1472,42 +1478,4 @@ var statusReportParams = []string{
 var testingStatusReportParams = map[string]string{
 	"client_encoding":             "UTF8",
 	"standard_conforming_strings": "on",
-}
-
-// readTimeoutConn overloads net.Conn.Read by periodically calling
-// checkExitConds() and aborting the read if an error is returned.
-type readTimeoutConn struct {
-	net.Conn
-	// checkExitConds is called periodically by Read(). If it returns an error,
-	// the Read() returns that error. Future calls to Read() are allowed, in which
-	// case checkExitConds() will be called again.
-	checkExitConds func() error
-}
-
-func (c *readTimeoutConn) Read(b []byte) (int, error) {
-	// readTimeout is the amount of time ReadTimeoutConn should wait on a
-	// read before checking for exit conditions. The tradeoff is between the
-	// time it takes to react to session context cancellation and the overhead
-	// of waking up and checking for exit conditions.
-	const readTimeout = 1 * time.Second
-
-	// Remove the read deadline when returning from this function to avoid
-	// unexpected behavior.
-	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
-	for {
-		if err := c.checkExitConds(); err != nil {
-			return 0, err
-		}
-		if err := c.SetReadDeadline(timeutil.Now().Add(readTimeout)); err != nil {
-			return 0, err
-		}
-		n, err := c.Conn.Read(b)
-		if err != nil {
-			// Continue if the error is due to timing out.
-			if ne := (net.Error)(nil); errors.As(err, &ne) && ne.Timeout() {
-				continue
-			}
-		}
-		return n, err
-	}
 }

@@ -67,6 +67,8 @@ const spheroidDistanceMessage = "\n\nWhen operating on a spheroid, this function
 
 const (
 	defaultWKTDecimalDigits = 15
+	// defaultGeoJSONDecimalDigits is the default number of digits coordinates for builtins in GeoJSON.
+	defaultGeoJSONDecimalDigits = 9
 )
 
 // infoBuilder is used to build a detailed info string that is consistent between
@@ -1778,14 +1780,14 @@ var geoBuiltins = map[string]builtinDefinition{
 					evalCtx,
 					tuple,
 					"", /* geoColumn */
-					geo.DefaultGeoJSONDecimalDigits,
+					defaultGeoJSONDecimalDigits,
 					false, /* pretty */
 				)
 			},
 			Info: infoBuilder{
 				info: fmt.Sprintf(
 					"Returns the GeoJSON representation of a given Geometry. Coordinates have a maximum of %d decimal digits.",
-					geo.DefaultGeoJSONDecimalDigits,
+					defaultGeoJSONDecimalDigits,
 				),
 			}.String(),
 			Volatility: volatility.Immutable,
@@ -1799,14 +1801,14 @@ var geoBuiltins = map[string]builtinDefinition{
 					evalCtx,
 					tuple,
 					string(tree.MustBeDString(args[1])),
-					geo.DefaultGeoJSONDecimalDigits,
+					defaultGeoJSONDecimalDigits,
 					false, /* pretty */
 				)
 			},
 			Info: infoBuilder{
 				info: fmt.Sprintf(
 					"Returns the GeoJSON representation of a given Geometry, using geo_column as the geometry for the given Feature. Coordinates have a maximum of %d decimal digits.",
-					geo.DefaultGeoJSONDecimalDigits,
+					defaultGeoJSONDecimalDigits,
 				),
 			}.String(),
 			Volatility: volatility.Stable,
@@ -1864,14 +1866,14 @@ var geoBuiltins = map[string]builtinDefinition{
 		},
 		geometryOverload1(
 			func(_ context.Context, _ *eval.Context, g *tree.DGeometry) (tree.Datum, error) {
-				geojson, err := geo.SpatialObjectToGeoJSON(g.Geometry.SpatialObject(), geo.DefaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagShortCRSIfNot4326)
+				geojson, err := geo.SpatialObjectToGeoJSON(g.Geometry.SpatialObject(), defaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagShortCRSIfNot4326)
 				return tree.NewDString(string(geojson)), err
 			},
 			types.String,
 			infoBuilder{
 				info: fmt.Sprintf(
 					"Returns the GeoJSON representation of a given Geometry. Coordinates have a maximum of %d decimal digits.",
-					geo.DefaultGeoJSONDecimalDigits,
+					defaultGeoJSONDecimalDigits,
 				),
 			},
 			volatility.Immutable,
@@ -1921,14 +1923,14 @@ Options is a flag that can be bitmasked. The options are:
 		},
 		geographyOverload1(
 			func(_ context.Context, _ *eval.Context, g *tree.DGeography) (tree.Datum, error) {
-				geojson, err := geo.SpatialObjectToGeoJSON(g.Geography.SpatialObject(), geo.DefaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagZero)
+				geojson, err := geo.SpatialObjectToGeoJSON(g.Geography.SpatialObject(), defaultGeoJSONDecimalDigits, geo.SpatialObjectToGeoJSONFlagZero)
 				return tree.NewDString(string(geojson)), err
 			},
 			types.String,
 			infoBuilder{
 				info: fmt.Sprintf(
 					"Returns the GeoJSON representation of a given Geography. Coordinates have a maximum of %d decimal digits.",
-					geo.DefaultGeoJSONDecimalDigits,
+					defaultGeoJSONDecimalDigits,
 				),
 			},
 			volatility.Immutable,
@@ -7777,7 +7779,7 @@ This variant will cast all geometry_str arguments into Geometry types.
 // stAsGeoJSONFromTuple returns a *tree.DString representing JSON output
 // for ST_AsGeoJSON.
 func stAsGeoJSONFromTuple(
-	evalCtx *eval.Context, tuple *tree.DTuple, geoColumn string, numDecimalDigits int, pretty bool,
+	evalCtx *eval.Context, tuple *tree.DTuple, geoColumn string, maxDecimalDigits int, pretty bool,
 ) (*tree.DString, error) {
 	typ := tuple.ResolvedType()
 	labels := typ.TupleLabels()
@@ -7805,7 +7807,7 @@ func stAsGeoJSONFromTuple(
 			if g, ok := d.(*tree.DGeometry); ok {
 				foundGeoColumn = true
 				var err error
-				geometry, err = g.ToJSON()
+				geometry, err = g.ToJSON(maxDecimalDigits)
 				if err != nil {
 					return nil, err
 				}
@@ -7814,7 +7816,7 @@ func stAsGeoJSONFromTuple(
 			if g, ok := d.(*tree.DGeography); ok {
 				foundGeoColumn = true
 				var err error
-				geometry, err = g.ToJSON()
+				geometry, err = g.ToJSON(maxDecimalDigits)
 				if err != nil {
 					return nil, err
 				}

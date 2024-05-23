@@ -218,10 +218,10 @@ func (*seqUUIDGen) NewV3(uuid.UUID, string) uuid.UUID {
 	panic("not implemented")
 }
 
-func (g *seqUUIDGen) NewV4() (uuid.UUID, error) {
+func (g *seqUUIDGen) NewV4() uuid.UUID {
 	nextV4 := g.next()
 	nextV4.SetVersion(uuid.V4)
-	return nextV4, nil
+	return nextV4
 }
 
 func (*seqUUIDGen) NewV5(uuid.UUID, string) uuid.UUID {
@@ -403,7 +403,7 @@ func buildReplicaDescriptorFromTestData(
 		Start:           clock.Now().Add(5*time.Minute.Nanoseconds(), 0).UnsafeToClockTimestamp(),
 		Expiration:      nil,
 		Replica:         desc.InternalReplicas[lhIndex],
-		ProposedTS:      nil,
+		ProposedTS:      hlc.ClockTimestamp{},
 		Epoch:           0,
 		Sequence:        0,
 		AcquisitionType: 0,

@@ -72,6 +72,8 @@ type eventStream struct {
 	lastCheckpointTime time.Time
 	lastCheckpointLen  int
 
+	lastPolled time.Time
+
 	debug streampb.DebugProducerStatus
 }
 
@@ -111,6 +113,8 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) (retErr error) {
 		return errors.AssertionFailedf("expected to be started once")
 	}
 
+	s.lastPolled = timeutil.Now()
+
 	sourceTenantID, err := s.validateProducerJobAndSpec(ctx)
 	if err != nil {
 		return err
@@ -149,6 +153,7 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) (retErr error) {
 		rangefeed.WithFrontierQuantized(quantize.Get(&s.execCfg.Settings.SV)),
 		rangefeed.WithOnValues(s.onValues),
 		rangefeed.WithFiltering(s.spec.WithFiltering),
+		rangefeed.WithInvoker(func(fn func() error) error { return fn() }),
 	}
 	if emitMetadata.Get(&s.execCfg.Settings.SV) {
 		opts = append(opts, rangefeed.WithOnMetadata(s.onMetadata))
@@ -215,6 +220,12 @@ func (s *eventStream) setErr(err error) bool {
 
 // Next implements eval.ValueGenerator interface.
 func (s *eventStream) Next(ctx context.Context) (bool, error) {
+	emitWait := int64(timeutil.Since(s.lastPolled))
+
+	s.debug.Flushes.LastEmitWaitNanos.Store(emitWait)
+	s.debug.Flushes.EmitWaitNanos.Add(emitWait)
+	s.lastPolled = timeutil.Now()
+
 	select {
 	case <-ctx.Done():
 		return false, ctx.Err()
@@ -226,6 +237,10 @@ func (s *eventStream) Next(ctx context.Context) (bool, error) {
 		case err := <-s.errCh:
 			return false, err
 		default:
+			produceWait := int64(timeutil.Since(s.lastPolled))
+			s.debug.Flushes.ProduceWaitNanos.Add(produceWait)
+			s.debug.Flushes.LastProduceWaitNanos.Store(produceWait)
+			s.lastPolled = timeutil.Now()
 			return true, nil
 		}
 	}

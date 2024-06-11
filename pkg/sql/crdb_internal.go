@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -226,6 +227,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalPCRStreamsTableID:                  crdbInternalPCRStreamsTable,
 		catconstants.CrdbInternalPCRStreamSpansTableID:              crdbInternalPCRStreamSpansTable,
 		catconstants.CrdbInternalPCRStreamCheckpointsTableID:        crdbInternalPCRStreamCheckpointsTable,
+		catconstants.CrdbInternalLDRProcessorTableID:                crdbInternalLDRProcessorTable,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -1836,6 +1838,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   database_name       STRING NOT NULL,
   exec_node_ids       INT[] NOT NULL,
   kv_node_ids         INT[] NOT NULL,
+  used_follower_read  BOOL NOT NULL,
   txn_fingerprint_id  STRING,
   index_recommendations STRING[] NOT NULL,
   latency_seconds_min FLOAT,
@@ -1984,8 +1987,9 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 				tree.MakeDBool(tree.DBool(stats.Key.FullScan)),                                                                           // full_scan
 				alloc.NewDJSON(tree.DJSON{JSON: samplePlan}),                                                                             // sample_plan
 				alloc.NewDString(tree.DString(stats.Key.Database)),                                                                       // database_name
-				execNodeIDs,          // exec_node_ids
-				kvNodeIDs,            // kv_node_ids
+				execNodeIDs, // exec_node_ids
+				kvNodeIDs,   // kv_node_ids
+				tree.MakeDBool(tree.DBool(stats.Stats.UsedFollowerRead)), // used_follower_read
 				txnFingerprintID,     // txn_fingerprint_id
 				indexRecommendations, // index_recommendations
 				alloc.NewDFloat(tree.DFloat(stats.Stats.LatencyInfo.Min)), // latency_seconds_min
@@ -9028,6 +9032,11 @@ CREATE TABLE crdb_internal.cluster_replication_node_streams (
 	megabytes FLOAT,
 	last_checkpoint INTERVAL,
 	
+	produce_wait INTERVAL,
+	emit_wait INTERVAL,
+	last_produce_wait INTERVAL,
+	last_emit_wait INTERVAL,
+
 	rf_checkpoints INT,
 	rf_advances INT,
 	rf_last_advance INTERVAL,
@@ -9052,24 +9061,53 @@ CREATE TABLE crdb_internal.cluster_replication_node_streams (
 			return tree.NewDInterval(duration.Age(now, t), types.DefaultIntervalTypeMetadata)
 		}
 
+		// Transform `.0000000000` to `.0` to shorted/de-noise HLCs.
+		shortenLogical := func(d *tree.DDecimal) *tree.DDecimal {
+			var tmp apd.Decimal
+			d.Modf(nil, &tmp)
+			if tmp.IsZero() {
+				if _, err := tree.DecimalCtx.Quantize(&tmp, &d.Decimal, -1); err == nil {
+					d.Decimal = tmp
+				}
+			}
+			return d
+		}
+
 		for _, s := range sm.DebugGetProducerStatuses(ctx) {
 			resolved := time.UnixMicro(s.RF.ResolvedMicros.Load())
 			resolvedDatum := tree.DNull
 			if resolved.Unix() != 0 {
-				resolvedDatum = eval.TimestampToDecimalDatum(hlc.Timestamp{WallTime: resolved.UnixNano()})
+				resolvedDatum = shortenLogical(eval.TimestampToDecimalDatum(hlc.Timestamp{WallTime: resolved.UnixNano()}))
 			}
 
 			if err := addRow(
 				tree.NewDInt(tree.DInt(s.StreamID)),
 				tree.NewDString(fmt.Sprintf("%d[%d]", s.Spec.ConsumerNode, s.Spec.ConsumerProc)),
 				tree.NewDInt(tree.DInt(len(s.Spec.Spans))),
-				eval.TimestampToDecimalDatum(s.Spec.InitialScanTimestamp),
-				eval.TimestampToDecimalDatum(s.Spec.PreviousReplicatedTimestamp),
+				shortenLogical(eval.TimestampToDecimalDatum(s.Spec.InitialScanTimestamp)),
+				shortenLogical(eval.TimestampToDecimalDatum(s.Spec.PreviousReplicatedTimestamp)),
 
 				tree.NewDInt(tree.DInt(s.Flushes.Batches.Load())),
 				tree.NewDInt(tree.DInt(s.Flushes.Checkpoints.Load())),
 				tree.NewDFloat(tree.DFloat(math.Round(float64(s.Flushes.Bytes.Load())/float64(1<<18))/4)),
 				age(time.UnixMicro(s.LastCheckpoint.Micros.Load())),
+
+				tree.NewDInterval(
+					duration.MakeDuration(s.Flushes.ProduceWaitNanos.Load(), 0, 0),
+					types.DefaultIntervalTypeMetadata,
+				),
+				tree.NewDInterval(
+					duration.MakeDuration(s.Flushes.EmitWaitNanos.Load(), 0, 0),
+					types.DefaultIntervalTypeMetadata,
+				),
+				tree.NewDInterval(
+					duration.MakeDuration(s.Flushes.LastProduceWaitNanos.Load(), 0, 0),
+					types.DefaultIntervalTypeMetadata,
+				),
+				tree.NewDInterval(
+					duration.MakeDuration(s.Flushes.LastEmitWaitNanos.Load(), 0, 0),
+					types.DefaultIntervalTypeMetadata,
+				),
 
 				tree.NewDInt(tree.DInt(s.RF.Checkpoints.Load())),
 				tree.NewDInt(tree.DInt(s.RF.Advances.Load())),
@@ -9157,6 +9195,33 @@ CREATE TABLE crdb_internal.cluster_replication_node_stream_checkpoints (
 				); err != nil {
 					return err
 				}
+			}
+		}
+		return nil
+	},
+}
+var crdbInternalLDRProcessorTable = virtualSchemaTable{
+	comment: `node-level table listing all currently running logical replication writer processors`,
+	schema: `
+CREATE TABLE crdb_internal.logical_replication_node_processors (
+	stream_id INT,
+	consumer STRING
+);`,
+	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
+		sm, err := p.EvalContext().StreamManagerFactory.GetReplicationStreamManager(ctx)
+		if err != nil {
+			// A non-CCL binary can't have anything to inspect so just return empty.
+			if err.Error() == "replication streaming requires a CCL binary" {
+				return nil
+			}
+			return err
+		}
+		for _, status := range sm.DebugGetLogicalConsumerStatuses(ctx) {
+			if err := addRow(
+				tree.NewDInt(tree.DInt(status.StreamID)),
+				tree.NewDString(fmt.Sprintf("%d[%d]", p.extendedEvalCtx.ExecCfg.JobRegistry.ID(), status.ProcessorID)),
+			); err != nil {
+				return err
 			}
 		}
 		return nil

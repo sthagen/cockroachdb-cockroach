@@ -9,7 +9,7 @@ bulkio.backup.deprecated_full_backup_with_subdir.enabled	boolean	false	when true
 bulkio.backup.file_size	byte size	128 MiB	target size for individual data files produced during BACKUP	application
 bulkio.backup.read_timeout	duration	5m0s	amount of time after which a read attempt is considered timed out, which causes the backup to fail	application
 bulkio.backup.read_with_priority_after	duration	1m0s	amount of time since the read-as-of time above which a BACKUP should use priority when retrying reads	application
-changefeed.aggregator.flush_jitter	float	0.1	jitter aggregator flushes as a fraction of min_checkpoint_frequency	application
+changefeed.aggregator.flush_jitter	float	0.1	jitter aggregator flushes as a fraction of min_checkpoint_frequency. This setting has no effect if min_checkpoint_frequency is set to 0.	application
 changefeed.backfill.concurrent_scan_requests	integer	0	number of concurrent scan requests per node issued during a backfill	application
 changefeed.backfill.scan_request_size	integer	524288	the maximum number of bytes returned by each scan request	application
 changefeed.batch_reduction_retry.enabled	boolean	false	if true, kafka changefeeds upon erroring on an oversized batch will attempt to resend the messages with progressively lower batch sizes	application
@@ -338,7 +338,9 @@ sql.txn.read_committed_isolation.enabled	boolean	true	set to true to allow trans
 sql.txn_fingerprint_id_cache.capacity	integer	100	the maximum number of txn fingerprint IDs stored	application
 storage.max_sync_duration	duration	20s	maximum duration for disk operations; any operations that take longer than this setting trigger a warning log entry or process crash	system-visible
 storage.max_sync_duration.fatal.enabled	boolean	true	if true, fatal the process when a disk operation exceeds storage.max_sync_duration	application
-storage.sstable.compression_algorithm	enumeration	snappy	"determines the compression algorithm to use when compressing sstable data blocks; supported values: ""snappy"", ""zstd"" [snappy = 1, zstd = 2]"	system-visible
+storage.sstable.compression_algorithm	enumeration	snappy	"determines the compression algorithm to use when compressing sstable data blocks for use in a Pebble store; supported values: ""snappy"", ""zstd"" [snappy = 1, zstd = 2]"	system-visible
+storage.sstable.compression_algorithm_backup_storage	enumeration	snappy	"determines the compression algorithm to use when compressing sstable data blocks for backup row data storage; supported values: ""snappy"", ""zstd"" [snappy = 1, zstd = 2]"	system-visible
+storage.sstable.compression_algorithm_backup_transport	enumeration	snappy	"determines the compression algorithm to use when compressing sstable data blocks for backup transport; supported values: ""snappy"", ""zstd"" [snappy = 1, zstd = 2]"	system-visible
 timeseries.storage.resolution_10s.ttl	duration	240h0m0s	the maximum age of time series data stored at the 10 second resolution. Data older than this is subject to rollup and deletion.	system-visible
 timeseries.storage.resolution_30m.ttl	duration	2160h0m0s	the maximum age of time series data stored at the 30 minute resolution. Data older than this is subject to deletion.	system-visible
 trace.debug_http_endpoint.enabled	boolean	false	if set, traces for recent requests can be seen at https://<ui>/debug/requests	application

@@ -384,6 +384,10 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"batches",
 			"checkpoints",
 			"megabytes",
+			"produce_wait",
+			"emit_wait",
+			"last_produce_wait",
+			"last_emit_wait",
 			"last_checkpoint",
 			"rf_checkpoints",
 			"rf_advances",
@@ -404,6 +408,12 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"consumer",
 			"resolved",
 			"resolved_age",
+		},
+	},
+	`"".crdb_internal.logical_replication_node_processors`: {
+		nonSensitiveCols: NonSensitiveColumns{
+			"stream_id",
+			"consumer",
 		},
 	},
 	"crdb_internal.default_privileges": {
@@ -980,6 +990,7 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 			"database_name",
 			"exec_node_ids",
 			"kv_node_ids",
+			"used_follower_read",
 			"txn_fingerprint_id",
 			"index_recommendations",
 			"latency_seconds_min",

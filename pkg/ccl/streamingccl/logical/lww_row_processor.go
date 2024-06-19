@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -121,6 +122,10 @@ func (lww *sqlLastWriteWinsRowProcessor) ProcessRow(
 	}
 }
 
+var attributeToUser = sessiondata.InternalExecutorOverride{
+	AttributeToUser: true,
+}
+
 func (lww *sqlLastWriteWinsRowProcessor) insertRow(
 	ctx context.Context, txn isql.Txn, row cdcevent.Row,
 ) error {
@@ -155,7 +160,7 @@ func (lww *sqlLastWriteWinsRowProcessor) insertRow(
 	if !ok {
 		return errors.Errorf("no pre-generated insert query for table %d column family %d", row.TableID, row.FamilyID)
 	}
-	if _, err := txn.ExecParsed(ctx, "replicated-insert", txn.KV(), insertQuery, datums...); err != nil {
+	if _, err := txn.ExecParsed(ctx, "replicated-insert", txn.KV(), attributeToUser, insertQuery, datums...); err != nil {
 		log.Warningf(ctx, "replicated insert failed (query: %s): %s", insertQuery.SQL, err.Error())
 		return err
 	}
@@ -176,7 +181,7 @@ func (lww *sqlLastWriteWinsRowProcessor) deleteRow(
 	datums = append(datums, &lww.scratch.ts)
 	lww.scratch.datums = datums[:0]
 	deleteQuery := lww.queryBuffer.deleteQueries[row.TableID]
-	if _, err := txn.ExecParsed(ctx, "replicated-delete", txn.KV(), deleteQuery, datums...); err != nil {
+	if _, err := txn.ExecParsed(ctx, "replicated-delete", txn.KV(), attributeToUser, deleteQuery, datums...); err != nil {
 		log.Warningf(ctx, "replicated delete failed (query: %s): %s", deleteQuery.SQL, err.Error())
 		return err
 	}
@@ -194,77 +199,72 @@ func makeInsertQueries(
 		var onConflictUpdateClause strings.Builder
 		argIdx := 1
 		seenIds := make(map[catid.ColumnID]struct{})
-		addColumn := func(colName string, colID catid.ColumnID) {
-			// We will set crdb_internal_origin_timestamp ourselves from the MVCC timestamp of the incoming datum.
-			// We should never see this on the rangefeed as a non-null value as that would imply we've looped data around.
-			if colName == "crdb_internal_origin_timestamp" {
-				return
-			}
-			if _, seen := seenIds[colID]; seen {
-				return
-			}
-
-			if argIdx == 1 {
-				columnNames.WriteString(colName)
-				fmt.Fprintf(&valueStrings, "$%d", argIdx)
-				fmt.Fprintf(&onConflictUpdateClause, "%s = $%d", colName, argIdx)
-			} else {
-				fmt.Fprintf(&columnNames, ", %s", colName)
-				fmt.Fprintf(&valueStrings, ", $%d", argIdx)
-				fmt.Fprintf(&onConflictUpdateClause, ",\n%s = $%d", colName, argIdx)
-			}
-			seenIds[colID] = struct{}{}
-			argIdx++
-		}
 
 		publicColumns := td.PublicColumns()
 		colOrd := catalog.ColumnIDToOrdinalMap(publicColumns)
+		addColumnByNameNoCheck := func(colName string) {
+			if argIdx == 1 {
+				columnNames.WriteString(colName)
+				fmt.Fprintf(&valueStrings, "$%d", argIdx)
+				fmt.Fprintf(&onConflictUpdateClause, "%s = excluded.%[1]s", colName)
+			} else {
+				fmt.Fprintf(&columnNames, ", %s", colName)
+				fmt.Fprintf(&valueStrings, ", $%d", argIdx)
+				fmt.Fprintf(&onConflictUpdateClause, ",\n%s = excluded.%[1]s", colName)
+			}
+			argIdx++
+		}
+		addColumnByID := func(colID catid.ColumnID) error {
+			ord, ok := colOrd.Get(colID)
+			if !ok {
+				return errors.AssertionFailedf("expected to find column %d", colID)
+			}
+			col := publicColumns[ord]
+			if col.IsComputed() {
+				return nil
+			}
+			colName := col.GetName()
+			// We will set crdb_internal_origin_timestamp ourselves from the MVCC timestamp of the incoming datum.
+			// We should never see this on the rangefeed as a non-null value as that would imply we've looped data around.
+			if colName == "crdb_internal_origin_timestamp" {
+				return nil
+			}
+			if _, seen := seenIds[colID]; seen {
+				return nil
+			}
+			addColumnByNameNoCheck(colName)
+			seenIds[colID] = struct{}{}
+			return nil
+		}
+
 		primaryIndex := td.GetPrimaryIndex()
-
 		for i := 0; i < primaryIndex.NumKeyColumns(); i++ {
-			colID := primaryIndex.GetKeyColumnID(i)
-			ord, ok := colOrd.Get(colID)
-			if !ok {
-				return errors.AssertionFailedf("expected to find column %d", colID)
+			if err := addColumnByID(primaryIndex.GetKeyColumnID(i)); err != nil {
+				return err
 			}
-			col := publicColumns[ord]
-			if col.IsComputed() {
-				continue
-			}
-			addColumn(col.GetName(), col.GetID())
 		}
 
-		for i, colName := range family.ColumnNames {
-			colID := family.ColumnIDs[i]
-			ord, ok := colOrd.Get(colID)
-			if !ok {
-				return errors.AssertionFailedf("expected to find column %d", colID)
+		for i := range family.ColumnNames {
+			if err := addColumnByID(family.ColumnIDs[i]); err != nil {
+				return err
 			}
-			col := publicColumns[ord]
-			if col.IsComputed() {
-				continue
-			}
-			addColumn(colName, family.ColumnIDs[i])
 		}
-
+		addColumnByNameNoCheck("crdb_internal_origin_timestamp")
 		var err error
-		originTSIdx := argIdx
-		baseQuery := `
-INSERT INTO %s (%s, crdb_internal_origin_timestamp)
-VALUES (%s, $%d)
+		const baseQuery = `
+INSERT INTO %s AS t (%s)
+VALUES (%s)
 ON CONFLICT ON CONSTRAINT %s
 DO UPDATE SET
-%s,
-crdb_internal_origin_timestamp=$%[4]d
-WHERE (%[1]s.crdb_internal_mvcc_timestamp <= $%[4]d
-       AND %[1]s.crdb_internal_origin_timestamp IS NULL)
-   OR (%[1]s.crdb_internal_origin_timestamp <= $%[4]d
-       AND %[1]s.crdb_internal_origin_timestamp IS NOT NULL)`
+%s
+WHERE (t.crdb_internal_mvcc_timestamp <= excluded.crdb_internal_origin_timestamp
+       AND t.crdb_internal_origin_timestamp IS NULL)
+   OR (t.crdb_internal_origin_timestamp <= excluded.crdb_internal_origin_timestamp
+       AND t.crdb_internal_origin_timestamp IS NOT NULL)`
 		queries[family.ID], err = parser.ParseOne(fmt.Sprintf(baseQuery,
 			fqTableName,
 			columnNames.String(),
 			valueStrings.String(),
-			originTSIdx,
 			td.GetPrimaryIndex().GetName(),
 			onConflictUpdateClause.String(),
 		))

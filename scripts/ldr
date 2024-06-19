@@ -22,6 +22,9 @@ usage: $0 <command>
     Shortand to run 'create', 'start', 'workload init', 'jobs start', and then 'workload run' to
     get LDR up and running in one command. Any extra arguments are passed along to 'create'.
 
+  * 'go'
+    Like 'setup' but without 'create', e.g. to run again after a wipe/put. 
+
   * 'create'
     creates two clusters, \$USER-a and \$USER-b, defaulting to 3x16vCPU but any optional extra args
     including overriding those defaults are passed through to 'roachprod create'. It stages cockroach
@@ -56,6 +59,10 @@ case $1 in
   "setup")
     shift
     $0 create "$@"
+    $0 go
+    ;;
+
+  "go")
     $0 start
     $0 workload init
     $0 jobs start
@@ -83,8 +90,8 @@ case $1 in
     "start")
       roachprod sql $A:1 -- -e "SET CLUSTER SETTING kv.rangefeed.enabled = true"
       roachprod sql $B:1 -- -e "SET CLUSTER SETTING kv.rangefeed.enabled = true"
-      roachprod sql $A:1 -- -e "USE ycsb; SELECT crdb_internal.start_logical_replication_job($(roachprod pgurl --insecure $B:1), ARRAY['usertable']);"
-      roachprod sql $B:1 -- -e "USE ycsb; SELECT crdb_internal.start_logical_replication_job($(roachprod pgurl --insecure $A:1), ARRAY['usertable']);"
+      roachprod sql $A:1 -- -e "USE ycsb; SELECT crdb_internal.start_logical_replication_job($(roachprod pgurl --database ycsb --insecure $B:1), ARRAY['usertable']);"
+      roachprod sql $B:1 -- -e "USE ycsb; SELECT crdb_internal.start_logical_replication_job($(roachprod pgurl --database ycsb --insecure $A:1), ARRAY['usertable']);"
       ;;
     "pause")
       roachprod sql $A:1 -- -e "PAUSE JOBS (WITH x AS (SHOW JOBS) SELECT job_id FROM x WHERE job_type = 'LOGICAL REPLICATION' AND status = 'running');"
@@ -196,7 +203,7 @@ case $1 in
     # exited non-zero. So we capture the result in an `||` so we keep going to
     # the second one, then if we're still running, exit with the first's result.
     ret=0
-    
+
     echo "${A}:"
     roachprod "${cmd}" $A "$@" || ret=$?
     echo "${B}:"

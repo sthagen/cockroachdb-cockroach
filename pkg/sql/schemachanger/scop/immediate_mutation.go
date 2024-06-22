@@ -11,6 +11,7 @@
 package scop
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -672,6 +673,19 @@ type RemoveTableComment struct {
 	TableID descpb.ID
 }
 
+// UpsertTypeComment is used to add a comment to a Type.
+type UpsertTypeComment struct {
+	immediateMutationOp
+	TypeID  descpb.ID
+	Comment string
+}
+
+// RemoveTypeComment is used to delete a comment associated with a Type.
+type RemoveTypeComment struct {
+	immediateMutationOp
+	TypeID descpb.ID
+}
+
 // UpsertDatabaseComment is used to add a comment to a database.
 type UpsertDatabaseComment struct {
 	immediateMutationOp
@@ -870,4 +884,12 @@ type InitSequence struct {
 type CreateDatabaseDescriptor struct {
 	immediateMutationOp
 	DatabaseID descpb.ID
+}
+
+// AddDatabaseZoneConfig adds a zone config to a database.
+type AddDatabaseZoneConfig struct {
+	immediateMutationOp
+	DatabaseID descpb.ID
+	ZoneConfig *zonepb.ZoneConfig
+	SeqNum     uint32
 }

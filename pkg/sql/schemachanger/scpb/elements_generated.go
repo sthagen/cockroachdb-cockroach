@@ -792,6 +792,43 @@ func (c *ElementCollection[E]) FilterDatabaseRoleSetting() *ElementCollection[*D
 	return (*ElementCollection[*DatabaseRoleSetting])(ret)
 }
 
+func (e DatabaseZoneConfig) element() {}
+
+// Element implements ElementGetter.
+func (e * ElementProto_DatabaseZoneConfig) Element() Element {
+	return e.DatabaseZoneConfig
+}
+
+// ForEachDatabaseZoneConfig iterates over elements of type DatabaseZoneConfig.
+// Deprecated
+func ForEachDatabaseZoneConfig(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *DatabaseZoneConfig),
+) {
+  c.FilterDatabaseZoneConfig().ForEach(fn)
+}
+
+// FindDatabaseZoneConfig finds the first element of type DatabaseZoneConfig.
+// Deprecated
+func FindDatabaseZoneConfig(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *DatabaseZoneConfig) {
+	if tc := c.FilterDatabaseZoneConfig(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*DatabaseZoneConfig)
+	}
+	return current, target, element
+}
+
+// DatabaseZoneConfigElements filters elements of type DatabaseZoneConfig.
+func (c *ElementCollection[E]) FilterDatabaseZoneConfig() *ElementCollection[*DatabaseZoneConfig] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*DatabaseZoneConfig)
+		return ok
+	})
+	return (*ElementCollection[*DatabaseZoneConfig])(ret)
+}
+
 func (e EnumType) element() {}
 
 // Element implements ElementGetter.
@@ -2272,6 +2309,43 @@ func (c *ElementCollection[E]) FilterTemporaryIndex() *ElementCollection[*Tempor
 	return (*ElementCollection[*TemporaryIndex])(ret)
 }
 
+func (e TypeComment) element() {}
+
+// Element implements ElementGetter.
+func (e * ElementProto_TypeComment) Element() Element {
+	return e.TypeComment
+}
+
+// ForEachTypeComment iterates over elements of type TypeComment.
+// Deprecated
+func ForEachTypeComment(
+	c *ElementCollection[Element], fn func(current Status, target TargetStatus, e *TypeComment),
+) {
+  c.FilterTypeComment().ForEach(fn)
+}
+
+// FindTypeComment finds the first element of type TypeComment.
+// Deprecated
+func FindTypeComment(
+	c *ElementCollection[Element],
+) (current Status, target TargetStatus, element *TypeComment) {
+	if tc := c.FilterTypeComment(); !tc.IsEmpty() {
+		var e Element
+		current, target, e = tc.Get(0)
+		element = e.(*TypeComment)
+	}
+	return current, target, element
+}
+
+// TypeCommentElements filters elements of type TypeComment.
+func (c *ElementCollection[E]) FilterTypeComment() *ElementCollection[*TypeComment] {
+	ret := c.genericFilter(func(_ Status, _ TargetStatus, e Element) bool {
+		_, ok := e.(*TypeComment)
+		return ok
+	})
+	return (*ElementCollection[*TypeComment])(ret)
+}
+
 func (e UniqueWithoutIndexConstraint) element() {}
 
 // Element implements ElementGetter.
@@ -2467,6 +2541,8 @@ func (e* ElementProto) SetElement(element Element) {
 			e.ElementOneOf = &ElementProto_DatabaseRegionConfig{ DatabaseRegionConfig: t}
 		case *DatabaseRoleSetting:
 			e.ElementOneOf = &ElementProto_DatabaseRoleSetting{ DatabaseRoleSetting: t}
+		case *DatabaseZoneConfig:
+			e.ElementOneOf = &ElementProto_DatabaseZoneConfig{ DatabaseZoneConfig: t}
 		case *EnumType:
 			e.ElementOneOf = &ElementProto_EnumType{ EnumType: t}
 		case *EnumTypeValue:
@@ -2547,6 +2623,8 @@ func (e* ElementProto) SetElement(element Element) {
 			e.ElementOneOf = &ElementProto_TableZoneConfig{ TableZoneConfig: t}
 		case *TemporaryIndex:
 			e.ElementOneOf = &ElementProto_TemporaryIndex{ TemporaryIndex: t}
+		case *TypeComment:
+			e.ElementOneOf = &ElementProto_TypeComment{ TypeComment: t}
 		case *UniqueWithoutIndexConstraint:
 			e.ElementOneOf = &ElementProto_UniqueWithoutIndexConstraint{ UniqueWithoutIndexConstraint: t}
 		case *UniqueWithoutIndexConstraintUnvalidated:
@@ -2582,6 +2660,7 @@ func GetElementOneOfProtos() []interface{} {
 	((*ElementProto_DatabaseData)(nil)),
 	((*ElementProto_DatabaseRegionConfig)(nil)),
 	((*ElementProto_DatabaseRoleSetting)(nil)),
+	((*ElementProto_DatabaseZoneConfig)(nil)),
 	((*ElementProto_EnumType)(nil)),
 	((*ElementProto_EnumTypeValue)(nil)),
 	((*ElementProto_ForeignKeyConstraint)(nil)),
@@ -2622,6 +2701,7 @@ func GetElementOneOfProtos() []interface{} {
 	((*ElementProto_TableSchemaLocked)(nil)),
 	((*ElementProto_TableZoneConfig)(nil)),
 	((*ElementProto_TemporaryIndex)(nil)),
+	((*ElementProto_TypeComment)(nil)),
 	((*ElementProto_UniqueWithoutIndexConstraint)(nil)),
 	((*ElementProto_UniqueWithoutIndexConstraintUnvalidated)(nil)),
 	((*ElementProto_UserPrivileges)(nil)),
@@ -2654,6 +2734,7 @@ func GetElementTypes() []interface{} {
 	((*DatabaseData)(nil)),
 	((*DatabaseRegionConfig)(nil)),
 	((*DatabaseRoleSetting)(nil)),
+	((*DatabaseZoneConfig)(nil)),
 	((*EnumType)(nil)),
 	((*EnumTypeValue)(nil)),
 	((*ForeignKeyConstraint)(nil)),
@@ -2694,6 +2775,7 @@ func GetElementTypes() []interface{} {
 	((*TableSchemaLocked)(nil)),
 	((*TableZoneConfig)(nil)),
 	((*TemporaryIndex)(nil)),
+	((*TypeComment)(nil)),
 	((*UniqueWithoutIndexConstraint)(nil)),
 	((*UniqueWithoutIndexConstraintUnvalidated)(nil)),
 	((*UserPrivileges)(nil)),

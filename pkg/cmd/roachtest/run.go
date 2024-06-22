@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/operations"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -181,6 +182,14 @@ func runTests(register func(registry.Registry), filter *registry.TestFilter) err
 	// may still be running long after the test has completed.
 	defer leaktest.AfterTest(l)()
 
+	// We allow roachprod users to set a default auth-mode through the
+	// ROACHPROD_DEFAULT_AUTH_MODE env var. However, roachtests shouldn't
+	// use this feature in order to minimize confusion over which auth-mode
+	// is being used.
+	if err = os.Unsetenv(install.DefaultAuthModeEnv); err != nil {
+		return err
+	}
+
 	err = runner.Run(
 		ctx, specs, roachtestflags.Count, parallelism, opt,
 		testOpts{
@@ -218,7 +227,7 @@ func setLogConfig(baseDir string) {
 	if err := logConf.Validate(&baseDir); err != nil {
 		panic(err)
 	}
-	if _, err := log.ApplyConfig(logConf, log.FileSinkMetrics{}); err != nil {
+	if _, err := log.ApplyConfig(logConf, log.FileSinkMetrics{}, nil /* fatalOnLogStall */); err != nil {
 		panic(err)
 	}
 }

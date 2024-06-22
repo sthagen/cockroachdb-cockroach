@@ -104,6 +104,7 @@ const (
 	CommentOnIndexTag      = "COMMENT ON INDEX"
 	CommentOnSchemaTag     = "COMMENT ON SCHEMA"
 	CommentOnTableTag      = "COMMENT ON TABLE"
+	CommentOnTypeTag       = "COMMENT ON TYPE"
 	DropDatabaseTag        = "DROP DATABASE"
 	DropFunctionTag        = "DROP FUNCTION"
 	DropProcedureTag       = "DROP PROCEDURE"
@@ -116,6 +117,7 @@ const (
 	DropViewTag            = "DROP VIEW"
 	ImportTag              = "IMPORT"
 	RestoreTag             = "RESTORE"
+	ConfigureZoneTag       = "CONFIGURE ZONE"
 )
 
 // Statements represent a list of statements.
@@ -809,6 +811,15 @@ func (*CommentOnTable) StatementType() StatementType { return TypeDDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CommentOnTable) StatementTag() string { return CommentOnTableTag }
+
+// StatementReturnType implements the Statement interface.
+func (*CommentOnType) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*CommentOnType) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CommentOnType) StatementTag() string { return CommentOnTypeTag }
 
 // StatementReturnType implements the Statement interface.
 func (*CommitTransaction) StatementReturnType() StatementReturnType { return Ack }
@@ -2326,6 +2337,7 @@ func (n *CommentOnDatabase) String() string                   { return AsString(
 func (n *CommentOnSchema) String() string                     { return AsString(n) }
 func (n *CommentOnIndex) String() string                      { return AsString(n) }
 func (n *CommentOnTable) String() string                      { return AsString(n) }
+func (n *CommentOnType) String() string                       { return AsString(n) }
 func (n *CommitTransaction) String() string                   { return AsString(n) }
 func (n *CopyFrom) String() string                            { return AsString(n) }
 func (n *CopyTo) String() string                              { return AsString(n) }

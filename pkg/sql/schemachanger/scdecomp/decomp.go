@@ -151,6 +151,17 @@ func (w *walkCtx) walkDatabase(db catalog.DatabaseDescriptor) {
 		w.backRefs.Add(id)
 		return nil
 	})
+	zoneConfig, err := w.zoneConfigReader.GetZoneConfig(w.ctx, db.GetID())
+	if err != nil {
+		panic(err)
+	}
+	if zoneConfig != nil {
+		w.ev(scpb.Status_PUBLIC, &scpb.DatabaseZoneConfig{
+			DatabaseID: db.GetID(),
+			ZoneConfig: zoneConfig.ZoneConfigProto(),
+			SeqNum:     0,
+		})
+	}
 }
 
 func (w *walkCtx) walkSchema(sc catalog.SchemaDescriptor) {
@@ -215,6 +226,14 @@ func (w *walkCtx) walkType(typ catalog.TypeDescriptor) {
 		ChildObjectID: typ.GetID(),
 		SchemaID:      typ.GetParentSchemaID(),
 	})
+	{
+		if comment, ok := w.commentReader.GetTypeComment(typ.GetID()); ok {
+			w.ev(scpb.Status_PUBLIC, &scpb.TypeComment{
+				TypeID:  typ.GetID(),
+				Comment: comment,
+			})
+		}
+	}
 	for i := 0; i < typ.NumReferencingDescriptors(); i++ {
 		w.backRefs.Add(typ.GetReferencingDescriptorID(i))
 	}

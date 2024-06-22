@@ -103,6 +103,8 @@ type ImmediateMutationVisitor interface {
 	SetJobStateOnDescriptor(context.Context, SetJobStateOnDescriptor) error
 	UpsertTableComment(context.Context, UpsertTableComment) error
 	RemoveTableComment(context.Context, RemoveTableComment) error
+	UpsertTypeComment(context.Context, UpsertTypeComment) error
+	RemoveTypeComment(context.Context, RemoveTypeComment) error
 	UpsertDatabaseComment(context.Context, UpsertDatabaseComment) error
 	RemoveDatabaseComment(context.Context, RemoveDatabaseComment) error
 	UpsertSchemaComment(context.Context, UpsertSchemaComment) error
@@ -132,6 +134,7 @@ type ImmediateMutationVisitor interface {
 	SetSequenceOptions(context.Context, SetSequenceOptions) error
 	InitSequence(context.Context, InitSequence) error
 	CreateDatabaseDescriptor(context.Context, CreateDatabaseDescriptor) error
+	AddDatabaseZoneConfig(context.Context, AddDatabaseZoneConfig) error
 }
 
 // Visit is part of the ImmediateMutationOp interface.
@@ -540,6 +543,16 @@ func (op RemoveTableComment) Visit(ctx context.Context, v ImmediateMutationVisit
 }
 
 // Visit is part of the ImmediateMutationOp interface.
+func (op UpsertTypeComment) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.UpsertTypeComment(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op RemoveTypeComment) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.RemoveTypeComment(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
 func (op UpsertDatabaseComment) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
 	return v.UpsertDatabaseComment(ctx, op)
 }
@@ -682,4 +695,9 @@ func (op InitSequence) Visit(ctx context.Context, v ImmediateMutationVisitor) er
 // Visit is part of the ImmediateMutationOp interface.
 func (op CreateDatabaseDescriptor) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
 	return v.CreateDatabaseDescriptor(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op AddDatabaseZoneConfig) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.AddDatabaseZoneConfig(ctx, op)
 }

@@ -295,8 +295,10 @@ func (ie *InternalExecutor) initConnEx(
 		// it's created.
 		if ie.syntheticDescriptors != nil {
 			postSetupFn = func(ex *connExecutor) {
+				// Note that we don't need to set shouldResetSyntheticDescriptors
+				// since ReleaseAll will be called on the descs.Collection which
+				// will also release synthetic descriptors.
 				ex.extraTxnState.descCollection.SetSyntheticDescriptors(ie.syntheticDescriptors)
-				ex.extraTxnState.shouldResetSyntheticDescriptors = true
 			}
 		}
 		srvMetrics := &ie.s.InternalMetrics
@@ -318,7 +320,7 @@ func (ie *InternalExecutor) initConnEx(
 			srvMetrics,
 			applicationStats,
 			ie.s.cfg.GenerateID(),
-			false, /* fromOuterTxn */
+			false, /* underOuterTxn */
 			postSetupFn,
 		)
 	} else {
@@ -376,11 +378,13 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 	shouldResetSyntheticDescriptors := len(ie.syntheticDescriptors) > 0
 
 	var postSetupFn func(*connExecutor)
-	// If an internal executor is run with a not-nil txn, we may want to
-	// let it inherit the descriptor collection, schema change job records
-	// and job collections from the caller.
+	// If an internal executor is run with a not-nil txn and has some extra txn
+	// state already set up, we may want to let it inherit the descriptor
+	// collection, schema change job records and job collections from the
+	// caller.
 	if ie.extraTxnState != nil {
 		postSetupFn = func(ex *connExecutor) {
+			ex.extraTxnState.skipResettingSchemaObjects = true
 			ex.extraTxnState.descCollection = ie.extraTxnState.descCollection
 			ex.extraTxnState.jobs = ie.extraTxnState.jobs
 			ex.extraTxnState.schemaChangerState = ie.extraTxnState.schemaChangerState
@@ -406,7 +410,7 @@ func (ie *InternalExecutor) newConnExecutorWithTxn(
 		srvMetrics,
 		applicationStats,
 		ie.s.cfg.GenerateID(),
-		ie.extraTxnState != nil, /* fromOuterTxn */
+		true, /* underOuterTxn */
 		postSetupFn,
 	)
 
@@ -919,6 +923,9 @@ func applyOverrides(o sessiondata.InternalExecutorOverride, sd *sessiondata.Sess
 	if o.OptimizerUseHistograms {
 		sd.OptimizerUseHistograms = true
 	}
+	if o.DisableChangefeedReplication {
+		sd.DisableChangefeedReplication = true
+	}
 
 	if o.MultiOverride != "" {
 		overrides := strings.Split(o.MultiOverride, ",")
@@ -1181,7 +1188,11 @@ func (ie *InternalExecutor) execInternal(
 	// the span to the iterator. This is necessary so that the connExecutor
 	// exits before the span is finished.
 	ctx, sp := tracing.EnsureChildSpan(ctx, ie.s.cfg.AmbientCtx.Tracer, opName)
-	stmtBuf := NewStmtBuf()
+	numCommands := 2 // ExecStmt -> Sync
+	if len(qargs) > 0 {
+		numCommands = 4 // PrepareStmt -> BindStmt -> ExecPortal -> Sync
+	}
+	stmtBuf := NewStmtBuf(numCommands)
 	var wg sync.WaitGroup
 
 	defer func() {
@@ -1260,10 +1271,6 @@ func (ie *InternalExecutor) execInternal(
 	if parsed.NumPlaceholders > numParams {
 		numParams = parsed.NumPlaceholders
 	}
-	typeHints := make(tree.PlaceholderTypes, numParams)
-	for i, d := range datums {
-		typeHints[tree.PlaceholderIdx(i)] = d.ResolvedType()
-	}
 	if len(qargs) == 0 {
 		if err := stmtBuf.Push(
 			ctx,
@@ -1285,6 +1292,10 @@ func (ie *InternalExecutor) execInternal(
 			return nil, err
 		}
 	} else {
+		typeHints := make(tree.PlaceholderTypes, numParams)
+		for i, d := range datums {
+			typeHints[tree.PlaceholderIdx(i)] = d.ResolvedType()
+		}
 		if err := stmtBuf.Push(
 			ctx,
 			PrepareStmt{
@@ -1386,8 +1397,11 @@ func (ie *InternalExecutor) commitTxn(ctx context.Context) error {
 	}
 
 	rw := newAsyncIEResultChannel()
-	stmtBuf := NewStmtBuf()
+	stmtBuf := NewStmtBuf(0 /* toReserve */)
 
+	// Create a fresh conn executor simply for the purpose of committing the
+	// txn.
+	// TODO(#124935): this probably will need to change.
 	ex, err := ie.initConnEx(
 		ctx, ie.extraTxnState.txn, rw, defaultIEExecutionMode, sd, stmtBuf,
 		nil /* syncCallback */, false, /* attributeToUser */
@@ -1397,6 +1411,8 @@ func (ie *InternalExecutor) commitTxn(ctx context.Context) error {
 	}
 	// TODO(janexing): is this correct?
 	ex.planner.txn = ie.extraTxnState.txn
+	// TODO(#124935): might need to set ex.extraTxnState.shouldExecuteOnTxnFinish
+	// to true.
 
 	defer ex.close(ctx, externalTxnClose)
 	if ie.extraTxnState.txn.IsCommitted() {

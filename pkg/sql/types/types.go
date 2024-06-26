@@ -267,8 +267,8 @@ func (u UserDefinedTypeName) Basename() string {
 }
 
 // FQName returns the fully qualified name.
-func (u UserDefinedTypeName) FQName() string {
-	return FormatTypeName(u)
+func (u UserDefinedTypeName) FQName(explicitCatalog bool) string {
+	return FormatTypeName(u, explicitCatalog)
 }
 
 // Convenience list of pre-constructed types. Caller code can use any of these
@@ -1551,6 +1551,8 @@ func (t *T) Name() string {
 			return "oidvector"
 		case oid.T_int2vector:
 			return "int2vector"
+		case oid.T_anyarray:
+			return "anyarray"
 		}
 		return t.ArrayContents().Name() + "[]"
 
@@ -1688,6 +1690,8 @@ func (t *T) SQLStandardNameWithTypmod(haveTypmod bool, typmod int) string {
 			return "oidvector"
 		case oid.T_int2vector:
 			return "int2vector"
+		case oid.T_anyarray:
+			return "anyarray"
 		}
 		// If we have a typemod specified then pass it down when
 		// formatting the array type.
@@ -1977,6 +1981,8 @@ func (t *T) SQLString() string {
 		}
 		return t.ArrayContents().SQLString() + "[]"
 	case EnumFamily:
+		// TODO(125934): Include composite type names in this branch as well, so
+		// they can be properly identified in SHOW CREATE.
 		if t.Oid() == oid.T_anyenum {
 			return "anyenum"
 		}
@@ -1987,9 +1993,27 @@ func (t *T) SQLString() string {
 		if t.TypeMeta.Name == nil {
 			return fmt.Sprintf("@%d", t.Oid())
 		}
-		return t.TypeMeta.Name.FQName()
+		// Do not include the catalog name. We do not allow a table to reference
+		// a type in another database, so it will always be for the current database.
+		// Removing the catalog name makes the output more portable for other
+		// databases when this function is called to produce DDL like in SHOW
+		// CREATE.
+		return t.TypeMeta.Name.FQName(false /* explicitCatalog */)
 	}
 	return strings.ToUpper(t.Name())
+}
+
+// SQLStringFullyQualified is a wrapper for SQLString() for when we need the
+// type name to be a fully-qualified 3-part name.
+func (t *T) SQLStringFullyQualified() string {
+	// TODO(125934): include composite type names here
+	if t.TypeMeta.Name != nil && t.Family() == EnumFamily {
+		// Include the catalog in the type name. This is necessary to properly
+		// resolve the type, as some code paths require the database name to
+		// correctly distinguish cross-database references.
+		return t.TypeMeta.Name.FQName(true /* explicitCatalog */)
+	}
+	return t.SQLString()
 }
 
 // SQLStringForError returns a version of SQLString that will preserve safe
@@ -2034,7 +2058,7 @@ func (t *T) SQLStringForError() redact.RedactableString {
 // type name. The logic for proper formatting lives in the tree package.
 var FormatTypeName = fallbackFormatTypeName
 
-func fallbackFormatTypeName(UserDefinedTypeName) string {
+func fallbackFormatTypeName(UserDefinedTypeName, bool) string {
 	return "formatting logic has not been injected from tree"
 }
 
@@ -2165,6 +2189,18 @@ func (t *T) IsWildcardType() bool {
 		// Note that pointer comparison is insufficient since we might have
 		// deserialized t from disk.
 		if t.Identical(wildcard) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsPolymorphicType returns true if the type can be used as the parameter or
+// return-type of a polymorphic function. Note that this does not include RECORD
+// (AnyTuple) or RECORD[].
+func (t *T) IsPolymorphicType() bool {
+	for _, poly := range []*T{Any, AnyArray, AnyEnum, AnyEnumArray} {
+		if t.Identical(poly) {
 			return true
 		}
 	}
@@ -2723,7 +2759,7 @@ func (t *T) EnumGetIdxOfPhysical(phys []byte) (int, error) {
 	err := errors.Newf(
 		"could not find %v in enum %q representation %s %s",
 		phys,
-		t.TypeMeta.Name.FQName(),
+		t.TypeMeta.Name.FQName(true /* explicitCatalog */),
 		t.TypeMeta.EnumData.debugString(),
 		debug.Stack(),
 	)

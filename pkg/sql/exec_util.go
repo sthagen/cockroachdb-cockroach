@@ -119,6 +119,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -1241,6 +1242,7 @@ func EmptySystemTenantOnly[T any]() SystemTenantOnly[T] {
 // an Executor; the rest will have sane defaults set if omitted.
 type ExecutorConfig struct {
 	Settings          *cluster.Settings
+	Stopper           *stop.Stopper
 	NodeInfo          NodeInfo
 	Codec             keys.SQLCodec
 	DefaultZoneConfig *zonepb.ZoneConfig
@@ -3822,6 +3824,10 @@ func (m *sessionDataMutator) SetOptimizerPushOffsetIntoIndexJoin(val bool) {
 
 func (m *sessionDataMutator) SetPlanCacheMode(val sessiondatapb.PlanCacheMode) {
 	m.data.PlanCacheMode = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUsePolymorphicParameterFix(val bool) {
+	m.data.OptimizerUsePolymorphicParameterFix = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

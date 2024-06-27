@@ -66,7 +66,8 @@ type InternalExecutorOverride struct {
 	// the construction of the connExecutor used for the query.
 	AttributeToUser bool
 	// DisableChangefeedReplication, when true, disables changefeed events from
-	// being emitted for changes to data made in a session.
+	// being emitted for changes to data made in a session. It is illegal to set
+	// this option when using the internal executor with an outer txn.
 	DisableChangefeedReplication bool
 }
 
@@ -78,4 +79,12 @@ var NoSessionDataOverride = InternalExecutorOverride{}
 // the user to the NodeUser.
 var NodeUserSessionDataOverride = InternalExecutorOverride{
 	User: username.MakeSQLUsernameFromPreNormalizedString(username.NodeUser),
+}
+
+// NodeUserWithLowUserPrioritySessionDataOverride is an InternalExecutorOverride
+// which overrides the user to the NodeUser and sets the quality of service to
+// sessiondatapb.UserLow.
+var NodeUserWithLowUserPrioritySessionDataOverride = InternalExecutorOverride{
+	User:             username.MakeSQLUsernameFromPreNormalizedString(username.NodeUser),
+	QualityOfService: &sessiondatapb.UserLowQoS,
 }

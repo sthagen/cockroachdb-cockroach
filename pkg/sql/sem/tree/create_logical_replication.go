@@ -18,13 +18,13 @@ import (
 
 type CreateLogicalReplicationStream struct {
 	PGURL   Expr
-	On      LogicalReplicationResources
+	From    LogicalReplicationResources
 	Into    LogicalReplicationResources
 	Options LogicalReplicationOptions
 }
 
 type LogicalReplicationResources struct {
-	Tables   TablePatterns
+	Tables   []*UnresolvedName
 	Database Name
 }
 
@@ -42,15 +42,16 @@ var _ NodeFormatter = &LogicalReplicationOptions{}
 // Format implements the NodeFormatter interface.
 func (node *CreateLogicalReplicationStream) Format(ctx *FmtCtx) {
 	ctx.WriteString("CREATE LOGICAL REPLICATION STREAM FROM ")
-	ctx.FormatNode(node.PGURL)
+	ctx.FormatNode(&node.From)
 	ctx.WriteString(" ON ")
-	ctx.FormatNode(&node.On)
+	ctx.FormatNode(node.PGURL)
 	ctx.WriteString(" INTO ")
 	ctx.FormatNode(&node.Into)
 
 	if !node.Options.IsDefault() {
-		ctx.WriteString(" WITH ")
+		ctx.WriteString(" WITH OPTIONS (")
 		ctx.FormatNode(&node.Options)
+		ctx.WriteString(")")
 	}
 }
 
@@ -68,7 +69,7 @@ func (lrr *LogicalReplicationResources) Format(ctx *FmtCtx) {
 		}
 		ctx.WriteString(")")
 	} else {
-		ctx.WriteString("Table ")
+		ctx.WriteString("TABLE ")
 		ctx.FormatNode(lrr.Tables[0])
 	}
 }

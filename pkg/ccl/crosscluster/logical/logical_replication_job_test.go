@@ -154,8 +154,8 @@ func TestLogicalStreamIngestionJob(t *testing.T) {
 		jobAID jobspb.JobID
 		jobBID jobspb.JobID
 	)
-	dbA.QueryRow(t, fmt.Sprintf("SELECT crdb_internal.start_logical_replication_job('%s', %s)", dbBURL.String(), `ARRAY['tab']`)).Scan(&jobAID)
-	dbB.QueryRow(t, fmt.Sprintf("SELECT crdb_internal.start_logical_replication_job('%s', %s)", dbAURL.String(), `ARRAY['tab']`)).Scan(&jobBID)
+	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", dbBURL.String()).Scan(&jobAID)
+	dbB.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", dbAURL.String()).Scan(&jobBID)
 
 	now := server.Server(0).Clock().Now()
 	t.Logf("waiting for replication job %d", jobAID)
@@ -192,6 +192,48 @@ func TestLogicalStreamIngestionJob(t *testing.T) {
 	}
 	require.Equal(t, int64(expPuts), numPuts.Load())
 	require.Equal(t, int64(expCPuts), numCPuts.Load())
+}
+
+func TestLogicalStreamIngestionErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	server := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	defer server.Stopper().Stop(ctx)
+	s := server.Server(0).ApplicationLayer()
+	url, cleanup := s.PGUrl(t, serverutils.DBName("a"))
+	defer cleanup()
+	urlA := url.String()
+
+	_, err := server.Conns[0].Exec("CREATE DATABASE a")
+	require.NoError(t, err)
+	_, err = server.Conns[0].Exec("CREATE DATABASE B")
+	require.NoError(t, err)
+
+	dbA := sqlutils.MakeSQLRunner(s.SQLConn(t, serverutils.DBName("a")))
+	dbB := sqlutils.MakeSQLRunner(s.SQLConn(t, serverutils.DBName("b")))
+
+	createStmt := "CREATE TABLE tab (pk int primary key, payload string)"
+	dbA.Exec(t, createStmt)
+	dbB.Exec(t, createStmt)
+
+	createQ := "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab"
+
+	dbB.ExpectErrWithHint(t, "currently require a .* DECIMAL column", "ADD COLUMN", createQ, urlA)
+
+	dbB.Exec(t, "ALTER TABLE tab ADD COLUMN crdb_internal_origin_timestamp STRING")
+	dbB.ExpectErr(t, ".*column must be type DECIMAL for use by logical replication", createQ, urlA)
+
+	dbB.Exec(t, fmt.Sprintf("ALTER TABLE tab RENAME COLUMN %[1]s TO str_col, ADD COLUMN %[1]s DECIMAL", originTimestampColumnName))
+
+	if s.Codec().IsSystem() {
+		dbB.ExpectErr(t, "kv.rangefeed.enabled must be enabled on the source cluster for logical replication", createQ, urlA)
+		kvserver.RangefeedEnabled.Override(ctx, &server.Server(0).ClusterSettings().SV, true)
+	}
+
+	dbB.Exec(t, createQ, urlA)
 }
 
 func TestLogicalStreamIngestionJobWithColumnFamilies(t *testing.T) {
@@ -242,7 +284,7 @@ family f2(other_payload, v2))
 	defer cleanup()
 
 	var jobBID jobspb.JobID
-	serverBSQL.QueryRow(t, fmt.Sprintf("SELECT crdb_internal.start_logical_replication_job('%s', %s)", serverAURL.String(), `ARRAY['tab']`)).Scan(&jobBID)
+	serverBSQL.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", serverAURL.String()).Scan(&jobBID)
 
 	WaitUntilReplicatedTime(t, serverA.Server(0).Clock().Now(), serverBSQL, jobBID)
 	serverASQL.Exec(t, "INSERT INTO tab(pk, payload, other_payload) VALUES (2, 'potato', 'ruroh2')")
@@ -318,11 +360,9 @@ func TestRandomTables(t *testing.T) {
 	dbAURL.Path = "a"
 	defer cleanup()
 
-	streamStartStmt := fmt.Sprintf(
-		"SELECT crdb_internal.start_logical_replication_job('%s', ARRAY['%s'])",
-		dbAURL.String(), tableName)
+	streamStartStmt := fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLE %[1]s ON $1 INTO TABLE %[1]s", tableName)
 	var jobBID jobspb.JobID
-	runnerB.QueryRow(t, streamStartStmt).Scan(&jobBID)
+	runnerB.QueryRow(t, streamStartStmt, dbAURL.String()).Scan(&jobBID)
 
 	t.Logf("waiting for replication job %d", jobBID)
 	WaitUntilReplicatedTime(t, s.Clock().Now(), runnerB, jobBID)
@@ -395,11 +435,9 @@ func TestPreviouslyInterestingTables(t *testing.T) {
 			_, err = randgen.PopulateTableWithRandData(rng,
 				sqlA, tableName, numInserts, nil)
 			require.NoError(t, err)
-			streamStartStmt := fmt.Sprintf(
-				"SELECT crdb_internal.start_logical_replication_job('%s', ARRAY['%s'])",
-				dbAURL.String(), tableName)
+			streamStartStmt := fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLE %[1]s ON $1 INTO TABLE %[1]s", tableName)
 			var jobBID jobspb.JobID
-			runnerB.QueryRow(t, streamStartStmt).Scan(&jobBID)
+			runnerB.QueryRow(t, streamStartStmt, dbAURL.String()).Scan(&jobBID)
 
 			t.Logf("waiting for replication job %d", jobBID)
 			WaitUntilReplicatedTime(t, s.Clock().Now(), runnerB, jobBID)

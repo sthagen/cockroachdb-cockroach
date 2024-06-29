@@ -4601,12 +4601,12 @@ create_stmt:
 //  < FUNCTION 'udf' FOR TABLE local_name  , ... >
 // ]
 create_logical_replication_stream_stmt:
-  CREATE LOGICAL REPLICATION STREAM FROM d_expr ON logical_replication_resources INTO logical_replication_resources opt_logical_replication_options
+  CREATE LOGICAL REPLICATION STREAM FROM logical_replication_resources ON string_or_placeholder INTO logical_replication_resources opt_logical_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateLogicalReplicationStream{
-      PGURL: $6.expr(),
-      On: $8.logicalReplicationResources(),
+      From: $6.logicalReplicationResources(),
+      PGURL: $8.expr(),
       Into: $10.logicalReplicationResources(),
       Options: *$11.logicalReplicationOptions(),
     }
@@ -4617,7 +4617,7 @@ logical_replication_resources:
   TABLE db_object_name
   {
     $$.val = tree.LogicalReplicationResources{
-      Tables: tree.TablePatterns{
+      Tables: []*tree.UnresolvedName{
         $2.unresolvedObjectName().ToUnresolvedName(),
       },
     }
@@ -4637,7 +4637,7 @@ logical_replication_resources_list:
   db_object_name
   {
     $$.val = tree.LogicalReplicationResources{
-      Tables: tree.TablePatterns{
+      Tables: []*tree.UnresolvedName{
         $1.unresolvedObjectName().ToUnresolvedName(),
       },
     }
@@ -4679,20 +4679,20 @@ logical_replication_options_list:
 
 // List of valid logical replication options.
 logical_replication_options:
-  CURSOR '=' d_expr
+  CURSOR '=' string_or_placeholder
   {
     $$.val = &tree.LogicalReplicationOptions{Cursor: $3.expr()}
   }
 |
-  MODE '=' d_expr
+  MODE '=' string_or_placeholder
   {
     $$.val = &tree.LogicalReplicationOptions{Mode: $3.expr()}
   }
-| DEFAULT FUNCTION '=' d_expr
+| DEFAULT FUNCTION '=' string_or_placeholder
   {
     $$.val = &tree.LogicalReplicationOptions{DefaultFunction: $4.expr()}
   } 
-| FUNCTION d_expr FOR TABLE db_object_name
+| FUNCTION string_or_placeholder FOR TABLE db_object_name
   {
      $$.val = &tree.LogicalReplicationOptions{UserFunctions: map[tree.TablePattern]tree.Expr{$5.unresolvedObjectName().ToUnresolvedName():$2.expr()}}
   }

@@ -787,8 +787,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 		// Drop the proposal.
 		return false
 	}
-	// use latest "last" index after truncate/append
-	li = r.raftLog.append(es...)
+	r.raftLog.append(es...)
 	// The leader needs to self-ack the entries just appended once they have
 	// been durably persisted (since it doesn't send an MsgApp to itself). This
 	// response message will be added to msgsAfterAppend and delivered back to
@@ -799,7 +798,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 	//  if r.maybeCommit() {
 	//  	r.bcastAppend()
 	//  }
-	r.send(pb.Message{To: r.id, Type: pb.MsgAppResp, Index: li})
+	r.send(pb.Message{To: r.id, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
 	return true
 }
 
@@ -1677,14 +1676,26 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	// TODO(pav-kv): construct logSlice up the stack next to receiving the
 	// message, and validate it before taking any action (e.g. bumping term).
 	a := logSliceFromMsgApp(&m)
+	if err := a.valid(); err != nil {
+		// TODO(pav-kv): add a special kind of logger.Errorf that panics in tests,
+		// but logs an error in prod. We want to eliminate all such errors in tests.
+		r.logger.Errorf("%x received an invalid MsgApp: %v", r.id, err)
+		return
+	}
 
 	if a.prev.index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
 	}
-	if mlastIndex, ok := r.raftLog.maybeAppend(a, m.Commit); ok {
+	if r.raftLog.maybeAppend(a) {
 		r.accTerm = m.Term // our log is now consistent with the m.Term leader
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
+		// TODO(pav-kv): make it possible to commit even if the append did not
+		// succeed or is stale. If r.accTerm >= m.Term, then our log contains all
+		// committed entries at m.Term (by raft invariants), so it is safe to bump
+		// the commit index even if the MsgApp is stale.
+		lastIndex := a.lastIndex()
+		r.raftLog.commitTo(min(m.Commit, lastIndex))
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: lastIndex})
 		return
 	}
 	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",

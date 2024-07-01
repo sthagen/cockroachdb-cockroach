@@ -11,7 +11,6 @@ package logical
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -21,7 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
-	"github.com/cockroachdb/cockroach/pkg/repstream"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -71,37 +69,6 @@ type logicalReplicationResumer struct {
 
 var _ jobs.Resumer = (*logicalReplicationResumer)(nil)
 
-func init() {
-	repstream.CreateRemoteProduceJobForLogicalReplicationHook = createRemoteProduceJobForLogicalReplication
-}
-
-func createRemoteProduceJobForLogicalReplication(
-	ctx context.Context, srcAddr string, tableNames []string,
-) (*streampb.ReplicationProducerSpec, error) {
-	// TODO(ssd): Copy over our GetFirstActiveClient logic
-	// so that we can connect to any node that we've seen
-	// in a previous Topology.
-	streamAddr, err := url.Parse(srcAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	client, err := streamclient.NewPartitionedStreamClient(ctx, streamAddr, streamclient.WithLogical())
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = client.Close(ctx) }()
-
-	spec, err := client.CreateForTables(ctx, &streampb.ReplicationProducerRequest{
-		TableNames: tableNames,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return spec, err
-}
-
 // Resume is part of the jobs.Resumer interface.
 func (r *logicalReplicationResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	jobExecCtx := execCtx.(sql.JobExecContext)
@@ -150,12 +117,13 @@ func (r *logicalReplicationResumer) ingest(
 		replicatedTimeAtStart = progress.ReplicatedTime
 	)
 
-	streamAddr, err := url.Parse(payload.TargetClusterConnStr)
-	if err != nil {
-		return err
-	}
+	client, err := streamclient.NewStreamClient(ctx,
+		crosscluster.StreamAddress(payload.TargetClusterConnStr),
+		jobExecCtx.ExecCfg().InternalDB,
+		streamclient.WithStreamID(streampb.StreamID(streamID)),
+		streamclient.WithLogical(),
+	)
 
-	client, err := streamclient.NewPartitionedStreamClient(ctx, streamAddr, streamclient.WithStreamID(streampb.StreamID(streamID)), streamclient.WithLogical())
 	if err != nil {
 		return err
 	}

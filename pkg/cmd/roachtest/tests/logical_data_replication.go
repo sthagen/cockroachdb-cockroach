@@ -59,13 +59,13 @@ func registerLogicalDataReplicationTests(r registry.Registry) {
 					kvWorkload.sourceInitCmd("system", setup.right.nodes))
 
 				// Setup LDR-specific columns
-				setup.left.sysSQL.Exec(t, "ALTER TABLE kv.kv ADD COLUMN crdb_internal_origin_timestamp DECIMAL NOT VISIBLE DEFAULT NULL ON UPDATE NULL")
-				setup.right.sysSQL.Exec(t, "ALTER TABLE kv.kv ADD COLUMN crdb_internal_origin_timestamp DECIMAL NOT VISIBLE DEFAULT NULL ON UPDATE NULL")
+				setup.left.sysSQL.Exec(t, "ALTER TABLE kv.kv ADD COLUMN crdb_replication_origin_timestamp DECIMAL NOT VISIBLE DEFAULT NULL ON UPDATE NULL")
+				setup.right.sysSQL.Exec(t, "ALTER TABLE kv.kv ADD COLUMN crdb_replication_origin_timestamp DECIMAL NOT VISIBLE DEFAULT NULL ON UPDATE NULL")
 
 				startLDR := func(targetDB *sqlutils.SQLRunner, sourceURL string) int {
 					targetDB.Exec(t, "USE kv")
 					r := targetDB.QueryRow(t,
-						"SELECT crdb_internal.start_logical_replication_job($1, ARRAY['kv'])",
+						"CREATE LOGICAL REPLICATION STREAM FROM TABLE kv ON $1 INTO TABLE kv",
 						sourceURL,
 					)
 					var jobID int

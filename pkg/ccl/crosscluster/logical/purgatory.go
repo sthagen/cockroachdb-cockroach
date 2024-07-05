@@ -14,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -24,13 +25,21 @@ import (
 // of being emitted, and will be emitted when the purgatory level is processed
 // instead.
 type purgatory struct {
-	levels     []purgatoryLevel
+	// configuration provided at construction.
 	delay      time.Duration // delay to wait between attempts of a level.
 	deadline   time.Duration // age of a level after which drain is mandatory.
-	levelLimit int
+	byteLimit  int64
+	flush      func(context.Context, []streampb.StreamEvent_KV, bool, bool) ([]streampb.StreamEvent_KV, int64, error)
+	checkpoint func(context.Context, []jobspb.ResolvedSpan) error
+
+	// internally managed state.
+	bytes                   int64
+	levels                  []purgatoryLevel
+	eventsGauge, bytesGauge *metric.Gauge
 }
 
 type purgatoryLevel struct {
+	bytes                   int64
 	events                  []streampb.StreamEvent_KV
 	willResolve             []jobspb.ResolvedSpan
 	closedAt, lastAttempted time.Time
@@ -47,30 +56,26 @@ func (p *purgatory) Checkpoint(ctx context.Context, checkpoint []jobspb.Resolved
 }
 
 func (p *purgatory) Store(
-	ctx context.Context,
-	events []streampb.StreamEvent_KV,
-	flush func(context.Context, []streampb.StreamEvent_KV, bool) ([]streampb.StreamEvent_KV, error),
-	checkpoint func(context.Context, []jobspb.ResolvedSpan) error,
+	ctx context.Context, events []streampb.StreamEvent_KV, byteSize int64,
 ) error {
 	if len(events) == 0 {
 		return nil
 	}
 
 	if p.full() {
-		if err := p.Drain(ctx, flush, checkpoint); err != nil {
+		if err := p.Drain(ctx); err != nil {
 			return err
 		}
 	}
 
-	p.levels = append(p.levels, purgatoryLevel{events: events})
+	p.levels = append(p.levels, purgatoryLevel{events: events, bytes: byteSize})
+	p.bytes += byteSize
+	p.bytesGauge.Inc(byteSize)
+	p.eventsGauge.Inc(int64(len(events)))
 	return nil
 }
 
-func (p *purgatory) Drain(
-	ctx context.Context,
-	flush func(context.Context, []streampb.StreamEvent_KV, bool) ([]streampb.StreamEvent_KV, error),
-	checkpoint func(context.Context, []jobspb.ResolvedSpan) error,
-) error {
+func (p *purgatory) Drain(ctx context.Context) error {
 	var resolved int
 
 	for i := range p.levels {
@@ -83,20 +88,31 @@ func (p *purgatory) Drain(
 		if timeutil.Since(p.levels[i].lastAttempted) < p.delay && !mustProcess {
 			break
 		}
-
 		p.levels[i].lastAttempted = timeutil.Now()
-		remaining, err := flush(ctx, p.levels[i].events, mustProcess)
+
+		const isRetry = true
+		levelBytes, levelCount := p.levels[i].bytes, len(p.levels[i].events)
+		remaining, remainingSize, err := p.flush(ctx, p.levels[i].events, isRetry, mustProcess)
 		if err != nil {
 			return err
 		}
-		p.levels[i].events = remaining
+		if len(remaining) > 0 {
+			p.levels[i].events, p.levels[i].bytes = remaining, remainingSize
+			p.bytes -= levelBytes - p.levels[i].bytes
+		} else {
+			p.levels[i].events, p.levels[i].bytes = nil, 0
+			p.bytes -= levelBytes
+		}
+
+		p.bytesGauge.Dec(levelBytes - p.levels[i].bytes)
+		p.eventsGauge.Dec(int64(levelCount - len(remaining)))
 
 		// If we have resolved every prior level and all events in this level were
 		// handled, we can resolve this level and emit its checkpoint, if any.
 		if resolved == i && len(remaining) == 0 {
 			resolved++
 			if p.levels[i].willResolve != nil {
-				if err := checkpoint(ctx, p.levels[i].willResolve); err != nil {
+				if err := p.checkpoint(ctx, p.levels[i].willResolve); err != nil {
 					return err
 				}
 			}
@@ -113,6 +129,5 @@ func (p purgatory) Empty() bool {
 }
 
 func (p *purgatory) full() bool {
-	// TODO(dt): make this smarter, i.e. byte size.
-	return len(p.levels) >= p.levelLimit
+	return p.bytes >= p.byteLimit
 }

@@ -523,8 +523,9 @@ func (rs *storeReplicaVisitor) Visit(visitor func(*Replica) bool) {
 	// stale) view of all Replicas without holding the Store lock. In particular,
 	// no locks are acquired during the copy process.
 	rs.repls = nil
-	rs.store.mu.replicasByRangeID.Range(func(repl *Replica) {
+	rs.store.mu.replicasByRangeID.Range(func(_ roachpb.RangeID, repl *Replica) bool {
 		rs.repls = append(rs.repls, repl)
+		return true
 	})
 
 	switch rs.order {
@@ -911,6 +912,8 @@ type Store struct {
 	// transport is connected to, and is used by the canonical
 	// replicaFlowControlIntegration implementation.
 	raftTransportForFlowControl raftTransportForFlowControl
+	// metricsMu protects the collection and update of engine metrics.
+	metricsMu syncutil.Mutex
 
 	coalescedMu struct {
 		syncutil.Mutex
@@ -1037,7 +1040,7 @@ type Store struct {
 		syncutil.RWMutex
 		// Map of replicas by Range ID (map[roachpb.RangeID]*Replica).
 		// May be read without holding Store.mu.
-		replicasByRangeID rangeIDReplicaMap
+		replicasByRangeID syncutil.Map[roachpb.RangeID, Replica]
 		// A btree key containing objects of type *Replica or *ReplicaPlaceholder.
 		// Both types have an associated key range; the btree is keyed on their
 		// start keys.
@@ -1129,7 +1132,6 @@ type Store struct {
 
 	computeInitialMetrics              sync.Once
 	systemConfigUpdateQueueRateLimiter *quotapool.RateLimiter
-	spanConfigUpdateQueueRateLimiter   *quotapool.RateLimiter
 
 	rangeFeedSlowClosedTimestampNudge *singleflight.Group
 
@@ -3099,8 +3101,9 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 // performance critical code.
 func (s *Store) ReplicaCount() int {
 	var count int
-	s.mu.replicasByRangeID.Range(func(*Replica) {
+	s.mu.replicasByRangeID.Range(func(_ roachpb.RangeID, _ *Replica) bool {
 		count++
+		return true
 	})
 	return count
 }
@@ -3397,12 +3400,13 @@ func (s *Store) checkpointSpans(desc *roachpb.RangeDescriptor) []roachpb.Span {
 	_ = s.TODOEngine() // this method needs to return two sets of spans, one for each engine
 	// Find immediate left and right neighbours by range ID.
 	var prevID, nextID roachpb.RangeID
-	s.mu.replicasByRangeID.Range(func(r *Replica) {
-		if id, our := r.RangeID, desc.RangeID; id < our && id > prevID {
+	s.mu.replicasByRangeID.Range(func(rangeID roachpb.RangeID, _ *Replica) bool {
+		if id, our := rangeID, desc.RangeID; id < our && id > prevID {
 			prevID = id
 		} else if id > our && (nextID == 0 || id < nextID) {
 			nextID = id
 		}
+		return true
 	})
 	if prevID == 0 {
 		prevID = desc.RangeID
@@ -3473,6 +3477,13 @@ func (s *Store) checkpoint(tag string, spans []roachpb.Span) (string, error) {
 // computeMetrics is a common metric computation that is used by
 // ComputeMetricsPeriodically and ComputeMetrics to compute metrics.
 func (s *Store) computeMetrics(ctx context.Context) (m storage.Metrics, err error) {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.computeMetricsLocked(ctx)
+}
+
+// computeMetricsLocked should only be used while holding store.metricsMu.
+func (s *Store) computeMetricsLocked(ctx context.Context) (m storage.Metrics, err error) {
 	ctx = s.AnnotateCtx(ctx)
 	if err = s.updateCapacityGauges(ctx); err != nil {
 		return m, err

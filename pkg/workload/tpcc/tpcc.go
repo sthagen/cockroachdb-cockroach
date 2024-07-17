@@ -24,6 +24,7 @@ import (
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -131,8 +132,9 @@ type tpcc struct {
 	// In that case, we reset w_ytd & d_ytd periodically and skip 3.3.2.1 and 3.3.2.8 consistency checks.
 	isLongDurationWorkload bool
 
-	// wait group for any background reset table operation to avoid goroutine leaks during long duration workloads
-	resetTableWg sync.WaitGroup
+	// context group for any background reset table operation to avoid goroutine leaks during long duration workloads
+	resetTableGrp      ctxgroup.Group
+	resetTableCancelFn context.CancelFunc
 }
 
 type waitSetter struct {
@@ -305,7 +307,6 @@ var tpccMeta = workload.Meta{
 		g.flags.StringVar(&g.txnPreambleFile, "txn-preamble-file", "", "queries that will be injected before each txn")
 		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
-
 		// Hardcode this since it doesn't seem like anyone will want to change
 		// it and it's really noisy in the generated fixture paths.
 		g.nowString = []byte(`2006-01-02 15:04:05`)
@@ -478,14 +479,14 @@ func (w *tpcc) Hooks() workload.Hooks {
 			var stmts []string
 			for i, region := range w.multiRegionCfg.regions {
 				var stmt string
+				// Region additions should be idempotent.
+				if _, ok := regions[region]; ok {
+					continue
+				}
 				// The first region is the PRIMARY region.
 				if i == 0 {
 					stmt = fmt.Sprintf(`alter database %s set primary region %q`, dbName, region)
 				} else {
-					// Region additions should be idempotent.
-					if _, ok := regions[region]; ok {
-						continue
-					}
 					stmt = fmt.Sprintf(`alter database %s add region %q`, dbName, region)
 				}
 				stmts = append(stmts, stmt)
@@ -835,6 +836,10 @@ func (w *tpcc) Ops(
 		}
 	}
 
+	var resetTableCtx context.Context
+	resetTableCtx, w.resetTableCancelFn = context.WithCancel(ctx)
+	w.resetTableGrp = ctxgroup.WithContext(resetTableCtx)
+
 	if duration, err := w.flags.GetDuration("duration"); err == nil {
 		if duration == 0 || duration >= longDurationWorkloadThreshold {
 			log.Warningf(ctx,
@@ -1029,7 +1034,7 @@ func (w *tpcc) Ops(
 	}
 
 	// Close idle connections.
-	ql.Close = func(context context.Context) error {
+	ql.Close = func(_ context.Context) error {
 		for _, conn := range conns {
 			if err := conn.Close(ctx); err != nil {
 				log.Warningf(ctx, "%v", err)
@@ -1041,8 +1046,10 @@ func (w *tpcc) Ops(
 			}
 		}
 
-		w.resetTableWg.Wait()
-
+		w.resetTableCancelFn()
+		if err := w.resetTableGrp.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+			log.Warningf(ctx, "%v", err)
+		}
 		return nil
 	}
 	return ql, nil

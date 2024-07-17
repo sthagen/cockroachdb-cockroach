@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/quick"
+
+	"github.com/stretchr/testify/require"
 )
 
 type intMapInterface mapInterface[int64, int64]
@@ -262,7 +264,7 @@ func TestMapRangeNestedCall(t *testing.T) { // Issue 46399
 	})
 
 	if length != 0 {
-		t.Fatalf("Unexpected sync.Map size, got %v want %v", length, 0)
+		t.Fatalf("Unexpected syncutil.Map size, got %v want %v", length, 0)
 	}
 }
 
@@ -302,4 +304,13 @@ func TestMapCheckPtr(t *testing.T) {
 			panic("invalid mapOp")
 		}
 	}
+}
+
+// TestMapStoreNilValue tests that storing a nil value in a Map is not allowed.
+func TestMapStoreNilValue(t *testing.T) {
+	var m Map[int64, struct{}]
+	require.Panics(t, func() { m.Store(1, nil) })
+	require.Panics(t, func() { m.LoadOrStore(1, nil) })
+	require.NotPanics(t, func() { m.Store(1, &struct{}{}) })
+	require.NotPanics(t, func() { m.LoadOrStore(1, &struct{}{}) })
 }

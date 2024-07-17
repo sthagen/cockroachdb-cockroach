@@ -386,22 +386,25 @@ var regularBuiltins = map[string]builtinDefinition{
 	"concat": makeBuiltin(
 		defProps(),
 		tree.Overload{
-			Types:      tree.VariadicType{VarType: types.String},
+			Types:      tree.VariadicType{VarType: types.Any},
 			ReturnType: tree.FixedReturnType(types.String),
 			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
-				var buffer bytes.Buffer
-				length := 0
+				ctx := tree.NewFmtCtx(tree.FmtPgwireText)
 				for _, d := range args {
 					if d == tree.DNull {
 						continue
 					}
-					length += len(string(tree.MustBeDString(d)))
-					if length > builtinconstants.MaxAllocatedStringSize {
+					// This is more lenient than we want and may lead to serious
+					// over-allocation for some data types (e.g. printing large arrays of
+					// integers). A proper solution would add a lot of complexity
+					// here, with attendant performance penalties. The right answer is
+					// probably to push this functionality into the Formatter.
+					if ctx.Buffer.Len()+int(d.Size()) > builtinconstants.MaxAllocatedStringSize {
 						return nil, errStringTooLarge
 					}
-					buffer.WriteString(string(tree.MustBeDString(d)))
+					d.Format(ctx)
 				}
-				return tree.NewDString(buffer.String()), nil
+				return tree.NewDString(ctx.CloseAndGetString()), nil
 			},
 			Info:              "Concatenates a comma-separated list of strings.",
 			Volatility:        volatility.Immutable,
@@ -5735,7 +5738,34 @@ SELECT
 			Volatility: volatility.Volatile,
 		},
 	),
+	"crdb_internal.log": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "msg", Typ: types.String}},
+			ReturnType: tree.FixedReturnType(types.Void),
 
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// The user must have REPAIRCLUSTER to use this builtin.
+				if err := evalCtx.SessionAccessor.CheckPrivilege(
+					ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.REPAIRCLUSTER,
+				); err != nil {
+					return nil, err
+				}
+
+				s, ok := tree.AsDString(args[0])
+				if !ok {
+					return nil, errors.Newf("expected string value, got %T", args[0])
+				}
+				msg := string(s)
+				log.Infof(ctx, "crdb_internal.log(): %s", msg)
+				return tree.DVoidDatum, nil
+			},
+			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility: volatility.Volatile,
+		},
+	),
 	"crdb_internal.force_log_fatal": makeBuiltin(
 		tree.FunctionProperties{
 			Category: builtinconstants.CategorySystemInfo,

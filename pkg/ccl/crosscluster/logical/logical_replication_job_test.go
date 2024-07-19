@@ -503,6 +503,8 @@ func TestPreviouslyInterestingTables(t *testing.T) {
 	type testCase struct {
 		name   string
 		schema string
+		useUDF bool
+		delete bool
 	}
 
 	testCases := []testCase{
@@ -514,6 +516,14 @@ func TestPreviouslyInterestingTables(t *testing.T) {
 			name:   "comparison-invariant-to-different-covering-indexes",
 			schema: `CREATE TABLE rand_table (col1_0 DECIMAL, INDEX (col1_0) VISIBILITY 0.17, UNIQUE (col1_0 DESC), UNIQUE (col1_0 ASC), INDEX (col1_0 ASC), UNIQUE (col1_0 ASC))`,
 		},
+		{
+
+			// Single column tables previously had a bug
+			// with tuple parsing the UDF apply query.
+			name:   "single column table with udf",
+			schema: `CREATE TABLE rand_table (pk INT PRIMARY KEY)`,
+			useUDF: true,
+		},
 	}
 
 	baseTableName := "rand_table"
@@ -523,6 +533,13 @@ func TestPreviouslyInterestingTables(t *testing.T) {
 	defer cleanup()
 	for i, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.useUDF {
+				defaultSQLProcessor = udfApplierProcessor
+				defer func() {
+					defaultSQLProcessor = lwwProcessor
+				}()
+			}
+
 			tableName := fmt.Sprintf("%s%d", baseTableName, i)
 			schemaStmt := strings.ReplaceAll(tc.schema, baseTableName, tableName)
 			addCol := fmt.Sprintf(`ALTER TABLE %s `+lwwColumnAdd, tableName)
@@ -530,15 +547,30 @@ func TestPreviouslyInterestingTables(t *testing.T) {
 			runnerB.Exec(t, schemaStmt)
 			runnerA.Exec(t, addCol)
 			runnerB.Exec(t, addCol)
+			if tc.useUDF {
+				runnerB.Exec(t, fmt.Sprintf(testingUDFAcceptProposedBase, tableName))
+			}
 			_, err := randgen.PopulateTableWithRandData(rng,
 				sqlA, tableName, numInserts, nil)
 			require.NoError(t, err)
-			streamStartStmt := fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLE %[1]s ON $1 INTO TABLE %[1]s", tableName)
+
+			var streamStartStmt string
+			if tc.useUDF {
+				streamStartStmt = fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLE %[1]s ON $1 INTO TABLE %[1]s WITH FUNCTION repl_apply FOR TABLE %[1]s", tableName)
+			} else {
+				streamStartStmt = fmt.Sprintf("CREATE LOGICAL REPLICATION STREAM FROM TABLE %[1]s ON $1 INTO TABLE %[1]s", tableName)
+			}
 			var jobBID jobspb.JobID
 			runnerB.QueryRow(t, streamStartStmt, dbAURL.String()).Scan(&jobBID)
 
 			t.Logf("waiting for replication job %d", jobBID)
 			WaitUntilReplicatedTime(t, s.Clock().Now(), runnerB, jobBID)
+
+			if tc.delete {
+				runnerA.Exec(t, fmt.Sprintf("DELETE FROM %s LIMIT 5", tableName))
+				WaitUntilReplicatedTime(t, s.Clock().Now(), runnerB, jobBID)
+			}
+
 			compareReplicatedTables(t, s, "a", "b", tableName, runnerA, runnerB)
 		})
 	}
@@ -887,43 +919,41 @@ func TestLogicalStreamIngestionJobWithFallbackUDF(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, sqlA, sqlB, cleanup := setupTwoDBUDFTestCluster(t)
-	defer cleanup()
+	ctx := context.Background()
+	server, s, dbA, dbB := setupLogicalTestServer(t, ctx, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+			Knobs: base.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			},
+		},
+	})
+	defer server.Stopper().Stop(ctx)
 
-	// Set the default back to the lww resolver, but leave udfName set.
-	defaultSQLProcessor = lwwProcessor
-
-	dbA := sqlutils.MakeSQLRunner(sqlA)
-	dbB := sqlutils.MakeSQLRunner(sqlB)
-	createBasicTable(t, dbA, "tab")
-	createBasicTable(t, dbB, "tab")
 	lwwFunc := `CREATE OR REPLACE FUNCTION repl_apply(action STRING, proposed tab, existing tab, prev tab, existing_mvcc_timestamp DECIMAL, existing_origin_timestamp DECIMAL,proposed_mvcc_timestamp DECIMAL, proposed_previous_mvcc_timestamp DECIMAL)
-	RETURNS crdb_replication_applier_decision
+	RETURNS string
 	AS $$
 	BEGIN
 	IF existing_origin_timestamp IS NULL THEN
 	    IF existing_mvcc_timestamp < proposed_mvcc_timestamp THEN
 			SELECT crdb_internal.log('case 1');
-			RETURN ('accept_proposed', NULL);
+			RETURN 'accept_proposed';
 		ELSE
 			SELECT crdb_internal.log('case 2');
-			RETURN ('ignore_proposed', NULL);
+			RETURN 'ignore_proposed';
 		END IF;
 	ELSE
 		IF existing_origin_timestamp < proposed_mvcc_timestamp THEN
 			SELECT crdb_internal.log('case 3');
-			RETURN ('accept_proposed', NULL);
+			RETURN 'accept_proposed';
 		ELSE
 			SELECT crdb_internal.log('case 4');
-			RETURN ('ignore_proposed', NULL);
+			RETURN 'ignore_proposed';
 		END IF;
 	END IF;
 	END
 	$$ LANGUAGE plpgsql`
-	// TODO(ssd): We should make this type automatically for people or remove the `upsert_specified action so that we don't need it`
-	dbB.Exec(t, applierTypes)
 	dbB.Exec(t, lwwFunc)
-	dbA.Exec(t, applierTypes)
 	dbA.Exec(t, lwwFunc)
 
 	dbAURL, cleanup := s.PGUrl(t, serverutils.DBName("a"))
@@ -943,8 +973,8 @@ func TestLogicalStreamIngestionJobWithFallbackUDF(t *testing.T) {
 		jobAID jobspb.JobID
 		jobBID jobspb.JobID
 	)
-	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", dbBURL.String()).Scan(&jobAID)
-	dbB.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", dbAURL.String()).Scan(&jobBID)
+	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH FUNCTION repl_apply FOR TABLE tab", dbBURL.String()).Scan(&jobAID)
+	dbB.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH FUNCTION repl_apply FOR TABLE tab", dbAURL.String()).Scan(&jobBID)
 
 	now := s.Clock().Now()
 	t.Logf("waiting for replication job %d", jobAID)

@@ -200,6 +200,10 @@ const (
 	numOpTypes int = iota
 )
 
+func isDMLOpType(t opType) bool {
+	return t == insertRow || t == selectStmt || t == validate
+}
+
 var opFuncs = []func(*operationGenerator, context.Context, pgx.Tx) (*opStmt, error){
 	// Non-DDL
 	insertRow:  (*operationGenerator).insertRow,
@@ -254,7 +258,7 @@ var opFuncs = []func(*operationGenerator, context.Context, pgx.Tx) (*opStmt, err
 
 var opWeights = []int{
 	// Non-DDL
-	insertRow:  0, // Disabled and tracked with #127263
+	insertRow:  10,
 	selectStmt: 10,
 	validate:   2, // validate twice more often
 
@@ -271,7 +275,7 @@ var opWeights = []int{
 	alterTableAddConstraintUnique:     1,
 	alterTableAlterColumnType:         0, // Disabled and tracked with #66662.
 	alterTableAlterPrimaryKey:         1,
-	alterTableDropColumn:              0, // Disabled and tracked with #127286.
+	alterTableDropColumn:              1,
 	alterTableDropColumnDefault:       1,
 	alterTableDropConstraint:          1,
 	alterTableDropNotNull:             1,

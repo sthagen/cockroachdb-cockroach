@@ -16,8 +16,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -60,7 +58,7 @@ func (og *operationGenerator) sequenceExists(
 }
 
 func (og *operationGenerator) columnExistsOnTable(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	return og.scanBool(ctx, tx, `SELECT EXISTS (
 	SELECT column_name
@@ -136,8 +134,152 @@ func (og *operationGenerator) tableHasDependencies(
 	return og.scanBool(ctx, tx, q, tableName.Object(), tableName.Schema())
 }
 
+// columnRemovalWillDropFKBackingIndexes determines if dropping this column
+// will lead to no indexes backing a foreign key.
+func (og *operationGenerator) columnRemovalWillDropFKBackingIndexes(
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columName tree.Name,
+) (bool, error) {
+	return og.scanBool(ctx, tx, fmt.Sprintf(`
+WITH
+	fk
+		AS (
+			SELECT
+				oid,
+				(
+					SELECT
+						r.relname
+					FROM
+						pg_class AS r
+					WHERE
+						r.oid = c.confrelid
+				)
+					AS base_table,
+				a.attname AS base_col,
+				array_position(c.confkey, a.attnum)
+					AS base_ordinal,
+				(
+					SELECT
+						r.relname
+					FROM
+						pg_class AS r
+					WHERE
+						r.oid = c.conrelid
+				)
+					AS referencing_table,
+				unnest(
+					(
+						SELECT
+							array_agg(attname)
+						FROM
+							pg_attribute
+						WHERE
+							attrelid = c.conrelid
+							AND ARRAY[attnum] <@ c.conkey
+							AND array_position(
+									c.confkey,
+									a.attnum
+								)
+								= array_position(
+										c.conkey,
+										attnum
+									)
+					)
+				)
+					AS referencing_col
+			FROM
+				pg_constraint AS c
+				JOIN pg_attribute AS a ON
+						c.confrelid = a.attrelid
+						AND ARRAY[attnum] <@ c.confkey
+			WHERE
+				c.confrelid = $1::REGCLASS::OID
+		),
+	valid_indexes
+		AS (
+			SELECT
+				*
+			FROM
+				[SHOW INDEXES FROM %s]
+			WHERE
+				index_name
+				NOT IN (
+						SELECT
+							DISTINCT index_name
+						FROM
+							[SHOW INDEXES FROM %s]
+						WHERE
+							column_name = $2
+							AND index_name
+								!= table_name || '_pkey'
+					)
+		),
+	matching_indexes
+		AS (
+			SELECT
+				oid,
+				index_name,
+				count(base_ordinal) AS count_base_ordinal,
+				count(seq_in_index) AS count_seq_in_index
+			FROM
+				fk, valid_indexes
+			WHERE
+				storing = 'f'
+				AND non_unique = 'f'
+				AND base_col = column_name
+			GROUP BY
+				(oid, index_name)
+		),
+	valid_index_attrib_count
+		AS (
+			SELECT
+				index_name,
+				max(seq_in_index) AS max_seq_in_index
+			FROM
+				valid_indexes
+			WHERE
+				storing = 'f'
+			GROUP BY
+				index_name
+		),
+	valid_fk_count
+		AS (
+			SELECT
+				oid, max(base_ordinal) AS max_base_ordinal
+			FROM
+				fk
+			GROUP BY
+				fk
+		),
+	matching_fks
+		AS (
+			SELECT
+				DISTINCT f.oid
+			FROM
+				valid_index_attrib_count AS i,
+				valid_fk_count AS f,
+				matching_indexes AS m
+			WHERE
+				f.oid = m.oid
+				AND i.index_name = m.index_name
+				AND i.max_seq_in_index
+					= m.count_seq_in_index
+				AND f.max_base_ordinal
+					= m.count_base_ordinal
+		)
+SELECT
+	EXISTS(
+		SELECT
+			*
+		FROM
+			fk
+		WHERE
+			oid NOT IN (SELECT oid FROM matching_fks)
+	);
+`, tableName.String(), tableName.String()), tableName.String(), columName)
+}
+
 func (og *operationGenerator) columnIsDependedOn(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	// To see if a column is depended on, the ordinal_position of the column is looked up in
 	// information_schema.columns. Then, this position is used to see if that column has view dependencies
@@ -148,6 +290,9 @@ func (og *operationGenerator) columnIsDependedOn(
 	// stored as a list of numbers in a string, so SQL functions are used to parse these values
 	// into arrays. unnest is used to flatten rows with this column of array type into multiple rows,
 	// so performing unions and joins is easier.
+	//
+	// To check if any foreign key references exist to this table, we use pg_constraint
+	// and check if any columns are dependent.
 	return og.scanBool(ctx, tx, `SELECT EXISTS(
 		SELECT source.column_id
 			FROM (
@@ -184,12 +329,13 @@ func (og *operationGenerator) columnIsDependedOn(
 			      AND table_name = $3
 			      AND column_name = $4
 			  ) AS source ON source.column_id = cons.column_id
-)`, tableName.String(), tableName.Schema(), tableName.Object(), columnName)
+)
+`, tableName.String(), tableName.Schema(), tableName.Object(), columnName)
 }
 
 // colIsRefByComputed determines if a column is referenced by a computed column.
 func (og *operationGenerator) colIsRefByComputed(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	return og.scanBool(ctx, tx, `SELECT EXISTS(
     SELECT
@@ -208,7 +354,7 @@ func (og *operationGenerator) colIsRefByComputed(
 }
 
 func (og *operationGenerator) columnIsDependedOnByView(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	return og.scanBool(ctx, tx, `SELECT EXISTS(
 		SELECT source.column_id
@@ -245,7 +391,7 @@ func (og *operationGenerator) columnIsDependedOnByView(
 }
 
 func (og *operationGenerator) colIsPrimaryKey(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	primaryColumns, err := og.scanStringArray(ctx, tx,
 		`
@@ -269,275 +415,11 @@ SELECT array_agg(column_name)
 	}
 
 	for _, primaryColumn := range primaryColumns {
-		// primaryColumn will be double-quoted only if it had any special
-		// characters, so compare against both the quoted	and the unquoted
-		// name.
-		if primaryColumn == columnName || primaryColumn == lexbase.EscapeSQLIdent(columnName) {
+		if tree.Name(primaryColumn) == columnName {
 			return true, nil
 		}
 	}
 	return false, nil
-}
-
-// exprColumnCollector collects all the columns observed inside
-// an expression.
-type exprColumnCollector struct {
-	colInfo         map[string]column
-	columnsObserved map[string]column
-}
-
-var _ tree.Visitor = &exprColumnCollector{}
-
-// newExprColumnCollector constructs an expression collector, that
-// will search for a set of columns.
-func newExprColumnCollector(colInfo []column) *exprColumnCollector {
-	collect := exprColumnCollector{
-		colInfo:         make(map[string]column),
-		columnsObserved: make(map[string]column),
-	}
-	for _, col := range colInfo {
-		collect.colInfo[col.name] = col
-	}
-	return &collect
-}
-
-// VisitPost implements tree.Visitor
-func (e *exprColumnCollector) VisitPost(expr tree.Expr) (newNode tree.Expr) {
-	return expr
-}
-
-// VisitPre implements tree.Visitor
-func (e *exprColumnCollector) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
-	switch t := expr.(type) {
-	case *tree.ColumnItem:
-		e.columnsObserved[t.ColumnName.String()] = e.colInfo[t.ColumnName.String()]
-	case *tree.UnresolvedName:
-		e.columnsObserved[t.String()] = e.colInfo[t.String()]
-	}
-	return true, expr
-}
-
-// valuesViolateUniqueConstraints determines if any unique constraints (including primary
-// constraints and constraint expressions) that will be violated upon inserting
-// the specified rows into the specified table.
-func (og *operationGenerator) valuesViolateUniqueConstraints(
-	ctx context.Context,
-	tx pgx.Tx,
-	tableName *tree.TableName,
-	nonGeneratedColNames []string,
-	colInfo []column,
-	rows [][]string,
-) (bool, codesWithConditions, error) {
-	var generatedCodes codesWithConditions
-	constraints, err := getUniqueConstraintsForTable(ctx, tx, tableName.String())
-	if err != nil {
-		return false, nil, og.checkAndAdjustForUnknownSchemaErrors(err)
-	}
-	// Determine if the tuples are unique for a given constraint, where the index
-	// will be the constraint.
-	constraintTuples := make([]map[string]struct{}, 0, len(constraints))
-	for range constraints {
-		constraintTuples = append(constraintTuples, make(map[string]struct{}))
-	}
-	for _, row := range rows {
-		hasGenerationError := false
-		// Put values to be inserted into a column name to value map to simplify lookups.
-		columnsToValues := map[string]string{}
-		for i := 0; i < len(nonGeneratedColNames); i++ {
-			columnsToValues[nonGeneratedColNames[i]] = row[i]
-		}
-		newCols := make(map[string]string)
-		// Resolve any generated expressions, which have been validated earlier.
-		for _, colInfo := range colInfo {
-			if !colInfo.generated {
-				continue
-			}
-			evalTxn, err := tx.Begin(ctx)
-			if err != nil {
-				return false, nil, err
-			}
-			newCols[colInfo.name], err = og.generateColumn(ctx, tx, colInfo, columnsToValues)
-			if err != nil {
-				if rbkErr := evalTxn.Rollback(ctx); rbkErr != nil {
-					return false, nil, errors.WithSecondaryError(err, rbkErr)
-				}
-				var pgErr *pgconn.PgError
-				if !errors.As(err, &pgErr) {
-					return false, nil, err
-				}
-				// Only accept know error types for generated expressions.
-				if !isValidGenerationError(pgErr.Code) {
-					return false, nil, err
-				}
-				generatedCodes = append(generatedCodes,
-					codesWithConditions{
-						{code: pgcode.MakeCode(pgErr.Code), condition: true},
-					}...,
-				)
-				hasGenerationError = true
-				continue
-			}
-			err = evalTxn.Commit(ctx)
-			if err != nil {
-				return false, nil, err
-			}
-		}
-		for k, v := range newCols {
-			columnsToValues[k] = v
-		}
-		// Skip over constraint validation, since we know an expression is bad here.
-		if hasGenerationError {
-			continue
-		}
-		// Next validate the uniqueness of both constraints and index expressions.
-		for constraintIdx, constraint := range constraints {
-			nonTupleConstraint := constraint
-			if len(nonTupleConstraint) > 2 &&
-				nonTupleConstraint[0] == '(' &&
-				nonTupleConstraint[len(nonTupleConstraint)-1] == ')' {
-				nonTupleConstraint = nonTupleConstraint[1 : len(nonTupleConstraint)-1]
-			}
-			hasNullsQuery := strings.Builder{}
-			hasNullsQuery.WriteString("SELECT num_nulls(")
-			hasNullsQuery.WriteString(nonTupleConstraint)
-			hasNullsQuery.WriteString(") > 0 FROM (VALUES(")
-
-			tupleSelectQuery := strings.Builder{}
-			tupleSelectQuery.WriteString("SELECT array[(")
-			tupleSelectQuery.WriteString(constraint)
-			tupleSelectQuery.WriteString(")::STRING] FROM (VALUES(")
-
-			query := strings.Builder{}
-			columns := strings.Builder{}
-			t, err := parser.ParseExpr(constraint)
-			if err != nil {
-				return false, nil, err
-			}
-			collector := newExprColumnCollector(colInfo)
-			t.Walk(collector)
-			// For the uniqueness query we are going to use CTEs, where existingValues
-			// will select the expression for all values in the table. newValue will be
-			// the second expression, which will refer to the expression values we are
-			// trying to insert.
-			query.WriteString("WITH existingValues AS (SELECT ")
-			query.WriteString(constraint)
-			query.WriteString(" FROM ")
-			query.WriteString(tableName.String())
-			query.WriteString("), ")
-			query.WriteString("newValue as ( SELECT ")
-			query.WriteString(" ")
-			query.WriteString(constraint)
-			query.WriteString(" FROM (VALUES( ")
-			colIdx := 0
-			for col := range collector.columnsObserved {
-				value := columnsToValues[col]
-				if colIdx != 0 {
-					query.WriteString(",")
-					columns.WriteString(",")
-					tupleSelectQuery.WriteString(",")
-					hasNullsQuery.WriteString(",")
-				}
-				query.WriteString(value)
-				columns.WriteString(col)
-				hasNullsQuery.WriteString(value)
-				tupleSelectQuery.WriteString(value)
-				colIdx++
-			}
-
-			hasNullsQuery.WriteString(") ) AS T(")
-			hasNullsQuery.WriteString(columns.String())
-			hasNullsQuery.WriteString(")")
-			tupleSelectQuery.WriteString(") ) AS T(")
-			tupleSelectQuery.WriteString(columns.String())
-			tupleSelectQuery.WriteString(")")
-			query.WriteString(") ) AS T(")
-			query.WriteString(columns.String())
-			query.WriteString(") )")
-			// Finally we are going to compute the intersection between the existing
-			// expression values in the table and the new expression value that will
-			// be computed for this row.
-			// Note: We could have done a join query instead, but the optimizer can be clever
-			// and potentially optimize out constants, which could lead to failures as
-			// seen in #125751, for floating point values.
-			query.WriteString(" SELECT count(*) > 0 FROM (SELECT * FROM existingValues INTERSECT SELECT * FROM newValue)")
-			evalTxn, err := tx.Begin(ctx)
-			if err != nil {
-				return false, nil, err
-			}
-			// Detect if any null values exist.
-			handleEvalTxnError := func(err error) (bool, error) {
-				// No choice but to rollback, expression is malformed.
-				rollbackErr := evalTxn.Rollback(ctx)
-				if rollbackErr != nil {
-					return false, errors.CombineErrors(err, rollbackErr)
-				}
-				var pgErr *pgconn.PgError
-				if !errors.As(err, &pgErr) {
-					return false, err
-				}
-				// Only accept known error types for generated expressions.
-				if !isValidGenerationError(pgErr.Code) {
-					return false, err
-				}
-				generatedCodes = append(generatedCodes,
-					codesWithConditions{
-						{code: pgcode.MakeCode(pgErr.Code), condition: true},
-					}...,
-				)
-				return true, nil
-			}
-			hasNullValues, err := og.scanBool(ctx, evalTxn, hasNullsQuery.String())
-			if err != nil {
-				skipConstraint, err := handleEvalTxnError(err)
-				if err != nil {
-					return false, generatedCodes, err
-				}
-				if skipConstraint {
-					continue
-				}
-			}
-			// If it has null values, we are going to skip later on,
-			// so skip this operation.
-			var exists bool
-			if !hasNullValues {
-				exists, err = og.scanBool(ctx, evalTxn, query.String())
-				if err != nil {
-					skipConstraint, err := handleEvalTxnError(err)
-					if err != nil {
-						return false, generatedCodes, err
-					}
-					if skipConstraint {
-						continue
-					}
-				}
-			}
-			err = evalTxn.Commit(ctx)
-			if err != nil {
-				return false, nil, err
-			}
-			// Proceed to the next constraint if it has NULL values.
-			if hasNullValues {
-				continue
-			}
-			if exists {
-				return true, nil, nil
-			}
-			// Gather the tuples and check if it's unique.
-			values, err := og.scanStringArrayNullableRows(ctx, tx, tupleSelectQuery.String())
-			if err != nil {
-				return false, nil, err
-			}
-			var value string
-			if values[0][0] != nil {
-				value = *values[0][0]
-				if _, ok := constraintTuples[constraintIdx][value]; ok {
-					return true, nil, nil
-				}
-				constraintTuples[constraintIdx][value] = struct{}{}
-			}
-		}
-	}
-	return false, generatedCodes, nil
 }
 
 // ErrSchemaChangesDisallowedDueToPkSwap is generated when schema changes are
@@ -613,7 +495,7 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 	ctx context.Context,
 	tx pgx.Tx,
 	tableName *tree.TableName,
-	nonGeneratedColNames []string,
+	nonGeneratedColNames []tree.Name,
 	colInfos []column,
 	row []string,
 ) (
@@ -622,8 +504,13 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 	potentialErrCodes codesWithConditions,
 	err error,
 ) {
+	defer func() {
+		if len(expectedErrCodes) > 0 {
+			isInvalidInsert = true
+		}
+	}()
 	// Put values to be inserted into a column name to value map to simplify lookups.
-	columnsToValues := map[string]string{}
+	columnsToValues := map[tree.Name]string{}
 	for i := 0; i < len(nonGeneratedColNames); i++ {
 		columnsToValues[nonGeneratedColNames[i]] = row[i]
 	}
@@ -663,7 +550,7 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 			}
 			query.WriteString(value)
 			queryEvalOrderCheck.WriteString(nonNullValue)
-			cols.WriteString(colName)
+			cols.WriteString(colName.String())
 			colIdx++
 		}
 
@@ -683,7 +570,7 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 				}
 				query.WriteString(col)
 				queryEvalOrderCheck.WriteString(col)
-				cols.WriteString(colInfo.name)
+				cols.WriteString(colInfo.name.String())
 				colIdx++
 			}
 		}
@@ -743,25 +630,9 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 		if !colInfo.generated {
 			continue
 		}
-		err = validateExpression(colInfo.generatedExpression, colInfo.typ.SQLString(), colInfo.nullable, false)
+		err = validateExpression(colInfo.generatedExpression, colInfo.typ.SQLString(), colInfo.nullable, true)
 		if err != nil {
 			return false, nil, nil, err
-		}
-	}
-	// Any bad generated expression means we don't have to bother with indexes next,
-	// since we expect the insert to fail earlier.
-	if expectedErrCodes == nil {
-		// Validate unique constraint expressions that are backed by indexes.
-		constraints, err := getUniqueConstraintsForTable(ctx, tx, tableName.String())
-		if err != nil {
-			return false, nil, nil, og.checkAndAdjustForUnknownSchemaErrors(err)
-		}
-
-		for _, constraint := range constraints {
-			err = validateExpression(constraint, "STRING", true, true)
-			if err != nil {
-				return false, nil, nil, err
-			}
 		}
 	}
 	return len(expectedErrCodes) > 0, expectedErrCodes, potentialErrCodes, nil
@@ -769,7 +640,7 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 
 // generateColumn generates values for columns that are generated.
 func (og *operationGenerator) generateColumn(
-	ctx context.Context, tx pgx.Tx, colInfo column, columnsToValues map[string]string,
+	ctx context.Context, tx pgx.Tx, colInfo column, columnsToValues map[tree.Name]string,
 ) (string, error) {
 	if !colInfo.generated {
 		return "", errors.AssertionFailedf("column is not generated: %v", colInfo.name)
@@ -794,7 +665,7 @@ func (og *operationGenerator) generateColumn(
 			cols.WriteString(",")
 		}
 		query.WriteString(value)
-		cols.WriteString(colName)
+		cols.WriteString(colName.String())
 		colIdx++
 	}
 	query.WriteString(")) AS t(")
@@ -921,9 +792,16 @@ func (og *operationGenerator) scanStringArray(
 // The column names must already be quoted/escaped if necessary when this
 // function is called.
 func (og *operationGenerator) canApplyUniqueConstraint(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columns []string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columns []tree.Name,
 ) (bool, error) {
-	columnNames := strings.Join(columns, ", ")
+	var columnNamesBuilder strings.Builder
+	for i, c := range columns {
+		if i > 0 {
+			columnNamesBuilder.WriteString(", ")
+		}
+		columnNamesBuilder.WriteString(c.String())
+	}
+	columnNames := columnNamesBuilder.String()
 
 	// If a row contains NULL in each of the columns relevant to a unique constraint,
 	// then the row will always be unique to other rows with respect to the constraint
@@ -933,7 +811,7 @@ func (og *operationGenerator) canApplyUniqueConstraint(
 	// verified easily using a SELECT DISTINCT statement.
 	whereNotNullClause := strings.Builder{}
 	for idx, column := range columns {
-		whereNotNullClause.WriteString(fmt.Sprintf("%s IS NOT NULL ", column))
+		whereNotNullClause.WriteString(fmt.Sprintf("%s IS NOT NULL ", column.String()))
 		if idx != len(columns)-1 {
 			whereNotNullClause.WriteString("OR ")
 		}
@@ -959,13 +837,13 @@ func (og *operationGenerator) canApplyUniqueConstraint(
 }
 
 func (og *operationGenerator) columnContainsNull(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	return og.scanBool(ctx, tx, fmt.Sprintf(`SELECT EXISTS (
 		SELECT %s
 		  FROM %s
 	   WHERE %s IS NULL
-	)`, lexbase.EscapeSQLIdent(columnName), tableName.String(), lexbase.EscapeSQLIdent(columnName)))
+	)`, columnName.String(), tableName.String(), columnName.String()))
 }
 
 func (og *operationGenerator) constraintIsPrimary(
@@ -984,7 +862,7 @@ func (og *operationGenerator) constraintIsPrimary(
 
 // Checks if a column has a single unique constraint.
 func (og *operationGenerator) columnHasSingleUniqueConstraint(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	// Rowid will always be unique, though the index is hidden.
 	if columnName == "rowid" {
@@ -1026,7 +904,7 @@ func (og *operationGenerator) constraintIsUnique(
 }
 
 func (og *operationGenerator) columnIsStoredComputed(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	// Note that we COALESCE because the column may not exist.
 	return og.scanBool(ctx, tx, `
@@ -1043,7 +921,7 @@ SELECT COALESCE(
 }
 
 func (og *operationGenerator) columnIsVirtualComputed(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	// Note that we COALESCE because the column may not exist.
 	return og.scanBool(ctx, tx, `
@@ -1107,7 +985,7 @@ SELECT count(*) FROM %s
 		  LEFT JOIN %s as t2
 				     ON t1.%s = t2.%s
 			WHERE t2.%s IS NOT NULL
-`, childTable.String(), parentTable.String(), tree.NameString(childColumn.name), tree.NameString(parentColumn.name), tree.NameString(parentColumn.name))
+`, childTable.String(), parentTable.String(), childColumn.name.String(), parentColumn.name.String(), parentColumn.name.String())
 
 	numJoinRows, err := og.scanInt(ctx, tx, q)
 	if err != nil {
@@ -1148,7 +1026,7 @@ func (og *operationGenerator) violatesFkConstraints(
 	ctx context.Context,
 	tx pgx.Tx,
 	tableName *tree.TableName,
-	nonGeneratedColNames []string,
+	nonGeneratedColNames []tree.Name,
 	rows [][]string,
 ) (bool, error) {
 	// TODO(annie): readd the join on active constraints once #120702 is resolved.
@@ -1157,7 +1035,7 @@ func (og *operationGenerator) violatesFkConstraints(
 	// not the case with table/schema names; thus, only column names are quote_ident'ed to ensure that they get
 	// referenced properly.
 	fkConstraints, err := og.scanStringArrayRows(ctx, tx, fmt.Sprintf(`
-		SELECT array[parent.table_schema, parent.table_name, quote_ident(parent.column_name), quote_ident(child.column_name)]
+		SELECT array[parent.table_schema, parent.table_name, parent.column_name, child.column_name]
 		  FROM (
 		        SELECT conname, conkey, confkey, conrelid, confrelid
 		          FROM pg_constraint
@@ -1191,7 +1069,7 @@ func (og *operationGenerator) violatesFkConstraints(
 
 	// Maps a column name to its index. This way, the value of a column in a row can be looked up
 	// using row[colToIndexMap["columnName"]] = "valueForColumn"
-	columnNameToIndexMap := map[string]int{}
+	columnNameToIndexMap := map[tree.Name]int{}
 
 	for i, name := range nonGeneratedColNames {
 		columnNameToIndexMap[name] = i
@@ -1199,13 +1077,13 @@ func (og *operationGenerator) violatesFkConstraints(
 
 	for _, row := range rows {
 		for _, constraint := range fkConstraints {
-			parentTableSchema := constraint[0]
-			parentTableName := constraint[1]
-			parentColumnName := constraint[2]
-			childColumnName := constraint[3]
+			parentTableSchema := tree.Name(constraint[0])
+			parentTableName := tree.Name(constraint[1])
+			parentColumnName := tree.Name(constraint[2])
+			childColumnName := tree.Name(constraint[3])
 
 			// If self referential, there cannot be a violation.
-			parentAndChildAreSame := parentTableSchema == tableName.Schema() && parentTableName == tableName.Object()
+			parentAndChildAreSame := parentTableSchema == tableName.SchemaName && parentTableName == tableName.ObjectName
 			if parentAndChildAreSame && parentColumnName == childColumnName {
 				continue
 			}
@@ -1230,8 +1108,8 @@ func (og *operationGenerator) violatesFkConstraints(
 func (og *operationGenerator) violatesFkConstraintsHelper(
 	ctx context.Context,
 	tx pgx.Tx,
-	columnNameToIndexMap map[string]int,
-	parentTableSchema, parentTableName, parentColumn, childColumn string,
+	columnNameToIndexMap map[tree.Name]int,
+	parentTableSchema, parentTableName, parentColumn, childColumn tree.Name,
 	childTableName *tree.TableName,
 	parentAndChildAreSameTable bool,
 	rowToInsert []string,
@@ -1271,7 +1149,7 @@ func (og *operationGenerator) violatesFkConstraintsHelper(
 			var parentValueInSameInsert string
 			if parentColInfo.generated {
 				// If the parent column is a computed column, spend time to generate the value.
-				columnsToValues := map[string]string{}
+				columnsToValues := map[tree.Name]string{}
 				for name, idx := range columnNameToIndexMap {
 					columnsToValues[name] = rowToInsert[idx]
 				}
@@ -1304,12 +1182,12 @@ func (og *operationGenerator) violatesFkConstraintsHelper(
 	    SELECT %s count(*) = 0 from %s.%s
 	    WHERE %s = (%s)
 	`,
-		checkSharedParentChildRows, parentTableSchema, parentTableName, parentColumn, childValue)
+		checkSharedParentChildRows, parentTableSchema.String(), parentTableName.String(), parentColumn.String(), childValue)
 	return og.scanBool(ctx, tx, q)
 }
 
-func (og *operationGenerator) columnIsInDroppingIndex(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+func (og *operationGenerator) columnIsInAddingOrDroppingIndex(
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	return og.scanBool(ctx, tx, `
 SELECT EXISTS(
@@ -1323,7 +1201,6 @@ SELECT EXISTS(
                                                      = indexes.index_id
                                                  AND table_id = $1::REGCLASS
                                                  AND type = 'INDEX'
-                                                 AND direction = 'DROP'
        );
 `, tableName.String(), columnName)
 }
@@ -1369,7 +1246,7 @@ SELECT true
 }
 
 func (og *operationGenerator) columnNotNullConstraintInMutation(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name,
 ) (bool, error) {
 	return og.scanBool(ctx, tx, `
   WITH `+descriptorsAndConstraintMutationsCTE+`,
@@ -1545,7 +1422,7 @@ SELECT
 // supplied table is not REGIONAL BY ROW.
 func (og *operationGenerator) getRegionColumn(
 	ctx context.Context, tx pgx.Tx, tableName *tree.TableName,
-) (string, error) {
+) (tree.Name, error) {
 	isTableRegionalByRow, err := og.tableIsRegionalByRow(ctx, tx, tableName)
 	if err != nil {
 		return "", err
@@ -1583,7 +1460,7 @@ FROM
 		return "", err
 	}
 
-	return regionCol, nil
+	return tree.Name(regionCol), nil
 }
 
 // tableIsRegionalByRow checks whether the given table is a REGIONAL BY ROW table.

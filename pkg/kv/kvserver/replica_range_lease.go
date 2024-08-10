@@ -159,7 +159,7 @@ var RejectLeaseOnLeaderUnknown = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.lease.reject_on_leader_unknown.enabled",
 	"reject lease requests on a replica that does not know the raft leader",
-	true,
+	false,
 )
 
 // leaseRequestHandle is a handle to an asynchronous lease request.
@@ -740,7 +740,7 @@ func (r *Replica) leaseSettings(ctx context.Context) leases.Settings {
 		RejectLeaseOnLeaderUnknown:                RejectLeaseOnLeaderUnknown.Get(&r.store.ClusterSettings().SV),
 		DisableAboveRaftLeaseTransferSafetyChecks: r.store.cfg.TestingKnobs.DisableAboveRaftLeaseTransferSafetyChecks,
 		AllowLeaseProposalWhenNotLeader:           r.store.cfg.TestingKnobs.AllowLeaseRequestProposalsWhenNotLeader,
-		ExpToEpochEquiv:                           r.store.ClusterSettings().Version.IsActive(ctx, clusterversion.V24_1Start),
+		ExpToEpochEquiv:                           r.store.ClusterSettings().Version.IsActive(ctx, clusterversion.TODO_Delete_V24_1Start),
 		MinExpirationSupported:                    r.store.ClusterSettings().Version.IsActive(ctx, clusterversion.V24_2_LeaseMinTimestamp),
 		RangeLeaseDuration:                        r.store.cfg.RangeLeaseDuration,
 	}

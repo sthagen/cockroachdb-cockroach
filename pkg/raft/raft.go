@@ -858,7 +858,8 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 	//  if r.maybeCommit() {
 	//  	r.bcastAppend()
 	//  }
-	r.send(pb.Message{To: r.id, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
+	r.send(pb.Message{To: r.id, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex(),
+		Commit: r.raftLog.committed})
 	return true
 }
 
@@ -995,7 +996,12 @@ func (r *raft) hup(t CampaignType) {
 		r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
 		return
 	}
-
+	// TODO(arul): we will eventually want some kind of logic like this.
+	//
+	//if r.supportingFortifiedLeader() && t != campaignTransfer {
+	//	r.logger.Debugf("%x ignoring MsgHup due to leader fortification", r.id)
+	//	return
+	//}
 	if !r.promotable() {
 		r.logger.Warningf("%x is unpromotable and can not campaign", r.id)
 		return
@@ -1007,6 +1013,21 @@ func (r *raft) hup(t CampaignType) {
 
 	r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
 	r.campaign(t)
+}
+
+// supportingFortifiedLeader returns whether the peer is providing fortification
+// support to a leader. When a peer is providing support to a leader, it must
+// not campaign or vote to disrupt that leader's term, unless specifically asked
+// to do so by the leader.
+// TODO(arul): this is a placeholder implementation. Move it around as you see
+// fit.
+func (r *raft) supportingFortifiedLeader() bool {
+	if r.leadEpoch == 0 {
+		return false // not supporting any leader
+	}
+	assertTrue(r.lead != None, "leader epoch is set but leader is not")
+	epoch, ok := r.storeLiveness.SupportFor(r.lead)
+	return ok && epoch == r.leadEpoch
 }
 
 // errBreak is a sentinel error used to break a callback-based loop.
@@ -1727,12 +1748,31 @@ func stepFollower(r *raft, m pb.Message) error {
 		m.To = r.lead
 		r.send(m)
 	case pb.MsgForgetLeader:
-		if r.lead != None {
-			r.logger.Infof("%x forgetting leader %x at term %d", r.id, r.lead, r.Term)
-			r.lead = None
+		// TODO(nvanbenschoten): remove MsgForgetLeader once the sole caller in
+		// Replica.maybeForgetLeaderOnVoteRequestLocked is removed. This will
+		// accompany the removal of epoch-based leases.
+		if r.lead == None {
+			r.logger.Infof("%x no leader at term %d; dropping forget leader msg", r.id, r.Term)
+			return nil
 		}
+		if r.supportingFortifiedLeader() && r.lead != m.From {
+			r.logger.Infof("%x [term %d] ignored MsgForgetLeader from %x due to leader fortification", r.id, r.Term, m.From)
+			return nil
+		}
+		r.logger.Infof("%x forgetting leader %x at term %d", r.id, r.lead, r.Term)
+		r.lead = None
 	case pb.MsgTimeoutNow:
-		r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership.", r.id, r.Term, m.From)
+		// TODO(nvanbenschoten): we will eventually want some kind of logic like
+		// this. However, even this may not be enough, because we're calling a
+		// campaignTransfer election, which bypasses leader fortification checks. It
+		// may never be safe for MsgTimeoutNow to come from anyone but the leader.
+		// We need to think about this more.
+		//
+		//if r.supportingFortifiedLeader() && r.lead != m.From {
+		//	r.logger.Infof("%x [term %d] ignored MsgTimeoutNow from %x due to leader fortification", r.id, r.Term, m.From)
+		//	return nil
+		//}
+		r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership", r.id, r.Term, m.From)
 		// Leadership transfers never use pre-vote even if r.preVote is true; we
 		// know we are not recovering from a partition so there is no need for the
 		// extra round trip.
@@ -1765,7 +1805,8 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	}
 
 	if a.prev.index < r.raftLog.committed {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed,
+			Commit: r.raftLog.committed})
 		return
 	}
 	if r.raftLog.maybeAppend(a) {
@@ -1775,7 +1816,8 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 		// the commit index even if the MsgApp is stale.
 		lastIndex := a.lastIndex()
 		r.raftLog.commitTo(logMark{term: m.Term, index: min(m.Commit, lastIndex)})
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: lastIndex})
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: lastIndex,
+			Commit: r.raftLog.committed})
 		return
 	}
 	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
@@ -1800,9 +1842,12 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	hintIndex := min(m.Index, r.raftLog.lastIndex())
 	hintIndex, hintTerm := r.raftLog.findConflictByTerm(hintIndex, m.LogTerm)
 	r.send(pb.Message{
-		To:         m.From,
-		Type:       pb.MsgAppResp,
-		Index:      m.Index,
+		To:    m.From,
+		Type:  pb.MsgAppResp,
+		Index: m.Index,
+		// This helps the leader track the follower's commit index. This flow is
+		// independent from accepted/rejected log appends.
+		Commit:     r.raftLog.committed,
 		Reject:     true,
 		RejectHint: hintIndex,
 		LogTerm:    hintTerm,
@@ -1873,16 +1918,19 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	if r.restore(s) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, id.index, id.term)
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex(),
+			Commit: r.raftLog.committed})
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, id.index, id.term)
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed,
+			Commit: r.raftLog.committed})
 	}
 }
 
 func (r *raft) handleFortify(m pb.Message) {
 	assertTrue(r.state == StateFollower, "leaders should locally fortify without sending a message")
+	assertTrue(r.lead == m.From, "only the leader should send fortification requests")
 
 	epoch, live := r.storeLiveness.SupportFor(r.lead)
 	if !live {
@@ -1896,18 +1944,17 @@ func (r *raft) handleFortify(m pb.Message) {
 		return
 	}
 	r.leadEpoch = epoch
-	// TODO(arul): for now, we reject the fortification request because the leader
-	// hasn't been taught how to handle it.
 	r.send(pb.Message{
-		To:     m.From,
-		Type:   pb.MsgFortifyLeaderResp,
-		Reject: true,
+		To:        m.From,
+		Type:      pb.MsgFortifyLeaderResp,
+		LeadEpoch: epoch,
 	})
 }
 
 func (r *raft) handleFortifyResp(m pb.Message) {
 	assertTrue(r.state == StateLeader, "only leaders should be handling fortification responses")
-	assertTrue(m.Reject, "TODO(arul): implement")
+	// TODO(arul): record support once
+	// https://github.com/cockroachdb/cockroach/issues/125264 lands.
 }
 
 // restore recovers the state machine from a snapshot. It restores the log and the

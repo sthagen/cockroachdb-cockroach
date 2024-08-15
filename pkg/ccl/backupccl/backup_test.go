@@ -183,7 +183,7 @@ func TestBackupRestoreSingleNodeLocal(t *testing.T) {
 	// Set the testing knob so we count each time we write a checkpoint.
 	params := base.TestClusterArgs{}
 	knobs := base.TestingKnobs{
-		SQLExecutor: &sql.ExecutorTestingKnobs{
+		BackupRestore: &sql.BackupRestoreTestingKnobs{
 			AfterBackupChunk: func() {
 				chunks++
 			},
@@ -1552,7 +1552,7 @@ func TestRestoreReplanOnLag(t *testing.T) {
 	retryErrorChan := make(chan error)
 	defer close(retryErrorChan)
 	//Shorten replan frequency setting to reduce test runtime.
-	replanFreq := time.Second
+	replanFreq := time.Millisecond * 10
 
 	params := base.TestClusterArgs{}
 	knobs := base.TestingKnobs{
@@ -10205,7 +10205,7 @@ func TestBackupNoOverwriteCheckpoint(t *testing.T) {
 	// Set the testing knob so we count each time we write a checkpoint.
 	params := base.TestClusterArgs{}
 	knobs := base.TestingKnobs{
-		SQLExecutor: &sql.ExecutorTestingKnobs{
+		BackupRestore: &sql.BackupRestoreTestingKnobs{
 			AfterBackupCheckpoint: func() {
 				numCheckpointsWritten++
 			},

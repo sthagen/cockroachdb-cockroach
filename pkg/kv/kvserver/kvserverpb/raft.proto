@@ -93,7 +93,7 @@ message RaftMessageRequest {
   repeated RaftHeartbeat heartbeat_resps = 7 [(gogoproto.nullable) = false];
 
   // AdmittedRaftLogEntries is coalesced information about all raft log entries
-  // that were admitted below raft.
+  // that were admitted below raft. Used only in RACv1.
   repeated kv.kvserver.kvflowcontrol.kvflowcontrolpb.AdmittedRaftLogEntries admitted_raft_log_entries = 11 [(gogoproto.nullable) = false];
 
   // UsingRAC2Protocol is set to true iff the leader is using the RACv2
@@ -114,6 +114,8 @@ message RaftMessageRequest {
 message RaftMessageRequestBatch {
   repeated RaftMessageRequest requests = 1 [(gogoproto.nullable) = false];
 
+  // StoreIDs is used only in RACv1.
+  //
   // StoreIDs identifies all the stores on the client node. It's populated on
   // the first RaftMessageRequestBatch sent along MultiRaft.RaftMessageBatch
   // gRPC stream identifying at least one store, and the populated once more
@@ -222,6 +224,12 @@ message SnapshotRequest {
     // will have their metadata present in the snapshot but not the
     // file contents.
     bool external_replicate = 13;
+
+    // If true, the snapshot is iterating over range keys and point
+    // keys in key order, as opposed to iterating over point keys first
+    // and range keys second. The receiver can take advantage of this
+    // to split points/range keys into multiple sstables for ingestion.
+    bool range_keys_in_order = 14;
 
     reserved 1, 4, 6, 7, 8, 9;
   }

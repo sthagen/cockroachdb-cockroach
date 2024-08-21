@@ -129,18 +129,20 @@ func newLogicalReplicationWriterProcessor(
 	}
 
 	tableConfigs := make(map[descpb.ID]sqlProcessorTableConfig)
-	tableIDToName := make(map[int32]fullyQualifiedTableName)
-	for tableID, md := range spec.TableMetadata {
+	srcTableIDToDstMeta := make(map[descpb.ID]dstTableMetadata)
+	for dstTableID, md := range spec.TableMetadata {
 		desc := md.SourceDescriptor
-		tableConfigs[descpb.ID(tableID)] = sqlProcessorTableConfig{
+		tableConfigs[descpb.ID(dstTableID)] = sqlProcessorTableConfig{
 			srcDesc: tabledesc.NewBuilder(&desc).BuildImmutableTable(),
 			dstOID:  md.DestinationFunctionOID,
 		}
 
-		tableIDToName[tableID] = fullyQualifiedTableName{
+		srcTableID := desc.GetID()
+		srcTableIDToDstMeta[srcTableID] = dstTableMetadata{
 			database: md.DestinationParentDatabaseName,
 			schema:   md.DestinationParentSchemaName,
 			table:    md.DestinationTableName,
+			tableID:  descpb.ID(dstTableID),
 		}
 	}
 	bhPool := make([]BatchHandler, maxWriterWorkers)
@@ -216,7 +218,7 @@ func newLogicalReplicationWriterProcessor(
 			StreamID:    streampb.StreamID(spec.StreamID),
 			ProcessorID: processorID,
 		},
-		dlqClient: InitDeadLetterQueueClient(dlqDbExec, tableIDToName),
+		dlqClient: InitDeadLetterQueueClient(dlqDbExec, srcTableIDToDstMeta),
 		metrics:   flowCtx.Cfg.JobRegistry.MetricsStruct().JobSpecificMetrics[jobspb.TypeLogicalReplication].(*Metrics),
 	}
 	lrw.purgatory = purgatory{
@@ -289,7 +291,7 @@ func (lrw *logicalReplicationWriterProcessor) Start(ctx context.Context) {
 
 	if streamingKnobs, ok := lrw.FlowCtx.TestingKnobs().StreamingTestingKnobs.(*sql.StreamingTestingKnobs); ok {
 		if streamingKnobs != nil && streamingKnobs.BeforeClientSubscribe != nil {
-			streamingKnobs.BeforeClientSubscribe(addr, string(token), lrw.frontier)
+			streamingKnobs.BeforeClientSubscribe(addr, string(token), lrw.frontier, lrw.spec.FilterRangefeed)
 		}
 	}
 	sub, err := streamClient.Subscribe(ctx,
@@ -297,7 +299,7 @@ func (lrw *logicalReplicationWriterProcessor) Start(ctx context.Context) {
 		int32(lrw.FlowCtx.NodeID.SQLInstanceID()), lrw.ProcessorID,
 		token,
 		lrw.spec.InitialScanTimestamp, lrw.frontier,
-		streamclient.WithFiltering(true),
+		streamclient.WithFiltering(lrw.spec.FilterRangefeed),
 		streamclient.WithDiff(true),
 	)
 	if err != nil {

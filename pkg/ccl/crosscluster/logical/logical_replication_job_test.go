@@ -613,7 +613,7 @@ func TestRandomTables(t *testing.T) {
 		// We do not have full support for column families.
 		randgen.SkipColumnFamilyMutation())
 	stmt := tree.SerializeForDisplay(createStmt)
-	t.Logf(stmt)
+	t.Log(stmt)
 	runnerA.Exec(t, stmt)
 	runnerB.Exec(t, stmt)
 
@@ -897,6 +897,7 @@ func TestLogicalJobResiliency(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "multi cluster/node config exhausts hardware")
+	skip.UnderDeadlock(t, "Scattering prior to creating LDR job slows down ingestion")
 
 	clusterArgs := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
@@ -1066,7 +1067,7 @@ func CreateScatteredTable(t *testing.T, db *sqlutils.SQLRunner, numNodes int, db
 	// ranges, so if we write just a few ranges those might all be on a single
 	// server, which will cause the test to flake.
 	numRanges := 50
-	rowsPerRange := 40
+	rowsPerRange := 20
 	db.Exec(t, "INSERT INTO tab (pk) SELECT * FROM generate_series(1, $1)",
 		numRanges*rowsPerRange)
 	db.Exec(t, "ALTER TABLE tab SPLIT AT (SELECT * FROM generate_series($1::INT, $2::INT, $3::INT))",
@@ -1359,8 +1360,12 @@ func TestShowLogicalReplicationJobs(t *testing.T) {
 		jobAID jobspb.JobID
 		jobBID jobspb.JobID
 	)
-	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab on $1 INTO TABLE tab", dbBURL.String()).Scan(&jobAID)
-	dbB.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab on $1 INTO TABLE tab", dbAURL.String()).Scan(&jobBID)
+	dbA.QueryRow(t,
+		"CREATE LOGICAL REPLICATION STREAM FROM TABLE tab on $1 INTO TABLE tab",
+		dbBURL.String()).Scan(&jobAID)
+	dbB.QueryRow(t,
+		"CREATE LOGICAL REPLICATION STREAM FROM TABLE tab on $1 INTO TABLE tab WITH DEFAULT FUNCTION = 'dlq'",
+		dbAURL.String()).Scan(&jobBID)
 
 	now := server.Server(0).Clock().Now()
 	t.Logf("waiting for replication job %d", jobAID)
@@ -1380,11 +1385,12 @@ func TestShowLogicalReplicationJobs(t *testing.T) {
 	}
 
 	var (
-		jobID                jobspb.JobID
-		status               string
-		targets              pq.StringArray
-		replicatedTime       time.Time
-		replicationStartTime time.Time
+		jobID                  jobspb.JobID
+		status                 string
+		targets                pq.StringArray
+		replicatedTime         time.Time
+		replicationStartTime   time.Time
+		conflictResolutionType string
 	)
 
 	showRows := dbA.Query(t, "SELECT * FROM [SHOW LOGICAL REPLICATION JOBS] ORDER BY job_id")
@@ -1415,13 +1421,16 @@ func TestShowLogicalReplicationJobs(t *testing.T) {
 
 	rowIdx = 0
 	for showWithDetailsRows.Next() {
-		err := showWithDetailsRows.Scan(&jobID, &status, &targets, &replicatedTime, &replicationStartTime)
+		err := showWithDetailsRows.Scan(&jobID, &status, &targets, &replicatedTime, &replicationStartTime, &conflictResolutionType)
 		require.NoError(t, err)
 
 		expectedJobID := jobIDs[rowIdx]
 		payload := jobutils.GetJobPayload(t, dbA, expectedJobID)
 		expectedReplicationStartTime := payload.GetLogicalReplicationDetails().ReplicationStartTime.GoTime().Round(time.Microsecond)
 		require.Equal(t, expectedReplicationStartTime, replicationStartTime)
+
+		expectedConflictResolutionType := payload.GetLogicalReplicationDetails().DefaultConflictResolution.ConflictResolutionType.String()
+		require.Equal(t, expectedConflictResolutionType, conflictResolutionType)
 
 		rowIdx++
 	}

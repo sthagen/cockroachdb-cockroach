@@ -218,7 +218,6 @@ type ProcessorOptions struct {
 	NodeID    roachpb.NodeID
 	StoreID   roachpb.StoreID
 	RangeID   roachpb.RangeID
-	TenantID  roachpb.TenantID
 	ReplicaID roachpb.ReplicaID
 
 	Replica                Replica
@@ -319,7 +318,8 @@ type Processor interface {
 	// the v1 entry encoding.
 	GetEnabledWhenLeader() EnabledWhenLeaderLevel
 
-	// OnDescChangedLocked provides a possibly updated RangeDescriptor.
+	// OnDescChangedLocked provides a possibly updated RangeDescriptor. The
+	// tenantID passed in all calls must be the same.
 	//
 	// Both Replica mu and raftMu are held.
 	//
@@ -330,7 +330,8 @@ type Processor interface {
 	// OnDescChangedRaftMuLocked, or (b) add a method in RangeController that
 	// only updates the voting replicas used in WaitForEval, and call that
 	// from OnDescChangedLocked, and do the rest of the updating later.
-	OnDescChangedLocked(ctx context.Context, desc *roachpb.RangeDescriptor)
+	OnDescChangedLocked(
+		ctx context.Context, desc *roachpb.RangeDescriptor, tenantID roachpb.TenantID)
 
 	// HandleRaftReadyRaftMuLocked corresponds to processing that happens when
 	// Replica.handleRaftReadyRaftMuLocked is called. It must be called even
@@ -389,6 +390,15 @@ type Processor interface {
 	AdmittedLogEntry(
 		ctx context.Context, state EntryForAdmissionCallbackState,
 	)
+
+	// AdmitForEval is called to admit work that wants to evaluate at the
+	// leaseholder.
+	//
+	// If the callee decided not to admit because replication admission
+	// control is disabled, or for any other reason, admitted will be false
+	// and error will be nil.
+	AdmitForEval(
+		ctx context.Context, pri admissionpb.WorkPriority, ct time.Time) (admitted bool, err error)
 }
 
 type processorImpl struct {
@@ -442,6 +452,8 @@ type processorImpl struct {
 		// the state in replicas.
 		replicas        rac2.ReplicaSet
 		replicasChanged bool
+		// Set once, in the first call to OnDescChanged.
+		tenantID roachpb.TenantID
 	}
 	// Atomic value, for serving GetEnabledWhenLeader. Mirrors
 	// mu.enabledWhenLeader.
@@ -519,16 +531,31 @@ func descToReplicaSet(desc *roachpb.RangeDescriptor) rac2.ReplicaSet {
 }
 
 // OnDescChangedLocked implements Processor.
-func (p *processorImpl) OnDescChangedLocked(ctx context.Context, desc *roachpb.RangeDescriptor) {
+func (p *processorImpl) OnDescChangedLocked(
+	ctx context.Context, desc *roachpb.RangeDescriptor, tenantID roachpb.TenantID,
+) {
 	p.opts.Replica.RaftMuAssertHeld()
 	p.opts.Replica.MuAssertHeld()
 	if p.raftMu.replicas == nil {
 		// Replica is initialized, in that we have a descriptor. Get the
 		// RaftNode.
 		p.raftMu.raftNode = p.opts.Replica.RaftNodeMuLocked()
+		p.raftMu.tenantID = tenantID
+	} else {
+		if p.raftMu.tenantID != tenantID {
+			panic(errors.AssertionFailedf("tenantId was changed from %s to %s",
+				p.raftMu.tenantID, tenantID))
+		}
 	}
+	initialization := p.raftMu.replicas == nil
 	p.raftMu.replicas = descToReplicaSet(desc)
 	p.raftMu.replicasChanged = true
+	// We need to promptly return tokens if some replicas have been removed,
+	// since those tokens could be used by other ranges with replicas on the
+	// same store. Ensure that promptness by scheduling ready.
+	if !initialization {
+		p.opts.RaftScheduler.EnqueueRaftReady(p.opts.RangeID)
+	}
 }
 
 // makeStateConsistentRaftMuLockedProcLocked, uses the union of the latest
@@ -775,7 +802,7 @@ func (p *processorImpl) AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
 		// NB: cannot hold mu when calling Admit since the callback may
 		// execute from inside Admit, when the entry is immediately admitted.
 		submitted := p.opts.ACWorkQueue.Admit(ctx, EntryForAdmission{
-			TenantID:       p.opts.TenantID,
+			TenantID:       p.raftMu.tenantID,
 			Priority:       admissionPri,
 			CreateTime:     meta.AdmissionCreateTime,
 			RequestedCount: int64(len(entry.Data)),
@@ -886,6 +913,14 @@ func (p *processorImpl) AdmittedLogEntry(
 		p.mu.scheduledAdmittedProcessing = true
 		p.opts.RaftScheduler.EnqueueRaftReady(p.opts.RangeID)
 	}
+}
+
+// AdmitForEval implements Processor.
+func (p *processorImpl) AdmitForEval(
+	ctx context.Context, pri admissionpb.WorkPriority, ct time.Time,
+) (admitted bool, err error) {
+	// TODO(sumeer):
+	return false, nil
 }
 
 func admittedIncreased(prev, next [raftpb.NumPriorities]uint64) bool {

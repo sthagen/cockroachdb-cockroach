@@ -418,51 +418,22 @@ var varGen = map[string]sessionVar{
 	`default_transaction_isolation`: {
 		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
 			allowReadCommitted := allowReadCommittedIsolation.Get(&m.settings.SV)
-			allowSnapshot := allowSnapshotIsolation.Get(&m.settings.SV)
+			allowRepeatableRead := allowRepeatableReadIsolation.Get(&m.settings.SV)
 			hasLicense := base.CCLDistributionAndEnterpriseEnabled(m.settings)
 			var allowedValues = []string{"serializable"}
-			if allowSnapshot {
-				// TODO(nvanbenschoten): switch to "repeatable read".
-				allowedValues = append(allowedValues, "snapshot")
+			if allowRepeatableRead {
+				allowedValues = append(allowedValues, "repeatable read")
 			}
 			if allowReadCommitted {
 				allowedValues = append(allowedValues, "read committed")
 			}
 			level, ok := tree.IsolationLevelMap[strings.ToLower(s)]
-			originalLevel := level
-			upgraded := false
-			upgradedDueToLicense := false
 			if !ok {
 				return newVarValueError(`default_transaction_isolation`, s, allowedValues...)
 			}
-			switch level {
-			case tree.ReadUncommittedIsolation:
-				upgraded = true
-				fallthrough
-			case tree.ReadCommittedIsolation:
-				level = tree.SerializableIsolation
-				if allowReadCommitted && hasLicense {
-					level = tree.ReadCommittedIsolation
-				} else {
-					upgraded = true
-					if allowReadCommitted && !hasLicense {
-						upgradedDueToLicense = true
-					}
-				}
-			case tree.RepeatableReadIsolation:
-				upgraded = true
-				fallthrough
-			case tree.SnapshotIsolation:
-				level = tree.SerializableIsolation
-				if allowSnapshot && hasLicense {
-					level = tree.SnapshotIsolation
-				} else {
-					upgraded = true
-					if allowSnapshot && !hasLicense {
-						upgradedDueToLicense = true
-					}
-				}
-			}
+			originalLevel := level
+			level, upgraded, upgradedDueToLicense := level.UpgradeToEnabledLevel(
+				allowReadCommitted, allowRepeatableRead, hasLicense)
 			if f := m.upgradedIsolationLevel; upgraded && f != nil {
 				f(ctx, originalLevel, upgradedDueToLicense)
 			}
@@ -1608,16 +1579,15 @@ var varGen = map[string]sessionVar{
 	// See https://github.com/postgres/postgres/blob/REL_10_STABLE/src/backend/utils/misc/guc.c#L3401-L3409
 	`transaction_isolation`: {
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
-			level := tree.IsolationLevelFromKVTxnIsolationLevel(evalCtx.Txn.IsoLevel())
+			level := tree.FromKVIsoLevel(evalCtx.Txn.IsoLevel())
 			return strings.ToLower(level.String()), nil
 		},
 		RuntimeSet: func(ctx context.Context, evalCtx *extendedEvalContext, local bool, s string) error {
 			level, ok := tree.IsolationLevelMap[strings.ToLower(s)]
 			if !ok {
 				var allowedValues = []string{"serializable"}
-				if allowSnapshotIsolation.Get(&evalCtx.ExecCfg.Settings.SV) {
-					// TODO(nvanbenschoten): switch to "repeatable read".
-					allowedValues = append(allowedValues, "snapshot")
+				if allowRepeatableReadIsolation.Get(&evalCtx.ExecCfg.Settings.SV) {
+					allowedValues = append(allowedValues, "repeatable read")
 				}
 				if allowReadCommittedIsolation.Get(&evalCtx.ExecCfg.Settings.SV) {
 					allowedValues = append(allowedValues, "read committed")

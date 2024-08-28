@@ -4738,7 +4738,7 @@ logical_replication_options:
   }
 | IGNORE_CDC_IGNORED_TTL_DELETES
   {
-    $$.val = &tree.LogicalReplicationOptions{FilterRangefeed: tree.MakeDBool(true)}
+    $$.val = &tree.LogicalReplicationOptions{IgnoreCDCIgnoredTTLDeletes: tree.MakeDBool(true)}
   }
 
 // %Help: CREATE VIRTUAL CLUSTER - create a new virtual cluster
@@ -7573,7 +7573,7 @@ set_exprs_internal:
 // %Text:
 // SET [SESSION] <var> { TO | = } <values...>
 // SET [SESSION] TIME ZONE <tz>
-// SET [SESSION] CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL { READ COMMITTED | SERIALIZABLE }
+// SET [SESSION] CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL { READ COMMITTED | REPEATABLE READ | SERIALIZABLE }
 // SET [SESSION] TRACING { TO | = } { on | off | cluster | kv | results } [,...]
 //
 // %SeeAlso: SHOW SESSION, RESET, DISCARD, SHOW, SET CLUSTER SETTING, SET TRANSACTION, SET LOCAL
@@ -7630,7 +7630,7 @@ set_local_stmt:
 // SET [SESSION] TRANSACTION <txnparameters...>
 //
 // Transaction parameters:
-//    ISOLATION LEVEL { READ COMMITTED | SERIALIZABLE }
+//    ISOLATION LEVEL { READ COMMITTED | REPEATABLE READ | SERIALIZABLE }
 //    PRIORITY { LOW | NORMAL | HIGH }
 //    AS OF SYSTEM TIME <expr>
 //    [NOT] DEFERRABLE
@@ -12536,7 +12536,7 @@ transaction_stmt:
 // START TRANSACTION [ <txnparameter> [[,] ...] ]
 //
 // Transaction parameters:
-//    ISOLATION LEVEL { READ COMMITTED | SERIALIZABLE }
+//    ISOLATION LEVEL { READ COMMITTED | REPEATABLE READ | SERIALIZABLE }
 //    PRIORITY { LOW | NORMAL | HIGH }
 //
 // %SeeAlso: COMMIT, ROLLBACK, WEBDOCS/begin-transaction.html

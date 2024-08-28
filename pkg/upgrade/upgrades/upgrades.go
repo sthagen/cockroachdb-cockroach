@@ -108,11 +108,19 @@ var upgrades = []upgradebase.Upgrade{
 	),
 
 	upgrade.NewTenantUpgrade(
-		"add new table_metadata table to the system tenant",
+		"add new table_metadata table and job to the system tenant",
 		clusterversion.V24_3_TableMetadata.Version(),
 		upgrade.NoPrecondition,
-		addTableMetadataTable,
+		addTableMetadataTableAndJob,
 		upgrade.RestoreActionNotRequired("cluster restore does not restore this table"),
+	),
+
+	upgrade.NewTenantUpgrade(
+		"add exclude_data_from_backup to certain system tables on tenants",
+		clusterversion.V24_3_TenantExcludeDataFromBackup.Version(),
+		upgrade.NoPrecondition,
+		tenantExcludeDataFromBackup,
+		upgrade.RestoreActionNotRequired("cluster restore does not restore affected tables"),
 	),
 
 	// Note: when starting a new release version, the first upgrade (for

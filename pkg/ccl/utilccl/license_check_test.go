@@ -74,6 +74,8 @@ func TestGetLicenseTypePresent(t *testing.T) {
 		{licenseccl.License_Enterprise, "Enterprise", licenseccl.Production, "production"},
 		{licenseccl.License_Evaluation, "Evaluation", licenseccl.Development, "development"},
 		{licenseccl.License_Enterprise, "Enterprise", licenseccl.Unspecified, ""},
+		{licenseccl.License_Free, "Free", licenseccl.Development, "development"},
+		{licenseccl.License_Trial, "Trial", licenseccl.PreProduction, "pre-production"},
 	} {
 		st := cluster.MakeTestingClusterSettings()
 		updater := st.MakeUpdater()
@@ -162,12 +164,12 @@ func TestTimeToEnterpriseLicenseExpiry(t *testing.T) {
 	}).Encode()
 
 	lic0M, _ := (&licenseccl.License{
-		Type:              licenseccl.License_Evaluation,
+		Type:              licenseccl.License_Free,
 		ValidUntilUnixSec: t0.AddDate(0, 0, 0).Unix(),
 	}).Encode()
 
 	licExpired, _ := (&licenseccl.License{
-		Type:              licenseccl.License_Evaluation,
+		Type:              licenseccl.License_Trial,
 		ValidUntilUnixSec: t0.AddDate(0, -1, 0).Unix(),
 	}).Encode()
 
@@ -176,9 +178,6 @@ func TestTimeToEnterpriseLicenseExpiry(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	manualTime := timeutil.NewManualTime(t0)
-
-	err := UpdateMetricOnLicenseChange(context.Background(), st, base.LicenseTTL, manualTime, stopper)
-	require.NoError(t, err)
 
 	for _, tc := range []struct {
 		desc       string
@@ -195,7 +194,7 @@ func TestTimeToEnterpriseLicenseExpiry(t *testing.T) {
 			if err := setLicense(ctx, updater, tc.lic); err != nil {
 				t.Fatal(err)
 			}
-			actual := base.LicenseTTL.Value()
+			actual := base.GetLicenseTTL(context.Background(), st, manualTime)
 			require.Equal(t, tc.ttlSeconds, actual)
 		})
 	}

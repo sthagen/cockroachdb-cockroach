@@ -15,10 +15,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -142,9 +144,9 @@ type AdmittedPiggybacker interface {
 // EntryForAdmission is the information provided to the admission control (AC)
 // system, when requesting admission.
 type EntryForAdmission struct {
-	// Information needed by the AC system, for deciding when to admit, and
-	// for maintaining its accounting of how much work has been
-	// requested/admitted.
+	// Information needed by the AC system, for deciding when to admit, and for
+	// maintaining its accounting of how much work has been requested/admitted.
+	StoreID    roachpb.StoreID
 	TenantID   roachpb.TenantID
 	Priority   admissionpb.WorkPriority
 	CreateTime int64
@@ -155,6 +157,10 @@ type EntryForAdmission struct {
 	// ingested into Pebble.
 	Ingested bool
 
+	// Routing info to get to the Processor, in addition to StoreID.
+	RangeID   roachpb.RangeID
+	ReplicaID roachpb.ReplicaID
+
 	// CallbackState is information that is needed by the callback when the
 	// entry is admitted.
 	CallbackState EntryForAdmissionCallbackState
@@ -163,12 +169,7 @@ type EntryForAdmission struct {
 // EntryForAdmissionCallbackState is passed to the callback when the entry is
 // admitted.
 type EntryForAdmissionCallbackState struct {
-	// Routing state to get to the Processor.
-	StoreID roachpb.StoreID
-	RangeID roachpb.RangeID
-
-	// State needed by the Processor.
-	ReplicaID  roachpb.ReplicaID
+	// TODO(pav-kv): use LogMark.
 	LeaderTerm uint64
 	Index      uint64
 	Priority   raftpb.Priority
@@ -225,6 +226,7 @@ type ProcessorOptions struct {
 	AdmittedPiggybacker    AdmittedPiggybacker
 	ACWorkQueue            ACWorkQueue
 	RangeControllerFactory RangeControllerFactory
+	Settings               *cluster.Settings
 
 	EnabledWhenLeaderLevel EnabledWhenLeaderLevel
 }
@@ -338,28 +340,27 @@ type Processor interface {
 	// if there was no Ready, since it can be used to advance Admitted, and do
 	// other processing.
 	//
-	// The entries slice is Ready.Entries, i.e., represent MsgStorageAppend on
-	// all replicas. To stay consistent with the structure of
-	// Replica.handleRaftReadyRaftMuLocked, this method only does leader
-	// specific processing of entries.
-	// AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked does the general
-	// replica processing for MsgStorageAppend.
+	// The RaftEvent represents MsgStorageAppend on all replicas. To stay
+	// consistent with the structure of Replica.handleRaftReadyRaftMuLocked, this
+	// method only does leader specific processing of entries.
+	// AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked does the general replica
+	// processing for MsgStorageAppend.
 	//
 	// raftMu is held.
-	HandleRaftReadyRaftMuLocked(ctx context.Context, entries []raftpb.Entry)
-	// AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked subjects entries to
-	// admission control on a replica (leader or follower). Like
-	// HandleRaftReadyRaftMuLocked, this is called from
-	// Replica.handleRaftReadyRaftMuLocked. It is split off from that function
-	// since it is natural to position the admission control processing when we
-	// are writing to the store in Replica.handleRaftReadyRaftMuLocked. This is
-	// a noop if the leader is not using the RACv2 protocol. Returns false if
-	// the leader is using RACv1, in which the caller should follow the RACv1
-	// admission pathway.
+	HandleRaftReadyRaftMuLocked(context.Context, rac2.RaftEvent)
+	// AdmitRaftEntriesRaftMuLocked subjects entries to admission control on a
+	// replica (leader or follower). Like HandleRaftReadyRaftMuLocked, this is
+	// called from Replica.handleRaftReadyRaftMuLocked.
+	//
+	// It is split off from that function since it is natural to position the
+	// admission control processing when we are writing to the store in
+	// Replica.handleRaftReadyRaftMuLocked. This is a noop if the leader is not
+	// using the RACv2 protocol. Returns false if the leader is using RACv1, in
+	// which the caller should follow the RACv1 admission pathway.
 	//
 	// raftMu is held.
-	AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
-		ctx context.Context, leaderTerm uint64, entries []raftpb.Entry) bool
+	AdmitRaftEntriesRaftMuLocked(
+		ctx context.Context, event rac2.RaftEvent) bool
 
 	// EnqueuePiggybackedAdmittedAtLeader is called at the leader when
 	// receiving a piggybacked MsgAppResp that can advance a follower's
@@ -432,7 +433,12 @@ type processorImpl struct {
 		// protocol is enabled.
 		leader struct {
 			enqueuedPiggybackedResponses map[roachpb.ReplicaID]raftpb.Message
-			rc                           rac2.RangeController
+			// Updating the rc reference requires both the enclosing mu and
+			// rcReferenceUpdateMu. Code paths that want to access this
+			// reference only need one of these mutexes. rcReferenceUpdateMu
+			// is ordered after the enclosing mu.
+			rcReferenceUpdateMu syncutil.RWMutex
+			rc                  rac2.RangeController
 			// Term is used to notice transitions out of leadership and back,
 			// to recreate rc. It is set when rc is created, and is not
 			// up-to-date if there is no rc (which can happen when using the
@@ -647,7 +653,11 @@ func (p *processorImpl) closeLeaderStateRaftMuLockedProcLocked(ctx context.Conte
 		return
 	}
 	p.mu.leader.rc.CloseRaftMuLocked(ctx)
-	p.mu.leader.rc = nil
+	func() {
+		p.mu.leader.rcReferenceUpdateMu.Lock()
+		defer p.mu.leader.rcReferenceUpdateMu.Unlock()
+		p.mu.leader.rc = nil
+	}()
 	p.mu.leader.enqueuedPiggybackedResponses = nil
 	p.mu.leader.term = 0
 }
@@ -658,17 +668,21 @@ func (p *processorImpl) createLeaderStateRaftMuLockedProcLocked(
 	if p.mu.leader.rc != nil {
 		panic("RangeController already exists")
 	}
-	p.mu.leader.rc = p.opts.RangeControllerFactory.New(rangeControllerInitState{
-		replicaSet:    p.raftMu.replicas,
-		leaseholder:   p.mu.leaseholderID,
-		nextRaftIndex: nextUnstableIndex,
-	})
+	func() {
+		p.mu.leader.rcReferenceUpdateMu.Lock()
+		defer p.mu.leader.rcReferenceUpdateMu.Unlock()
+		p.mu.leader.rc = p.opts.RangeControllerFactory.New(rangeControllerInitState{
+			replicaSet:    p.raftMu.replicas,
+			leaseholder:   p.mu.leaseholderID,
+			nextRaftIndex: nextUnstableIndex,
+		})
+	}()
 	p.mu.leader.term = term
 	p.mu.leader.enqueuedPiggybackedResponses = map[roachpb.ReplicaID]raftpb.Message{}
 }
 
 // HandleRaftReadyRaftMuLocked implements Processor.
-func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, entries []raftpb.Entry) {
+func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, e rac2.RaftEvent) {
 	p.opts.Replica.RaftMuAssertHeld()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -677,7 +691,7 @@ func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, entries
 	}
 	if p.raftMu.raftNode == nil {
 		if buildutil.CrdbTestBuild {
-			if len(entries) > 0 {
+			if len(e.Entries) > 0 {
 				panic(errors.AssertionFailedf("entries provided without raft node"))
 			}
 		}
@@ -704,8 +718,8 @@ func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, entries
 			myLeaderTerm = p.raftMu.raftNode.TermLocked()
 		}
 	}()
-	if len(entries) > 0 {
-		nextUnstableIndex = entries[0].Index
+	if len(e.Entries) > 0 {
+		nextUnstableIndex = e.Entries[0].Index
 	}
 	p.mu.lastObservedStableIndex = stableIndex
 	p.mu.scheduledAdmittedProcessing = false
@@ -734,18 +748,14 @@ func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, entries
 		// known, we simply drop the message.
 	}
 	if p.mu.leader.rc != nil {
-		if err := p.mu.leader.rc.HandleRaftEventRaftMuLocked(ctx, rac2.RaftEvent{
-			Entries: entries,
-		}); err != nil {
+		if err := p.mu.leader.rc.HandleRaftEventRaftMuLocked(ctx, e); err != nil {
 			log.Errorf(ctx, "error handling raft event: %v", err)
 		}
 	}
 }
 
-// AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked implements Processor.
-func (p *processorImpl) AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
-	ctx context.Context, leaderTerm uint64, entries []raftpb.Entry,
-) bool {
+// AdmitRaftEntriesRaftMuLocked implements Processor.
+func (p *processorImpl) AdmitRaftEntriesRaftMuLocked(ctx context.Context, e rac2.RaftEvent) bool {
 	// NB: the state being read here is only modified under raftMu, so it will
 	// not become stale during this method.
 	var isLeaderUsingV2Protocol bool
@@ -758,7 +768,7 @@ func (p *processorImpl) AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
 	if !isLeaderUsingV2Protocol {
 		return false
 	}
-	for _, entry := range entries {
+	for _, entry := range e.Entries {
 		typ, priBits, err := raftlog.EncodingOf(entry)
 		if err != nil {
 			panic(errors.Wrap(err, "unable to determine raft command encoding"))
@@ -782,7 +792,7 @@ func (p *processorImpl) AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
 				p.mu.Lock()
 				defer p.mu.Unlock()
 				raftPri = p.mu.follower.lowPriOverrideState.getEffectivePriority(entry.Index, raftPri)
-				p.mu.waitingForAdmissionState.add(leaderTerm, entry.Index, raftPri)
+				p.mu.waitingForAdmissionState.add(e.Term, entry.Index, raftPri)
 			}()
 		} else {
 			raftPri = raftpb.LowPri
@@ -795,23 +805,23 @@ func (p *processorImpl) AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
 			func() {
 				p.mu.Lock()
 				defer p.mu.Unlock()
-				p.mu.waitingForAdmissionState.add(leaderTerm, entry.Index, raftPri)
+				p.mu.waitingForAdmissionState.add(e.Term, entry.Index, raftPri)
 			}()
 		}
 		admissionPri := rac2.RaftToAdmissionPriority(raftPri)
 		// NB: cannot hold mu when calling Admit since the callback may
 		// execute from inside Admit, when the entry is immediately admitted.
 		submitted := p.opts.ACWorkQueue.Admit(ctx, EntryForAdmission{
+			StoreID:        p.opts.StoreID,
 			TenantID:       p.raftMu.tenantID,
 			Priority:       admissionPri,
 			CreateTime:     meta.AdmissionCreateTime,
 			RequestedCount: int64(len(entry.Data)),
 			Ingested:       typ.IsSideloaded(),
+			RangeID:        p.opts.RangeID,
+			ReplicaID:      p.opts.ReplicaID,
 			CallbackState: EntryForAdmissionCallbackState{
-				StoreID:    p.opts.StoreID,
-				RangeID:    p.opts.RangeID,
-				ReplicaID:  p.opts.ReplicaID,
-				LeaderTerm: leaderTerm,
+				LeaderTerm: e.Term,
 				Index:      entry.Index,
 				Priority:   raftPri,
 			},
@@ -821,7 +831,7 @@ func (p *processorImpl) AdmitRaftEntriesFromMsgStorageAppendRaftMuLocked(
 			func() {
 				p.mu.Lock()
 				defer p.mu.Unlock()
-				p.mu.waitingForAdmissionState.remove(leaderTerm, entry.Index, raftPri)
+				p.mu.waitingForAdmissionState.remove(e.Term, entry.Index, raftPri)
 			}()
 		}
 	}
@@ -897,7 +907,7 @@ func (p *processorImpl) AdmittedLogEntry(
 ) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.mu.destroyed || state.ReplicaID != p.opts.ReplicaID {
+	if p.mu.destroyed {
 		return
 	}
 	admittedMayAdvance :=
@@ -919,8 +929,22 @@ func (p *processorImpl) AdmittedLogEntry(
 func (p *processorImpl) AdmitForEval(
 	ctx context.Context, pri admissionpb.WorkPriority, ct time.Time,
 ) (admitted bool, err error) {
-	// TODO(sumeer):
-	return false, nil
+	workClass := admissionpb.WorkClassFromPri(pri)
+	mode := kvflowcontrol.Mode.Get(&p.opts.Settings.SV)
+	bypass := mode == kvflowcontrol.ApplyToElastic && workClass == admissionpb.RegularWorkClass
+	if bypass {
+		return false, nil
+	}
+	var rc rac2.RangeController
+	func() {
+		p.mu.leader.rcReferenceUpdateMu.RLock()
+		defer p.mu.leader.rcReferenceUpdateMu.RUnlock()
+		rc = p.mu.leader.rc
+	}()
+	if rc == nil {
+		return false, nil
+	}
+	return p.mu.leader.rc.WaitForEval(ctx, pri)
 }
 
 func admittedIncreased(prev, next [raftpb.NumPriorities]uint64) bool {

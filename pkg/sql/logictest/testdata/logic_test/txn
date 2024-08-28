@@ -239,11 +239,11 @@ statement ok
 UPDATE kv SET v = 'b' WHERE k in ('a')
 
 onlyif config enterprise-configs
-skipif config local-read-committed
+skipif config weak-iso-level-configs
 statement error pgcode 25001 cannot change the isolation level of a running transaction
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED
 
-onlyif config local-read-committed
+onlyif config weak-iso-level-configs
 statement error pgcode 25001 cannot change the isolation level of a running transaction
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
 
@@ -257,11 +257,11 @@ statement ok
 SELECT * FROM kv LIMIT 1
 
 onlyif config enterprise-configs
-skipif config local-read-committed
+skipif config weak-iso-level-configs
 statement error pgcode 25001 cannot change the isolation level of a running transaction
 SET transaction_isolation = 'READ COMMITTED'
 
-onlyif config local-read-committed
+onlyif config weak-iso-level-configs
 statement error pgcode 25001 cannot change the isolation level of a running transaction
 SET transaction_isolation = 'SERIALIZABLE'
 
@@ -271,7 +271,11 @@ ROLLBACK
 statement ok
 SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = false
 
-# Transactions default to serializable when the read_committed cluster setting is off.
+statement ok
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = false
+
+# Transactions default to serializable when the read_committed and
+# repeatable_read cluster settings are off.
 
 statement ok
 BEGIN TRANSACTION
@@ -341,9 +345,9 @@ SHOW DEFAULT_TRANSACTION_ISOLATION
 ----
 serializable
 
-# SNAPSHOT can be used with a hidden cluster setting
+# REPEATABLE READ can be used with a hidden cluster setting.
 statement ok
-SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = true
 
 statement ok
 BEGIN
@@ -411,7 +415,7 @@ statement ok
 COMMIT
 
 statement ok
-SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = false
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = false
 
 statement ok
 SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true
@@ -759,7 +763,7 @@ statement ok
 COMMIT
 
 statement ok
-SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = true
 
 statement ok
 BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW
@@ -791,7 +795,7 @@ high
 statement ok
 COMMIT
 
-# With the snapshot_isolation.enabled cluster setting set to true,
+# With the repeatable_read_isolation.enabled cluster setting set to true,
 # REPEATABLE READ gets mapped to SNAPSHOT if there is a valid license.
 onlyif config enterprise-configs
 query T noticetrace
@@ -820,7 +824,7 @@ SHOW DEFAULT_TRANSACTION_ISOLATION
 serializable
 
 statement ok
-SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = false
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = false
 
 statement ok
 SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
@@ -922,9 +926,9 @@ SHOW default_transaction_isolation
 serializable
 
 statement ok
-SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = true
 
-# Since snapshot_isolation.enabled is true, setting isolation level to
+# Since repeatable_read_isolation.enabled is true, setting isolation level to
 # REPEATABLE READ should map to SNAPSHOT.
 statement ok
 SET default_transaction_isolation = 'repeatable read'
@@ -957,10 +961,10 @@ SHOW default_transaction_isolation
 serializable
 
 statement ok
-SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = false
+SET CLUSTER SETTING sql.txn.repeatable_read_isolation.enabled = false
 
-# Since snapshot_isolation.enabled is false, setting isolation level to SNAPSHOT
-# should map to SERIALIZABLE.
+# Since repeatable_read_isolation.enabled is false, setting isolation level to
+# SNAPSHOT should map to SERIALIZABLE.
 statement ok
 SET default_transaction_isolation = 'repeatable read'
 

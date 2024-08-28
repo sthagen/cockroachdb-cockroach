@@ -58,12 +58,12 @@ var elasticCPUDurationPerInternalLowPriRead = settings.RegisterDurationSetting(
 	settings.DurationInRange(admission.MinElasticCPUDuration, admission.MaxElasticCPUDuration),
 )
 
-// internalLowPriReadElasticControlEnabled determines whether internally
-// submitted low pri reads integrate with elastic CPU control.
-var internalLowPriReadElasticControlEnabled = settings.RegisterBoolSetting(
+// elasticAdmissionAllLowPri determines whether internally
+// submitted low bulk pri requests integrate with elastic CPU control.
+var elasticAdmissionAllLowPri = settings.RegisterBoolSetting(
 	settings.SystemOnly,
-	"kvadmission.low_pri_read_elastic_control.enabled",
-	"determines whether the internally submitted low priority reads integrate with elastic CPU control",
+	"kvadmission.elastic_control_bulk_low_priority.enabled",
+	"determines whether the all low bulk priority requests integrate with elastic CPU control",
 	true,
 )
 
@@ -399,14 +399,13 @@ func (n *controllerImpl) AdmitKVWork(
 		//   handed out through this mechanism, as a way to provide latency
 		//   isolation to non-elastic ("latency sensitive") work running on the
 		//   same machine.
-		// - We do the same for internally submitted low priority reads in
+		// - We do the same for internally submitted bulk low priority requests in
 		//   general (notably, for KV work done on the behalf of row-level TTL
-		//   reads). Everything admissionpb.UserLowPri and above uses the slots
-		//   mechanism.
-		isInternalLowPriRead := ba.IsReadOnly() && admissionInfo.Priority < admissionpb.UserLowPri
+		//   reads or other jobs). Everything admissionpb.UserLowPri and above uses
+		//   the slots mechanism.
 		shouldUseElasticCPU :=
 			(exportRequestElasticControlEnabled.Get(&n.settings.SV) && ba.IsSingleExportRequest()) ||
-				(internalLowPriReadElasticControlEnabled.Get(&n.settings.SV) && isInternalLowPriRead)
+				(admissionInfo.Priority <= admissionpb.BulkLowPri && elasticAdmissionAllLowPri.Get(&n.settings.SV))
 
 		if shouldUseElasticCPU {
 			var admitDuration time.Duration
@@ -660,9 +659,9 @@ var _ replica_rac2.ACWorkQueue = &controllerImpl{}
 
 // Admit implements replica_rac2.ACWorkQueue. It is only used for the RACv2 protocol.
 func (n *controllerImpl) Admit(ctx context.Context, entry replica_rac2.EntryForAdmission) bool {
-	storeAdmissionQ := n.storeGrantCoords.TryGetQueueForStore(entry.CallbackState.StoreID)
+	storeAdmissionQ := n.storeGrantCoords.TryGetQueueForStore(entry.StoreID)
 	if storeAdmissionQ == nil {
-		log.Errorf(ctx, "unable to find queue for store: %s", entry.CallbackState.StoreID)
+		log.Errorf(ctx, "unable to find queue for store: %s", entry.StoreID)
 		return false // nothing to do
 	}
 
@@ -678,8 +677,8 @@ func (n *controllerImpl) Admit(ctx context.Context, entry replica_rac2.EntryForA
 	}
 	wi.ReplicatedWorkInfo = admission.ReplicatedWorkInfo{
 		Enabled:    true,
-		RangeID:    entry.CallbackState.RangeID,
-		ReplicaID:  entry.CallbackState.ReplicaID,
+		RangeID:    entry.RangeID,
+		ReplicaID:  entry.ReplicaID,
 		LeaderTerm: entry.CallbackState.LeaderTerm,
 		LogPosition: admission.LogPosition{
 			Term:  0, // Ignored by callback in RACv2.

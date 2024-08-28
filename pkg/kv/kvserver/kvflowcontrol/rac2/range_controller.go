@@ -33,12 +33,18 @@ import (
 type RangeController interface {
 	// WaitForEval seeks admission to evaluate a request at the given priority.
 	// This blocks until there are positive tokens available for the request to
-	// be admitted for evaluation. Note the number of tokens required by the
-	// request is not considered, only the priority of the request, as the number
-	// of tokens is not known until eval.
+	// be admitted for evaluation, or the context is canceled (which returns an
+	// error). Note the number of tokens required by the request is not
+	// considered, only the priority of the request, as the number of tokens is
+	// not known until eval.
+	//
+	// In the non-error case, the waited return value is true if the
+	// RangeController was not closed during the execution of WaitForEval. If
+	// closed, a (false, nil) will be returned -- this is important for the
+	// caller to fall back to waiting on the local store.
 	//
 	// No mutexes should be held.
-	WaitForEval(ctx context.Context, pri admissionpb.WorkPriority) error
+	WaitForEval(ctx context.Context, pri admissionpb.WorkPriority) (waited bool, err error)
 	// HandleRaftEventRaftMuLocked handles the provided raft event for the range.
 	//
 	// Requires replica.raftMu to be held.
@@ -100,10 +106,28 @@ type FollowerStateInfo struct {
 	Admitted [raftpb.NumPriorities]uint64
 }
 
-// TODO(pav-kv): This struct is a placeholder for the interface or struct
-// containing raft entries. Replace this as part of #128019.
+// RaftEvent carries a RACv2-relevant subset of raft state sent to storage.
 type RaftEvent struct {
+	// Term is the leader term on whose behalf the entries or snapshot are
+	// written. Note that it may be behind the raft node's current term.
+	Term uint64
+	// Snap contains the snapshot to be written to storage.
+	Snap *raftpb.Snapshot
+	// Entries contains the log entries to be written to storage.
 	Entries []raftpb.Entry
+}
+
+// RaftEventFromMsgStorageAppend constructs a RaftEvent from the given raft
+// MsgStorageAppend message. Returns zero value if the message is empty.
+func RaftEventFromMsgStorageAppend(msg raftpb.Message) RaftEvent {
+	if msg.Type != raftpb.MsgStorageAppend {
+		return RaftEvent{}
+	}
+	return RaftEvent{
+		Term:    msg.LogTerm,
+		Snap:    msg.Snapshot,
+		Entries: msg.Entries,
+	}
 }
 
 // NoReplicaID is a special value of roachpb.ReplicaID, which can never be a
@@ -210,13 +234,15 @@ func NewRangeController(
 	return rc
 }
 
-// This blocks until there are positive tokens available for the request to
-// be admitted for evaluation. Note the number of tokens required by the
-// request is not considered, only the priority of the request, as the number
-// of tokens is not known until eval.
+// WaitForEval blocks until there are positive tokens available for the
+// request to be admitted for evaluation. Note the number of tokens required
+// by the request is not considered, only the priority of the request, as the
+// number of tokens is not known until eval.
 //
 // No mutexes should be held.
-func (rc *rangeController) WaitForEval(ctx context.Context, pri admissionpb.WorkPriority) error {
+func (rc *rangeController) WaitForEval(
+	ctx context.Context, pri admissionpb.WorkPriority,
+) (waited bool, err error) {
 	wc := admissionpb.WorkClassFromPri(pri)
 	waitForAllReplicateHandles := false
 	if wc == admissionpb.ElasticWorkClass {
@@ -234,7 +260,7 @@ retry:
 
 	if vssRefreshCh == nil {
 		// RangeControllerImpl is closed.
-		return nil
+		return false, nil
 	}
 	for _, vs := range vss {
 		quorumCount := (len(vs) + 2) / 2
@@ -270,13 +296,13 @@ retry:
 			case WaitSuccess:
 				continue
 			case ContextCanceled:
-				return ctx.Err()
+				return false, ctx.Err()
 			case RefreshWaitSignaled:
 				goto retry
 			}
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // HandleRaftEventRaftMuLocked handles the provided raft event for the range.

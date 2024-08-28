@@ -228,6 +228,11 @@ const (
 	// to the system tenant.
 	V24_3_TableMetadata
 
+	// V24_3_TenantExcludeDataFromBackup is the migration to add
+	// `exclude_data_from_backup` on certain system tables with low GC
+	// TTL to mirror the behaviour on the system tenant.
+	V24_3_TenantExcludeDataFromBackup
+
 	// *************************************************
 	// Step (1) Add new versions above this comment.
 	// Do not add new versions to a patch release.
@@ -276,9 +281,10 @@ var versionTable = [numKeys]roachpb.Version{
 	// v24.3 versions. Internal versions must be even.
 	V24_3_Start: {Major: 24, Minor: 2, Internal: 2},
 
-	V24_3_StoreLivenessEnabled:    {Major: 24, Minor: 2, Internal: 4},
-	V24_3_AddTimeseriesZoneConfig: {Major: 24, Minor: 2, Internal: 6},
-	V24_3_TableMetadata:           {Major: 24, Minor: 2, Internal: 8},
+	V24_3_StoreLivenessEnabled:        {Major: 24, Minor: 2, Internal: 4},
+	V24_3_AddTimeseriesZoneConfig:     {Major: 24, Minor: 2, Internal: 6},
+	V24_3_TableMetadata:               {Major: 24, Minor: 2, Internal: 8},
+	V24_3_TenantExcludeDataFromBackup: {Major: 24, Minor: 2, Internal: 10},
 
 	// *************************************************
 	// Step (2): Add new versions above this comment.
@@ -330,16 +336,6 @@ const finalVersion Key = -1
 func (k Key) Version() roachpb.Version {
 	version := versionTable[k]
 	return maybeApplyDevOffset(k, version)
-}
-
-// FenceVersion is the fence version -- the internal immediately prior -- for
-// the named version, if it is Internal.
-func (k Key) FenceVersion() roachpb.Version {
-	v := k.Version()
-	if v.Internal > 0 {
-		v.Internal -= 1
-	}
-	return v
 }
 
 // IsFinal returns true if the key corresponds to a final version (as opposed to

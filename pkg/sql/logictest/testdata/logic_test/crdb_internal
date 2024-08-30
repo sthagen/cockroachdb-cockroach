@@ -47,6 +47,7 @@ crdb_internal  databases                                    table  node  NULL  N
 crdb_internal  default_privileges                           table  node  NULL  NULL
 crdb_internal  feature_usage                                table  node  NULL  NULL
 crdb_internal  forward_dependencies                         table  node  NULL  NULL
+crdb_internal  fully_qualified_names                        view   node  NULL  NULL
 crdb_internal  gossip_alerts                                table  node  NULL  NULL
 crdb_internal  gossip_liveness                              table  node  NULL  NULL
 crdb_internal  gossip_network                               table  node  NULL  NULL
@@ -1707,5 +1708,38 @@ user root
 
 statement ok
 REVOKE SYSTEM VIEWCLUSTERMETADATA FROM testuser
+
+subtest end
+
+subtest test_crdb_internal_table_spans
+
+statement ok
+CREATE DATABASE test_table_spans;
+USE test_table_spans;
+
+statement ok
+CREATE TABLE foo (a INT PRIMARY KEY, INDEX idx(a)); INSERT INTO foo VALUES(1);
+
+statement ok
+CREATE TABLE bar (a INT PRIMARY KEY, INDEX idx(a));
+
+query TB rowsort
+SELECT name, dropped  
+FROM "".crdb_internal.table_spans s JOIN "".crdb_internal.tables t ON s.descriptor_id = t.table_id 
+WHERE t.database_name = 'test_table_spans';
+----
+foo    false
+bar    false
+
+statement ok
+DROP TABLE bar
+
+query TB rowsort
+SELECT name, dropped  
+FROM "".crdb_internal.table_spans s JOIN "".crdb_internal.tables t ON s.descriptor_id = t.table_id 
+WHERE t.database_name = 'test_table_spans';
+----
+foo    false
+bar    true
 
 subtest end

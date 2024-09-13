@@ -242,6 +242,8 @@
 <tr><td>STORAGE</td><td>kv.rangefeed.budget_allocation_blocked</td><td>Number of times RangeFeed waited for budget availability</td><td>Events</td><td>COUNTER</td><td>COUNT</td><td>AVG</td><td>NON_NEGATIVE_DERIVATIVE</td></tr>
 <tr><td>STORAGE</td><td>kv.rangefeed.budget_allocation_failed</td><td>Number of times RangeFeed failed because memory budget was exceeded</td><td>Events</td><td>COUNTER</td><td>COUNT</td><td>AVG</td><td>NON_NEGATIVE_DERIVATIVE</td></tr>
 <tr><td>STORAGE</td><td>kv.rangefeed.catchup_scan_nanos</td><td>Time spent in RangeFeed catchup scan</td><td>Nanoseconds</td><td>COUNTER</td><td>NANOSECONDS</td><td>AVG</td><td>NON_NEGATIVE_DERIVATIVE</td></tr>
+<tr><td>STORAGE</td><td>kv.rangefeed.closed_timestamp.slow_ranges</td><td>Number of ranges that have a closed timestamp lagging by more than 5x target lag. Periodically re-calculated</td><td>Ranges</td><td>GAUGE</td><td>COUNT</td><td>AVG</td><td>NONE</td></tr>
+<tr><td>STORAGE</td><td>kv.rangefeed.closed_timestamp_max_behind_nanos</td><td>Largest latency between realtime and replica max closed timestamp for replicas that have active rangeeds on them</td><td>Nanoseconds</td><td>GAUGE</td><td>NANOSECONDS</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>STORAGE</td><td>kv.rangefeed.mem_shared</td><td>Memory usage by rangefeeds</td><td>Memory</td><td>GAUGE</td><td>BYTES</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>STORAGE</td><td>kv.rangefeed.mem_system</td><td>Memory usage by rangefeeds on system ranges</td><td>Memory</td><td>GAUGE</td><td>BYTES</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>STORAGE</td><td>kv.rangefeed.processors_goroutine</td><td>Number of active RangeFeed processors using goroutines</td><td>Processors</td><td>GAUGE</td><td>COUNT</td><td>AVG</td><td>NONE</td></tr>
@@ -869,6 +871,8 @@
 <tr><td>APPLICATION</td><td>changefeed.max_behind_nanos</td><td>(Deprecated in favor of checkpoint_progress) The most any changefeed&#39;s persisted checkpoint is behind the present</td><td>Nanoseconds</td><td>GAUGE</td><td>NANOSECONDS</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>APPLICATION</td><td>changefeed.message_size_hist</td><td>Message size histogram</td><td>Bytes</td><td>HISTOGRAM</td><td>BYTES</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>APPLICATION</td><td>changefeed.messages.messages_pushback_nanos</td><td>Total time spent throttled for messages quota</td><td>Nanoseconds</td><td>COUNTER</td><td>NANOSECONDS</td><td>AVG</td><td>NON_NEGATIVE_DERIVATIVE</td></tr>
+<tr><td>APPLICATION</td><td>changefeed.network.bytes_in</td><td>The number of bytes received from the network by changefeeds</td><td>Bytes</td><td>COUNTER</td><td>COUNT</td><td>AVG</td><td>NON_NEGATIVE_DERIVATIVE</td></tr>
+<tr><td>APPLICATION</td><td>changefeed.network.bytes_out</td><td>The number of bytes sent over the network by changefeeds</td><td>Bytes</td><td>COUNTER</td><td>COUNT</td><td>AVG</td><td>NON_NEGATIVE_DERIVATIVE</td></tr>
 <tr><td>APPLICATION</td><td>changefeed.nprocs_consume_event_nanos</td><td>Total time spent waiting to add an event to the parallel consumer</td><td>Nanoseconds</td><td>HISTOGRAM</td><td>NANOSECONDS</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>APPLICATION</td><td>changefeed.nprocs_flush_nanos</td><td>Total time spent idle waiting for the parallel consumer to flush</td><td>Nanoseconds</td><td>HISTOGRAM</td><td>NANOSECONDS</td><td>AVG</td><td>NONE</td></tr>
 <tr><td>APPLICATION</td><td>changefeed.nprocs_in_flight_count</td><td>Number of buffered events in the parallel consumer</td><td>Count of Events</td><td>GAUGE</td><td>COUNT</td><td>AVG</td><td>NONE</td></tr>

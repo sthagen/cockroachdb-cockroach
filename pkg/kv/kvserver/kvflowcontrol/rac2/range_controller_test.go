@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/datadriven"
+	"github.com/gogo/protobuf/jsonpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -239,7 +240,6 @@ func (s *testingRCState) getOrInitRange(r testingRange) *testingRCRange {
 			RaftInterface:       testRC,
 			Clock:               s.clock,
 			CloseTimerScheduler: s.probeToCloseScheduler,
-			AdmittedTracker:     testRC,
 			EvalWaitMetrics:     s.evalMetrics,
 		}
 
@@ -284,17 +284,6 @@ func (r *testingRCRange) FollowerStateRaftMuLocked(replicaID roachpb.ReplicaID) 
 	return replica.info
 }
 
-func (r *testingRCRange) GetAdmitted(replicaID roachpb.ReplicaID) AdmittedVector {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	replica, ok := r.mu.r.replicaSet[replicaID]
-	if !ok {
-		return AdmittedVector{}
-	}
-	return replica.av
-}
-
 func (r *testingRCRange) startWaitForEval(name string, pri admissionpb.WorkPriority) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -319,29 +308,15 @@ func (r *testingRCRange) startWaitForEval(name string, pri admissionpb.WorkPrior
 	}()
 }
 
-func (r *testingRCRange) admit(
-	ctx context.Context,
-	t *testing.T,
-	storeID roachpb.StoreID,
-	term uint64,
-	toIndex uint64,
-	pri admissionpb.WorkPriority,
-) {
+func (r *testingRCRange) admit(ctx context.Context, storeID roachpb.StoreID, av AdmittedVector) {
 	r.mu.Lock()
-
+	defer r.mu.Unlock()
 	for _, replica := range r.mu.r.replicaSet {
 		if replica.desc.StoreID == storeID {
-			replica := replica
-			replica.av.Admitted[AdmissionToRaftPriority(pri)] = toIndex
-			replica.av.Term = term
-			r.mu.r.replicaSet[replica.desc.ReplicaID] = replica
-			break
+			r.rc.AdmitRaftMuLocked(ctx, replica.desc.ReplicaID, av)
+			return
 		}
 	}
-
-	r.mu.Unlock()
-	// Send an empty raft event in order to trigger potential token return.
-	require.NoError(t, r.rc.HandleRaftEventRaftMuLocked(ctx, RaftEvent{}))
 }
 
 type testingRange struct {
@@ -364,7 +339,6 @@ const invalidTrackerState = tracker.StateSnapshot + 1
 type testingReplica struct {
 	desc roachpb.ReplicaDescriptor
 	info FollowerStateInfo
-	av   AdmittedVector
 }
 
 func scanRanges(t *testing.T, input string) []testingRange {
@@ -627,10 +601,22 @@ func (t *testingProbeToCloseTimerScheduler) ScheduleSendStreamCloseRaftMuLocked(
 //     range_id=<range_id>
 //
 //   - metrics: Prints the current state of the eval metrics.
+//
+//   - inspect: Prints the result of an Inspect() call to the RangeController
+//     for a range.
+//     range_id=<range_id>
 func TestRangeController(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
+
+	// Used to marshal the output of the Inspect() method into a human-readable
+	// formatted JSON string. See case "inspect" below.
+	marshaller := jsonpb.Marshaler{
+		Indent:       "  ",
+		EmitDefaults: true,
+		OrigName:     true,
+	}
 
 	datadriven.Walk(t, datapathutils.TestDataPath(t, "range_controller"), func(t *testing.T, path string) {
 		state := &testingRCState{}
@@ -825,7 +811,10 @@ func TestRangeController(t *testing.T) {
 						require.True(t, strings.HasPrefix(parts[3], "pri="))
 						parts[3] = strings.TrimPrefix(strings.TrimSpace(parts[3]), "pri=")
 						pri := parsePriority(t, parts[3])
-						state.ranges[lastRangeID].admit(ctx, t, roachpb.StoreID(storeID), uint64(term), uint64(to_index), pri)
+
+						av := AdmittedVector{Term: uint64(term)}
+						av.Admitted[AdmissionToRaftPriority(pri)] = uint64(to_index)
+						state.ranges[lastRangeID].admit(ctx, roachpb.StoreID(storeID), av)
 					}
 				}
 				return state.tokenCountsString()
@@ -932,6 +921,14 @@ func TestRangeController(t *testing.T) {
 						testingFirst(evalMetrics.Duration[wc].CumulativeSnapshot().Total()))
 				}
 				return buf.String()
+
+			case "inspect":
+				var rangeID int
+				d.ScanArgs(t, "range_id", &rangeID)
+				handle := state.ranges[roachpb.RangeID(rangeID)].rc.InspectRaftMuLocked(ctx)
+				marshaled, err := marshaller.MarshalToString(&handle)
+				require.NoError(t, err)
+				return fmt.Sprintf("%v", marshaled)
 
 			default:
 				panic(fmt.Sprintf("unknown command: %s", d.Cmd))

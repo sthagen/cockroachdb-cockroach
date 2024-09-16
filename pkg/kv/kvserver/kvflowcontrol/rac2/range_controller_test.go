@@ -11,8 +11,10 @@
 package rac2
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -232,6 +234,8 @@ func (s *testingRCState) getOrInitRange(t *testing.T, r testingRange) *testingRC
 		testRC = &testingRCRange{}
 		testRC.mu.r = r
 		testRC.mu.evals = make(map[string]*testingRCEval)
+		testRC.mu.outstandingReturns = make(map[roachpb.ReplicaID]kvflowcontrol.Tokens)
+		testRC.mu.quorumPosition = kvflowcontrolpb.RaftLogPosition{Term: 1, Index: 0}
 		options := RangeControllerOptions{
 			RangeID:             r.rangeID,
 			TenantID:            r.tenantID,
@@ -268,10 +272,23 @@ type testingRCEval struct {
 
 type testingRCRange struct {
 	rc *rangeController
+	// snapshots contain snapshots of the tracker state for different replicas,
+	// at various points in time. It is used in TestUsingSimulation.
+	snapshots []testingTrackerSnapshot
 
 	mu struct {
 		syncutil.Mutex
-		r     testingRange
+		r testingRange
+		// outstandingReturns is used in TestUsingSimulation to track token
+		// returns. Likewise, for quorumPosition. It is not used in
+		// TestRangeController.
+		outstandingReturns map[roachpb.ReplicaID]kvflowcontrol.Tokens
+		quorumPosition     kvflowcontrolpb.RaftLogPosition
+		// evals is used in TestRangeController for WaitForEval goroutine
+		// callbacks. It is not used in TestUsingSimulation, as the simulation test
+		// requires determinism on a smaller timescale than calling WaitForEval via
+		// multiple goroutines would allow. See testingNonBlockingAdmit to see how
+		// WaitForEval is done in simulation tests.
 		evals map[string]*testingRCEval
 	}
 }
@@ -327,6 +344,29 @@ type testingRange struct {
 	tenantID       roachpb.TenantID
 	localReplicaID roachpb.ReplicaID
 	replicaSet     map[roachpb.ReplicaID]testingReplica
+}
+
+func makeSingleVoterTestingRange(
+	rangeID roachpb.RangeID,
+	tenantID roachpb.TenantID,
+	localNodeID roachpb.NodeID,
+	localStoreID roachpb.StoreID,
+) testingRange {
+	return testingRange{
+		rangeID:        rangeID,
+		tenantID:       tenantID,
+		localReplicaID: 1,
+		replicaSet: map[roachpb.ReplicaID]testingReplica{
+			1: {
+				desc: roachpb.ReplicaDescriptor{
+					NodeID:    localNodeID,
+					StoreID:   localStoreID,
+					ReplicaID: 1,
+					Type:      roachpb.VOTER_FULL,
+				},
+			},
+		},
+	}
 }
 
 func (t testingRange) replicas() ReplicaSet {
@@ -588,12 +628,13 @@ func (t *testingProbeToCloseTimerScheduler) ScheduleSendStreamCloseRaftMuLocked(
 //
 //   - close_rcs: Closes all range controllers.
 //
-//   - admit: Admits the given store to the given range.
+//   - admit: Admits up to to_index for the given store, part of the given
+//     range.
 //     range_id=<range_id>
 //     store_id=<store_id> term=<term> to_index=<to_index> pri=<pri>
 //     ...
 //
-//   - raft_event: Simulates a raft event on the given rangeStateProbe, calling
+//   - raft_event: Simulates a raft event on the given range, calling
 //     HandleRaftEvent.
 //     range_id=<range_id>
 //     term=<term> index=<index> pri=<pri> size=<size>
@@ -1051,4 +1092,81 @@ func testingFirst(args ...interface{}) interface{} {
 		return args[0]
 	}
 	return nil
+}
+
+func TestRaftEventFromMsgStorageAppendAndMsgAppsBasic(t *testing.T) {
+	// raftpb.Entry and raftpb.Message are only partially populated below, which
+	// could be improved in the future.
+	appendMsg := raftpb.Message{
+		Type:     raftpb.MsgStorageAppend,
+		LogTerm:  10,
+		Snapshot: &raftpb.Snapshot{},
+		Entries: []raftpb.Entry{
+			{
+				Term: 9,
+			},
+		},
+	}
+	outboundMsgs := []raftpb.Message{
+		{
+			Type: raftpb.MsgApp,
+			To:   20,
+			Entries: []raftpb.Entry{
+				{
+					Term: 9,
+				},
+			},
+		},
+		{
+			Type: raftpb.MsgBeat,
+			To:   22,
+		},
+		{
+			Type: raftpb.MsgApp,
+			To:   21,
+		},
+		{
+			Type: raftpb.MsgApp,
+			To:   20,
+			Entries: []raftpb.Entry{
+				{
+					Term: 10,
+				},
+			},
+		},
+	}
+	msgAppScratch := map[roachpb.ReplicaID][]raftpb.Message{}
+
+	// No outbound msgs.
+	event := RaftEventFromMsgStorageAppendAndMsgApps(20, appendMsg, nil, msgAppScratch)
+	require.Equal(t, uint64(10), event.Term)
+	require.Equal(t, appendMsg.Snapshot, event.Snap)
+	require.Equal(t, appendMsg.Entries, event.Entries)
+	require.Nil(t, event.MsgApps)
+	// Zero value.
+	event = RaftEventFromMsgStorageAppendAndMsgApps(20, raftpb.Message{}, nil, msgAppScratch)
+	require.Equal(t, RaftEvent{}, event)
+	// Outbound msgs contains no MsgApps for a follower, since the only MsgApp
+	// is for the leader.
+	event = RaftEventFromMsgStorageAppendAndMsgApps(20, appendMsg, outboundMsgs[:2], msgAppScratch)
+	require.Equal(t, uint64(10), event.Term)
+	require.Equal(t, appendMsg.Snapshot, event.Snap)
+	require.Equal(t, appendMsg.Entries, event.Entries)
+	require.Nil(t, event.MsgApps)
+	// Outbound msgs contains MsgApps for followers. We call this twice to
+	// ensure msgAppScratch is cleared before reuse.
+	for i := 0; i < 2; i++ {
+		event = RaftEventFromMsgStorageAppendAndMsgApps(19, appendMsg, outboundMsgs, msgAppScratch)
+		require.Equal(t, uint64(10), event.Term)
+		require.Equal(t, appendMsg.Snapshot, event.Snap)
+		require.Equal(t, appendMsg.Entries, event.Entries)
+		var msgApps []raftpb.Message
+		for _, v := range msgAppScratch {
+			msgApps = append(msgApps, v...)
+		}
+		slices.SortStableFunc(msgApps, func(a, b raftpb.Message) int {
+			return cmp.Compare(a.To, b.To)
+		})
+		require.Equal(t, []raftpb.Message{outboundMsgs[0], outboundMsgs[3], outboundMsgs[2]}, msgApps)
+	}
 }

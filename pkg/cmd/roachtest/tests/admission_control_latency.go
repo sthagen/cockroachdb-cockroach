@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -201,16 +203,16 @@ func registerLatencyTests(r registry.Registry) {
 	// NB: If these tests fail because they are flaky, increase the numbers
 	// until they pass. Additionally add the seed (from the log) that caused
 	// them to fail as a comment in the test.
-	addMetamorphic(r, restart{}, 1000)
-	addMetamorphic(r, partition{}, 1000)
+	addMetamorphic(r, restart{}, math.Inf(1))
+	addMetamorphic(r, partition{}, math.Inf(1))
 	addMetamorphic(r, addNode{}, 2.0)
 	addMetamorphic(r, decommission{}, 2.0)
 	addMetamorphic(r, backfill{}, 20.0)
 
 	// NB: If these tests fail, it likely signals a regression. Investigate the
 	// history of the test on roachperf to see what changed.
-	addFull(r, restart{}, 1000)
-	addFull(r, partition{}, 1000)
+	addFull(r, restart{}, math.Inf(1))
+	addFull(r, partition{}, math.Inf(1))
 	addFull(r, addNode{}, 2.0)
 	addFull(r, decommission{}, 2.0)
 	addFull(r, backfill{}, 20.0)
@@ -677,7 +679,7 @@ func (v variations) runTest(ctx context.Context, t test.Test, c cluster.Cluster)
 		// Wait for the first 3/4 of the duration and then measure the QPS in
 		// the last 1/4.
 		waitDuration(ctx, v.fillDuration*3/4)
-		clusterMaxRate <- v.measureQPS(ctx, t.L(), v.fillDuration*1/4)
+		clusterMaxRate <- v.measureQPS(ctx, t, t.L(), v.fillDuration*1/4)
 		return nil
 	})
 	// Start filling the system without a rate.
@@ -731,7 +733,8 @@ func (v variations) runTest(ctx context.Context, t test.Test, c cluster.Cluster)
 	t.Status("T5: validating results")
 	require.NoError(t, downloadProfiles(ctx, c, t.L(), t.ArtifactsDir()))
 
-	require.NoError(t, v.writePerfArtifacts(ctx, t.Name(), t.ArtifactsDir(), baselineStats, perturbationStats, afterStats))
+	require.NoError(t, v.writePerfArtifacts(ctx, t.Name(), t.PerfArtifactsDir(), baselineStats, perturbationStats,
+		afterStats))
 
 	t.L().Printf("validating stats during the perturbation")
 	duringOK := isAcceptableChange(t.L(), baselineStats, perturbationStats, v.acceptableChange)
@@ -896,7 +899,9 @@ func (v variations) targetNodes() option.NodeListOption {
 // duration is the interval to measure over. Setting too short of an interval
 // can mean inaccuracy in results. Setting too long of an interval may mean the
 // impact is blurred out.
-func (v variations) measureQPS(ctx context.Context, l *logger.Logger, duration time.Duration) int {
+func (v variations) measureQPS(
+	ctx context.Context, t test.Test, l *logger.Logger, duration time.Duration,
+) int {
 	stableNodes := v.stableNodes()
 
 	totalOpsCompleted := func() int {
@@ -907,25 +912,27 @@ func (v variations) measureQPS(ctx context.Context, l *logger.Logger, duration t
 			defer db.Close()
 			dbs = append(dbs, db)
 		}
-		rates := make(chan int, len(dbs))
 		// Count the inserts before sleeping.
+		var total int64
+		group := ctxgroup.WithContext(ctx)
 		for _, db := range dbs {
-			db := db
-			go func() {
+			group.Go(func() error {
 				var v float64
 				if err := db.QueryRowContext(
 					ctx, `SELECT sum(value) FROM crdb_internal.node_metrics WHERE name in ('sql.select.count', 'sql.insert.count')`,
 				).Scan(&v); err != nil {
-					panic(err)
+					return err
 				}
-				rates <- int(v)
-			}()
+				atomic.AddInt64(&total, int64(v))
+				return nil
+			})
 		}
-		var total int
-		for range dbs {
-			total += <-rates
+
+		if err := group.Wait(); err != nil {
+			t.Fatal(err)
 		}
-		return total
+
+		return int(total)
 	}
 
 	// Measure the current time and the QPS now.

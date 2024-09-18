@@ -39,17 +39,21 @@ type Replica interface {
 	RaftMuAssertHeld()
 	// MuAssertHeld asserts that Replica.mu is held.
 	MuAssertHeld()
-	// MuLock acquires Replica.mu.
-	MuLock()
-	// MuUnlock releases Replica.mu.
-	MuUnlock()
-	// LeaseholderMuLocked returns the Replica's current knowledge of the
+	// MuRLock acquires Replica.mu for reads.
+	MuRLock()
+	// MuRUnlock releases the Replica.mu read lock.
+	MuRUnlock()
+	// LeaseholderMuRLocked returns the Replica's current knowledge of the
 	// leaseholder, which can be stale. It is only called after Processor
 	// knows the Replica is initialized.
 	//
-	// At least Replica mu is held. The caller does not make any claims about
-	// whether it holds raftMu or not.
-	LeaseholderMuLocked() roachpb.ReplicaID
+	// Replica mu is held for reads or writes. The caller does not make any claims
+	// about whether it holds raftMu or not.
+	LeaseholderMuRLocked() roachpb.ReplicaID
+	// IsScratchRange returns true if this is range is a scratch range (i.e.
+	// overlaps with the scratch span and has a start key <=
+	// keys.ScratchRangeMin).
+	IsScratchRange() bool
 }
 
 // RaftScheduler abstracts kvserver.raftScheduler.
@@ -213,6 +217,7 @@ type ProcessorOptions struct {
 	EvalWaitMetrics        *rac2.EvalWaitMetrics
 
 	EnabledWhenLeaderLevel EnabledWhenLeaderLevel
+	Knobs                  *kvflowcontrol.TestingKnobs
 }
 
 // SideChannelInfoUsingRaftMessageRequest is used to provide a follower
@@ -557,8 +562,8 @@ func (p *processorImpl) SetEnabledWhenLeaderRaftMuLocked(
 	var term uint64
 	var nextUnstableIndex uint64
 	func() {
-		p.opts.Replica.MuLock()
-		defer p.opts.Replica.MuUnlock()
+		p.opts.Replica.MuRLock()
+		defer p.opts.Replica.MuRUnlock()
 		leaderID = p.replMu.raftNode.LeaderLocked()
 		if leaderID == p.opts.ReplicaID {
 			term = p.replMu.raftNode.TermLocked()
@@ -780,11 +785,11 @@ func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, e rac2.
 	var leaderID, leaseholderID roachpb.ReplicaID
 	var term uint64
 	func() {
-		p.opts.Replica.MuLock()
-		defer p.opts.Replica.MuUnlock()
+		p.opts.Replica.MuRLock()
+		defer p.opts.Replica.MuRUnlock()
 		nextUnstableIndex = p.replMu.raftNode.NextUnstableIndexLocked()
 		leaderID = p.replMu.raftNode.LeaderLocked()
-		leaseholderID = p.opts.Replica.LeaseholderMuLocked()
+		leaseholderID = p.opts.Replica.LeaseholderMuRLocked()
 		term = p.replMu.raftNode.TermLocked()
 	}()
 	if len(e.Entries) > 0 {
@@ -800,8 +805,11 @@ func (p *processorImpl) HandleRaftReadyRaftMuLocked(ctx context.Context, e rac2.
 	// our admitted vector is likely consistent with the latest leader term.
 	p.maybeSendAdmittedRaftMuLocked(ctx)
 	if rc := p.leader.rc; rc != nil {
-		if err := rc.HandleRaftEventRaftMuLocked(ctx, e); err != nil {
-			log.Errorf(ctx, "error handling raft event: %v", err)
+		if knobs := p.opts.Knobs; knobs == nil || !knobs.UseOnlyForScratchRanges ||
+			p.opts.Replica.IsScratchRange() {
+			if err := rc.HandleRaftEventRaftMuLocked(ctx, e); err != nil {
+				log.Errorf(ctx, "error handling raft event: %v", err)
+			}
 		}
 	}
 }
@@ -1141,6 +1149,7 @@ type RangeControllerFactoryImpl struct {
 	evalWaitMetrics            *rac2.EvalWaitMetrics
 	streamTokenCounterProvider *rac2.StreamTokenCounterProvider
 	closeTimerScheduler        rac2.ProbeToCloseTimerScheduler
+	knobs                      *kvflowcontrol.TestingKnobs
 }
 
 func NewRangeControllerFactoryImpl(
@@ -1148,12 +1157,14 @@ func NewRangeControllerFactoryImpl(
 	evalWaitMetrics *rac2.EvalWaitMetrics,
 	streamTokenCounterProvider *rac2.StreamTokenCounterProvider,
 	closeTimerScheduler rac2.ProbeToCloseTimerScheduler,
+	knobs *kvflowcontrol.TestingKnobs,
 ) RangeControllerFactoryImpl {
 	return RangeControllerFactoryImpl{
 		clock:                      clock,
 		evalWaitMetrics:            evalWaitMetrics,
 		streamTokenCounterProvider: streamTokenCounterProvider,
 		closeTimerScheduler:        closeTimerScheduler,
+		knobs:                      knobs,
 	}
 }
 
@@ -1172,6 +1183,7 @@ func (f RangeControllerFactoryImpl) New(
 			Clock:               f.clock,
 			CloseTimerScheduler: f.closeTimerScheduler,
 			EvalWaitMetrics:     f.evalWaitMetrics,
+			Knobs:               f.knobs,
 		},
 		rac2.RangeControllerInitState{
 			ReplicaSet:  state.replicaSet,

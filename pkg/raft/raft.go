@@ -260,13 +260,6 @@ type Config struct {
 	// See: https://github.com/etcd-io/raft/issues/80
 	DisableConfChangeValidation bool
 
-	// StepDownOnRemoval makes the leader step down when it is removed from the
-	// group or demoted to a learner.
-	//
-	// This behavior will become unconditional in the future. See:
-	// https://github.com/etcd-io/raft/issues/83
-	StepDownOnRemoval bool
-
 	// StoreLiveness is a reference to the store liveness fabric.
 	StoreLiveness raftstoreliveness.StoreLiveness
 
@@ -428,7 +421,6 @@ type raft struct {
 	// when raft changes its state to follower or candidate.
 	randomizedElectionTimeout int
 	disableProposalForwarding bool
-	stepDownOnRemoval         bool
 
 	tick func()
 	step stepFunc
@@ -464,7 +456,6 @@ func newRaft(c *Config) *raft {
 		preVote:                     c.PreVote,
 		disableProposalForwarding:   c.DisableProposalForwarding,
 		disableConfChangeValidation: c.DisableConfChangeValidation,
-		stepDownOnRemoval:           c.StepDownOnRemoval,
 		storeLiveness:               c.StoreLiveness,
 		crdbVersion:                 c.CRDBVersion,
 	}
@@ -639,7 +630,7 @@ func (r *raft) maybeSendAppend(to pb.PeerID) bool {
 
 	var entries []pb.Entry
 	if pr.CanSendEntries(last) {
-		if entries, err = r.raftLog.entries(pr.Next, r.maxMsgSize); err != nil {
+		if entries, err = r.raftLog.entries(prevIndex, r.maxMsgSize); err != nil {
 			// Send a snapshot if we failed to get the entries.
 			return r.maybeSendSnapshot(to, pr)
 		}
@@ -670,11 +661,7 @@ func (r *raft) maybeSendSnapshot(to pb.PeerID, pr *tracker.Progress) bool {
 
 	snapshot, err := r.raftLog.snapshot()
 	if err != nil {
-		if err == ErrSnapshotTemporarilyUnavailable {
-			r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
-			return false
-		}
-		panic(err) // TODO(bdarnell)
+		panic(err) // TODO(pav-kv): handle storage errors uniformly.
 	}
 	if IsEmptySnap(snapshot) {
 		panic("need non-empty snapshot")
@@ -1141,7 +1128,7 @@ func (r *raft) hasUnappliedConfChanges() bool {
 	found := false
 	// Scan all unapplied committed entries to find a config change. Paginate the
 	// scan, to avoid a potentially unlimited memory spike.
-	lo, hi := r.raftLog.applied+1, r.raftLog.committed+1
+	lo, hi := r.raftLog.applied, r.raftLog.committed
 	// Reuse the maxApplyingEntsSize limit because it is used for similar purposes
 	// (limiting the read of unapplied committed entries) when raft sends entries
 	// via the Ready struct for application.
@@ -1157,7 +1144,7 @@ func (r *raft) hasUnappliedConfChanges() bool {
 		}
 		return nil
 	}); err != nil && err != errBreak {
-		r.logger.Panicf("error scanning unapplied entries [%d, %d): %v", lo, hi, err)
+		r.logger.Panicf("error scanning unapplied entries (%d, %d]: %v", lo, hi, err)
 	}
 	return found
 }
@@ -2276,7 +2263,7 @@ func (r *raft) switchToConfig(cfg quorum.Config, progressMap tracker.ProgressMap
 	r.isLearner = pr != nil && pr.IsLearner
 
 	if (pr == nil || r.isLearner) && r.state == StateLeader {
-		// This node is leader and was removed or demoted, step down if requested.
+		// This node is leader and was removed or demoted, step down.
 		//
 		// We prevent demotions at the time writing but hypothetically we handle
 		// them the same way as removing the leader.
@@ -2284,11 +2271,10 @@ func (r *raft) switchToConfig(cfg quorum.Config, progressMap tracker.ProgressMap
 		// TODO(tbg): ask follower with largest Match to TimeoutNow (to avoid
 		// interruption). This might still drop some proposals but it's better than
 		// nothing.
-		if r.stepDownOnRemoval {
-			// NB: Similar to the CheckQuorum step down case, we must remember our
-			// prior stint as leader, lest we regress the QSE.
-			r.becomeFollower(r.Term, r.lead)
-		}
+		//
+		// NB: Similar to the CheckQuorum step down case, we must remember our
+		// prior stint as leader, lest we regress the QSE.
+		r.becomeFollower(r.Term, r.lead)
 		return cs
 	}
 

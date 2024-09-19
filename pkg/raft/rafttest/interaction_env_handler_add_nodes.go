@@ -65,8 +65,6 @@ func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) e
 				arg.Scan(t, i, &cfg.MaxCommittedSizePerReady)
 			case "disable-conf-change-validation":
 				arg.Scan(t, i, &cfg.DisableConfChangeValidation)
-			case "step-down-on-removal":
-				arg.Scan(t, i, &cfg.StepDownOnRemoval)
 			case "crdb-version":
 				var key string
 				arg.Scan(t, i, &key)
@@ -127,10 +125,7 @@ func (env *InteractionEnv) AddNodes(n int, cfg raft.Config, snap pb.Snapshot) er
 			if err := s.ApplySnapshot(snap); err != nil {
 				return err
 			}
-			fi, err := s.FirstIndex()
-			if err != nil {
-				return err
-			}
+			fi := s.FirstIndex()
 			// At the time of writing and for *MemoryStorage, applying a
 			// snapshot also truncates appropriately, but this would change with
 			// other storage engines potentially.

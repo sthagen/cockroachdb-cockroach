@@ -8,18 +8,23 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+import { Moment } from "moment-timezone";
+
 import { NodeID } from "src/types/clusterTypes";
 
-export type DatabaseRow = {
+export type TableRow = {
+  qualifiedNameWithSchema: string;
   name: string;
-  id: number;
-  approximateDiskSizeBytes: number;
-  tableCount: number;
+  dbName: string;
+  dbID: number;
+  replicationSizeBytes: number;
   rangeCount: number;
-  nodesByRegion: {
-    isLoading: boolean;
-    data: Record<string, NodeID[]>;
-  };
-  schemaInsightsCount: number;
+  columnCount: number;
+  nodesByRegion: Record<string, NodeID[]>;
+  liveDataPercentage: number;
+  liveDataBytes: number;
+  totalDataBytes: number;
+  autoStatsCollectionEnabled: boolean;
+  statsLastUpdated: Moment;
   key: string;
 };

@@ -654,6 +654,16 @@ def go_deps():
         ],
     )
     go_repository(
+        name = "com_github_aws_aws_sdk_go_v2_service_kafka",
+        build_file_proto_mode = "disable_global",
+        importpath = "github.com/aws/aws-sdk-go-v2/service/kafka",
+        sha256 = "6bcabd3e2d2abad2e21d01ee0a43a80bf2ec1b42506ce3ed7e3c5312cbdbaa2f",
+        strip_prefix = "github.com/aws/aws-sdk-go-v2/service/kafka@v1.21.0",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/aws/aws-sdk-go-v2/service/kafka/com_github_aws_aws_sdk_go_v2_service_kafka-v1.21.0.zip",
+        ],
+    )
+    go_repository(
         name = "com_github_aws_aws_sdk_go_v2_service_kms",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/aws/aws-sdk-go-v2/service/kms",
@@ -1838,10 +1848,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "4d9617e032f83d04de74946d48c7bd96b0b908973fe5b553ddcb21ad4518f69f",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20240913174238-d5fd9927fa4d",
+        sha256 = "95d5b020636d314f7fae6221a21afcee17ec5c1c55c368ec7d409ba238ffc5f6",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20240917211111-c826c0a21671",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20240913174238-d5fd9927fa4d.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20240917211111-c826c0a21671.zip",
         ],
     )
     go_repository(

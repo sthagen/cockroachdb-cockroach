@@ -94,6 +94,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v0.6.1
 	github.com/Azure/go-autorest/autorest/adal v0.9.15
 	github.com/BurntSushi/toml v1.2.1
+	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/DataDog/datadog-api-client-go/v2 v2.15.0
 	github.com/DataExMachina-dev/side-eye-go v0.0.0-20240528211710-5eb9c7a69e1d
 	github.com/IBM/sarama v1.42.1
@@ -110,7 +111,7 @@ require (
 	github.com/apache/pulsar-client-go v0.12.0
 	github.com/aws/aws-msk-iam-sasl-signer-go v1.0.0
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.16
-	github.com/aws/aws-sdk-go-v2/service/kafka v1.21.0
+	github.com/aws/aws-sdk-go-v2/service/kafka v1.37.1
 	github.com/aws/aws-sdk-go-v2/service/kms v1.35.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.61.0
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.33.0
@@ -133,7 +134,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
-	github.com/cockroachdb/pebble v0.0.0-20240917211111-c826c0a21671
+	github.com/cockroachdb/pebble v0.0.0-20240923205819-785dc8d817a4
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b

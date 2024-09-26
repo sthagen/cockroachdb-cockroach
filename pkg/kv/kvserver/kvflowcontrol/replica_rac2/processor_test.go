@@ -133,13 +133,14 @@ func (rn *testRaftNode) NextUnstableIndexLocked() uint64 {
 	return rn.nextUnstableIndex
 }
 
-func (rn *testRaftNode) FollowerStateRaftMuLocked(
-	replicaID roachpb.ReplicaID,
-) rac2.FollowerStateInfo {
-	rn.r.mu.AssertHeld()
-	fmt.Fprintf(rn.b, " RaftNode.FollowerStateRaftMuLocked(%v)\n", replicaID)
-	// TODO(kvoli,sumeerbhola): implement.
-	return rac2.FollowerStateInfo{}
+func (rn *testRaftNode) ReplicasStateLocked(_ map[roachpb.ReplicaID]rac2.ReplicaStateInfo) {
+	rn.r.mu.AssertRHeld()
+	fmt.Fprint(rn.b, " RaftNode.ReplicasStateLocked\n")
+}
+
+func (rn *testRaftNode) SendPingRaftMuLocked(to roachpb.ReplicaID) bool {
+	fmt.Fprintf(rn.b, " RaftNode.SendPingRaftMuLocked(%d)\n", to)
+	return true
 }
 
 func (rn *testRaftNode) setMark(t *testing.T, mark rac2.LogMark) {
@@ -243,6 +244,10 @@ func (c *testRangeController) AdmitRaftMuLocked(
 	_ context.Context, replicaID roachpb.ReplicaID, av rac2.AdmittedVector,
 ) {
 	fmt.Fprintf(c.b, " RangeController.AdmitRaftMuLocked(%s, %+v)\n", replicaID, av)
+}
+
+func (c *testRangeController) MaybeSendPingsRaftMuLocked() {
+	fmt.Fprintf(c.b, " RangeController.MaybeSendPingsRaftMuLocked()\n")
 }
 
 func (c *testRangeController) SetReplicasRaftMuLocked(

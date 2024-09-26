@@ -35,6 +35,8 @@ var raftLeaderFortificationFractionEnabled = settings.RegisterFloatSetting(
 		"by extension, use Leader leases for all ranges which do not require "+
 		"expiration-based leases. Set to a value between 0.0 and 1.0 to gradually "+
 		"roll out Leader leases across the ranges in a cluster.",
+	// TODO(nvanbenschoten): make this a metamorphic constant once raft leader
+	// fortification and leader leases are sufficiently stable.
 	envutil.EnvOrDefaultFloat64("COCKROACH_LEADER_FORTIFICATION_FRACTION_ENABLED", 0.0),
 	settings.FloatInRange(0.0, 1.0),
 	settings.WithPublic,
@@ -79,16 +81,13 @@ func (r *replicaRLockedStoreLiveness) SupportFor(replicaID raftpb.PeerID) (raftp
 // SupportFrom implements the raftstoreliveness.StoreLiveness interface.
 func (r *replicaRLockedStoreLiveness) SupportFrom(
 	replicaID raftpb.PeerID,
-) (raftpb.Epoch, hlc.Timestamp, bool) {
+) (raftpb.Epoch, hlc.Timestamp) {
 	storeID, ok := r.getStoreIdent(replicaID)
 	if !ok {
-		return 0, hlc.Timestamp{}, false
+		return 0, hlc.Timestamp{}
 	}
-	epoch, exp, ok := r.store.storeLiveness.SupportFrom(storeID)
-	if !ok {
-		return 0, hlc.Timestamp{}, false
-	}
-	return raftpb.Epoch(epoch), exp, true
+	epoch, exp := r.store.storeLiveness.SupportFrom(storeID)
+	return raftpb.Epoch(epoch), exp
 }
 
 // SupportFromEnabled implements the raftstoreliveness.StoreLiveness interface.
@@ -124,5 +123,7 @@ func raftFortificationEnabledForRangeID(fracEnabled float64, rangeID roachpb.Ran
 
 // SupportExpired implements the raftstoreliveness.StoreLiveness interface.
 func (r *replicaRLockedStoreLiveness) SupportExpired(ts hlc.Timestamp) bool {
-	return ts.Less(r.store.Clock().Now())
+	// A support expiration timestamp equal to the current time is considered
+	// expired, to be consistent with support withdrawal in Store Liveness.
+	return ts.LessEq(r.store.Clock().Now())
 }

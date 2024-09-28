@@ -51,6 +51,12 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// Path variables.
+const (
+	dbIdPathVar    = "database_id"
+	tableIdPathVar = "table_id"
+)
+
 type ApiV2System interface {
 	health(w http.ResponseWriter, r *http.Request)
 	listNodes(w http.ResponseWriter, r *http.Request)
@@ -187,10 +193,13 @@ func registerRoutes(
 		{"rules/", a.listRules, false, authserver.RegularRole, true},
 
 		{"sql/", a.execSQL, true, authserver.RegularRole, true},
-		{"database_metadata/", a.GetDBMetadata, true, authserver.RegularRole, true},
+		{"database_metadata/", a.GetDbMetadata, true, authserver.RegularRole, true},
+		{"database_metadata/{database_id:[0-9]+}/", a.GetDbMetadataForId, true, authserver.RegularRole, true},
 		{"table_metadata/", a.GetTableMetadata, true, authserver.RegularRole, true},
 		{"table_metadata/{table_id:[0-9]+}/", a.GetTableMetadataWithDetails, true, authserver.RegularRole, true},
 		{"table_metadata/updatejob/", a.TableMetadataJob, true, authserver.RegularRole, true},
+		{fmt.Sprintf("grants/databases/{%s:[0-9]+}/", dbIdPathVar), a.getDatabaseGrants, true, authserver.RegularRole, true},
+		{fmt.Sprintf("grants/tables/{%s:[0-9]+}/", tableIdPathVar), a.getTableGrants, true, authserver.RegularRole, true},
 	}
 
 	// For all routes requiring authentication, have the outer mux (a.mux)

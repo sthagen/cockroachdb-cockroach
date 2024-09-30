@@ -735,7 +735,7 @@ func (r *raft) sendHeartbeat(to pb.PeerID) {
 // maybeSendFortify sends a fortification RPC to the given peer if it isn't
 // fortified but the peer's store supports the leader's store in StoreLiveness.
 func (r *raft) maybeSendFortify(id pb.PeerID) {
-	if !r.storeLiveness.SupportFromEnabled() {
+	if !r.fortificationTracker.FortificationEnabled() {
 		// The underlying store liveness fabric hasn't been enabled to allow the
 		// leader to request support from peers. No-op.
 		return
@@ -2338,6 +2338,10 @@ func (r *raft) switchToConfig(cfg quorum.Config, progressMap tracker.ProgressMap
 	}
 
 	r.maybeCommit()
+	// If the configuration change means that there are new followers, fortify
+	// them immediately, without waiting for the next heartbeatTimeout to fire.
+	// bcastFortify is a no-op for peers that are already fortified.
+	r.bcastFortify()
 	// If the configuration change means that more entries are committed now,
 	// broadcast/append to everyone in the updated config.
 	//

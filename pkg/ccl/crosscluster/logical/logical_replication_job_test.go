@@ -89,6 +89,7 @@ var (
 
 func TestLogicalStreamIngestionJobNameResolution(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -194,12 +195,22 @@ func (t fatalDLQ) Log(
 
 func TestLogicalStreamIngestionJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	defer TestingSetDLQ(fatalDLQ{t})()
 
-	ctx := context.Background()
 	// keyPrefix will be set later, but before countPuts is set.
+	for _, mode := range []string{"validated", "immediate"} {
+		t.Run(mode, func(t *testing.T) {
+			testLogicalStreamIngestionJobBasic(t, mode)
+		})
+
+	}
+}
+
+func testLogicalStreamIngestionJobBasic(t *testing.T, mode string) {
+	ctx := context.Background()
 	var keyPrefix []byte
 	var countPuts atomic.Bool
 	var numPuts, numCPuts atomic.Int64
@@ -276,8 +287,8 @@ func TestLogicalStreamIngestionJob(t *testing.T) {
 		jobAID jobspb.JobID
 		jobBID jobspb.JobID
 	)
-	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", dbBURL.String()).Scan(&jobAID)
-	dbB.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", dbAURL.String()).Scan(&jobBID)
+	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = $2", dbBURL.String(), mode).Scan(&jobAID)
+	dbB.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = $2", dbAURL.String(), mode).Scan(&jobBID)
 
 	now := s.Clock().Now()
 	WaitUntilReplicatedTime(t, now, dbA, jobAID)
@@ -300,22 +311,38 @@ func TestLogicalStreamIngestionJob(t *testing.T) {
 	dbA.CheckQueryResults(t, "SELECT * from a.tab", expectedRows)
 	dbB.CheckQueryResults(t, "SELECT * from b.tab", expectedRows)
 
-	// Verify that we didn't have the data looping problem. We expect 3 CPuts
-	// when inserting new rows and 3 Puts when updating existing rows.
-	expPuts, expCPuts := 3, 4
-	if tryOptimisticInsertEnabled.Get(&s.ClusterSettings().SV) {
-		// When performing 1 update, we don't have the prevValue set, so if
-		// we're using the optimistic insert strategy, it would result in an
-		// additional CPut (that ultimately fails). The cluster setting is
-		// randomized in tests, so we need to handle both cases.
-		expCPuts++
+	// Verify that we didn't have the data looping problem. These
+	// expecations are for how many operations happend on the
+	// a-side.
+	//
+	// These assertions feel likely to flake since they assume
+	// that the test runner is fast enough to beat the replication
+	// stream when applying subsequent operations.
+	if !skip.Duress() {
+		var expPuts, expCPuts int64
+		if mode == "validated" {
+			expPuts, expCPuts = 3, 3
+			if tryOptimisticInsertEnabled.Get(&s.ClusterSettings().SV) {
+				// When performing 1 update, we don't have the prevValue set, so if
+				// we're using the optimistic insert strategy, it would result in an
+				// additional CPut (that ultimately fails). The cluster setting is
+				// randomized in tests, so we need to handle both cases.
+				expCPuts++
+			}
+		} else if mode == "immediate" {
+			expPuts, expCPuts = 1, 7
+		} else {
+			t.Fatalf("no put/cput expectations for unknown mode: %s", mode)
+		}
+
+		require.Equal(t, expPuts, numPuts.Load())
+		require.Equal(t, expCPuts, numCPuts.Load())
 	}
-	require.Equal(t, int64(expPuts), numPuts.Load())
-	require.Equal(t, int64(expCPuts), numCPuts.Load())
 }
 
 func TestLogicalStreamIngestionJobWithCursor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -383,6 +410,7 @@ func TestLogicalStreamIngestionJobWithCursor(t *testing.T) {
 // as the destination side frontier advances.
 func TestLogicalStreamIngestionAdvancePTS(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -438,6 +466,7 @@ func TestLogicalStreamIngestionAdvancePTS(t *testing.T) {
 // job, resulting in the PTS record being removed.
 func TestLogicalStreamIngestionCancelUpdatesProducerJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -465,6 +494,7 @@ func TestLogicalStreamIngestionCancelUpdatesProducerJob(t *testing.T) {
 
 func TestLogicalStreamIngestionErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -510,6 +540,7 @@ func TestLogicalStreamIngestionErrors(t *testing.T) {
 
 func TestLogicalStreamIngestionJobWithColumnFamilies(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.IgnoreLint(t, "column families are not supported yet by LDR")
@@ -540,7 +571,7 @@ family f2(other_payload, v2))
 	defer cleanup()
 
 	var jobBID jobspb.JobID
-	serverBSQL.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab_with_cf ON $1 INTO TABLE tab_with_cf", serverAURL.String()).Scan(&jobBID)
+	serverBSQL.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab_with_cf ON $1 INTO TABLE tab_with_cf WITH MODE = validated", serverAURL.String()).Scan(&jobBID)
 
 	WaitUntilReplicatedTime(t, s.Clock().Now(), serverBSQL, jobBID)
 	serverASQL.Exec(t, "INSERT INTO tab_with_cf(pk, payload, other_payload) VALUES (2, 'potato', 'ruroh2')")
@@ -560,6 +591,7 @@ family f2(other_payload, v2))
 
 func TestLogicalReplicationWithPhantomDelete(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -588,6 +620,7 @@ func TestLogicalReplicationWithPhantomDelete(t *testing.T) {
 
 func TestFilterRangefeedInReplicationStream(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "multi cluster/node config exhausts hardware")
@@ -652,6 +685,7 @@ func TestFilterRangefeedInReplicationStream(t *testing.T) {
 
 func TestRandomTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -728,6 +762,7 @@ func TestRandomTables(t *testing.T) {
 
 func TestRandomStream(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	eventCount := 100
@@ -784,6 +819,7 @@ func TestRandomStream(t *testing.T) {
 // TestPreviouslyInterestingTables tests some schemas from previous failed runs of TestRandomTables.
 func TestPreviouslyInterestingTables(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -864,6 +900,7 @@ func TestPreviouslyInterestingTables(t *testing.T) {
 // logical replication job, it will trigger distSQL replanning.
 func TestLogicalAutoReplan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.WithIssue(t, 131184)
@@ -960,6 +997,7 @@ func TestLogicalAutoReplan(t *testing.T) {
 // pick up the job and resume
 func TestLogicalJobResiliency(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.WithIssue(t, 131184)
@@ -997,6 +1035,7 @@ func TestLogicalJobResiliency(t *testing.T) {
 
 func TestHeartbeatCancel(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "multi cluster/node config exhausts hardware")
@@ -1059,6 +1098,7 @@ func TestHeartbeatCancel(t *testing.T) {
 // conflicts streaming from multiple source tables
 func TestMultipleSourcesIntoSingleDest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1120,6 +1160,7 @@ func TestMultipleSourcesIntoSingleDest(t *testing.T) {
 // from each other and how they handle conflicts
 func TestFourWayReplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.UnderDuress(t, "running 12 LDR jobs on one server is too much")
@@ -1203,6 +1244,7 @@ func TestFourWayReplication(t *testing.T) {
 
 func TestForeignKeyConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1444,6 +1486,7 @@ func (m *mockDLQ) Log(
 // TestFlushErrorHandling exercises the flush path in cases where writes fail.
 func TestFlushErrorHandling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 
 	ctx := context.Background()
 	dlq := mockDLQ(0)
@@ -1482,6 +1525,7 @@ func TestFlushErrorHandling(t *testing.T) {
 
 func TestLogicalStreamIngestionJobWithFallbackUDF(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	skip.WithIssue(t, 129569, "flakey test")
@@ -1573,6 +1617,7 @@ func TestLogicalStreamIngestionJobWithFallbackUDF(t *testing.T) {
 
 func TestLogicalReplicationPlanner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
@@ -1649,6 +1694,7 @@ func TestLogicalReplicationPlanner(t *testing.T) {
 
 func TestShowLogicalReplicationJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
@@ -1784,6 +1830,7 @@ func TestShowLogicalReplicationJobs(t *testing.T) {
 // needed to start and administer LDR
 func TestUserPrivileges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1861,6 +1908,7 @@ func TestUserPrivileges(t *testing.T) {
 // are allowed on tables participating in logical replication.
 func TestLogicalReplicationSchemaChanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -1901,6 +1949,7 @@ func TestLogicalReplicationSchemaChanges(t *testing.T) {
 // schemas are compatible when creating the replication stream.
 func TestLogicalReplicationCreationChecks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.UnderDeadlock(t)
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()

@@ -1,23 +1,19 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storeliveness
 
 import "time"
 
 // Options includes all Store Liveness durations needed by the SupportManager.
+// TODO(mira): make sure these are initialized correctly as part of #125066.
 type Options struct {
-	// HeartbeatInterval determines how often Store Liveness sends heartbeats.
-	HeartbeatInterval time.Duration
 	// LivenessInterval determines the Store Liveness support expiration time.
 	LivenessInterval time.Duration
+	// HeartbeatInterval determines how often Store Liveness sends heartbeats.
+	HeartbeatInterval time.Duration
 	// SupportExpiryInterval determines how often Store Liveness checks if support
 	// should be withdrawn.
 	SupportExpiryInterval time.Duration
@@ -32,13 +28,13 @@ type Options struct {
 
 // NewOptions instantiates the Store Liveness Options.
 func NewOptions(
-	heartbeatInterval time.Duration,
 	livenessInterval time.Duration,
+	heartbeatInterval time.Duration,
 	supportWithdrawalGracePeriod time.Duration,
 ) Options {
 	return Options{
-		HeartbeatInterval:            heartbeatInterval,
 		LivenessInterval:             livenessInterval,
+		HeartbeatInterval:            heartbeatInterval,
 		SupportExpiryInterval:        1 * time.Second,
 		IdleSupportFromInterval:      1 * time.Minute,
 		SupportWithdrawalGracePeriod: supportWithdrawalGracePeriod,

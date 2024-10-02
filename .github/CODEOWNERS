@@ -167,7 +167,7 @@
 /pkg/cli/syncbench/          @cockroachdb/storage @cockroachdb/kv-prs
 /pkg/cli/swappable_fs*       @cockroachdb/storage
 /pkg/cli/testutils.go        @cockroachdb/test-eng
-/pkg/cli/tsdump.go           @cockroachdb/obs-prs @cockroachdb/obs-india-prs
+/pkg/cli/tsdump*.go          @cockroachdb/obs-prs @cockroachdb/obs-india-prs
 /pkg/cli/userfile.go         @cockroachdb/disaster-recovery
 /pkg/cli/workload*           @cockroachdb/sql-foundations
 /pkg/cli/zip*.go             @cockroachdb/obs-prs    @cockroachdb/cli-prs @cockroachdb/obs-india-prs
@@ -181,6 +181,7 @@
 /pkg/server/admin*.go                    @cockroachdb/obs-prs @cockroachdb/server-prs
 /pkg/server/api_v2*.go                   @cockroachdb/obs-prs @cockroachdb/server-prs
 /pkg/server/api_v2_auth*.go              @cockroachdb/obs-prs @cockroachdb/server-prs @cockroachdb/prodsec @cockroachdb/product-security
+/pkg/server/application_api/             @cockroachdb/obs-prs
 /pkg/server/authentication*.go           @cockroachdb/prodsec     @cockroachdb/server-prs @cockroachdb/product-security
 /pkg/server/clock_monotonicity.go        @cockroachdb/kv-prs
 /pkg/server/combined_statement_stats*.go @cockroachdb/obs-prs

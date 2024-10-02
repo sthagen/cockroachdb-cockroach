@@ -1,12 +1,7 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package replica_rac2
 
@@ -399,6 +394,11 @@ type Processor interface {
 	// underlying range controller. It is used to power /inspectz-style debugging
 	// pages.
 	InspectRaftMuLocked(ctx context.Context) (kvflowinspectpb.Handle, bool)
+
+	// SendStreamStats returns the stats for the replica send streams It is only
+	// populated on the leader. The stats may be used to inform placement
+	// decisions pertaining to the range.
+	SendStreamStats() rac2.RangeSendStreamStats
 }
 
 // processorImpl implements Processor.
@@ -1174,6 +1174,16 @@ func (p *processorImpl) InspectRaftMuLocked(ctx context.Context) (kvflowinspectp
 		return kvflowinspectpb.Handle{}, false
 	}
 	return p.leader.rc.InspectRaftMuLocked(ctx), true
+}
+
+// SendStreamStats implements Processor.
+func (p *processorImpl) SendStreamStats() rac2.RangeSendStreamStats {
+	p.leader.rcReferenceUpdateMu.RLock()
+	defer p.leader.rcReferenceUpdateMu.RUnlock()
+	if p.leader.rc == nil {
+		return nil
+	}
+	return p.leader.rc.SendStreamStats()
 }
 
 // RangeControllerFactoryImpl implements the RangeControllerFactory interface.

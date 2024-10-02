@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -30,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/replica_rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -2011,10 +2007,14 @@ func (r *Replica) checkTSAboveGCThresholdRLocked(
 	if threshold.Less(ts) {
 		return nil
 	}
+	desc := r.descRLocked()
 	return &kvpb.BatchTimestampBeforeGCError{
 		Timestamp:              ts,
 		Threshold:              threshold,
 		DataExcludedFromBackup: r.excludeReplicaFromBackupRLocked(ctx, rspan),
+		RangeID:                desc.RangeID,
+		StartKey:               desc.StartKey.AsRawKey(),
+		EndKey:                 desc.EndKey.AsRawKey(),
 	}
 }
 
@@ -2579,4 +2579,13 @@ func (r *Replica) maybeEnqueueProblemRange(
 	}
 	r.store.replicateQueue.AddAsync(ctx, r,
 		allocatorimpl.AllocatorReplaceDecommissioningVoter.Priority())
+}
+
+// SendStreamStats returns the range's flow control send stream stats iff the
+// replica is the raft leader and RACv2 is enabled, otherwise nil.
+func (r *Replica) SendStreamStats() rac2.RangeSendStreamStats {
+	if r.flowControlV2 == nil {
+		return nil
+	}
+	return r.flowControlV2.SendStreamStats()
 }

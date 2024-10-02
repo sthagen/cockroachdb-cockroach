@@ -1,12 +1,7 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storeliveness
 
@@ -33,8 +28,8 @@ var (
 	store       = slpb.StoreIdent{NodeID: roachpb.NodeID(1), StoreID: roachpb.StoreID(1)}
 	remoteStore = slpb.StoreIdent{NodeID: roachpb.NodeID(2), StoreID: roachpb.StoreID(2)}
 	options     = Options{
-		HeartbeatInterval:       3 * time.Millisecond,
 		LivenessInterval:        6 * time.Millisecond,
+		HeartbeatInterval:       3 * time.Millisecond,
 		SupportExpiryInterval:   1 * time.Millisecond,
 		IdleSupportFromInterval: 1 * time.Minute,
 	}
@@ -63,8 +58,19 @@ func TestSupportManagerRequestsSupport(t *testing.T) {
 	require.Equal(t, slpb.Epoch(0), epoch)
 	require.Equal(t, hlc.Timestamp{}, expiration)
 
+	testutils.SucceedsSoon(
+		t, func() error {
+			if sm.metrics.SupportFromStores.Value() != int64(1) {
+				return errors.New("store not added yet")
+			}
+			return nil
+		},
+	)
+
 	// Ensure heartbeats are sent.
 	msgs := ensureHeartbeats(t, sender, 10)
+	require.LessOrEqual(t, int64(10), sm.metrics.HeartbeatSuccesses.Count())
+	require.Equal(t, int64(0), sm.metrics.HeartbeatFailures.Count())
 	require.Equal(t, slpb.MsgHeartbeat, msgs[0].Type)
 	require.Equal(t, sm.storeID, msgs[0].From)
 	require.Equal(t, remoteStore, msgs[0].To)
@@ -89,6 +95,15 @@ func TestSupportManagerRequestsSupport(t *testing.T) {
 			}
 			require.Equal(t, slpb.Epoch(1), epoch)
 			require.Equal(t, requestedExpiration, expiration)
+			return nil
+		},
+	)
+	testutils.SucceedsSoon(
+		t, func() error {
+			if sm.metrics.MessageHandleSuccesses.Count() != int64(1) {
+				return errors.New("metric not incremented yet")
+			}
+			require.Equal(t, int64(0), sm.metrics.MessageHandleFailures.Count())
 			return nil
 		},
 	)
@@ -131,6 +146,9 @@ func TestSupportManagerProvidesSupport(t *testing.T) {
 			if sender.getNumSentMessages() == 0 {
 				return errors.New("more messages expected")
 			}
+			require.Equal(t, int64(1), sm.metrics.MessageHandleSuccesses.Count())
+			require.Equal(t, int64(0), sm.metrics.MessageHandleFailures.Count())
+			require.Equal(t, int64(1), sm.metrics.SupportForStores.Value())
 			return nil
 		},
 	)
@@ -156,8 +174,17 @@ func TestSupportManagerProvidesSupport(t *testing.T) {
 			if supported {
 				return errors.New("support not withdrawn yet")
 			}
-			require.Equal(t, slpb.Epoch(0), epoch)
+			require.Equal(t, slpb.Epoch(2), epoch)
 			require.False(t, supported)
+			return nil
+		},
+	)
+	testutils.SucceedsSoon(
+		t, func() error {
+			if sm.metrics.SupportWithdrawSuccesses.Count() != int64(1) {
+				return errors.New("metric not incremented yet")
+			}
+			require.Equal(t, int64(0), sm.metrics.SupportWithdrawFailures.Count())
 			return nil
 		},
 	)
@@ -362,6 +389,10 @@ func TestSupportManagerReceiveQueueLimit(t *testing.T) {
 	for i := 0; i < maxReceiveQueueSize; i++ {
 		require.NoError(t, sm.HandleMessage(heartbeat))
 	}
+	require.Equal(t, int64(maxReceiveQueueSize), sm.metrics.ReceiveQueueSize.Value())
+	require.Equal(
+		t, int64(maxReceiveQueueSize*heartbeat.Size()), sm.metrics.ReceiveQueueBytes.Value(),
+	)
 
 	// Nothing is consuming messages from the queue, so the next HandleMessage
 	// should result in an error.

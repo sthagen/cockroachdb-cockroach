@@ -350,8 +350,9 @@ type raft struct {
 	//
 	// Messages in this list may target other nodes or may target this node.
 	//
-	// Messages in this list have the type MsgAppResp, MsgVoteResp, or
-	// MsgPreVoteResp. See the comment in raft.send for details.
+	// Messages in this list have the type MsgAppResp, MsgVoteResp,
+	// MsgPreVoteResp, or MsgFortifyLeaderResp. See the comment in raft.send for
+	// details.
 	msgsAfterAppend []pb.Message
 
 	// the leader id
@@ -510,13 +511,24 @@ func (r *raft) hardState() pb.HardState {
 	}
 }
 
-// send schedules persisting state to a stable storage and AFTER that
-// sending the message (as part of next Ready message processing).
+// send prepares the given message for being sent, and puts it into the outgoing
+// message queue. The message will be handed over to the application via the
+// next Ready handling cycle, except in one condition below.
+//
+// Certain message types are scheduled for being sent *after* the unstable state
+// is durably persisted in storage. If AsyncStorageWrites config flag is true,
+// the responsibility of upholding this condition is on the application, so the
+// message will be handed over via the next Ready as usually; if false, the
+// message will skip one Ready handling cycle, and will be sent after the
+// application has persisted the state.
+//
+// TODO(pav-kv): remove this special case after !AsyncStorageWrites is removed.
 func (r *raft) send(m pb.Message) {
 	if m.From == None {
 		m.From = r.id
 	}
-	if m.Type == pb.MsgVote || m.Type == pb.MsgVoteResp || m.Type == pb.MsgPreVote || m.Type == pb.MsgPreVoteResp {
+	switch m.Type {
+	case pb.MsgVote, pb.MsgVoteResp, pb.MsgPreVote, pb.MsgPreVoteResp:
 		if m.Term == 0 {
 			// All {pre-,}campaign messages need to have the term set when
 			// sending.
@@ -532,7 +544,11 @@ func (r *raft) send(m pb.Message) {
 			//   same reasons MsgPreVote is
 			r.logger.Panicf("term should be set when sending %s", m.Type)
 		}
-	} else {
+	case pb.MsgApp:
+		if m.Term != r.Term {
+			r.logger.Panicf("invalid term %d in MsgApp, must be %d", m.Term, r.Term)
+		}
+	default:
 		if m.Term != 0 {
 			r.logger.Panicf("term should not be set when sending %s (was %d)", m.Type, m.Term)
 		}
@@ -542,8 +558,9 @@ func (r *raft) send(m pb.Message) {
 			m.Term = r.Term
 		}
 	}
-	if m.Type == pb.MsgAppResp || m.Type == pb.MsgVoteResp ||
-		m.Type == pb.MsgPreVoteResp || m.Type == pb.MsgFortifyLeaderResp {
+
+	switch m.Type {
+	case pb.MsgAppResp, pb.MsgVoteResp, pb.MsgPreVoteResp, pb.MsgFortifyLeaderResp:
 		// If async storage writes are enabled, messages added to the msgs slice
 		// are allowed to be sent out before unstable state (e.g. log entry
 		// writes and election votes) have been durably synced to the local
@@ -592,12 +609,50 @@ func (r *raft) send(m pb.Message) {
 		// we err on the side of safety and omit a `&& !m.Reject` condition
 		// above.
 		r.msgsAfterAppend = append(r.msgsAfterAppend, m)
-	} else {
+	default:
 		if m.To == r.id {
 			r.logger.Panicf("message should not be self-addressed when sending %s", m.Type)
 		}
 		r.msgs = append(r.msgs, m)
 	}
+}
+
+// prepareMsgApp constructs a MsgApp message for being sent to the given peer,
+// and hands it over to the caller. Updates the replication flow control state
+// to account for the fact that the message is about to be sent.
+func (r *raft) prepareMsgApp(to pb.PeerID, pr *tracker.Progress, ls logSlice) pb.Message {
+	commit := r.raftLog.committed
+	// Update the progress accordingly to the message being sent.
+	pr.SentEntries(len(ls.entries), uint64(payloadsSize(ls.entries)))
+	pr.MaybeUpdateSentCommit(commit)
+	// Hand over the message to the caller.
+	return pb.Message{
+		From:    r.id,
+		To:      to,
+		Type:    pb.MsgApp,
+		Term:    ls.term,
+		Index:   ls.prev.index,
+		LogTerm: ls.prev.term,
+		Entries: ls.entries,
+		Commit:  commit,
+		Match:   pr.Match,
+	}
+}
+
+// maybePrepareMsgApp returns a MsgApp message to be sent to the given peer,
+// containing the given log slice.
+//
+// Returns false if the current state of the node does not permit this MsgApp
+// send, e.g. the log slice is misaligned with the replication flow status.
+func (r *raft) maybePrepareMsgApp(to pb.PeerID, ls logSlice) (pb.Message, bool) {
+	if r.state != StateLeader || r.Term != ls.term {
+		return pb.Message{}, false
+	}
+	pr := r.trk.Progress(to)
+	if pr == nil || pr.State != tracker.StateReplicate || pr.Next != ls.prev.index+1 {
+		return pb.Message{}, false
+	}
+	return r.prepareMsgApp(to, pr, ls), true
 }
 
 // maybeSendAppend sends an append RPC with log entries (if any) that are not
@@ -628,7 +683,6 @@ func (r *raft) maybeSendAppend(to pb.PeerID) bool {
 		// follower log anymore. Send a snapshot instead.
 		return r.maybeSendSnapshot(to, pr)
 	}
-
 	var entries []pb.Entry
 	if pr.CanSendEntries(last) {
 		if entries, err = r.raftLog.entries(prevIndex, r.maxMsgSize); err != nil {
@@ -637,18 +691,11 @@ func (r *raft) maybeSendAppend(to pb.PeerID) bool {
 		}
 	}
 
-	// Send the MsgApp, and update the progress accordingly.
-	r.send(pb.Message{
-		To:      to,
-		Type:    pb.MsgApp,
-		Index:   prevIndex,
-		LogTerm: prevTerm,
-		Entries: entries,
-		Commit:  commit,
-		Match:   pr.Match,
-	})
-	pr.SentEntries(len(entries), uint64(payloadsSize(entries)))
-	pr.MaybeUpdateSentCommit(commit)
+	r.send(r.prepareMsgApp(to, pr, logSlice{
+		term:    r.Term,
+		prev:    entryID{index: prevIndex, term: prevTerm},
+		entries: entries,
+	}))
 	return true
 }
 
@@ -660,7 +707,6 @@ func (r *raft) sendPing(to pb.PeerID) bool {
 	if pr == nil || pr.State != tracker.StateReplicate || pr.MsgAppProbesPaused {
 		return false
 	}
-	commit := r.raftLog.committed
 	prevIndex := pr.Next - 1
 	prevTerm, err := r.raftLog.term(prevIndex)
 	// An error happens then the log is truncated beyond Next. We can't send a
@@ -668,16 +714,11 @@ func (r *raft) sendPing(to pb.PeerID) bool {
 	if err != nil {
 		return false
 	}
-	r.send(pb.Message{
-		To:      to,
-		Type:    pb.MsgApp,
-		Index:   prevIndex,
-		LogTerm: prevTerm,
-		Commit:  commit,
-		Match:   pr.Match,
-	})
-	pr.SentEntries(0, 0) // NB: this sets MsgAppProbesPaused to true again.
-	pr.MaybeUpdateSentCommit(commit)
+	// NB: this sets MsgAppProbesPaused to true again.
+	r.send(r.prepareMsgApp(to, pr, logSlice{
+		term: r.Term,
+		prev: entryID{index: prevIndex, term: prevTerm},
+	}))
 	return true
 }
 
@@ -1039,6 +1080,16 @@ func (r *raft) tickHeartbeat() {
 		if err := r.Step(pb.Message{From: r.id, Type: pb.MsgBeat}); err != nil {
 			r.logger.Debugf("error occurred during checking sending heartbeat: %v", err)
 		}
+
+		// Mark fortifying followers as recently active. We disable heartbeats when
+		// leader fortification is enabled, instead deferring to StoreLiveness for
+		// failure detection. As such, if there is no append activity for a raft
+		// group, it's possible for the leader to not communicate with a follower in
+		// a electionTimeout. We do not want to infer that the leader can't
+		// communicate with a follower in such cases, which could then cause the
+		// leader to spuriously step down because of CheckQuorum. Instead, we
+		// compute RecentlyActive based on StoreLiveness instead.
+		r.markFortifyingFollowersAsRecentlyActive()
 
 		// Try to refortify any followers that don't currently support us.
 		r.bcastFortify()
@@ -2436,6 +2487,24 @@ func (r *raft) testingStepDown() error {
 	}
 	r.becomeFollower(r.Term, r.id) // mirror the logic in how we step down when CheckQuorum fails
 	return nil
+}
+
+// markFortifyingFollowersAsRecentlyActive iterates over all the followers, and
+// mark them as recently active if they are supporting the leader.
+func (r *raft) markFortifyingFollowersAsRecentlyActive() {
+	if !r.fortificationTracker.FortificationEnabled() {
+		return
+	}
+
+	r.trk.Visit(func(id pb.PeerID, pr *tracker.Progress) {
+		if pr.RecentActive {
+			return // return early as it's already marked as recently active
+		}
+
+		if isFortified, _ := r.fortificationTracker.IsFortifiedBy(id); isFortified {
+			pr.RecentActive = true
+		}
+	})
 }
 
 // advanceCommitViaMsgAppOnly returns true if the commit index is advanced on

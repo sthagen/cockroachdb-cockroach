@@ -1,12 +1,7 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storeliveness
 
@@ -155,7 +150,8 @@ func (rsh *requesterStateHandler) getSupportFrom(id slpb.StoreIdent) (slpb.Suppo
 }
 
 // addStore adds a store to the requesterState.supportFrom map, if not present.
-func (rsh *requesterStateHandler) addStore(id slpb.StoreIdent) {
+// The function returns a boolean indicating whether the store was added.
+func (rsh *requesterStateHandler) addStore(id slpb.StoreIdent) bool {
 	// Adding a store doesn't require persisting anything to disk, so it doesn't
 	// need to go through the full checkOut/checkIn process. However, we still
 	// check out the update to ensure that there are no concurrent updates.
@@ -171,7 +167,9 @@ func (rsh *requesterStateHandler) addStore(id slpb.StoreIdent) {
 		// be removed immediately after adding.
 		rs.recentlyQueried.Store(active)
 		rsh.requesterState.supportFrom[id] = &rs
+		return true
 	}
+	return false
 }
 
 // markIdleStores marks all stores in the requesterState.supportFrom map as

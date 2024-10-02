@@ -1,12 +1,7 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package replica_rac2
 
@@ -278,6 +273,11 @@ func (c *testRangeController) InspectRaftMuLocked(ctx context.Context) kvflowins
 	return kvflowinspectpb.Handle{}
 }
 
+func (c *testRangeController) SendStreamStats() rac2.RangeSendStreamStats {
+	fmt.Fprintf(c.b, " RangeController.SendStreamStats\n")
+	return rac2.RangeSendStreamStats{}
+}
+
 func TestProcessorBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -524,6 +524,10 @@ func TestProcessorBasic(t *testing.T) {
 
 			case "inspect":
 				p.InspectRaftMuLocked(ctx)
+				return builderStr()
+
+			case "send-stream-stats":
+				p.SendStreamStats()
 				return builderStr()
 
 			default:

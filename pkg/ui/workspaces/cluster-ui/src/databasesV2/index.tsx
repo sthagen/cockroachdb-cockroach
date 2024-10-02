@@ -1,23 +1,22 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { Skeleton } from "antd";
 import React, { useMemo } from "react";
 import { Link } from "react-router-dom";
 
+import { useNodeStatuses } from "src/api";
 import {
   DatabaseMetadataRequest,
   DatabaseSortOptions,
   useDatabaseMetadata,
 } from "src/api/databases/getDatabaseMetadataApi";
+import { ColumnTitle } from "src/components/columnTitle";
+import { NodeRegionsSelector } from "src/components/nodeRegionsSelector/nodeRegionsSelector";
 import { RegionNodesLabel } from "src/components/regionNodesLabel";
+import { TableMetadataJobControl } from "src/components/tableMetadataLastUpdated/tableMetadataJobControl";
 import { PageLayout, PageSection } from "src/layouts";
 import { Loading } from "src/loading";
 import { PageConfig, PageConfigItem } from "src/pageConfig";
@@ -31,11 +30,8 @@ import {
   TableColumnProps,
 } from "src/sharedFromCloud/table";
 import useTable, { TableParams } from "src/sharedFromCloud/useTable";
+import { StoreID } from "src/types/clusterTypes";
 import { Bytes } from "src/util";
-
-import { useNodeStatuses } from "../api";
-import { NodeRegionsSelector } from "../components/nodeRegionsSelector/nodeRegionsSelector";
-import { StoreID } from "../types/clusterTypes";
 
 import { DatabaseColName } from "./constants";
 import { DatabaseRow } from "./databaseTypes";
@@ -45,7 +41,14 @@ const COLUMNS: (TableColumnProps<DatabaseRow> & {
   sortKey?: DatabaseSortOptions;
 })[] = [
   {
-    title: DatabaseColName.NAME,
+    title: (
+      <ColumnTitle
+        title={DatabaseColName.NAME}
+        withToolTip={{
+          tooltipText: "The name of the database.",
+        }}
+      />
+    ),
     sorter: (a, b) => a.name.localeCompare(b.name),
     sortKey: DatabaseSortOptions.NAME,
     render: (db: DatabaseRow) => {
@@ -53,7 +56,15 @@ const COLUMNS: (TableColumnProps<DatabaseRow> & {
     },
   },
   {
-    title: DatabaseColName.SIZE,
+    title: (
+      <ColumnTitle
+        title={DatabaseColName.SIZE}
+        withToolTip={{
+          tooltipText:
+            "The approximate total disk size across all table replicas in the database.",
+        }}
+      />
+    ),
     sortKey: DatabaseSortOptions.REPLICATION_SIZE,
     sorter: (a, b) => a.approximateDiskSizeBytes - b.approximateDiskSizeBytes,
     render: (db: DatabaseRow) => {
@@ -61,7 +72,14 @@ const COLUMNS: (TableColumnProps<DatabaseRow> & {
     },
   },
   {
-    title: DatabaseColName.TABLE_COUNT,
+    title: (
+      <ColumnTitle
+        title={DatabaseColName.TABLE_COUNT}
+        withToolTip={{
+          tooltipText: "The total number of tables in the database.",
+        }}
+      />
+    ),
     sortKey: DatabaseSortOptions.TABLE_COUNT,
     sorter: true,
     render: (db: DatabaseRow) => {
@@ -69,15 +87,15 @@ const COLUMNS: (TableColumnProps<DatabaseRow> & {
     },
   },
   {
-    title: DatabaseColName.RANGE_COUNT,
-    sortKey: DatabaseSortOptions.RANGES,
-    sorter: true,
-    render: (db: DatabaseRow) => {
-      return db.rangeCount;
-    },
-  },
-  {
-    title: DatabaseColName.NODE_REGIONS,
+    title: (
+      <ColumnTitle
+        title={DatabaseColName.NODE_REGIONS}
+        withToolTip={{
+          tooltipText:
+            "Regions/Nodes on which the database tables are located.",
+        }}
+      />
+    ),
     render: (db: DatabaseRow) => (
       <Skeleton loading={db.nodesByRegion.isLoading}>
         <div>
@@ -91,12 +109,6 @@ const COLUMNS: (TableColumnProps<DatabaseRow> & {
         </div>
       </Skeleton>
     ),
-  },
-  {
-    title: "Schema insights",
-    render: (db: DatabaseRow) => {
-      return db.schemaInsightsCount;
-    },
   },
 ];
 
@@ -134,11 +146,11 @@ export const DatabasesPageV2 = () => {
   const { params, setFilters, setSort, setSearch, setPagination } = useTable({
     initial: initialParams,
   });
-
-  const { data, error, isLoading } = useDatabaseMetadata(
+  const { data, error, isLoading, refreshDatabases } = useDatabaseMetadata(
     createDatabaseMetadataRequestFromParams(params),
   );
   const nodesResp = useNodeStatuses();
+
   const paginationState = data?.pagination_info;
 
   const onNodeRegionsChange = (storeIDs: StoreID[]) => {
@@ -216,6 +228,9 @@ export const DatabasesPageV2 = () => {
             entity="databases"
           />
           <Table
+            actionButton={
+              <TableMetadataJobControl onDataUpdated={refreshDatabases} />
+            }
             columns={colsWithSort}
             dataSource={tableData}
             pagination={{

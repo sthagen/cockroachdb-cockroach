@@ -1,12 +1,7 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storeliveness
 
@@ -135,6 +130,21 @@ func TestStoreLiveness(t *testing.T) {
 							strings.Join(sortedSupportMap, "\n"),
 						)
 
+					case "debug-metrics":
+						return fmt.Sprintf(
+							"HeartbeatSuccess: %d, HeartbeatFailure: %d\n"+
+								"MessageHandleSuccess: %d, MessageHandleFailure: %d\n"+
+								"SupportWithdrawSuccess: %d, SupportWithdrawFailure: %d\n"+
+								"SupportFromStores: %d, SupportForStores: %d",
+							sm.metrics.HeartbeatSuccesses.Count(),
+							sm.metrics.HeartbeatFailures.Count(),
+							sm.metrics.MessageHandleSuccesses.Count(),
+							sm.metrics.MessageHandleFailures.Count(),
+							sm.metrics.SupportWithdrawSuccesses.Count(),
+							sm.metrics.SupportWithdrawFailures.Count(),
+							sm.metrics.SupportFromStores.Value(),
+							sm.metrics.SupportForStores.Value(),
+						)
 					default:
 						return fmt.Sprintf("unknown command: %s", d.Cmd)
 					}

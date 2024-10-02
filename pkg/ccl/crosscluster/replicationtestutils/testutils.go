@@ -1,10 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package replicationtestutils
 
@@ -354,9 +351,9 @@ func (c *TenantStreamingClusters) BuildCreateTenantQuery(externalConnection stri
 	}
 	if c.Args.EnableReaderTenant {
 		if c.Args.RetentionTTLSeconds == 0 {
-			streamReplStmt = fmt.Sprintf("%s WITH READ CAPABILITIES", streamReplStmt)
+			streamReplStmt = fmt.Sprintf("%s WITH READ VIRTUAL CLUSTER", streamReplStmt)
 		} else {
-			streamReplStmt = fmt.Sprintf("%s, READ CAPABILITIES", streamReplStmt)
+			streamReplStmt = fmt.Sprintf("%s, READ VIRTUAL CLUSTER", streamReplStmt)
 		}
 	}
 	return streamReplStmt

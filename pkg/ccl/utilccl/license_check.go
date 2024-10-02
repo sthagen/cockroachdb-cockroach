@@ -1,10 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package utilccl
 
@@ -28,6 +25,10 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
+// trialLicenseUsageCount keeps track of the number of times a free trial
+// license has already been installed on this cluster.
+var trialLicenseUsageCount atomic.Int64
+
 var enterpriseLicense = settings.RegisterStringSetting(
 	settings.SystemVisible,
 	"enterprise.license",
@@ -35,7 +36,14 @@ var enterpriseLicense = settings.RegisterStringSetting(
 	"",
 	settings.WithValidateString(
 		func(sv *settings.Values, s string) error {
-			_, err := decode(s)
+			l, err := decode(s)
+			if err != nil {
+				return err
+			}
+			if l != nil && l.Type == licenseccl.License_Trial && trialLicenseUsageCount.Load() > 0 {
+				return errors.WithHint(errors.Newf("a trial license has previously been installed on this cluster"),
+					"Please install a non-trial license to continue")
+			}
 			return err
 		},
 	),
@@ -315,7 +323,10 @@ func check(l *licenseccl.License, at time.Time, org, feature string, withDetails
 func RegisterCallbackOnLicenseChange(
 	ctx context.Context, st *cluster.Settings, licenseEnforcer *licenseserver.Enforcer,
 ) {
-	refreshFunc := func(ctx context.Context) {
+	// refreshFunc is the function responsible for refreshing the enforcer's state.
+	// The isChange parameter indicates whether the license is actually being updated,
+	// as opposed to merely refreshing the current license.
+	refreshFunc := func(ctx context.Context, isChange bool) {
 		lic, err := getLicense(st)
 		if err != nil {
 			log.Errorf(ctx, "unable to refresh license enforcer for license change: %v", err)
@@ -339,9 +350,17 @@ func RegisterCallbackOnLicenseChange(
 			}
 		}
 		licenseEnforcer.RefreshForLicenseChange(ctx, licenseType, licenseExpiry)
+
+		cnt, err := licenseEnforcer.CalculateTrialUsageCount(ctx, licenseType, isChange)
+		if err != nil {
+			log.Errorf(ctx, "unable to calculate trial license usage count: %v", err)
+			return
+		}
+		trialLicenseUsageCount.Store(cnt)
 	}
 	// Install the hook so that we refresh license details when the license changes.
-	enterpriseLicense.SetOnChange(&st.SV, refreshFunc)
+	enterpriseLicense.SetOnChange(&st.SV,
+		func(ctx context.Context) { refreshFunc(ctx, true /* isChange */) })
 	// Call the refresh function for the current license.
-	refreshFunc(ctx)
+	refreshFunc(ctx, false /* isChange */)
 }

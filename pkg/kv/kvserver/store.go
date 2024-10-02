@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -2187,15 +2182,17 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	)
 	s.metrics.registry.AddMetricStruct(s.recoveryMgr.Metrics())
 
-	heartbeatInterval, livenessInterval := s.cfg.StoreLivenessDurations()
+	// Create the Store Liveness SupportManager.
+	livenessInterval, heartbeatInterval := s.cfg.StoreLivenessDurations()
 	supportGracePeriod := s.cfg.RPCContext.StoreLivenessWithdrawalGracePeriod()
-	options := storeliveness.NewOptions(heartbeatInterval, livenessInterval, supportGracePeriod)
+	options := storeliveness.NewOptions(livenessInterval, heartbeatInterval, supportGracePeriod)
 	sm := storeliveness.NewSupportManager(
 		slpb.StoreIdent{NodeID: s.nodeDesc.NodeID, StoreID: s.StoreID()}, s.StateEngine(), options,
 		s.cfg.Settings, s.stopper, s.cfg.Clock, s.cfg.StoreLivenessTransport,
 	)
 	s.cfg.StoreLivenessTransport.ListenMessages(s.StoreID(), sm)
 	s.storeLiveness = sm
+	s.metrics.registry.AddMetricStruct(sm.Metrics())
 	if err = sm.Start(ctx); err != nil {
 		return errors.Wrap(err, "starting store liveness")
 	}

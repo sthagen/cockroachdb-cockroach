@@ -369,7 +369,7 @@ func (r *Replica) encodePriorityForRACv2() bool {
 // of the proposal buffer.
 //
 // Note that this method is called for "new" proposals but also by
-// `tryReproposeWithNewLeaseIndex`. This second call leaves questions on what
+// `tryReproposeWithNewLeaseIndexRaftMuLocked`. This second call leaves questions on what
 // exactly the desired semantics are - some fields (MaxLeaseIndex,
 // ClosedTimestamp) will be set and this re-entrance into `propose`
 // is hard to fully understand. (The reset of `MaxLeaseIndex`	inside this
@@ -870,9 +870,9 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	var msgStorageAppend, msgStorageApply raftpb.Message
 	r.mu.Lock()
 	state := logstore.RaftState{ // used for append below
-		LastIndex: r.mu.lastIndexNotDurable,
-		LastTerm:  r.mu.lastTermNotDurable,
-		ByteSize:  r.mu.raftLogSize,
+		LastIndex: r.shMu.lastIndexNotDurable,
+		LastTerm:  r.shMu.lastTermNotDurable,
+		ByteSize:  r.shMu.raftLogSize,
 	}
 	leaderID := r.mu.leaderID
 	lastLeaderID := leaderID
@@ -1071,16 +1071,14 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			stats.tSnapEnd = timeutil.Now()
 			stats.snap.applied = true
 
-			// r.mu.lastIndexNotDurable, r.mu.lastTermNotDurable and r.mu.raftLogSize
-			// were updated in applySnapshot, but we also want to make sure we reflect
-			// these changes in the local variables we're tracking here.
-			r.mu.RLock()
+			// lastIndexNotDurable, lastTermNotDurable and raftLogSize were updated in
+			// applySnapshot, but we also want to make sure we reflect these changes
+			// in the local variables we're tracking here.
 			state = logstore.RaftState{
-				LastIndex: r.mu.lastIndexNotDurable,
-				LastTerm:  r.mu.lastTermNotDurable,
-				ByteSize:  r.mu.raftLogSize,
+				LastIndex: r.shMu.lastIndexNotDurable,
+				LastTerm:  r.shMu.lastTermNotDurable,
+				ByteSize:  r.shMu.raftLogSize,
 			}
-			r.mu.RUnlock()
 
 			// We refresh pending commands after applying a snapshot because this
 			// replica may have been temporarily partitioned from the Raft group and
@@ -1148,9 +1146,9 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// leader ID.
 	r.mu.Lock()
 	// TODO(pavelkalinnikov): put logstore.RaftState to r.mu directly.
-	r.mu.lastIndexNotDurable = state.LastIndex
-	r.mu.lastTermNotDurable = state.LastTerm
-	r.mu.raftLogSize = state.ByteSize
+	r.shMu.lastIndexNotDurable = state.LastIndex
+	r.shMu.lastTermNotDurable = state.LastTerm
+	r.shMu.raftLogSize = state.ByteSize
 	var becameLeader bool
 	if r.mu.leaderID != leaderID {
 		r.mu.leaderID = leaderID
@@ -1460,6 +1458,17 @@ func (r *Replica) processRACv2PiggybackedAdmitted(ctx context.Context) {
 	r.flowControlV2.ProcessPiggybackedAdmittedAtLeaderRaftMuLocked(ctx)
 }
 
+func (r *Replica) processRACv2RangeController(ctx context.Context) {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	r.flowControlV2.ProcessSchedulerEventRaftMuLocked(ctx)
+}
+
+// SendMsgApp implements rac2.MsgAppSender.
+func (r *Replica) SendMsgApp(ctx context.Context, msg raftpb.Message, lowPriorityOverride bool) {
+	r.sendRaftMessage(ctx, msg, lowPriorityOverride)
+}
+
 func (r *Replica) hasRaftReadyRLocked() bool {
 	return r.mu.internalRaftGroup.HasReady()
 }
@@ -1548,7 +1557,7 @@ func (r *Replica) refreshProposalsLocked(
 			//
 			// NB: lease proposals have MaxLeaseIndex 0, so they are cleaned
 			// up here too.
-			if p.command.MaxLeaseIndex <= r.mu.state.LeaseAppliedIndex {
+			if p.command.MaxLeaseIndex <= r.shMu.state.LeaseAppliedIndex {
 				r.cleanupFailedProposalLocked(p)
 				log.Eventf(p.ctx, "retry proposal %x: %s", p.idKey, reason)
 				p.finishApplication(ctx, makeProposalResultErr(
@@ -1608,8 +1617,8 @@ func (r *Replica) refreshProposalsLocked(
 
 	log.VInfof(ctx, 2,
 		"pending commands: reproposing %d (at applied index %d, lease applied index %d) %s",
-		len(reproposals), r.mu.state.RaftAppliedIndex,
-		r.mu.state.LeaseAppliedIndex, reason)
+		len(reproposals), r.shMu.state.RaftAppliedIndex,
+		r.shMu.state.LeaseAppliedIndex, reason)
 
 	// Reproposals are those commands which we weren't able to send back to the
 	// client (since we're not sure that another copy of them could apply at
@@ -1828,12 +1837,12 @@ func (r *Replica) sendRaftMessages(
 			}
 
 			if !drop {
-				r.sendRaftMessage(ctx, message)
+				r.sendRaftMessage(ctx, message, false)
 			}
 		}
 	}
 	if lastAppResp.Index > 0 {
-		r.sendRaftMessage(ctx, lastAppResp)
+		r.sendRaftMessage(ctx, lastAppResp, false)
 	}
 }
 
@@ -1896,8 +1905,11 @@ func (r *Replica) deliverLocalRaftMsgsRaftMuLockedReplicaMuLocked(
 // sendRaftMessage sends a Raft message.
 //
 // When calling this method, the raftMu may be held, but it does not need to be.
-// The Replica mu must not be held.
-func (r *Replica) sendRaftMessage(ctx context.Context, msg raftpb.Message) {
+// lowPriorityOverride may be set for a MsgApp. The Replica mu must not be
+// held.
+func (r *Replica) sendRaftMessage(
+	ctx context.Context, msg raftpb.Message, lowPriorityOverride bool,
+) {
 	lastToReplica, lastFromReplica := r.getLastReplicaDescriptors()
 
 	r.mu.RLock()
@@ -1946,12 +1958,13 @@ func (r *Replica) sendRaftMessage(ctx context.Context, msg raftpb.Message) {
 
 	req := newRaftMessageRequest()
 	*req = kvserverpb.RaftMessageRequest{
-		RangeID:           r.RangeID,
-		ToReplica:         toReplica,
-		FromReplica:       fromReplica,
-		Message:           msg,
-		RangeStartKey:     startKey, // usually nil
-		UsingRac2Protocol: r.flowControlV2.GetEnabledWhenLeader() >= kvflowcontrol.V2EnabledWhenLeaderV1Encoding,
+		RangeID:             r.RangeID,
+		ToReplica:           toReplica,
+		FromReplica:         fromReplica,
+		Message:             msg,
+		RangeStartKey:       startKey, // usually nil
+		UsingRac2Protocol:   r.flowControlV2.GetEnabledWhenLeader() >= kvflowcontrol.V2EnabledWhenLeaderV1Encoding,
+		LowPriorityOverride: lowPriorityOverride,
 	}
 	// For RACv2, annotate successful MsgAppResp messages with the vector of
 	// admitted log indices, by priority.
@@ -2053,7 +2066,7 @@ func (r *Replica) addSnapshotLogTruncationConstraint(
 ) (kvpb.RaftIndex, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	appliedIndex := r.mu.state.RaftAppliedIndex
+	appliedIndex := r.shMu.state.RaftAppliedIndex
 	// Cleared when OutgoingSnapshot closes.
 	if r.mu.snapshotLogTruncationConstraints == nil {
 		r.mu.snapshotLogTruncationConstraints = make(map[uuid.UUID]snapTruncationInfo)
@@ -2289,7 +2302,7 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	// method were to be called on an uninitialized replica (which
 	// has no state and thus an empty raft config), this might cause
 	// problems.
-	if _, currentMember := r.mu.state.Desc.GetReplicaDescriptorByID(r.replicaID); !currentMember {
+	if _, currentMember := r.shMu.state.Desc.GetReplicaDescriptorByID(r.replicaID); !currentMember {
 		return
 	}
 

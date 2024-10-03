@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package mixedversion implements a framework for testing
 // functionality when a cluster is in a mixed-version state.
@@ -1287,9 +1282,26 @@ func assertValidTest(test *Test, fatalFunc func(...interface{})) {
 	// valid (i.e., part of the `allDeploymentModes` list). This stops
 	// us from having to implement a `default` branch with an error when
 	// switching on deployment mode.
+	var supportsSeparateProcess bool
 	for _, dm := range test.options.enabledDeploymentModes {
 		if !validDeploymentMode(dm) {
 			fail(fmt.Errorf("invalid test options: unknown deployment mode %q", dm))
 		}
+
+		if dm == SeparateProcessDeployment {
+			supportsSeparateProcess = true
+		}
+	}
+
+	// In separate process deployments, we need to make sure the storage
+	// cluster is still functional while a node is restarting.
+	// Otherwise, the tenant could fail to keep its sqllivenes record
+	// active, causing it to voluntarily shutdown.
+	const minSeparateProcessNodes = 3
+	if supportsSeparateProcess && len(test.crdbNodes) < minSeparateProcessNodes {
+		fail(fmt.Errorf(
+			"invalid test options: %s deployments require cluster with at least %d nodes",
+			SeparateProcessDeployment, minSeparateProcessNodes,
+		))
 	}
 }

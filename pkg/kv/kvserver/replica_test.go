@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
@@ -506,7 +507,7 @@ func TestReplicaContains(t *testing.T) {
 
 	// This test really only needs a hollow shell of a Replica.
 	r := &Replica{}
-	r.mu.state.Desc = desc
+	r.shMu.state.Desc = desc
 	r.rangeStr.store(0, desc)
 
 	if !r.ContainsKey(roachpb.Key("aa")) {
@@ -852,13 +853,13 @@ func TestLeaseReplicaNotInDesc(t *testing.T) {
 			},
 		},
 	}
-	tc.repl.mu.Lock()
+	tc.repl.mu.RLock()
 	fr := kvserverbase.CheckForcedErr(
 		ctx, raftlog.MakeCmdIDKey(), &raftCmd, false, /* isLocal */
-		&tc.repl.mu.state,
+		&tc.repl.shMu.state,
 	)
 	pErr := fr.ForcedError
-	tc.repl.mu.Unlock()
+	tc.repl.mu.RUnlock()
 	if _, isErr := pErr.GetDetail().(*kvpb.LeaseRejectedError); !isErr {
 		t.Fatal(pErr)
 	} else if !testutils.IsPError(pErr, "replica not part of range") {
@@ -6661,9 +6662,9 @@ func TestAppliedIndex(t *testing.T) {
 			t.Errorf("expected %d, got %d", sum, reply.NewValue)
 		}
 
-		tc.repl.mu.Lock()
-		newAppliedIndex := tc.repl.mu.state.RaftAppliedIndex
-		tc.repl.mu.Unlock()
+		tc.repl.mu.RLock()
+		newAppliedIndex := tc.repl.shMu.state.RaftAppliedIndex
+		tc.repl.mu.RUnlock()
 		if newAppliedIndex <= appliedIndex {
 			t.Errorf("appliedIndex did not advance. Was %d, now %d", appliedIndex, newAppliedIndex)
 		}
@@ -7201,38 +7202,82 @@ func TestReplicaDestroy(t *testing.T) {
 }
 
 // TestQuotaPoolDisabled tests that the no quota is acquired by proposals when
-// the quota pool enablement setting is disabled.
+// the quota pool enablement setting is disabled or the flow control mode is
+// set to kvflowcontrol.ApplyToAll and kvflowcontrol is enabled.
 func TestQuotaPoolDisabled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	ctx := context.Background()
 
-	tc := testContext{}
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
+	testutils.RunTrueAndFalse(t, "enableRaftProposalQuota", func(t *testing.T, quotaPoolSettingEnabled bool) {
+		testutils.RunValues(t, "flowControlMode",
+			[]kvflowcontrol.ModeT{
+				kvflowcontrol.ApplyToElastic,
+				kvflowcontrol.ApplyToAll,
+			}, func(t *testing.T, flowControlMode kvflowcontrol.ModeT) {
+				testutils.RunTrueAndFalse(t, "flowControlEnabled", func(t *testing.T, flowControlEnabled bool) {
+					ctx := context.Background()
+					propErr := errors.New("proposal error")
+					type magicKey struct{}
 
-	tsc := TestStoreConfig(nil /* clock */)
-	enableRaftProposalQuota.Override(ctx, &tsc.Settings.SV, false)
-	tsc.TestingKnobs.TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
-		// Expect no quota allocation when the quota pool is disabled.
-		require.Nil(t, args.QuotaAlloc)
-		return nil
-	}
-	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
+					// We expect the quota pool to be enabled when both the quota pool
+					// setting is enabled and the flow control mode is set to
+					// ApplyToElastic or flow control is disabled.
+					expectEnabled := quotaPoolSettingEnabled &&
+						(flowControlMode == kvflowcontrol.ApplyToElastic || !flowControlEnabled)
 
-	// Flush a write all the way through the Raft proposal pipeline to ensure
-	// that the replica becomes the Raft leader and sets up its quota pool.
-	iArgs := incrementArgs([]byte("a"), 1)
-	_, pErr := tc.SendWrapped(iArgs)
-	require.Nil(t, pErr)
+					tc := testContext{}
+					stopper := stop.NewStopper()
+					defer stopper.Stop(ctx)
 
-	initialQuota := tc.repl.QuotaAvailable()
-	for i := 0; i < 10; i++ {
-		pArg := putArgs(roachpb.Key("a"), make([]byte, 1<<10))
-		_, pErr = tc.SendWrapped(&pArg)
-		require.Nil(t, pErr)
-	}
-	require.Equal(t, initialQuota, tc.repl.QuotaAvailable())
+					tsc := TestStoreConfig(nil /* clock */)
+					enableRaftProposalQuota.Override(ctx, &tsc.Settings.SV, quotaPoolSettingEnabled)
+					kvflowcontrol.Mode.Override(ctx, &tsc.Settings.SV, flowControlMode)
+					kvflowcontrol.Enabled.Override(ctx, &tsc.Settings.SV, flowControlEnabled)
+					tsc.TestingKnobs.TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+						// Expect no quota allocation when the quota pool is disabled,
+						// otherwise expect some quota for our requests only (some ranges are
+						// also disabled selectively).
+						if v := args.Ctx.Value(magicKey{}); v != nil && expectEnabled {
+							require.NotNil(t, args.QuotaAlloc)
+							return kvpb.NewError(propErr)
+						} else if !expectEnabled {
+							require.Nil(t, args.QuotaAlloc)
+						}
+						return nil
+					}
+					tc.StartWithStoreConfig(ctx, t, stopper, tsc)
+
+					// Flush a write all the way through the Raft proposal pipeline to ensure
+					// that the replica becomes the Raft leader and sets up its quota pool.
+					iArgs := incrementArgs([]byte("a"), 1)
+					_, pErr := tc.SendWrapped(iArgs)
+					require.Nil(t, pErr)
+
+					// The quota pool shouldn't be initialized if the pool is disabled via
+					// either setting.
+					if expectEnabled {
+						require.NotNil(t, tc.repl.mu.proposalQuota)
+					} else {
+						require.Nil(t, tc.repl.mu.proposalQuota)
+					}
+
+					for i := 0; i < 10; i++ {
+						ctx = context.WithValue(ctx, magicKey{}, "foo")
+						ba := &kvpb.BatchRequest{}
+						pArg := putArgs(roachpb.Key("a"), make([]byte, 1<<10))
+						ba.Add(&pArg)
+						_, pErr := tc.Sender().Send(ctx, ba)
+						if expectEnabled {
+							if !testutils.IsPError(pErr, propErr.Error()) {
+								t.Fatalf("expected error %v, found %v", propErr, pErr)
+							}
+						} else {
+							require.Nil(t, pErr)
+						}
+					}
+				})
+			})
+	})
 }
 
 // TestQuotaPoolReleasedOnFailedProposal tests that the quota acquired by
@@ -7251,6 +7296,10 @@ func TestQuotaPoolReleasedOnFailedProposal(t *testing.T) {
 	propErr := errors.New("proposal error")
 
 	tsc := TestStoreConfig(nil /* clock */)
+	// Override the kvflowcontrol.Mode setting to apply_to_elastic, as when
+	// apply_to_all is set (metamorphically), the quota pool will be disabled.
+	// See getQuotaPoolEnabledRLocked.
+	kvflowcontrol.Mode.Override(ctx, &tsc.Settings.SV, kvflowcontrol.ApplyToElastic)
 	tsc.TestingKnobs.TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 		if v := args.Ctx.Value(magicKey{}); v != nil {
 			minQuotaSize = tc.repl.mu.proposalQuota.ApproximateQuota() + args.QuotaAlloc.Acquired()
@@ -7290,7 +7339,13 @@ func TestQuotaPoolAccessOnDestroyedReplica(t *testing.T) {
 	tc := testContext{}
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	tc.Start(ctx, t, stopper)
+
+	// Override the kvflowcontrol.Mode setting to apply_to_elastic, as when
+	// apply_to_all is set (metamorphically), the quota pool will be disabled.
+	// See getQuotaPoolEnabledRLocked.
+	tsc := TestStoreConfig(nil /* clock */)
+	kvflowcontrol.Mode.Override(ctx, &tsc.Settings.SV, kvflowcontrol.ApplyToElastic)
+	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
 
 	repl, err := tc.store.GetReplica(1)
 	if err != nil {
@@ -7855,7 +7910,7 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 	// Set the max lease index to that of the recently applied write.
 	// Two requests can't have the same lease applied index.
 	tc.repl.mu.RLock()
-	wrongLeaseIndex = tc.repl.mu.state.LeaseAppliedIndex
+	wrongLeaseIndex = tc.repl.shMu.state.LeaseAppliedIndex
 	if wrongLeaseIndex < 1 {
 		t.Fatal("committed a few batches, but still at lease index zero")
 	}
@@ -8074,7 +8129,7 @@ func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 		t.Fatal("still pending commands")
 	}
 	lastAssignedIdx := tc.repl.mu.proposalBuf.LastAssignedLeaseIndexRLocked()
-	curIdx := tc.repl.mu.state.LeaseAppliedIndex
+	curIdx := tc.repl.shMu.state.LeaseAppliedIndex
 	if c := lastAssignedIdx - curIdx; c > 0 {
 		t.Errorf("no pending cmds, but have required index offset %d", c)
 	}
@@ -10336,7 +10391,7 @@ func TestReplicaRecomputeStats(t *testing.T) {
 
 	repl.raftMu.Lock()
 	repl.mu.Lock()
-	ms := repl.mu.state.Stats // intentionally mutated below
+	ms := repl.shMu.state.Stats // intentionally mutated below
 	disturbMS := enginepb.NewPopulatedMVCCStats(rnd, false)
 	disturbMS.ContainsEstimates = 0
 	ms.Add(*disturbMS)

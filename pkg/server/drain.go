@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -259,7 +254,7 @@ func delegateDrain(
 			if err == io.EOF {
 				break
 			}
-			if grpcutil.IsClosedConnection(err) {
+			if req.Shutdown && grpcutil.IsClosedConnection(err) {
 				// If the drain request contained Shutdown==true, it's
 				// possible for the RPC connection to the target node to be
 				// shut down before a DrainResponse and EOF is

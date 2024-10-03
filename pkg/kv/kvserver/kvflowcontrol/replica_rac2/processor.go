@@ -181,6 +181,7 @@ type rangeControllerInitState struct {
 	tenantID       roachpb.TenantID
 	localReplicaID roachpb.ReplicaID
 	raftInterface  rac2.RaftInterface
+	msgAppSender   rac2.MsgAppSender
 }
 
 // RangeControllerFactory abstracts RangeController creation for testing.
@@ -205,6 +206,7 @@ type ProcessorOptions struct {
 	RaftScheduler          RaftScheduler
 	AdmittedPiggybacker    AdmittedPiggybacker
 	ACWorkQueue            ACWorkQueue
+	MsgAppSender           rac2.MsgAppSender
 	RangeControllerFactory RangeControllerFactory
 	Settings               *cluster.Settings
 	EvalWaitMetrics        *rac2.EvalWaitMetrics
@@ -389,6 +391,12 @@ type Processor interface {
 	// and error will be nil.
 	AdmitForEval(
 		ctx context.Context, pri admissionpb.WorkPriority, ct time.Time) (admitted bool, err error)
+
+	// ProcessSchedulerEventRaftMuLocked is called to process events scheduled
+	// by the RangeController.
+	//
+	// raftMu is held.
+	ProcessSchedulerEventRaftMuLocked(ctx context.Context)
 
 	// InspectRaftMuLocked returns a handle to inspect the state of the
 	// underlying range controller. It is used to power /inspectz-style debugging
@@ -762,6 +770,7 @@ func (p *processorImpl) createLeaderStateRaftMuLocked(
 		tenantID:       p.desc.tenantID,
 		localReplicaID: p.opts.ReplicaID,
 		raftInterface:  p.replMu.raftNode,
+		msgAppSender:   p.opts.MsgAppSender,
 	})
 
 	func() {
@@ -1063,8 +1072,10 @@ func (p *processorImpl) ProcessPiggybackedAdmittedAtLeaderRaftMuLocked(ctx conte
 	}(); updatesEmpty {
 		return
 	}
-	for replicaID, state := range updates {
-		p.leader.rc.AdmitRaftMuLocked(ctx, replicaID, state)
+	if p.leader.rc != nil {
+		for replicaID, state := range updates {
+			p.leader.rc.AdmitRaftMuLocked(ctx, replicaID, state)
+		}
 	}
 	// Clear the scratch from the updates that we have just handled.
 	clear(p.leader.scratch)
@@ -1165,6 +1176,17 @@ func (p *processorImpl) AdmitForEval(
 	return rc.WaitForEval(ctx, pri)
 }
 
+// ProcessSchedulerEventRaftMuLocked implements Processor.
+func (p *processorImpl) ProcessSchedulerEventRaftMuLocked(ctx context.Context) {
+	p.opts.Replica.RaftMuAssertHeld()
+	if p.destroyed {
+		return
+	}
+	if rc := p.leader.rc; rc != nil {
+		rc.HandleSchedulerEventRaftMuLocked(ctx)
+	}
+}
+
 // InspectRaftMuLocked implements Processor.
 func (p *processorImpl) InspectRaftMuLocked(ctx context.Context) (kvflowinspectpb.Handle, bool) {
 	p.opts.Replica.RaftMuAssertHeld()
@@ -1197,6 +1219,7 @@ type RangeControllerFactoryImpl struct {
 	evalWaitMetrics            *rac2.EvalWaitMetrics
 	streamTokenCounterProvider *rac2.StreamTokenCounterProvider
 	closeTimerScheduler        rac2.ProbeToCloseTimerScheduler
+	scheduler                  rac2.Scheduler
 	knobs                      *kvflowcontrol.TestingKnobs
 }
 
@@ -1205,6 +1228,7 @@ func NewRangeControllerFactoryImpl(
 	evalWaitMetrics *rac2.EvalWaitMetrics,
 	streamTokenCounterProvider *rac2.StreamTokenCounterProvider,
 	closeTimerScheduler rac2.ProbeToCloseTimerScheduler,
+	scheduler rac2.Scheduler,
 	knobs *kvflowcontrol.TestingKnobs,
 ) RangeControllerFactoryImpl {
 	return RangeControllerFactoryImpl{
@@ -1212,6 +1236,7 @@ func NewRangeControllerFactoryImpl(
 		evalWaitMetrics:            evalWaitMetrics,
 		streamTokenCounterProvider: streamTokenCounterProvider,
 		closeTimerScheduler:        closeTimerScheduler,
+		scheduler:                  scheduler,
 		knobs:                      knobs,
 	}
 }
@@ -1228,8 +1253,10 @@ func (f RangeControllerFactoryImpl) New(
 			LocalReplicaID:      state.localReplicaID,
 			SSTokenCounter:      f.streamTokenCounterProvider,
 			RaftInterface:       state.raftInterface,
+			MsgAppSender:        state.msgAppSender,
 			Clock:               f.clock,
 			CloseTimerScheduler: f.closeTimerScheduler,
+			Scheduler:           f.scheduler,
 			EvalWaitMetrics:     f.evalWaitMetrics,
 			Knobs:               f.knobs,
 		},

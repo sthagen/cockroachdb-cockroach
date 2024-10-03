@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // "make test" would normally test this file, but it should only be tested
 // within docker compose. We also can't use just "gss" here because that
@@ -174,7 +169,7 @@ func TestGSS(t *testing.T) {
 			})
 			t.Run("cockroach", func(t *testing.T) {
 				out, err := exec.Command("/cockroach/cockroach", "sql",
-					"-e", "SELECT 1",
+					"-e", "SELECT authentication_method FROM [SHOW SESSIONS]",
 					"--certs-dir", "/certs",
 					// TODO(mjibson): Teach the CLI to not ask for passwords during kerberos.
 					// See #51588.
@@ -183,6 +178,11 @@ func TestGSS(t *testing.T) {
 				err = errors.Wrap(err, strings.TrimSpace(string(out)))
 				if !IsError(err, tc.gssErr) {
 					t.Errorf("expected err %v, got %v", tc.gssErr, err)
+				}
+				if tc.gsErr == "" {
+					if !strings.Contains(string(out), "gss") {
+						t.Errorf("expected authentication_method=gss, got %s", out)
+					}
 				}
 			})
 		})

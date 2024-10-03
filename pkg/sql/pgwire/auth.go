@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
@@ -107,7 +102,7 @@ func (c *conn) handleAuthentication(
 		return nil, c.sendError(ctx, pgerror.WithCandidateCode(err, pgcode.InvalidAuthorizationSpecification))
 	}
 
-	ac.SetAuthMethod(hbaEntry.Method.String())
+	ac.SetAuthMethod(redact.SafeString(hbaEntry.Method.String()))
 	ac.LogAuthInfof(ctx, redact.Sprintf("HBA rule: %s", hbaEntry.Input))
 
 	// Populate the AuthMethod with per-connection information so that it
@@ -418,7 +413,7 @@ type AuthConn interface {
 
 	// SetAuthMethod sets the authentication method for subsequent
 	// logging messages.
-	SetAuthMethod(method string)
+	SetAuthMethod(method redact.SafeString)
 	// SetDbUser updates the AuthConn with the actual database username
 	// the connection has authenticated to.
 	SetDbUser(dbUser username.SQLUsername)
@@ -449,7 +444,7 @@ type authPipe struct {
 
 	connDetails eventpb.CommonConnectionDetails
 	authDetails eventpb.CommonSessionDetails
-	authMethod  string
+	authMethod  redact.SafeString
 
 	ch chan []byte
 
@@ -521,8 +516,9 @@ func (p *authPipe) AuthFail(err error) {
 	p.readerDone <- authRes{err: err}
 }
 
-func (p *authPipe) SetAuthMethod(method string) {
+func (p *authPipe) SetAuthMethod(method redact.SafeString) {
 	p.authMethod = method
+	p.c.sessionArgs.AuthenticationMethod = method
 }
 
 func (p *authPipe) SetDbUser(dbUser username.SQLUsername) {

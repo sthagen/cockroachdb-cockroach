@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package upgrades contains the implementation of upgrades. It is imported
 // by the server library.
@@ -137,6 +132,14 @@ var upgrades = []upgradebase.Upgrade{
 		checkForPostUpgradeThrottlePreCond,
 		checkForPostUpgradeThrottleProcessing,
 		upgrade.RestoreActionNotRequired("this check does not persist anything"),
+	),
+
+	upgrade.NewTenantUpgrade(
+		"adds new columns to table_metadata table",
+		clusterversion.V24_3_AddTableMetadataCols.Version(),
+		upgrade.NoPrecondition,
+		addTableMetadataCols,
+		upgrade.RestoreActionNotRequired("cluster restore does not restore this table"),
 	),
 
 	// Note: when starting a new release version, the first upgrade (for

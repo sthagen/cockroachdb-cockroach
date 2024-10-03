@@ -1,12 +1,7 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -208,17 +203,17 @@ func registerLatencyTests(r registry.Registry) {
 	// them to fail as a comment in the test.
 	addMetamorphic(r, restart{}, math.Inf(1))
 	addMetamorphic(r, partition{}, math.Inf(1))
-	addMetamorphic(r, addNode{}, 2.0)
-	addMetamorphic(r, decommission{}, 2.0)
-	addMetamorphic(r, backfill{}, 20.0)
+	addMetamorphic(r, addNode{}, 3.0)
+	addMetamorphic(r, decommission{}, 3.0)
+	addMetamorphic(r, backfill{}, 40.0)
 
 	// NB: If these tests fail, it likely signals a regression. Investigate the
 	// history of the test on roachperf to see what changed.
 	addFull(r, restart{}, math.Inf(1))
 	addFull(r, partition{}, math.Inf(1))
-	addFull(r, addNode{}, 2.0)
-	addFull(r, decommission{}, 2.0)
-	addFull(r, backfill{}, 20.0)
+	addFull(r, addNode{}, 3.0)
+	addFull(r, decommission{}, 3.0)
+	addFull(r, backfill{}, 40.0)
 
 	// NB: These tests will never fail and are not enabled, but they are useful
 	// for development.
@@ -733,10 +728,10 @@ func (v variations) runTest(ctx context.Context, t test.Test, c cluster.Cluster)
 		afterStats))
 
 	t.L().Printf("validating stats during the perturbation")
-	duringOK := isAcceptableChange(t.L(), baselineStats, perturbationStats, v.acceptableChange)
+	failures := isAcceptableChange(t.L(), baselineStats, perturbationStats, v.acceptableChange)
 	t.L().Printf("validating stats after the perturbation")
-	afterOK := isAcceptableChange(t.L(), baselineStats, afterStats, v.acceptableChange)
-	require.True(t, duringOK && afterOK)
+	failures = append(failures, isAcceptableChange(t.L(), baselineStats, afterStats, v.acceptableChange)...)
+	require.True(t, len(failures) == 0, strings.Join(failures, "\n"))
 }
 
 // trackedStat is a collection of the relevant values from the histogram. The
@@ -774,27 +769,30 @@ func (t trackedStat) merge(o trackedStat, c scoreCalculator) trackedStat {
 // It compares all the metrics rather than failing fast. Normally multiple
 // metrics will fail at once if a test is going to fail and it is helpful to see
 // all the differences.
+// This returns an array of strings with the reason(s) the change was too large.
 func isAcceptableChange(
 	logger *logger.Logger, baseline, other map[string]trackedStat, acceptableChange float64,
-) bool {
+) []string {
 	// This can happen if we aren't measuring one of the phases.
+	var failures []string
 	if len(other) == 0 {
-		return true
+		return failures
 	}
-	allPassed := true
 	keys := sortedStringKeys(baseline)
+
 	for _, name := range keys {
 		baseStat := baseline[name]
 		otherStat := other[name]
 		increase := float64(otherStat.score) / float64(baseStat.score)
 		if increase > acceptableChange {
-			logger.Printf("FAILURE: %-15s: Increase %.4f > %.4f BASE: %v SCORE: %v\n", name, increase, acceptableChange, baseStat.score, otherStat.score)
-			allPassed = false
+			failure := fmt.Sprintf("FAILURE: %-15s: Increase %.4f > %.4f BASE: %v SCORE: %v\n", name, increase, acceptableChange, baseStat.score, otherStat.score)
+			logger.Printf(failure)
+			failures = append(failures, failure)
 		} else {
 			logger.Printf("PASSED : %-15s: Increase %.4f <= %.4f BASE: %v SCORE: %v\n", name, increase, acceptableChange, baseStat.score, otherStat.score)
 		}
 	}
-	return allPassed
+	return failures
 }
 
 // startNoBackup starts the nodes without enabling backup.

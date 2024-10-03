@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -530,7 +525,7 @@ func registerKVGracefulDraining(r registry.Registry) {
 			// #131569, disable this once the issue is resolved.
 			settings := install.MakeClusterSettings()
 			settings.ClusterSettings["server.cpu_profile.duration"] = "5s"
-			settings.ClusterSettings["server.cpu_profile.interval"] = "0s"
+			settings.ClusterSettings["server.cpu_profile.interval"] = "1s"
 			settings.ClusterSettings["server.cpu_profile.cpu_usage_combined_threshold"] = "15"
 			settings.ClusterSettings["server.cpu_profile.total_dump_size_limit"] = fmt.Sprintf("%d", 256<<20 /* 256MB */)
 			c.Start(ctx, t.L(), startOpts, settings, c.CRDBNodes())

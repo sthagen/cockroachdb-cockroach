@@ -1,18 +1,14 @@
 // Copyright 2024 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tablemetadatacache
 
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -23,8 +19,6 @@ const (
 	// tableBatchSize is the number of tables to fetch in a
 	// single batch from the system tables.
 	tableBatchSize = 20
-	// iterCols is the number of columns returned by the batch iterator.
-	iterCols = 10
 )
 
 const (
@@ -38,6 +32,11 @@ const (
 	indexCountIdx
 	spanStatsIdx
 	tableTypeIdx
+	autoStatsEnabledIdx
+	statsLastUpdatedIdx
+
+	// iterCols is the number of columns returned by the batch iterator.
+	iterCols
 )
 
 type paginationKey struct {
@@ -49,16 +48,18 @@ type paginationKey struct {
 // tableMetadataIterRow is the structured row returned by
 // the batch iterator.
 type tableMetadataIterRow struct {
-	tableID       int
-	tableName     string
-	dbID          int
-	dbName        string
-	schemaID      int
-	schemaName    string
-	columnCount   int
-	indexCount    int
-	spanStatsJSON []byte
-	tableType     string
+	tableID          int
+	tableName        string
+	dbID             int
+	dbName           string
+	schemaID         int
+	schemaName       string
+	columnCount      int
+	indexCount       int
+	spanStatsJSON    []byte
+	tableType        string
+	autoStatsEnabled *bool
+	statsLastUpdated *time.Time
 }
 
 type tableMetadataBatchIterator struct {
@@ -138,9 +139,12 @@ SELECT t.id,
 			 		WHEN d->'table'->>'viewQuery' IS NOT NULL THEN 'VIEW'
 			 		WHEN d->'table'->'sequenceOpts' IS NOT NULL THEN 'SEQUENCE'
 			 		ELSE 'TABLE'
-			 END as table_type
+			 END as table_type,
+			(d->'table'->'autoStatsSettings'->>'enabled')::BOOL as auto_stats_enabled,
+			ts.last_updated as stats_last_updated
 FROM tables t
 LEFT JOIN span_stats s ON t.id = s.id
+LEFT JOIN (select "tableID", max("createdAt") as last_updated from system.table_statistics group by "tableID") ts ON ts."tableID" = t.id
 LEFT JOIN system.namespace db_name ON t."parentID" = db_name.id
 LEFT JOIN system.namespace schema_name ON t."parentSchemaID" = schema_name.id,
 crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', t.descriptor) AS d
@@ -180,7 +184,7 @@ ORDER BY (t."parentID", t."parentSchemaID", t.name)
 				continue
 			}
 
-			batchIter.batchRows = append(batchIter.batchRows, tableMetadataIterRow{
+			iterRow := tableMetadataIterRow{
 				tableID:       int(tree.MustBeDInt(row[idIdx])),
 				tableName:     string(tree.MustBeDString(row[tableNameIdx])),
 				dbID:          int(tree.MustBeDInt(row[parentIDIdx])),
@@ -191,7 +195,19 @@ ORDER BY (t."parentID", t."parentSchemaID", t.name)
 				indexCount:    int(tree.MustBeDInt(row[indexCountIdx])),
 				spanStatsJSON: []byte(tree.MustBeDJSON(row[spanStatsIdx]).JSON.String()),
 				tableType:     string(tree.MustBeDString(row[tableTypeIdx])),
-			})
+			}
+
+			if row[autoStatsEnabledIdx] != tree.DNull {
+				b := bool(tree.MustBeDBool(row[autoStatsEnabledIdx]))
+				iterRow.autoStatsEnabled = &b
+			}
+
+			if row[statsLastUpdatedIdx] != tree.DNull {
+				t := tree.MustBeDTimestamp(row[statsLastUpdatedIdx])
+				iterRow.statsLastUpdated = &t.Time
+			}
+
+			batchIter.batchRows = append(batchIter.batchRows, iterRow)
 		}
 
 		// The namespace table contains non-table entries like types. It's possible we did not

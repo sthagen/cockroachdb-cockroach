@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -1261,6 +1256,10 @@ type MVCCGetOptions struct {
 	// ReadCategory is used to map to a user-understandable category string, for
 	// stats aggregation and metrics, and a Pebble-understandable QoS.
 	ReadCategory fs.ReadCategory
+	// ReturnRawMVCCValues indicates the get should return a
+	// roachpb.Value whose RawBytes may contain MVCCValueHeader
+	// data.
+	ReturnRawMVCCValues bool
 }
 
 // MVCCGetResult bundles return values for the MVCCGet family of functions.
@@ -1557,6 +1556,7 @@ func mvccGet(
 		inconsistent:     opts.Inconsistent,
 		skipLocked:       opts.SkipLocked,
 		tombstones:       opts.Tombstones,
+		rawMVCCValues:    opts.ReturnRawMVCCValues,
 		failOnMoreRecent: opts.FailOnMoreRecent,
 		keyBuf:           mvccScanner.keyBuf,
 	}
@@ -4557,6 +4557,7 @@ func mvccScanInit(
 		maxKeys:          opts.MaxKeys,
 		targetBytes:      opts.TargetBytes,
 		allowEmpty:       opts.AllowEmpty,
+		rawMVCCValues:    opts.ReturnRawMVCCValues,
 		wholeRows:        opts.WholeRowsOfSize > 1, // single-KV rows don't need processing
 		maxLockConflicts: opts.MaxLockConflicts,
 		inconsistent:     opts.Inconsistent,
@@ -4820,6 +4821,10 @@ type MVCCScanOptions struct {
 	// ReadCategory is used to map to a user-understandable category string, for
 	// stats aggregation and metrics, and a Pebble-understandable QoS.
 	ReadCategory fs.ReadCategory
+	// ReturnRawMVCCValues indicates that the scan should return
+	// roachpb.Value whose RawBytes may contain MVCCValueHeader
+	// data.
+	ReturnRawMVCCValues bool
 }
 
 func (opts *MVCCScanOptions) validate() error {

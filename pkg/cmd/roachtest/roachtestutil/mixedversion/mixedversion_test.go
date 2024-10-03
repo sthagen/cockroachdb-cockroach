@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package mixedversion
 
@@ -189,6 +184,16 @@ func Test_assertValidTest(t *testing.T) {
 	require.Error(t, fatalErr)
 	require.Equal(t,
 		`mixedversion.NewTest: invalid test options: no deployment modes enabled`,
+		fatalErr.Error(),
+	)
+
+	// separate-process deployments requires cluster validation
+	mvt = newTest(NeverUseFixtures, EnabledDeploymentModes(allDeploymentModes...))
+	mvt.crdbNodes = option.NodeListOption{1}
+	assertValidTest(mvt, fatalFunc())
+	require.Error(t, fatalErr)
+	require.Equal(t,
+		`mixedversion.NewTest: invalid test options: separate-process deployments require cluster with at least 3 nodes`,
 		fatalErr.Error(),
 	)
 

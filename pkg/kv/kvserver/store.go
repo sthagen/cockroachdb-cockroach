@@ -59,6 +59,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
 	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftlogger"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftstoreliveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -379,7 +380,8 @@ func newRaftConfig(
 	id raftpb.PeerID,
 	appliedIndex kvpb.RaftIndex,
 	storeCfg StoreConfig,
-	logger raft.Logger,
+	lazyReplication bool,
+	logger raftlogger.Logger,
 	storeLiveness raftstoreliveness.StoreLiveness,
 ) *raft.Config {
 	return &raft.Config{
@@ -391,6 +393,7 @@ func newRaftConfig(
 		MaxUncommittedEntriesSize:   storeCfg.RaftMaxUncommittedEntriesSize,
 		MaxCommittedSizePerReady:    storeCfg.RaftMaxCommittedSizePerReady,
 		DisableConfChangeValidation: true, // see https://github.com/cockroachdb/cockroach/issues/105797
+		LazyReplication:             lazyReplication,
 		MaxSizePerMsg:               storeCfg.RaftMaxSizePerMsg,
 		MaxInflightMsgs:             storeCfg.RaftMaxInflightMsgs,
 		MaxInflightBytes:            storeCfg.RaftMaxInflightBytes,

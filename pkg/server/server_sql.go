@@ -1146,11 +1146,10 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	if tableStatsKnobs := cfg.TestingKnobs.TableStatsKnobs; tableStatsKnobs != nil {
 		tableStatsTestingKnobs = tableStatsKnobs.(*stats.TableStatsTestingKnobs)
 	}
-
 	if tableMetadataKnobs := cfg.TestingKnobs.TableMetadata; tableMetadataKnobs != nil {
 		execCfg.TableMetadataKnobs = tableMetadataKnobs.(*tablemetadatacacheutil.TestingKnobs)
-
 	}
+
 	// Set up internal memory metrics for use by internal SQL executors.
 	// Don't add them to the registry now because it will be added as part of pgServer metrics.
 	sqlMemMetrics := sql.MakeMemMetrics("sql", cfg.HistogramWindowInterval())
@@ -1924,8 +1923,11 @@ func (s *SQLServer) startLicenseEnforcer(ctx context.Context, knobs base.Testing
 		license.WithSystemTenant(s.execCfg.Codec.ForSystemTenant()),
 		license.WithTelemetryStatusReporter(s.diagnosticsReporter),
 	}
-	if knobs.Server != nil {
-		opts = append(opts, license.WithTestingKnobs(&knobs.Server.(*TestingKnobs).LicenseTestingKnobs))
+	if s.tenantConnect != nil {
+		opts = append(opts, license.WithMetadataAccessor(s.tenantConnect))
+	}
+	if knobs.LicenseTestingKnobs != nil {
+		opts = append(opts, license.WithTestingKnobs(knobs.LicenseTestingKnobs.(*license.TestingKnobs)))
 	}
 	err := startup.RunIdempotentWithRetry(ctx, s.stopper.ShouldQuiesce(), "license enforcer start",
 		func(ctx context.Context) error {

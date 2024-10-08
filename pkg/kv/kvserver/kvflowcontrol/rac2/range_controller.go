@@ -273,15 +273,14 @@ func RaftEventFromMsgStorageAppendAndMsgApps(
 	outboundMsgs []raftpb.Message,
 	logSnapshot RaftLogSnapshot,
 	msgAppScratch map[roachpb.ReplicaID][]raftpb.Message,
+	replicaStateInfoMap map[roachpb.ReplicaID]ReplicaStateInfo,
 ) RaftEvent {
-	event := RaftEvent{MsgAppMode: mode, LogSnapshot: logSnapshot}
+	event := RaftEvent{
+		MsgAppMode: mode, LogSnapshot: logSnapshot, ReplicasStateInfo: replicaStateInfoMap}
 	if appendMsg.Type == raftpb.MsgStorageAppend {
-		event = RaftEvent{
-			MsgAppMode: event.MsgAppMode,
-			Term:       appendMsg.LogTerm,
-			Snap:       appendMsg.Snapshot,
-			Entries:    appendMsg.Entries,
-		}
+		event.Term = appendMsg.LogTerm
+		event.Snap = appendMsg.Snapshot
+		event.Entries = appendMsg.Entries
 	}
 	if len(outboundMsgs) == 0 {
 		return event
@@ -2032,8 +2031,10 @@ func (rss *replicaSendStream) handleReadyEntriesLocked(
 				}
 			}
 			tokens := entry.tokens
-			if fn := rss.parent.parent.opts.Knobs.OverrideTokenDeduction; fn != nil {
-				tokens = fn(tokens)
+			if rss.parent.parent.opts.Knobs != nil {
+				if fn := rss.parent.parent.opts.Knobs.OverrideTokenDeduction; fn != nil {
+					tokens = fn(tokens)
+				}
 			}
 			if inSendQueue && entry.index >= rss.mu.nextRaftIndexInitial {
 				// Was in send-queue and had eval tokens deducted for it.
@@ -2075,8 +2076,10 @@ func (rss *replicaSendStream) handleReadyEntriesLocked(
 				pri = entry.pri
 			}
 			tokens := entry.tokens
-			if fn := rss.parent.parent.opts.Knobs.OverrideTokenDeduction; fn != nil {
-				tokens = fn(tokens)
+			if rss.parent.parent.opts.Knobs != nil {
+				if fn := rss.parent.parent.opts.Knobs.OverrideTokenDeduction; fn != nil {
+					tokens = fn(tokens)
+				}
 			}
 			if inSendQueue && entry.index >= rss.mu.nextRaftIndexInitial {
 				// Is in send-queue and will have eval tokens deducted for it.

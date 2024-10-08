@@ -627,7 +627,10 @@ func (r *Replica) stepRaftGroupRaftMuLocked(req *kvserverpb.RaftMessageRequest) 
 			wakeLeader := hasLeader && !fromLeader
 			r.maybeUnquiesceLocked(wakeLeader, false /* mayCampaign */)
 		}
-		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, r.Clock().PhysicalTime())
+		if r.store.TestingKnobs() == nil ||
+			!r.store.TestingKnobs().DisableUpdateLastUpdateTimesMapOnRaftGroupStep {
+			r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, r.Clock().PhysicalTime())
+		}
 		switch req.Message.Type {
 		case raftpb.MsgPreVote, raftpb.MsgVote:
 			// If we receive a (pre)vote request, and we find our leader to be dead or
@@ -833,10 +836,13 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		level := kvflowcontrol.GetV2EnabledWhenLeaderLevel(
 			ctx, r.store.ClusterSettings(), r.store.TestingKnobs().FlowControlTestingKnobs)
 		if level > r.raftMu.flowControlLevel {
-			if r.raftMu.flowControlLevel == kvflowcontrol.V2NotEnabledWhenLeader {
-				func() {
-					r.mu.Lock()
-					defer r.mu.Unlock()
+			var basicState replica_rac2.RaftNodeBasicState
+			func() {
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				basicState = replica_rac2.MakeRaftNodeBasicStateLocked(
+					r.mu.internalRaftGroup, r.shMu.state.Lease.Replica.ReplicaID)
+				if r.raftMu.flowControlLevel == kvflowcontrol.V2NotEnabledWhenLeader {
 					// This will close all connected streams and consequently all
 					// requests waiting on v1 kvflowcontrol.ReplicationAdmissionHandles
 					// will return.
@@ -844,10 +850,10 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 					// Replace with a noop integration since want no code to execute on
 					// various calls.
 					r.mu.replicaFlowControlIntegration = noopReplicaFlowControlIntegration{}
-				}()
-			}
+				}
+			}()
 			r.raftMu.flowControlLevel = level
-			r.flowControlV2.SetEnabledWhenLeaderRaftMuLocked(ctx, level)
+			r.flowControlV2.SetEnabledWhenLeaderRaftMuLocked(ctx, level, basicState)
 		}
 	}
 
@@ -869,6 +875,9 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	var outboundMsgs []raftpb.Message
 	var msgStorageAppend, msgStorageApply raftpb.Message
 	rac2ModeToUse := r.replicationAdmissionControlModeToUse(ctx)
+	// Replication AC v2 state that is initialized while holding Replica.mu.
+	replicaStateInfoMap := r.raftMu.replicaStateScratchForFlowControl
+	var raftNodeBasicState replica_rac2.RaftNodeBasicState
 	var logSnapshot raft.LogSnapshot
 	r.mu.Lock()
 	rac2ModeForReady := r.mu.currentRACv2Mode
@@ -923,6 +932,9 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		if rac2ModeForReady == rac2.MsgAppPull {
 			logSnapshot = raftGroup.LogSnapshot()
 		}
+		raftNodeBasicState = replica_rac2.MakeRaftNodeBasicStateLocked(
+			raftGroup, r.shMu.state.Lease.Replica.ReplicaID)
+		replica_rac2.MakeReplicaStateInfos(raftGroup, replicaStateInfoMap)
 		// We unquiesce if we have a Ready (= there's work to do). We also have
 		// to unquiesce if we just flushed some proposals but there isn't a
 		// Ready, which can happen if the proposals got dropped (raft does this
@@ -952,8 +964,8 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	raftEvent := rac2.RaftEventFromMsgStorageAppendAndMsgApps(
 		rac2ModeForReady, r.ReplicaID(), msgStorageAppend, outboundMsgs,
 		replica_rac2.RaftLogSnapshot(logSnapshot),
-		r.raftMu.msgAppScratchForFlowControl)
-	r.flowControlV2.HandleRaftReadyRaftMuLocked(ctx, raftEvent)
+		r.raftMu.msgAppScratchForFlowControl, replicaStateInfoMap)
+	r.flowControlV2.HandleRaftReadyRaftMuLocked(ctx, raftNodeBasicState, raftEvent)
 	if !hasReady {
 		// We must update the proposal quota even if we don't have a ready.
 		// Consider the case when our quota is of size 1 and two out of three
@@ -1396,7 +1408,8 @@ func (r *Replica) tick(
 
 		r.updatePausedFollowersLocked(ctx, ioThresholdMap)
 
-		leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
+		storeClockTimestamp := r.store.Clock().NowAsClockTimestamp()
+		leaseStatus := r.leaseStatusAtRLocked(ctx, storeClockTimestamp)
 		// TODO(pav-kv): modify the quiescence criterion so that we don't quiesce if
 		// RACv2 holds some send tokens.
 		if r.maybeQuiesceRaftMuLockedReplicaMuLocked(ctx, leaseStatus, livenessMap) {
@@ -1437,6 +1450,9 @@ func (r *Replica) tick(
 		// live even when quiesced.
 		if r.isRaftLeaderRLocked() {
 			r.mu.lastUpdateTimes.update(r.replicaID, r.Clock().PhysicalTime())
+			// We also update lastUpdateTimes for replicas that provide store liveness
+			// support to the leader.
+			r.updateLastUpdateTimesUsingStoreLivenessRLocked(storeClockTimestamp)
 		}
 
 		r.mu.ticks++
@@ -3061,6 +3077,32 @@ func (r *Replica) printRaftTail(
 		}
 	}
 	return sb.String(), nil
+}
+
+// updateLastUpdateTimesUsingStoreLivenessRLocked updates the lastUpdateTimes
+// map if the follower's store is providing store liveness support. This is
+// useful because typically this map is updated on every message, but that
+// assumes that raft will periodically heartbeat. This assumption doesn't hold
+// under the raft fortification protocol, where failure detection is subsumed by
+// store liveness.
+//
+// This method assume that Replica.mu is held in read mode.
+func (r *Replica) updateLastUpdateTimesUsingStoreLivenessRLocked(
+	storeClockTimestamp hlc.ClockTimestamp,
+) {
+	// If store liveness is not enabled, there is nothing to do.
+	if !(*replicaRLockedStoreLiveness)(r).SupportFromEnabled() {
+		return
+	}
+
+	for _, desc := range r.descRLocked().Replicas().Descriptors() {
+		// If the replica's store if providing store liveness support, update
+		// lastUpdateTimes to indicate that it is alive.
+		_, curExp := (*replicaRLockedStoreLiveness)(r).SupportFrom(raftpb.PeerID(desc.ReplicaID))
+		if storeClockTimestamp.ToTimestamp().LessEq(curExp) {
+			r.mu.lastUpdateTimes.update(desc.ReplicaID, r.Clock().PhysicalTime())
+		}
+	}
 }
 
 func truncateEntryString(s string, maxChars int) string {

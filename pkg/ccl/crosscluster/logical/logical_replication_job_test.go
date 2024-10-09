@@ -1262,32 +1262,27 @@ func TestForeignKeyConstraints(t *testing.T) {
 	dbA.Exec(t, "CREATE TABLE test(a int primary key, b int)")
 
 	testutils.RunTrueAndFalse(t, "immediate-mode", func(t *testing.T, immediateMode bool) {
-		testutils.RunTrueAndFalse(t, "valid-foreign-key", func(t *testing.T, validForeignKey bool) {
-			fkStmt := "ALTER TABLE test ADD CONSTRAINT fkc FOREIGN KEY (b) REFERENCES tab(pk)"
-			if !validForeignKey {
-				fkStmt = fkStmt + " NOT VALID"
-			}
-			dbA.Exec(t, fkStmt)
+		fkStmt := "ALTER TABLE test ADD CONSTRAINT fkc FOREIGN KEY (b) REFERENCES tab(pk)"
+		dbA.Exec(t, fkStmt)
 
-			var mode string
-			if immediateMode {
-				mode = "IMMEDIATE"
-			} else {
-				mode = "VALIDATED"
-			}
+		var mode string
+		if immediateMode {
+			mode = "IMMEDIATE"
+		} else {
+			mode = "VALIDATED"
+		}
 
-			var jobID jobspb.JobID
-			stmt := "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = " + mode
-			if immediateMode && validForeignKey {
-				dbA.ExpectErr(t, "only 'NOT VALID' foreign keys are only supported with MODE = 'validated'", stmt, dbBURL.String())
-			} else {
-				dbA.QueryRow(t, stmt, dbBURL.String()).Scan(&jobID)
-				dbA.Exec(t, "CANCEL JOB $1", jobID)
-				jobutils.WaitForJobToCancel(t, dbA, jobID)
-			}
+		var jobID jobspb.JobID
+		stmt := "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab WITH MODE = " + mode
+		if immediateMode {
+			dbA.ExpectErr(t, "foreign keys are only supported with MODE = 'validated'", stmt, dbBURL.String())
+		} else {
+			dbA.QueryRow(t, stmt, dbBURL.String()).Scan(&jobID)
+			dbA.Exec(t, "CANCEL JOB $1", jobID)
+			jobutils.WaitForJobToCancel(t, dbA, jobID)
+		}
 
-			dbA.Exec(t, "ALTER TABLE test DROP CONSTRAINT fkc")
-		})
+		dbA.Exec(t, "ALTER TABLE test DROP CONSTRAINT fkc")
 	})
 }
 
@@ -1938,6 +1933,52 @@ func TestLogicalReplicationSchemaChanges(t *testing.T) {
 	dbA.Exec(t, "CANCEL JOB $1", jobAID)
 	jobutils.WaitForJobToCancel(t, dbA, jobAID)
 	dbA.Exec(t, "ALTER TABLE tab ADD COLUMN newcol INT NOT NULL DEFAULT 10")
+}
+
+// TestUserDefinedTypes verifies that user-defined types are correctly
+// replicated if the type is defined identically on both sides.
+func TestUserDefinedTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	clusterArgs := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+			Knobs: base.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			},
+		},
+	}
+
+	server, s, dbA, dbB := setupLogicalTestServer(t, ctx, clusterArgs, 1)
+	defer server.Stopper().Stop(ctx)
+
+	_, cleanupA := s.PGUrl(t, serverutils.DBName("a"))
+	defer cleanupA()
+
+	dbBURL, cleanupB := s.PGUrl(t, serverutils.DBName("b"))
+	defer cleanupB()
+
+	// Create the same user-defined type both tables.
+	dbA.Exec(t, "CREATE TYPE my_enum AS ENUM ('one', 'two', 'three')")
+	dbB.Exec(t, "CREATE TYPE my_enum AS ENUM ('one', 'two', 'three')")
+
+	dbA.Exec(t, "CREATE TABLE data (pk INT PRIMARY KEY, val my_enum DEFAULT 'two')")
+	dbB.Exec(t, "CREATE TABLE data (pk INT PRIMARY KEY, val my_enum DEFAULT 'two')")
+	dbA.Exec(t, fmt.Sprintf("ALTER TABLE data %s", lwwColumnAdd))
+	dbB.Exec(t, fmt.Sprintf("ALTER TABLE data %s", lwwColumnAdd))
+
+	dbB.Exec(t, "INSERT INTO data VALUES (1, 'one')")
+	// Force default expression evaluation.
+	dbB.Exec(t, "INSERT INTO data VALUES (2)")
+
+	var jobAID jobspb.JobID
+	dbA.QueryRow(t, "CREATE LOGICAL REPLICATION STREAM FROM TABLE data ON $1 INTO TABLE data with skip schema check", dbBURL.String()).Scan(&jobAID)
+	WaitUntilReplicatedTime(t, s.Clock().Now(), dbA, jobAID)
+	require.NoError(t, replicationtestutils.CheckEmptyDLQs(ctx, dbA.DB, "A"))
+	dbB.CheckQueryResults(t, "SELECT * FROM data", [][]string{{"1", "one"}, {"2", "two"}})
+	dbA.CheckQueryResults(t, "SELECT * FROM data", [][]string{{"1", "one"}, {"2", "two"}})
 }
 
 // TestLogicalReplicationCreationChecks verifies that we check that the table

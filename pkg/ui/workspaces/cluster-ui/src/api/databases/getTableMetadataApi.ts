@@ -49,6 +49,7 @@ export type TableMetadata = {
   autoStatsEnabled: boolean;
   // Optimizer stats.
   statsLastUpdated: moment.Moment | null;
+  replicaCount: number;
 };
 
 export type ListTableMetadataRequest = {
@@ -85,6 +86,7 @@ const convertTableMetadataFromServer = (
     statsLastUpdated: resp.stats_last_updated
       ? moment(resp.stats_last_updated)
       : null,
+    replicaCount: resp.replica_count ?? 0,
   };
 };
 
@@ -146,6 +148,10 @@ export const useTableMetadata = (req: ListTableMetadataRequest) => {
   const { data, error, isLoading, mutate } = useSWR<TableMetadataResponse>(
     key,
     () => getTableMetadata(req),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    },
   );
 
   return { data, error, isLoading, refreshTables: mutate };

@@ -55,6 +55,7 @@ export type TableMetadataServer = {
   auto_stats_enabled: boolean;
   // Optimizer stats.
   stats_last_updated: string | null;
+  replica_count: number;
 };
 
 export type TableMetadataResponseServer =
@@ -95,3 +96,22 @@ export type DatabaseGrantServer = {
 
 export type DatabaseGrantsResponseServer =
   APIV2ResponseWithPaginationState<DatabaseGrantServer>;
+
+// ------------------------------------------------------------------------------------
+// /api/v2/updatejob/ response.
+// ------------------------------------------------------------------------------------
+
+export type TableMetaUpdateJobResponseServer = {
+  current_status: string;
+  progress: number;
+  last_start_time: string | null;
+  last_completed_time: string | null;
+  last_updated_time: string | null;
+  data_valid_duration: number;
+  automatic_updates_enabled: boolean;
+};
+
+export type TriggerTableMetaUpdateJobResponseServer = {
+  job_triggered: boolean;
+  message: string;
+};

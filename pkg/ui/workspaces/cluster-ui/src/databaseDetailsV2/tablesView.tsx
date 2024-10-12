@@ -100,15 +100,7 @@ const COLUMNS: (TableColumnProps<TableRow> & { sortKey?: TableSortOption })[] =
       ),
       width: "20%",
       render: (t: TableRow) => (
-        <div>
-          {Object.entries(t.nodesByRegion ?? {}).map(([region, nodes]) => (
-            <RegionNodesLabel
-              key={region}
-              nodes={nodes}
-              region={{ label: region, code: region }}
-            />
-          ))}
-        </div>
+        <RegionNodesLabel nodesByRegion={t.nodesByRegion} />
       ),
     },
     {
@@ -127,7 +119,7 @@ const COLUMNS: (TableColumnProps<TableRow> & { sortKey?: TableSortOption })[] =
       render: (t: TableRow) => {
         return (
           <div>
-            <div>{t.percentLiveData * 100}%</div>
+            <div>{(t.percentLiveData * 100).toFixed(2)}%</div>
             <div>
               {Bytes(t.totalLiveDataBytes)} / {Bytes(t.totalDataBytes)}
             </div>
@@ -141,7 +133,7 @@ const COLUMNS: (TableColumnProps<TableRow> & { sortKey?: TableSortOption })[] =
           {TableColName.AUTO_STATS_ENABLED}
         </Tooltip>
       ),
-      sorter: true,
+      sorter: false,
       render: (t: TableRow) => {
         const type = t.autoStatsEnabled ? "success" : "error";
         const text = t.autoStatsEnabled ? "ENABLED" : "DISABLED";
@@ -158,7 +150,7 @@ const COLUMNS: (TableColumnProps<TableRow> & { sortKey?: TableSortOption })[] =
           {TableColName.STATS_LAST_UPDATED}
         </Tooltip>
       ),
-      sorter: true,
+      sorter: false,
       render: (t: TableRow) => (
         <Timestamp
           time={t.statsLastUpdated}
@@ -300,7 +292,7 @@ export const TablesPageV2 = () => {
           loading={isLoading}
           error={error}
           actionButton={
-            <TableMetadataJobControl onDataUpdated={refreshTables} />
+            <TableMetadataJobControl onJobComplete={refreshTables} />
           }
           columns={colsWithSort}
           dataSource={tableData}

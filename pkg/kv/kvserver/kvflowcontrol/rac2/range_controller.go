@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowinspectpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
+	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -144,7 +145,7 @@ type RaftInterface interface {
 	//
 	// If it returns true, all the entries in the slice are in the message, and
 	// Next is advanced to be equal to end.
-	SendMsgAppRaftMuLocked(replicaID roachpb.ReplicaID, slice RaftLogSlice) (raftpb.Message, bool)
+	SendMsgAppRaftMuLocked(replicaID roachpb.ReplicaID, slice raft.LogSlice) (raftpb.Message, bool)
 }
 
 // RaftLogSnapshot abstract raft.LogSnapshot.
@@ -163,10 +164,8 @@ type RaftLogSnapshot interface {
 	//
 	// NB: the [start, end) interval is different from RawNode.LogSlice which
 	// accepts an open-closed interval.
-	LogSlice(start, end uint64, maxSize uint64) (RaftLogSlice, error)
+	LogSlice(start, end uint64, maxSize uint64) (raft.LogSlice, error)
 }
-
-type RaftLogSlice interface{}
 
 // RaftMsgAppMode specifies how Raft (at the leader) generates MsgApps. In
 // both modes, Raft knows that (Match(i), Next(i)) are in-flight for a
@@ -538,7 +537,9 @@ type rangeController struct {
 
 	mu struct {
 		// All the fields in this struct are modified while holding raftMu and
-		// this mutex. So readers can hold either mutex.
+		// this mutex. So readers can hold either mutex. This mutex must be
+		// released quickly, since it is needed by rangeController.WaitForEval
+		// which can have high concurrency.
 		syncutil.RWMutex
 
 		// State for waiters. When anything in voterSets or nonVoterSets changes,
@@ -572,7 +573,8 @@ type rangeController struct {
 		// to call into the replicaSendStreams that have asked to be scheduled.
 		replicas map[roachpb.ReplicaID]struct{}
 	}
-	entryFCStateScratch []entryFCState
+	entryFCStateScratch       []entryFCState
+	lastSendQueueStatsScratch RangeSendQueueStats
 }
 
 // voterStateForWaiters informs whether WaitForEval is required to wait for
@@ -1090,7 +1092,7 @@ func (rc *rangeController) HandleRaftEventRaftMuLocked(ctx context.Context, e Ra
 
 	// It may have been longer than the sendQueueStatRefreshInterval since we
 	// last updated the send queue stats. Maybe update them now.
-	rc.maybeUpdateSendQueueStats()
+	rc.maybeUpdateSendQueueStatsRaftMuLocked()
 
 	return nil
 }
@@ -1373,13 +1375,15 @@ func (rc *rangeController) CloseRaftMuLocked(ctx context.Context) {
 	if log.V(1) {
 		log.VInfof(ctx, 1, "r%v closing range controller", rc.opts.RangeID)
 	}
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
+	func() {
+		rc.mu.Lock()
+		defer rc.mu.Unlock()
 
-	rc.mu.voterSets = nil
-	rc.mu.nonVoterSet = nil
-	close(rc.mu.waiterSetRefreshCh)
-	rc.mu.waiterSetRefreshCh = nil
+		rc.mu.voterSets = nil
+		rc.mu.nonVoterSet = nil
+		close(rc.mu.waiterSetRefreshCh)
+		rc.mu.waiterSetRefreshCh = nil
+	}()
 	// Return any tracked token deductions, as we don't expect to receive more
 	// AdmittedVector updates.
 	for _, rs := range rc.replicaMap {
@@ -1430,8 +1434,8 @@ func (rc *rangeController) SendStreamStats(statsToSet *RangeSendStreamStats) {
 		panic(errors.AssertionFailedf("statsToSet is non-empty %v", statsToSet.internal))
 	}
 	statsToSet.Clear()
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
 
 	statsToSet.internal = slices.Grow(statsToSet.internal, len(rc.mu.lastSendQueueStats))
 	// We will update the cheaper stats to ensure they are up-to-date. For the
@@ -1459,23 +1463,28 @@ func (rc *rangeController) SendStreamStats(statsToSet *RangeSendStreamStats) {
 	}
 }
 
-func (rc *rangeController) maybeUpdateSendQueueStats() {
+func (rc *rangeController) maybeUpdateSendQueueStatsRaftMuLocked() {
 	now := rc.opts.Clock.PhysicalTime()
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
-	if nextUpdateTime := rc.mu.lastSendQueueStatRefresh.Add(
-		sendQueueStatRefreshInterval); now.After(nextUpdateTime) {
-		// We should update the stats, it has been longer than
-		// sendQueueStatRefreshInterval.
-		rc.updateSendQueueStatsRaftMuRCLocked(now)
+	updateStats := false
+	func() {
+		rc.mu.Lock()
+		defer rc.mu.Unlock()
+		if nextUpdateTime := rc.mu.lastSendQueueStatRefresh.Add(
+			sendQueueStatRefreshInterval); now.After(nextUpdateTime) {
+			// We should update the stats, it has been longer than
+			// sendQueueStatRefreshInterval.
+			updateStats = true
+		}
+	}()
+	if !updateStats {
+		// Common case.
+		return
 	}
+	rc.updateSendQueueStatsRaftMuLocked(now)
 }
 
-func (rc *rangeController) updateSendQueueStatsRaftMuRCLocked(now time.Time) {
-	rc.mu.AssertHeld()
-
-	rc.mu.lastSendQueueStats.Clear()
+func (rc *rangeController) updateSendQueueStatsRaftMuLocked(now time.Time) {
+	rc.lastSendQueueStatsScratch.Clear()
 	for _, rs := range rc.replicaMap {
 		stats := ReplicaSendQueueStats{
 			ReplicaID: rs.desc.ReplicaID,
@@ -1488,8 +1497,12 @@ func (rc *rangeController) updateSendQueueStatsRaftMuRCLocked(now time.Time) {
 				stats.SendQueueCount = rs.sendStream.queueLengthLocked()
 			}()
 		}
-		rc.mu.lastSendQueueStats.Set(stats)
+		rc.lastSendQueueStatsScratch.Set(stats)
 	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.mu.lastSendQueueStats, rc.lastSendQueueStatsScratch =
+		rc.lastSendQueueStatsScratch, rc.mu.lastSendQueueStats
 	rc.mu.lastSendQueueStatRefresh = now
 }
 
@@ -1620,8 +1633,8 @@ func (rc *rangeController) checkConsistencyRaftMuLocked(ctx context.Context) {
 	replicas := map[roachpb.ReplicaID]stateForWaiters{}
 	func() {
 		var leaderID, leaseholderID roachpb.ReplicaID
-		rc.mu.Lock()
-		defer rc.mu.Unlock()
+		rc.mu.RLock()
+		defer rc.mu.RUnlock()
 		for _, vs := range rc.mu.voterSets {
 			for _, v := range vs {
 				if v.isLeader {
@@ -1840,13 +1853,11 @@ type replicaSendStream struct {
 			// LowPri.
 			originalEvalTokens [admissionpb.NumWorkClasses]kvflowcontrol.Tokens
 
-			// Approximate size stat for send-queue. For indices <
-			// nextRaftIndexInitial.
+			// entryTokensApproximator approximates the tokens needed per entry, for
+			// indices < nextRaftIndexInitial, in the send-queue.
 			//
-			// approxMeanSizeBytes is useful since it guides how many bytes to grab
-			// in deductedForScheduler.tokens. If each entry is 100 bytes, and half
-			// the entries are subject to AC, this should be ~50.
-			approxMeanSizeBytes kvflowcontrol.Tokens
+			// It guides how many bytes to grab in deductedForScheduler.tokens.
+			entryTokensApproximator entryTokensApproximator
 
 			// preciseSizeSum is the total size of entries subject to AC, and have
 			// an index >= nextRaftIndexInitial and >= indexToSend.
@@ -1939,9 +1950,6 @@ func (rs *replicaState) createReplicaSendStream(
 	rss.mu.nextRaftIndexInitial = nextRaftIndex
 	rss.mu.sendQueue.indexToSend = indexToSend
 	rss.mu.sendQueue.nextRaftIndex = nextRaftIndex
-	// TODO(sumeer): initialize based on recent appends seen by the
-	// RangeController.
-	rss.mu.sendQueue.approxMeanSizeBytes = 500
 	if mode == MsgAppPull && !rs.sendStream.isEmptySendQueueLocked() {
 		// NB: need to lock rss.mu since
 		// startAttemptingToEmptySendQueueViaWatcherLocked can hand a reference to
@@ -2525,6 +2533,8 @@ func (rss *replicaSendStream) dequeueFromQueueAndSendLocked(
 ) {
 	rss.mu.AssertHeld()
 	var tokensNeeded kvflowcontrol.Tokens
+	var approximatedNumEntries int
+	var approximatedNumActualTokens kvflowcontrol.Tokens
 	for _, entry := range msg.Entries {
 		entryState := getEntryFCStateOrFatal(ctx, entry)
 		if entryState.id.index != rss.mu.sendQueue.indexToSend {
@@ -2536,17 +2546,26 @@ func (rss *replicaSendStream) dequeueFromQueueAndSendLocked(
 				rss.mu.sendQueue.nextRaftIndex))
 		}
 		rss.mu.sendQueue.indexToSend++
+		isApproximatedEntry := entryState.id.index < rss.mu.nextRaftIndexInitial
+		if isApproximatedEntry {
+			approximatedNumEntries++
+			if entryState.usesFlowControl {
+				approximatedNumActualTokens += entryState.tokens
+			}
+		}
 		if entryState.usesFlowControl {
-			if entryState.id.index >= rss.mu.nextRaftIndexInitial {
+			if !isApproximatedEntry {
 				rss.mu.sendQueue.preciseSizeSum -= entryState.tokens
 				rss.mu.sendQueue.originalEvalTokens[WorkClassFromRaftPriority(entryState.pri)] -=
 					entryState.tokens
 			}
-			// TODO(sumeer): use knowledge from entries < nextRaftIndexInitial to
-			// adjust approxMeanSizeBytes.
 			tokensNeeded += entryState.tokens
 			rss.mu.tracker.Track(ctx, entryState.id, raftpb.LowPri, entryState.tokens)
 		}
+	}
+	if approximatedNumEntries > 0 {
+		rss.mu.sendQueue.entryTokensApproximator.addStats(
+			approximatedNumEntries, approximatedNumActualTokens)
 	}
 	if !rss.mu.sendQueue.forceFlushScheduled {
 		// Subtract from already deducted tokens.
@@ -2703,7 +2722,8 @@ func (rss *replicaSendStream) approxQueueSizeLocked() kvflowcontrol.Tokens {
 	var size kvflowcontrol.Tokens
 	countWithApproxStats := int64(rss.mu.nextRaftIndexInitial) - int64(rss.mu.sendQueue.indexToSend)
 	if countWithApproxStats > 0 {
-		size = kvflowcontrol.Tokens(countWithApproxStats) * rss.mu.sendQueue.approxMeanSizeBytes
+		size = kvflowcontrol.Tokens(countWithApproxStats) *
+			rss.mu.sendQueue.entryTokensApproximator.meanTokensPerEntry()
 	}
 	size += rss.mu.sendQueue.preciseSizeSum
 	return size
@@ -2824,4 +2844,29 @@ func (cs connectedState) SafeFormat(w redact.SafePrinter, _ rune) {
 	default:
 		panic(fmt.Sprintf("unknown connectedState %v", cs))
 	}
+}
+
+// entryTokensApproximator simply uses a mean of the entries observed to
+// approximate the tokens needed. More sophisticated heuristics can be
+// devised, if needed.
+type entryTokensApproximator struct {
+	numEntries int
+	numTokens  kvflowcontrol.Tokens
+}
+
+// REQUIRES: numEntries > 0.
+func (a *entryTokensApproximator) addStats(numEntries int, numTokens kvflowcontrol.Tokens) {
+	a.numEntries += numEntries
+	a.numTokens += numTokens
+}
+
+func (a *entryTokensApproximator) meanTokensPerEntry() kvflowcontrol.Tokens {
+	if a.numEntries == 0 {
+		return 500
+	}
+	mean := a.numTokens / kvflowcontrol.Tokens(a.numEntries)
+	if mean == 0 {
+		mean = 1
+	}
+	return mean
 }

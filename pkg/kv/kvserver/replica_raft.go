@@ -528,6 +528,31 @@ func checkReplicationChangeAllowed(
 		return err
 	}
 
+	// Check against direct voter removal. Voters must first be demoted to
+	// learners before they can be removed for at least two reasons:
+	// 1. the leader (or any voter) may be needed to vote for a candidate who
+	//    has not yet applied the configuration change. This is a liveness issue
+	//    if the leader/voter is immediately removed without stepping down to a
+	//    learner first and waiting for a second configuration change to
+	//    succeed.
+	//    For details, see: https://github.com/cockroachdb/cockroach/pull/42251.
+	// 2. the leader may have fortified its leadership term, binding the
+	//    liveness of the leader replica to the leader's store's store liveness
+	//    heartbeats. Removal of the leader replica from a store while that
+	//    store continues to heartbeat in the store liveness fabric will lead to
+	//    the leader disappearing without any other replica deciding that the
+	//    leader is gone and stepping up to campaign.
+	//
+	// This same check exists in the pkg/raft library, but we disable it with
+	// DisableConfChangeValidation.
+	for _, repl := range desc.Replicas().Voters().Descriptors() {
+		if _, ok := proposedDesc.Replicas().GetReplicaDescriptorByID(repl.ReplicaID); !ok {
+			err := errors.Errorf("cannot remove voter %s directly; must first demote to learner", repl)
+			err = errors.Mark(err, errMarkInvalidReplicationChange)
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -608,6 +633,7 @@ var errRemoved = errors.New("replica removed")
 func (r *Replica) stepRaftGroupRaftMuLocked(req *kvserverpb.RaftMessageRequest) error {
 	r.raftMu.AssertHeld()
 	var sideChannelInfo replica_rac2.SideChannelInfoUsingRaftMessageRequest
+	var admittedVector rac2.AdmittedVector
 	err := r.withRaftGroup(func(raftGroup *raft.RawNode) (bool, error) {
 		// We're processing an incoming raft message (from a batch that may
 		// include MsgVotes), so don't campaign if we wake up our raft
@@ -673,9 +699,8 @@ func (r *Replica) stepRaftGroupRaftMuLocked(req *kvserverpb.RaftMessageRequest) 
 			// If there is an admitted vector annotation, pass it to RACv2 to release
 			// the flow control tokens.
 			if term := req.AdmittedState.Term; term != 0 {
-				av := rac2.AdmittedVector{Term: term}
-				copy(av.Admitted[:], req.AdmittedState.Admitted)
-				r.flowControlV2.AdmitRaftMuLocked(context.TODO(), req.FromReplica.ReplicaID, av)
+				admittedVector = rac2.AdmittedVector{Term: term}
+				copy(admittedVector.Admitted[:], req.AdmittedState.Admitted)
 			}
 		}
 		err := raftGroup.Step(req.Message)
@@ -691,6 +716,9 @@ func (r *Replica) stepRaftGroupRaftMuLocked(req *kvserverpb.RaftMessageRequest) 
 	})
 	if sideChannelInfo != (replica_rac2.SideChannelInfoUsingRaftMessageRequest{}) {
 		r.flowControlV2.SideChannelForPriorityOverrideAtFollowerRaftMuLocked(sideChannelInfo)
+	}
+	if admittedVector.Term != 0 {
+		r.flowControlV2.AdmitRaftMuLocked(context.TODO(), req.FromReplica.ReplicaID, admittedVector)
 	}
 	return err
 }

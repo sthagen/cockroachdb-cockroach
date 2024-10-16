@@ -6,7 +6,7 @@ set -euo pipefail
 # clusters that ensures consistent use of the correct project-assignment vars
 # and done some additional sanity check enforcement on some flags.
 
-export GCE_PROJECT=cockroach-drt
+export ROACHPROD_GCE_DEFAULT_PROJECT=cockroach-drt
 export ROACHPROD_DNS="drt.crdb.io"
 
 if [ "$#" -lt 1 ]; then
@@ -422,6 +422,12 @@ EOF"
         $0 sql drt-ua1:1 --cluster=system -- -e "SET CLUSTER SETTING kv.rangefeed.enabled = true"
         $0 sql drt-ua2:1 --cluster=system -- -e "SET CLUSTER SETTING kv.rangefeed.enabled = true"
 
+        # enable weak transaction isolation levels.
+        $0 sql drt-ua1:1 --cluster=system -- -e "SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true"
+        $0 sql drt-ua2:1 --cluster=system -- -e "SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true"
+        $0 sql drt-ua1:1 --cluster=system -- -e "SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true"
+        $0 sql drt-ua2:1 --cluster=system -- -e "SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true"
+
         # Setup the main tenant, on ua1 initilly.
         $0 sql drt-ua1:1 --cluster=system -- -e "CREATE VIRTUAL CLUSTER main"
         $0 sql drt-ua1:1 --cluster=system -- -e "ALTER VIRTUAL CLUSTER main START SERVICE SHARED"
@@ -543,11 +549,15 @@ EOF"
         $0 sql drt-ldr1:1 -- -e "SET CLUSTER SETTING sql.ttl.default_delete_batch_size = 1000"
         $0 sql drt-ldr1:1 -- -e "SET CLUSTER SETTING sql.ttl.default_delete_rate_limit = 2000"
         $0 sql drt-ldr1:1 -- -e "SET CLUSTER SETTING sql.ttl.default_select_batch_size = 5000"
+        $0 sql drt-ldr1:1 -- -e "SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true"
+        $0 sql drt-ldr1:1 -- -e "SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true"
 
         $0 sql drt-ldr2:1 -- -e "SET CLUSTER SETTING kv.rangefeed.enabled = true"
         $0 sql drt-ldr2:1 -- -e "SET CLUSTER SETTING sql.ttl.default_delete_batch_size = 1000"
         $0 sql drt-ldr2:1 -- -e "SET CLUSTER SETTING sql.ttl.default_delete_rate_limit = 2000"
         $0 sql drt-ldr2:1 -- -e "SET CLUSTER SETTING sql.ttl.default_select_batch_size = 5000"
+        $0 sql drt-ldr2:1 -- -e "SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true"
+        $0 sql drt-ldr2:1 -- -e "SET CLUSTER SETTING sql.txn.snapshot_isolation.enabled = true"
 
         # import the workload
         $0 sql drt-ldr1:1 -- -e "CREATE DATABASE ycsb"

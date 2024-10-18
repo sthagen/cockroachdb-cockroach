@@ -111,6 +111,18 @@ var columnarBlocksEnabled = settings.RegisterBoolSetting(
 	settings.WithPublic,
 )
 
+// deleteCompactionsCanExcise controls whether delete compactions can
+// apply rangedels/rangekeydels on sstables they partially apply to, through
+// an excise operation, instead of just applying the rangedels/rangekeydels
+// that fully delete sstables.
+var deleteCompactionsCanExcise = settings.RegisterBoolSetting(
+	settings.SystemVisible,
+	"storage.delete_compaction_excise.enabled",
+	"set to false to direct Pebble to not partially excise sstables in delete-only compactions",
+	metamorphic.ConstantWithTestBool(
+		"storage.delete_compaction_excise.enabled", true), /* defaultValue */
+	settings.WithPublic)
+
 // IngestAsFlushable controls whether ingested sstables that overlap the
 // memtable may be lazily ingested: written to the WAL and enqueued in the list
 // of flushables (eg, memtables, large batches and now lazily-ingested
@@ -825,9 +837,10 @@ const MinimumSupportedFormatVersion = pebble.FormatSyntheticPrefixSuffix
 // DefaultPebbleOptions returns the default pebble options.
 func DefaultPebbleOptions() *pebble.Options {
 	opts := &pebble.Options{
-		Comparer:  EngineComparer,
-		FS:        vfs.Default,
-		KeySchema: keySchema,
+		Comparer:   EngineComparer,
+		FS:         vfs.Default,
+		KeySchema:  keySchema.Name,
+		KeySchemas: sstable.MakeKeySchemas(keySchema),
 		// A value of 2 triggers a compaction when there is 1 sub-level.
 		L0CompactionThreshold: 2,
 		L0StopWritesThreshold: 1000,
@@ -1226,6 +1239,9 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 	}
 	cfg.opts.Experimental.EnableColumnarBlocks = func() bool {
 		return columnarBlocksEnabled.Get(&cfg.settings.SV)
+	}
+	cfg.opts.Experimental.EnableDeleteOnlyCompactionExcises = func() bool {
+		return deleteCompactionsCanExcise.Get(&cfg.settings.SV)
 	}
 
 	auxDir := cfg.opts.FS.PathJoin(cfg.env.Dir, base.AuxiliaryDir)

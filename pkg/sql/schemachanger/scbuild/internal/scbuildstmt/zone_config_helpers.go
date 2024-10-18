@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -61,13 +60,14 @@ type zoneConfigObjBuilder interface {
 	// a database or a table ID.
 	getTargetID() catid.DescID
 
-	// applyZoneConfig
+	// applyZoneConfig applies the zone config to the object, returning the
+	// original zone config for logging.
 	applyZoneConfig(
 		b BuildCtx,
 		n *tree.SetZoneConfig,
 		copyFromParentList []tree.Name,
 		setters []func(c *zonepb.ZoneConfig),
-	) error
+	) (*zonepb.ZoneConfig, error)
 
 	// setZoneConfigToWrite fills our object with the zone config/subzone config
 	// we will be writing to KV.
@@ -652,10 +652,6 @@ func accumulateNewUniqueConstraints(currentZone, newZone *zonepb.ZoneConfig) []z
 func generateSubzoneSpans(
 	b BuildCtx, tableID catid.DescID, subzones []zonepb.Subzone,
 ) ([]zonepb.SubzoneSpan, error) {
-	if err := base.CheckEnterpriseEnabled(b.ClusterSettings(),
-		"replication zones on indexes or partitions"); err != nil {
-		return nil, err
-	}
 	// We already completely avoid creating subzone spans for dropped indexes.
 	// Whether this was intentional is a different story, but it turns out to be
 	// pretty sane. Dropped elements may refer to dropped types and we aren't
@@ -1012,7 +1008,7 @@ func prepareZoneConfig(
 	copyFromParentList []tree.Name,
 	setters []func(c *zonepb.ZoneConfig),
 	obj zoneConfigObject,
-) (*zonepb.ZoneConfig, error) {
+) (*zonepb.ZoneConfig, *zonepb.ZoneConfig, error) {
 	// TODO(annie): once we allow configuring zones for named zones/system ranges,
 	// we will need to guard against secondary tenants from configuring such
 	// ranges.
@@ -1037,7 +1033,7 @@ func prepareZoneConfig(
 	completeZone, _, err := obj.retrieveCompleteZoneConfig(b,
 		n.SetDefault /* getInheritedDefault */)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// We need to inherit zone configuration information from the correct zone,
@@ -1048,7 +1044,7 @@ func prepareZoneConfig(
 		// and completing at the level of the current zone.
 		zoneInheritedFields := zonepb.ZoneConfig{}
 		if err := obj.completeZoneConfig(b, &zoneInheritedFields); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		partialZone.CopyFromZone(zoneInheritedFields, copyFromParentList)
 	}
@@ -1060,22 +1056,25 @@ func prepareZoneConfig(
 	// finalZone is where the new changes are unmarshalled onto.
 	finalZone := *partialZone
 
+	// Clone our zone config to log the old zone config as well as the new one.
+	oldZone := protoutil.Clone(completeZone).(*zonepb.ZoneConfig)
+
 	if n.SetDefault {
 		finalZone = *zonepb.NewZoneConfig()
 	}
 
 	// Fill in our zone configs with var = val assignments.
 	if err := loadSettingsToZoneConfigs(setters, &newZone, &finalZone); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Validate that there are no conflicts in the zone setup.
 	if err := zonepb.ValidateNoRepeatKeysInZone(&newZone); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := validateZoneAttrsAndLocalities(b, currentZone, &newZone); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// The final zone config is the one we just processed.
@@ -1092,7 +1091,7 @@ func prepareZoneConfig(
 
 	// Finally, revalidate everything. Validate only the completeZone config.
 	if err := completeZone.Validate(); err != nil {
-		return nil, pgerror.Wrap(err, pgcode.CheckViolation, "could not validate zone config")
+		return nil, nil, pgerror.Wrap(err, pgcode.CheckViolation, "could not validate zone config")
 	}
 
 	// Finally, check for the extra protection partial zone configs would
@@ -1110,9 +1109,9 @@ func prepareZoneConfig(
 		err = errors.WithHint(err,
 			"try ALTER ... CONFIGURE ZONE USING <field_name> = COPY FROM PARENT [, ...] to "+
 				"populate the field")
-		return nil, err
+		return nil, nil, err
 	}
-	return partialZone, nil
+	return oldZone, partialZone, nil
 }
 
 // isCorrespondingTemporaryIndex returns true iff idx is a temporary index

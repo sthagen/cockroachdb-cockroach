@@ -158,16 +158,22 @@ type RaftLogSnapshot interface {
 	// only be called in MsgAppPull mode for followers. The maxSize is required
 	// to be > 0.
 	//
-	// If the sum of all entries in [start,end) are <= maxSize, all will be
-	// returned. Else, entries will be returned until, and including, the first
-	// entry that causes maxSize to be equaled or exceeded. This implies at
-	// least one entry will be returned in the slice on success.
+	// Returns the longest prefix of entries in the [start, end) interval such
+	// that the total size of the entries does not exceed maxSize. The limit can
+	// only be exceeded if the first entry is larger than maxSize, in which case
+	// only this first entry is returned.
 	//
-	// Returns an error if the log is truncated, or there is some other
-	// transient problem.
+	// Returns an error if the log is truncated beyond the start index, or there
+	// is some other transient problem.
 	//
 	// NB: the [start, end) interval is different from RawNode.LogSlice which
 	// accepts an open-closed interval.
+	//
+	// TODO(#132789): change the semantics so that maxSize can be exceeded not
+	// only if the first entry is large. It should be ok to exceed maxSize if the
+	// last entry makes it so. In the underlying storage implementation, we have
+	// paid the cost of fetching this entry anyway, so there is no need to drop it
+	// from the result.
 	LogSlice(start, end uint64, maxSize uint64) (raft.LogSlice, error)
 }
 
@@ -2324,6 +2330,18 @@ func (rs *replicaState) scheduledRaftMuLocked(
 		rss.mu.sendQueue.deductedForSchedulerTokens < bytesToSend {
 		bytesToSend = rss.mu.sendQueue.deductedForSchedulerTokens
 	}
+	// TODO(sumeer): if (for some reason) many entries are not subject to
+	// replication AC in pull mode, and a send-queue forms, and these entries
+	// are > 4KiB, we will empty the send-queue one entry at a time.
+	// Specifically, we will only deduct 4KiB of tokens, since the approx size
+	// of the send-queue will be zero. Then we will call LogSlice with
+	// maxSize=4KiB, which will return one entry. And then we will repeat. If
+	// this is a real problem, we can fix this by keeping track of not just the
+	// preciseSizeSum of tokens needed, but also the size sum of these entries.
+	// Then scale up the value of maxSize=deducted*(sizeSum/preciseSizeSum). In
+	// this example preciseSizeSum would be 0, so we would instead scale it up
+	// to MaxBytesToSend.
+	//
 	// NB: the rss.mu.sendQueue.deductedForScheduler.tokens represent what is
 	// subject to RAC. But Raft is unaware of this linkage between admission
 	// control and flow tokens, and MakeMsgApp will use this bytesToSend to
@@ -2762,6 +2780,19 @@ func (rss *replicaSendStream) stopAttemptingToEmptySendQueueViaWatcherRaftMuAndS
 	}
 }
 
+// Requires that send-queue is non-empty. Note that it is possible that all
+// the entries in the send-queue are not subject to replication admission
+// control, and we will still wait for non-zero tokens. This is considered
+// acceptable for two reasons (a) when nextRaftIndexInitial > indexToSend, the
+// replicaSendStream does not know whether entries in [indexToSend,
+// nextRaftIndexInitial) are subject to replication AC, (b) even when
+// replicaSendStream has precise knowledge of every entry in the send-queue,
+// it is arguably reasonable to wait for send tokens > 0, since these entries
+// will impose some load on the receiver. Case (b) is going to be rare anyway,
+// since very few entries are not subject to replication AC in pull mode
+// (since it is active only when replication AC is "apply_to_all"), and
+// usually the send-queue won't even form if the entries need zero tokens.
+//
 // NB: raftMu may or may not be held. Specifically, when called from Notify,
 // raftMu is not held.
 func (rss *replicaSendStream) startAttemptingToEmptySendQueueViaWatcherStreamLocked(
@@ -2793,16 +2824,18 @@ func (rss *replicaSendStream) Notify(ctx context.Context) {
 	if rss.mu.sendQueue.deductedForSchedulerTokens != 0 {
 		panic(errors.AssertionFailedf("watcher was registered when already had tokens"))
 	}
-	queueSize := rss.approxQueueSizeStreamLocked()
-	if queueSize == 0 {
+	if rss.isEmptySendQueueRaftMuAndStreamLocked() {
 		panic(errors.AssertionFailedf("watcher was registered with empty send-queue"))
 	}
 	// Deduct a bit more, so we can also dequeue things that get enqueued later,
 	// and transition to an empty send-queue.
 	//
 	// TODO(sumeer): refine this heuristic.
+	queueSize := rss.approxQueueSizeStreamLocked()
 	queueSize = kvflowcontrol.Tokens(float64(queueSize) * 1.1)
 	if queueSize < 2048 {
+		// NB: queueSize could be 0 if none of the entries were subject to
+		// replication AC. Even in that case we grab some tokens.
 		queueSize = 4096
 	}
 	flag := AdjNormal
@@ -2822,6 +2855,9 @@ func (rss *replicaSendStream) Notify(ctx context.Context) {
 
 // NB: raftMu may or may not be held. Specifically, when called from Notify,
 // raftMu is not held.
+//
+// NB: This can return 0 despite a non-empty send-queue if none of the entries
+// are subject to replication admission control.
 func (rss *replicaSendStream) approxQueueSizeStreamLocked() kvflowcontrol.Tokens {
 	rss.mu.AssertHeld()
 	var size kvflowcontrol.Tokens

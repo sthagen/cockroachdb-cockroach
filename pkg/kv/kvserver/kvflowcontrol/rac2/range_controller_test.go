@@ -440,12 +440,17 @@ func (r *testingRCRange) LogSlice(start, end uint64, maxSize uint64) (raft.LogSl
 	var size uint64
 	var entries []raftpb.Entry
 	for _, entry := range r.entries {
-		if entry.Index >= start && entry.Index < end {
-			entries = append(entries, entry)
-			size += uint64(len(entry.Data))
-			if size > maxSize {
-				break
-			}
+		if entry.Index < start || entry.Index >= end {
+			continue
+		}
+		size += uint64(entry.Size())
+		// Allow exceeding the size limit only if this is the first entry.
+		if size > maxSize && len(entries) != 0 {
+			break
+		}
+		entries = append(entries, entry)
+		if size >= maxSize {
+			break
 		}
 	}
 	// TODO(pav-kv): use a real LogSnapshot and construct a correct LogSlice.
@@ -697,18 +702,31 @@ func scanReplica(t *testing.T, line string) testingReplica {
 	}
 }
 
-func parsePriority(t *testing.T, input string) admissionpb.WorkPriority {
+// parsePriorityOrNone returns either a valid admissionpb.WorkPriority or
+// !subjectToRAC, where the latter represents an entry not subject to
+// replication admission control.
+func parsePriorityOrNone(
+	t *testing.T, input string,
+) (subjectToRAC bool, pri admissionpb.WorkPriority) {
 	switch input {
 	case "LowPri":
-		return admissionpb.LowPri
+		return true, admissionpb.LowPri
 	case "NormalPri":
-		return admissionpb.NormalPri
+		return true, admissionpb.NormalPri
 	case "HighPri":
-		return admissionpb.HighPri
+		return true, admissionpb.HighPri
+	case "None":
+		return false, 0
 	default:
 		require.Failf(t, "unknown work class", "%v", input)
-		return admissionpb.WorkPriority(-1)
+		return false, admissionpb.WorkPriority(-1)
 	}
+}
+
+func parsePriority(t *testing.T, input string) admissionpb.WorkPriority {
+	subjectToRAC, pri := parsePriorityOrNone(t, input)
+	require.Truef(t, subjectToRAC, "not a valid priority")
+	return pri
 }
 
 type testingEntryRange struct {
@@ -763,8 +781,12 @@ func parseRaftEvents(t *testing.T, input string) []testingRaftEvent {
 			parts[2] = strings.TrimSpace(parts[2])
 			require.True(t, strings.HasPrefix(parts[2], "pri="))
 			parts[2] = strings.TrimPrefix(strings.TrimSpace(parts[2]), "pri=")
-			pri = parsePriority(t, parts[2])
-			// TODO(sumeer/kvoli): also create entries that are not subject to AC.
+			var subjectToRAC bool
+			subjectToRAC, pri = parsePriorityOrNone(t, parts[2])
+			enc := raftlog.EntryEncodingStandardWithACAndPriority
+			if !subjectToRAC {
+				enc = raftlog.EntryEncodingStandardWithoutAC
+			}
 
 			parts[3] = strings.TrimSpace(parts[3])
 			require.True(t, strings.HasPrefix(parts[3], "size="))
@@ -775,7 +797,7 @@ func parseRaftEvents(t *testing.T, input string) []testingRaftEvent {
 			eventBuf[n-1].entries = append(eventBuf[n-1].entries, entryInfo{
 				term:   uint64(term),
 				index:  uint64(index),
-				enc:    raftlog.EntryEncodingStandardWithACAndPriority,
+				enc:    enc,
 				tokens: kvflowcontrol.Tokens(size),
 				pri:    AdmissionToRaftPriority(pri),
 			})
@@ -1402,7 +1424,7 @@ func TestRangeController(t *testing.T) {
 				}
 				return buf.String()
 
-			case "set-flow-control-config":
+			case "set_flow_control_config":
 				if d.HasArg("enabled") {
 					var enabled bool
 					d.ScanArgs(t, "enabled", &enabled)

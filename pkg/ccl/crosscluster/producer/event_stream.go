@@ -52,9 +52,10 @@ type eventStream struct {
 	data     tree.Datums
 
 	// Fields below initialized when Start called.
-	rf  *rangefeed.RangeFeed
-	mon *mon.BytesMonitor
-	acc mon.BoundAccount
+	rf    *rangefeed.RangeFeed
+	mon   *mon.BytesMonitor
+	acc   mon.BoundAccount
+	stats *rangeStatsPoller
 
 	// The remaining fields are used to process rangefeed messages.
 	// addMu is non-nil during initial scans, where it serializes the onValue and
@@ -163,10 +164,11 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) (retErr error) {
 	}
 
 	initialTimestamp := s.spec.InitialScanTimestamp
-	s.frontier, err = span.MakeFrontier(s.spec.Spans...)
+	frontier, err := span.MakeFrontier(s.spec.Spans...)
 	if err != nil {
 		return err
 	}
+	s.frontier = span.MakeConcurrentFrontier(frontier)
 	for _, sp := range s.spec.Progress {
 		if _, err := s.frontier.Forward(sp.Span, sp.Timestamp); err != nil {
 			s.frontier.Release()
@@ -185,6 +187,8 @@ func (s *eventStream) Start(ctx context.Context, txn *kv.Txn) (retErr error) {
 		// When resuming from cursor, advance frontier to the cursor position.
 		log.Infof(ctx, "resuming event stream (no initial scan) from %s", initialTimestamp)
 	}
+
+	s.stats = startStatsPoller(ctx, time.Minute, s.spec.Spans, s.frontier, s.execCfg.RangeDescIteratorFactory)
 
 	// Reserve batch kvsSize bytes from monitor.  We might have to do something more fancy
 	// in the future, but for now, grabbing chunk of memory from the monitor would do the trick.
@@ -264,6 +268,9 @@ func (s *eventStream) Close(ctx context.Context) {
 	}
 	if s.frontier != nil {
 		s.frontier.Release()
+	}
+	if s.stats != nil {
+		s.stats.Close()
 	}
 	s.acc.Close(ctx)
 }
@@ -364,7 +371,12 @@ func (s *eventStream) sendCheckpoint(ctx context.Context, frontier rangefeed.Vis
 	})
 	s.lastCheckpointLen = len(spans)
 
-	if s.setErr(s.sendFlush(ctx, &streampb.StreamEvent{Checkpoint: &streampb.StreamEvent_StreamCheckpoint{ResolvedSpans: spans}})) {
+	err := s.sendFlush(ctx, &streampb.StreamEvent{Checkpoint: &streampb.StreamEvent_StreamCheckpoint{
+		ResolvedSpans: spans,
+		RangeStats:    s.stats.MaybeStats(),
+	}})
+	if err != nil {
+		s.setErr(err)
 		return
 	}
 	// set the local time for pacing.
@@ -406,53 +418,6 @@ func (s *eventStream) sendFlush(ctx context.Context, event *streampb.StreamEvent
 	case s.streamCh <- tree.Datums{tree.NewDBytes(tree.DBytes(data))}:
 		return nil
 	}
-}
-
-type checkpointPacer struct {
-	pace    time.Duration
-	next    time.Time
-	skipped bool
-}
-
-func makeCheckpointPacer(frequency time.Duration) checkpointPacer {
-	return checkpointPacer{
-		pace:    frequency,
-		next:    timeutil.Now().Add(frequency),
-		skipped: false,
-	}
-}
-
-func (p *checkpointPacer) shouldCheckpoint(
-	currentFrontier hlc.Timestamp, frontierAdvanced bool,
-) bool {
-	now := timeutil.Now()
-	enoughTimeElapsed := p.next.Before(now)
-
-	// Handle previously skipped updates.
-	// Normally, we want to emit checkpoint records when frontier advances.
-	// However, checkpoints could be skipped if the frontier advanced too rapidly
-	// (i.e. more rapid than MinCheckpointFrequency).  In those cases, we skip emitting
-	// the checkpoint, but we will emit it at a later time.
-	if p.skipped {
-		if enoughTimeElapsed {
-			p.skipped = false
-			p.next = now.Add(p.pace)
-			return true
-		}
-		return false
-	}
-
-	isInitialScanCheckpoint := currentFrontier.IsEmpty()
-	// Handle updates when frontier advances.
-	if frontierAdvanced || isInitialScanCheckpoint {
-		if enoughTimeElapsed {
-			p.next = now.Add(p.pace)
-			return true
-		}
-		p.skipped = true
-		return false
-	}
-	return false
 }
 
 // Add a RangeFeedSSTable into current batch.

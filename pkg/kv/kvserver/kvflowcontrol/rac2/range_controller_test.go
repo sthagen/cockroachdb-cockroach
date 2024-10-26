@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowinspectpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
@@ -93,6 +94,10 @@ func (s *testingRCState) init(t *testing.T, ctx context.Context) {
 func sortReplicas(r *testingRCRange) []roachpb.ReplicaDescriptor {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return sortReplicasLocked(r)
+}
+
+func sortReplicasLocked(r *testingRCRange) []roachpb.ReplicaDescriptor {
 	return sortReplicaSet(r.mu.r.replicaSet)
 }
 
@@ -312,6 +317,12 @@ func (s *testingRCState) maybeSetInitialTokens(r testingRange) {
 	}
 }
 
+func makeTestMutexAsserter() ReplicaMutexAsserter {
+	var raftMu syncutil.Mutex
+	var replicaMu syncutil.RWMutex
+	return MakeReplicaMutexAsserter(&raftMu, &replicaMu)
+}
+
 func (s *testingRCState) getOrInitRange(
 	t *testing.T, r testingRange, mode RaftMsgAppMode,
 ) *testingRCRange {
@@ -339,6 +350,7 @@ func (s *testingRCState) getOrInitRange(
 			EvalWaitMetrics:        s.evalMetrics,
 			RangeControllerMetrics: s.rcMetrics,
 			WaitForEvalConfig:      s.waitForEvalConfig,
+			ReplicaMutexAsserter:   makeTestMutexAsserter(),
 			Knobs:                  &kvflowcontrol.TestingKnobs{},
 		}
 
@@ -348,7 +360,9 @@ func (s *testingRCState) getOrInitRange(
 			Leaseholder:   r.localReplicaID,
 			NextRaftIndex: r.nextRaftIndex,
 		}
+		options.ReplicaMutexAsserter.RaftMu.Lock()
 		testRC.rc = NewRangeController(s.testCtx, options, init)
+		options.ReplicaMutexAsserter.RaftMu.Unlock()
 		s.ranges[r.rangeID] = testRC
 	}
 	s.maybeSetInitialTokens(r)
@@ -356,7 +370,11 @@ func (s *testingRCState) getOrInitRange(
 	// send streams for the range.
 	event := testRC.makeRaftEventWithReplicasState()
 	event.MsgAppMode = mode
-	require.NoError(t, testRC.rc.HandleRaftEventRaftMuLocked(s.testCtx, event))
+	func() {
+		testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+		defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+		require.NoError(t, testRC.rc.HandleRaftEventRaftMuLocked(s.testCtx, event))
+	}()
 	return testRC
 }
 
@@ -490,7 +508,9 @@ func (r *testingRCRange) startWaitForEval(name string, pri admissionpb.WorkPrior
 func (r *testingRCRange) admit(ctx context.Context, storeID roachpb.StoreID, av AdmittedVector) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, replica := range r.mu.r.replicaSet {
+
+	for _, replDesc := range sortReplicasLocked(r) {
+		replica := r.mu.r.replicaSet[replDesc.ReplicaID]
 		if replica.desc.StoreID == storeID {
 			for _, v := range av.Admitted {
 				// Ensure that Match doesn't lag behind the highest index in the
@@ -498,7 +518,11 @@ func (r *testingRCRange) admit(ctx context.Context, storeID roachpb.StoreID, av 
 				replica.info.Match = max(replica.info.Match, v)
 			}
 			r.mu.r.replicaSet[replica.desc.ReplicaID] = replica
-			r.rc.AdmitRaftMuLocked(ctx, replica.desc.ReplicaID, av)
+			func() {
+				r.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+				defer r.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+				r.rc.AdmitRaftMuLocked(ctx, replica.desc.ReplicaID, av)
+			}()
 			return
 		}
 	}
@@ -899,8 +923,16 @@ func (t *testingProbeToCloseTimerScheduler) ScheduleSendStreamCloseRaftMuLocked(
 		case <-timer.Ch():
 		}
 		timer.MarkRead()
-		require.NoError(t.state.t,
-			t.state.ranges[rangeID].rc.HandleRaftEventRaftMuLocked(ctx, t.state.ranges[rangeID].makeRaftEventWithReplicasState()))
+		func() {
+			r := t.state.ranges[rangeID]
+			event := r.makeRaftEventWithReplicasState()
+
+			r.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+			defer r.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+
+			require.NoError(t.state.t,
+				r.rc.HandleRaftEventRaftMuLocked(ctx, event))
+		}()
 	}()
 }
 
@@ -1117,12 +1149,20 @@ func TestRangeController(t *testing.T) {
 						defer testRC.mu.Unlock()
 						testRC.mu.r = r
 					}()
-					require.NoError(t, testRC.rc.SetReplicasRaftMuLocked(ctx, r.replicas()))
+					func() {
+						testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+						defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+						require.NoError(t, testRC.rc.SetReplicasRaftMuLocked(ctx, r.replicas()))
+					}()
 					// Send an empty raft event in order to trigger any potential
 					// connectedState changes.
 					event := testRC.makeRaftEventWithReplicasState()
 					event.MsgAppMode = mode
-					require.NoError(t, testRC.rc.HandleRaftEventRaftMuLocked(ctx, event))
+					func() {
+						testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+						defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+						require.NoError(t, testRC.rc.HandleRaftEventRaftMuLocked(ctx, event))
+					}()
 				}
 				// Sleep for a bit to allow any timers to fire.
 				time.Sleep(20 * time.Millisecond)
@@ -1133,12 +1173,20 @@ func TestRangeController(t *testing.T) {
 				d.ScanArgs(t, "range_id", &rangeID)
 				d.ScanArgs(t, "replica_id", &replicaID)
 				testRC := state.ranges[roachpb.RangeID(rangeID)]
-				testRC.rc.SetLeaseholderRaftMuLocked(ctx, roachpb.ReplicaID(replicaID))
+				func() {
+					testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+					defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+					testRC.rc.SetLeaseholderRaftMuLocked(ctx, roachpb.ReplicaID(replicaID))
+				}()
 				return state.rangeStateString()
 
 			case "close_rcs":
 				for _, r := range state.ranges {
-					r.rc.CloseRaftMuLocked(ctx)
+					func() {
+						r.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+						defer r.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+						r.rc.CloseRaftMuLocked(ctx)
+					}()
 				}
 				evalStr := state.evalStateString()
 				for k := range state.ranges {
@@ -1274,7 +1322,11 @@ func TestRangeController(t *testing.T) {
 						}
 					}()
 					raftEvent.ReplicasStateInfo = testRC.replicasStateInfo()
-					require.NoError(t, testRC.rc.HandleRaftEventRaftMuLocked(ctx, raftEvent))
+					func() {
+						testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+						defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+						require.NoError(t, testRC.rc.HandleRaftEventRaftMuLocked(ctx, raftEvent))
+					}()
 				}
 				// Sleep for a bit to allow any timers to fire.
 				time.Sleep(20 * time.Millisecond)
@@ -1287,7 +1339,11 @@ func TestRangeController(t *testing.T) {
 				d.ScanArgs(t, "range_id", &rangeID)
 				d.ScanArgs(t, "replica_id", &replicaID)
 				testRC := state.ranges[roachpb.RangeID(rangeID)]
-				testRC.rc.scheduleReplica(roachpb.ReplicaID(replicaID))
+				func() {
+					testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+					defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+					testRC.rc.scheduleReplica(roachpb.ReplicaID(replicaID))
+				}()
 				return state.sendStreamString(roachpb.RangeID(rangeID))
 
 			case "handle_scheduler_event":
@@ -1298,7 +1354,11 @@ func TestRangeController(t *testing.T) {
 				if d.HasArg("push-mode") {
 					mode = MsgAppPush
 				}
-				testRC.rc.HandleSchedulerEventRaftMuLocked(ctx, mode, testRC.logSnapshot())
+				func() {
+					testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+					defer testRC.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+					testRC.rc.HandleSchedulerEventRaftMuLocked(ctx, mode, testRC.logSnapshot())
+				}()
 				// Sleep for a bit to allow any timers to fire.
 				time.Sleep(20 * time.Millisecond)
 				return state.sendStreamString(roachpb.RangeID(rangeID))
@@ -1344,7 +1404,11 @@ func TestRangeController(t *testing.T) {
 					var sizeCount, sizeBytes int64
 					for _, rcState := range state.ranges {
 						stats := RangeSendStreamStats{}
-						rcState.rc.updateSendQueueStatsRaftMuLocked(state.ts.Now())
+						func() {
+							rcState.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+							defer rcState.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+							rcState.rc.updateSendQueueStatsRaftMuLocked(state.ts.Now())
+						}()
 						rcState.rc.SendStreamStats(&stats)
 						count, bytes := stats.SumSendQueues()
 						sizeCount += count
@@ -1373,7 +1437,13 @@ func TestRangeController(t *testing.T) {
 			case "inspect":
 				var rangeID int
 				d.ScanArgs(t, "range_id", &rangeID)
-				handle := state.ranges[roachpb.RangeID(rangeID)].rc.InspectRaftMuLocked(ctx)
+				var handle kvflowinspectpb.Handle
+				func() {
+					rc := state.ranges[roachpb.RangeID(rangeID)].rc
+					rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+					defer rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+					handle = rc.InspectRaftMuLocked(ctx)
+				}()
 				marshaled, err := marshaller.MarshalToString(&handle)
 				require.NoError(t, err)
 				return fmt.Sprintf("%v", marshaled)
@@ -1388,7 +1458,11 @@ func TestRangeController(t *testing.T) {
 
 				r := state.ranges[roachpb.RangeID(rangeID)]
 				if refresh {
-					r.rc.updateSendQueueStatsRaftMuLocked(state.ts.Now())
+					func() {
+						r.rc.opts.ReplicaMutexAsserter.RaftMu.Lock()
+						defer r.rc.opts.ReplicaMutexAsserter.RaftMu.Unlock()
+						r.rc.updateSendQueueStatsRaftMuLocked(state.ts.Now())
+					}()
 				}
 				stats := RangeSendStreamStats{}
 				r.rc.SendStreamStats(&stats)
@@ -2282,4 +2356,37 @@ func TestConstructRaftEventForReplica(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRangeSendStreamStatsString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	stats := RangeSendStreamStats{
+		internal: []ReplicaSendStreamStats{
+			{
+				IsStateReplicate: false,
+				HasSendQueue:     true,
+				ReplicaSendQueueStats: ReplicaSendQueueStats{
+					ReplicaID:      1,
+					SendQueueCount: 10,
+					SendQueueBytes: 100,
+				},
+			},
+			{
+				IsStateReplicate: true,
+				HasSendQueue:     false,
+				ReplicaSendQueueStats: ReplicaSendQueueStats{
+					ReplicaID:      2,
+					SendQueueCount: 0,
+					SendQueueBytes: 0,
+				},
+			},
+		},
+	}
+
+	require.Equal(t,
+		"[r1=(is_state_replicate=false has_send_queue=true send_queue_size=100 B / 10 entries), "+
+			"r2=(is_state_replicate=true has_send_queue=false send_queue_size=0 B / 0 entries)]",
+		stats.String())
 }

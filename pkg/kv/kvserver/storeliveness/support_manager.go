@@ -53,6 +53,8 @@ type SupportManager struct {
 	metrics               *SupportManagerMetrics
 }
 
+var _ Fabric = (*SupportManager)(nil)
+
 // NewSupportManager creates a new Store Liveness SupportManager. The main
 // goroutine that processes Store Liveness messages is initialized
 // separately, via Start.
@@ -105,6 +107,18 @@ func (sm *SupportManager) SupportFor(id slpb.StoreIdent) (slpb.Epoch, bool) {
 	ss := sm.supporterStateHandler.getSupportFor(id)
 	// An empty expiration implies support has expired.
 	return ss.Epoch, !ss.Expiration.IsEmpty()
+}
+
+// InspectSupportFrom implements the InspectFabric interface.
+func (sm *SupportManager) InspectSupportFrom() slpb.SupportStatesPerStore {
+	supportStates := sm.requesterStateHandler.exportAllSupportFrom()
+	return slpb.SupportStatesPerStore{StoreID: sm.storeID, SupportStates: supportStates}
+}
+
+// InspectSupportFor implements the InspectFabric interface.
+func (sm *SupportManager) InspectSupportFor() slpb.SupportStatesPerStore {
+	supportStates := sm.supporterStateHandler.exportAllSupportFor()
+	return slpb.SupportStatesPerStore{StoreID: sm.storeID, SupportStates: supportStates}
 }
 
 // SupportFrom implements the Fabric interface. It delegates the response to the
@@ -298,6 +312,10 @@ func (sm *SupportManager) withdrawSupport(ctx context.Context) {
 	ssfu := sm.supporterStateHandler.checkOutUpdate()
 	defer sm.supporterStateHandler.finishUpdate(ssfu)
 	numWithdrawn := ssfu.withdrawSupport(now)
+	if numWithdrawn == 0 {
+		// No support to withdraw.
+		return
+	}
 
 	batch := sm.engine.NewBatch()
 	defer batch.Close()

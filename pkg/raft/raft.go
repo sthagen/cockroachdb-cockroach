@@ -1065,8 +1065,7 @@ func (r *raft) setTerm(term uint64) {
 	assertTrue(term > r.Term, "term cannot regress")
 	r.Term = term
 	r.Vote = None
-	r.lead = None
-	r.leadEpoch = 0
+	r.resetLead()
 }
 
 func (r *raft) setVote(id pb.PeerID) {
@@ -1087,7 +1086,7 @@ func (r *raft) setLead(lead pb.PeerID) {
 
 func (r *raft) resetLead() {
 	r.lead = None
-	r.leadEpoch = 0
+	r.resetLeadEpoch()
 }
 
 func (r *raft) setLeadEpoch(leadEpoch pb.Epoch) {
@@ -1357,6 +1356,14 @@ func (r *raft) hup(t CampaignType) {
 		r.logger.Debugf("%x ignoring MsgHup due to leader fortification", r.id)
 		return
 	}
+
+	// We shouldn't campaign if we don't have quorum support in store liveness.
+	if r.fortificationTracker.RequireQuorumSupportOnCampaign() &&
+		!r.fortificationTracker.QuorumSupported() {
+		r.logger.Debugf("%x cannot campaign since it's not supported by a quorum in store liveness", r.id)
+		return
+	}
+
 	if r.hasUnappliedConfChanges() {
 		r.logger.Warningf("%x cannot campaign at term %d since there are still pending configuration changes to apply", r.id, r.Term)
 		return
@@ -1537,13 +1544,21 @@ func (r *raft) Step(m pb.Message) error {
 		default:
 			r.logger.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]",
 				r.id, r.Term, m.Type, m.From, m.Term)
-			if IsMsgFromLeader(m.Type) {
-				// We've just received a message from a leader which was elected
-				// at a higher term. The old leader is no longer fortified, so it's
-				// safe to de-fortify at this point.
+			if IsMsgIndicatingLeader(m.Type) {
+				// We've just received a message that indicates that a new leader
+				// was elected at a higher term, but the message may not be from the
+				// leader itself. Either way, the old leader is no longer fortified,
+				// so it's safe to de-fortify at this point.
 				r.deFortify(m.From, m.Term)
-				r.becomeFollower(m.Term, m.From)
+				var lead pb.PeerID
+				if IsMsgFromLeader(m.Type) {
+					lead = m.From
+				}
+				r.becomeFollower(m.Term, lead)
 			} else {
+				// We've just received a message that does not indicate that a new
+				// leader was elected at a higher term. All it means is that some
+				// other peer has this term.
 				r.becomeFollower(m.Term, None)
 			}
 		}

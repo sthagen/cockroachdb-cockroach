@@ -194,10 +194,22 @@ type LivenessFabric struct {
 
 // NewLivenessFabric initializes and returns a LivenessFabric.
 func NewLivenessFabric() *LivenessFabric {
+	return NewLivenessFabricWithPeers()
+}
+
+// NewLivenessFabricWithPeers initializes and returns a LivenessFabric with the
+// given peer IDs provided.
+func NewLivenessFabricWithPeers(peers ...pb.PeerID) *LivenessFabric {
 	state := make(map[pb.PeerID]*MockStoreLiveness)
-	return &LivenessFabric{
+	fabric := &LivenessFabric{
 		state: state,
 	}
+
+	for _, peer := range peers {
+		fabric.AddPeer(peer)
+	}
+
+	return fabric
 }
 
 // AddPeer adds a peer to the liveness fabric.
@@ -314,5 +326,33 @@ func (l *LivenessFabric) BumpAllSupportEpochs() {
 		for s2ID := range storeLiveness.state {
 			l.BumpEpoch(s1ID, s2ID)
 		}
+	}
+}
+
+// Isolate isolates the target peer from all other peers in the liveness fabric.
+func (l *LivenessFabric) Isolate(targetID pb.PeerID) {
+	for id := range l.state {
+		if id == targetID {
+			// We don't want to withdraw the support from our self.
+			continue
+		}
+
+		l.WithdrawSupport(id, targetID)
+		l.WithdrawSupport(targetID, id)
+	}
+}
+
+// UnIsolate is the opposite of Isolate(). It unisolates the target peer from
+// all other peers in the liveness fabric.
+func (l *LivenessFabric) UnIsolate(targetID pb.PeerID) {
+	for id := range l.state {
+		if id == targetID {
+			// We don't have to grant support to our self since Isolate() doesn't
+			// withdraw it.
+			continue
+		}
+
+		l.GrantSupport(id, targetID)
+		l.GrantSupport(targetID, id)
 	}
 }

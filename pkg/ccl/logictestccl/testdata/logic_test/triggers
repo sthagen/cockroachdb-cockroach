@@ -583,7 +583,7 @@ statement error pgcode 42804 pq: argument of WHEN must be type bool, not type in
 CREATE TRIGGER foo AFTER INSERT ON xy WHEN (1) EXECUTE FUNCTION f();
 
 # The WHEN clause cannot reference table columns.
-statement error pgcode 42703 pq: column "x" does not exist
+statement error pgcode 42703 pq: column "x" does not exist\nHINT: column references in a trigger WHEN clause must be prefixed with NEW or OLD
 CREATE TRIGGER foo AFTER INSERT ON xy WHEN (x = 1) EXECUTE FUNCTION f();
 
 # The WHEN clause cannot contain a subquery.
@@ -781,6 +781,30 @@ statement error pgcode 42P01 pq: relation "t" does not exist
 CREATE TRIGGER foo AFTER INSERT ON xy FOR EACH ROW EXECUTE FUNCTION g();
 
 statement ok
+DROP FUNCTION g;
+
+subtest regression_134630
+
+statement ok
+CREATE TABLE t1 (a INT, b INT);
+CREATE TABLE t2 (a INT, b INT);
+
+statement ok
+CREATE FUNCTION g() RETURNS TRIGGER LANGUAGE PLpgSQL AS $$
+  BEGIN
+    INSERT INTO t2 VALUES ((NEW).a, (NEW).b);
+    RETURN NEW;
+  END
+$$;
+
+statement ok
+CREATE TRIGGER foo BEFORE INSERT OR UPDATE ON t1 FOR EACH ROW EXECUTE FUNCTION g();
+
+# Make sure the legacy schema-changer correctly removes the backreference from
+# t2 to t1.
+statement ok
+DROP TABLE t1;
+DROP TABLE t2;
 DROP FUNCTION g;
 
 # ==============================================================================

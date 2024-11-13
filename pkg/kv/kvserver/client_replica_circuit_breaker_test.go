@@ -472,9 +472,9 @@ func (s *dummyStream) SendUnbuffered(ev *kvpb.RangeFeedEvent) error {
 	}
 }
 
-// Disconnect implements the Stream interface. It mocks the disconnect behavior
+// SendError implements the Stream interface. It mocks the disconnect behavior
 // by sending the error to the done channel.
-func (s *dummyStream) Disconnect(err *kvpb.Error) {
+func (s *dummyStream) SendError(err *kvpb.Error) {
 	s.done <- err
 }
 
@@ -489,7 +489,7 @@ func waitReplicaRangeFeed(
 		return stream.SendUnbuffered(&event)
 	}
 
-	err := r.RangeFeed(stream.ctx, req, stream, nil /* pacer */)
+	_, err := r.RangeFeed(stream.ctx, req, stream, nil /* pacer */)
 	if err != nil {
 		return sendErrToStream(kvpb.NewError(err))
 	}

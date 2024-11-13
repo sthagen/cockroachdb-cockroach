@@ -2143,8 +2143,8 @@ func (n *Node) MuxRangeFeed(muxStream kvpb.Internal_MuxRangeFeedServer) error {
 			// span. If registration fails, it returns an error. Otherwise, it returns
 			// nil without blocking on rangefeed completion. Events are then sent to
 			// the provided streamSink. If the rangefeed disconnects after being
-			// successfully registered, it calls streamSink.Disconnect with the error.
-			if err := n.stores.RangeFeed(streamCtx, req, streamSink); err != nil {
+			// successfully registered, it calls streamSink.SendError with the error.
+			if _, err := n.stores.RangeFeed(streamCtx, req, streamSink); err != nil {
 				sm.SendBufferedError(
 					makeMuxRangefeedErrorEvent(req.StreamID, req.RangeID, kvpb.NewError(err)))
 			}

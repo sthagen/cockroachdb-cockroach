@@ -8,6 +8,7 @@ package logical
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"net/url"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/crosscluster/replicationtestutils"
@@ -517,13 +519,26 @@ func TestLogicalStreamIngestionErrors(t *testing.T) {
 	dbA.Exec(t, createStmt)
 	dbB.Exec(t, createStmt)
 
-	createQ := "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab"
-	if s.Codec().IsSystem() {
-		dbB.ExpectErr(t, "kv.rangefeed.enabled must be enabled on the source cluster for logical replication", createQ, urlA)
-		kvserver.RangefeedEnabled.Override(ctx, &s.ClusterSettings().SV, true)
-	}
+	t.Run("rangefeed disabled", func(t *testing.T) {
+		createQ := "CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab"
+		if s.Codec().IsSystem() {
+			dbB.ExpectErr(t, "kv.rangefeed.enabled must be enabled on the source cluster for logical replication", createQ, urlA)
+			kvserver.RangefeedEnabled.Override(ctx, &s.ClusterSettings().SV, true)
+		}
 
-	dbB.Exec(t, createQ, urlA)
+		dbB.Exec(t, createQ, urlA)
+	})
+
+	t.Run("multi stmt creation", func(t *testing.T) {
+		db := dbB.DB.(*gosql.DB)
+		var jobID jobspb.JobID
+		err := crdb.ExecuteTx(ctx, db, nil /* txopts */, func(tx *gosql.Tx) error {
+			return tx.QueryRow("CREATE LOGICAL REPLICATION STREAM FROM TABLE tab ON $1 INTO TABLE tab", urlA).Scan(&jobID)
+		})
+		require.True(t, testutils.IsError(err,
+			"cannot CREATE LOGICAL REPLICATION STREAM in a multi-statement transaction"))
+	})
+
 }
 
 func TestLogicalStreamIngestionJobWithColumnFamilies(t *testing.T) {
@@ -2268,6 +2283,23 @@ func TestLogicalReplicationCreationChecks(t *testing.T) {
 		"this schema change is disallowed on table tab because it is referenced by one or more logical replication jobs",
 		"ALTER TABLE tab ADD COLUMN c INT, SET (fillfactor = 70)",
 	)
+
+	// Kill replication job.
+	dbA.Exec(t, "CANCEL JOB $1", jobAID)
+	jobutils.WaitForJobToCancel(t, dbA, jobAID)
+	replicationtestutils.WaitForAllProducerJobsToFail(t, dbB)
+
+	// Add different default values to to the source and dest, verify the stream
+	// can be created, and that the default value is sent over the wire.
+	dbA.Exec(t, "CREATE TABLE tab2 (pk INT PRIMARY KEY, payload STRING DEFAULT 'cat')")
+	dbB.Exec(t, "CREATE TABLE b.tab2 (pk INT PRIMARY KEY, payload STRING DEFAULT 'dog')")
+	dbB.Exec(t, "Insert into tab2 values (1)")
+	dbA.QueryRow(t,
+		"CREATE LOGICAL REPLICATION STREAM FROM TABLE tab2 ON $1 INTO TABLE tab2",
+		dbBURL.String(),
+	).Scan(&jobAID)
+	WaitUntilReplicatedTime(t, s.Clock().Now(), dbA, jobAID)
+	dbA.CheckQueryResults(t, "SELECT * FROM tab2", [][]string{{"1", "dog"}})
 
 	// Kill replication job.
 	dbA.Exec(t, "CANCEL JOB $1", jobAID)

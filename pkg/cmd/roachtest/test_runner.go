@@ -7,7 +7,6 @@ package main
 
 import (
 	"context"
-	gosql "database/sql"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -1301,6 +1300,9 @@ func (r *testRunner) runTest(
 		}()
 
 		grafanaAnnotateTestStart(runCtx, t, c)
+		// Actively poll for VM preemptions, so we can bail out of tests early and
+		// avoid situations where a test times out and the flake assignment logic fails.
+		monitorForPreemptedVMs(runCtx, t, c, l)
 		// This is the call to actually run the test.
 		s.Run(runCtx, t, c)
 	}()
@@ -1427,7 +1429,7 @@ func getVMNames(fullVMNames []string) string {
 // getPreemptedVMNames returns a comma separated list of preempted VM
 // names, or an empty string if no VM was preempted or an error was found.
 func getPreemptedVMNames(ctx context.Context, c *clusterImpl, l *logger.Logger) string {
-	preemptedVMs, err := c.GetPreemptedVMs(ctx, l)
+	preemptedVMs, err := getPreemptedVMsHook(c, ctx, l)
 	if err != nil {
 		l.Printf("failed to check preempted VMs:\n%+v", err)
 		return ""
@@ -1490,8 +1492,7 @@ func (r *testRunner) postTestAssertions(
 			postAssertionErr(errors.WithDetail(err, "Unable to check health status"))
 		}
 
-		var db *gosql.DB
-		var validationNode int
+		validationNode := 0
 		for _, s := range statuses {
 			if s.Err != nil {
 				t.L().Printf("n%d:/health?ready=1 error=%s", s.Node, s.Err)
@@ -1503,9 +1504,8 @@ func (r *testRunner) postTestAssertions(
 				continue
 			}
 
-			if db == nil {
-				db = c.Conn(ctx, t.L(), s.Node)
-				validationNode = s.Node
+			if validationNode == 0 {
+				validationNode = s.Node // NB: s.Node is never zero
 			}
 			t.L().Printf("n%d:/health?ready=1 status=200 ok", s.Node)
 		}
@@ -1518,25 +1518,34 @@ func (r *testRunner) postTestAssertions(
 		//
 		// TODO(testinfra): figure out why this can still get stuck despite the
 		// above.
-		if db != nil {
-			defer db.Close()
-			t.L().Printf("running validation checks on node %d (<10m)", validationNode)
-			// If this validation fails due to a timeout, it is very likely that
-			// the replica divergence check below will also fail.
-			if t.spec.SkipPostValidations&registry.PostValidationInvalidDescriptors == 0 {
+		if validationNode == 0 {
+			t.L().Printf("no live node found, skipping validation checks")
+			return
+		}
+
+		t.L().Printf("running validation checks on node %d (<10m)", validationNode)
+		// If this validation fails due to a timeout, it is very likely that
+		// the replica divergence check below will also fail.
+		if t.spec.SkipPostValidations&registry.PostValidationInvalidDescriptors == 0 {
+			func() {
+				db := c.Conn(ctx, t.L(), validationNode)
+				defer db.Close()
 				if err := roachtestutil.CheckInvalidDescriptors(ctx, db); err != nil {
 					postAssertionErr(errors.WithDetail(err, "invalid descriptors check failed"))
 				}
-			}
-			// Detect replica divergence (i.e. ranges in which replicas have arrived
-			// at the same log position with different states).
-			if t.spec.SkipPostValidations&registry.PostValidationReplicaDivergence == 0 {
+			}()
+		}
+		// Detect replica divergence (i.e. ranges in which replicas have arrived
+		// at the same log position with different states).
+		if t.spec.SkipPostValidations&registry.PostValidationReplicaDivergence == 0 {
+			func() {
+				// NB: the consistency checks should run at the system tenant level.
+				db := c.Conn(ctx, t.L(), validationNode, option.VirtualClusterName("system"))
+				defer db.Close()
 				if err := c.assertConsistentReplicas(ctx, db, t); err != nil {
 					postAssertionErr(errors.WithDetail(err, "consistency check failed"))
 				}
-			}
-		} else {
-			t.L().Printf("no live node found, skipping validation checks")
+			}()
 		}
 	})
 
@@ -2115,4 +2124,41 @@ func getTestParameters(t *testImpl, c *clusterImpl, createOpts *vm.CreateOpts) m
 	}
 
 	return clusterParams
+}
+
+// getPreemptedVMsHook is a hook for unit tests to inject their own c.GetPreemptedVMs
+// implementation.
+var getPreemptedVMsHook = func(c cluster.Cluster, ctx context.Context, l *logger.Logger) ([]vm.PreemptedVM, error) {
+	return c.GetPreemptedVMs(ctx, l)
+}
+
+// pollPreemptionInterval is how often to poll for preempted VMs.
+var pollPreemptionInterval = 5 * time.Minute
+
+func monitorForPreemptedVMs(ctx context.Context, t test.Test, c cluster.Cluster, l *logger.Logger) {
+	if c.IsLocal() || !c.Spec().UseSpotVMs {
+		return
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(pollPreemptionInterval):
+				preemptedVMs, err := getPreemptedVMsHook(c, ctx, l)
+				if err != nil {
+					l.Printf("WARN: monitorForPreemptedVMs: failed to check preempted VMs:\n%+v", err)
+					continue
+				}
+
+				// If we find any preemptions, fail the test. Note that we will recheck for
+				// preemptions in post failure processing, which will correctly assign this
+				// failure as an infra flake.
+				if len(preemptedVMs) != 0 {
+					t.Errorf("monitorForPreemptedVMs: Preempted VMs detected: %s", preemptedVMs)
+				}
+			}
+		}
+	}()
 }

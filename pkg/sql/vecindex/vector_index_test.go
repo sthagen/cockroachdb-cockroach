@@ -7,8 +7,10 @@ package vecindex
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,8 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/quantize"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecstore"
+	"github.com/cockroachdb/cockroach/pkg/util/num32"
 	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,6 +50,9 @@ func TestDataDriven(t *testing.T) {
 
 			case "delete":
 				return state.Delete(d)
+
+			case "recall":
+				return state.Recall(d)
 			}
 
 			t.Fatalf("unknown cmd: %s", d.Cmd)
@@ -262,31 +269,139 @@ func (s *testState) Delete(d *datadriven.TestData) string {
 		}
 	}
 
-	txn := beginTransaction(s.Ctx, s.T, s.InMemStore)
-	defer commitTransaction(s.Ctx, s.T, s.InMemStore, txn)
+	for i, line := range strings.Split(d.Input, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
 
-	// Get root in order to acquire partition lock.
-	_, err := s.InMemStore.GetPartition(s.Ctx, txn, vecstore.RootKey)
-	require.NoError(s.T, err)
+		// If vector to delete has a colon, then its value is specified as well
+		// as its name. This is useful for forcing a certain value to delete.
+		var key vecstore.PrimaryKey
+		var vec vector.T
+		parts := strings.Split(line, ":")
+		if len(parts) == 1 {
+			// Get the value from the store.
+			key = vecstore.PrimaryKey(line)
+			vec = s.InMemStore.GetVector(key)
+		} else {
+			require.Len(s.T, parts, 2)
+			// Parse the value after the colon.
+			key = vecstore.PrimaryKey(parts[0])
+			vec = s.parseVector(parts[1])
+		}
 
-	if notFound {
-		for _, line := range strings.Split(d.Input, "\n") {
-			line = strings.TrimSpace(line)
-			if len(line) == 0 {
-				continue
-			}
+		// Delete within the scope of a transaction.
+		txn := beginTransaction(s.Ctx, s.T, s.InMemStore)
 
-			// Simulate case where the vector is deleted in the primary index, but
-			// it cannot be found in the secondary index.
-			s.InMemStore.DeleteVector(txn, []byte(line))
+		// If notFound=true, then simulate case where the vector is deleted in
+		// the primary index, but it cannot be found in the secondary index.
+		if !notFound {
+			err := s.Index.Delete(s.Ctx, txn, vec, key)
+			require.NoError(s.T, err)
+		}
+		s.InMemStore.DeleteVector(txn, key)
+
+		commitTransaction(s.Ctx, s.T, s.InMemStore, txn)
+
+		if (i+1)%s.Options.MaxPartitionSize == 0 {
+			// Periodically, run synchronous fixups so that test results are
+			// deterministic.
+			require.NoError(s.T, s.Index.fixups.runAll(s.Ctx))
 		}
 	}
 
-	// TODO(andyk): Add code to delete vector from index.
+	// Handle any remaining fixups.
+	require.NoError(s.T, s.Index.fixups.runAll(s.Ctx))
 
-	tree, err := s.Index.Format(s.Ctx, txn, FormatOptions{PrimaryKeyStrings: true})
-	require.NoError(s.T, err)
-	return tree
+	return s.FormatTree(d)
+}
+
+func (s *testState) Recall(d *datadriven.TestData) string {
+	searchSet := vecstore.SearchSet{MaxResults: 1}
+	options := SearchOptions{}
+	samples := 50
+	var err error
+	for _, arg := range d.CmdArgs {
+		switch arg.Key {
+		case "samples":
+			require.Len(s.T, arg.Vals, 1)
+			samples, err = strconv.Atoi(arg.Vals[0])
+			require.NoError(s.T, err)
+
+		case "topk":
+			require.Len(s.T, arg.Vals, 1)
+			searchSet.MaxResults, err = strconv.Atoi(arg.Vals[0])
+			require.NoError(s.T, err)
+
+		case "beam-size":
+			require.Len(s.T, arg.Vals, 1)
+			options.BaseBeamSize, err = strconv.Atoi(arg.Vals[0])
+			require.NoError(s.T, err)
+		}
+	}
+
+	txn := beginTransaction(s.Ctx, s.T, s.InMemStore)
+	defer commitTransaction(s.Ctx, s.T, s.InMemStore, txn)
+
+	// calcTruth calculates the true nearest neighbors for the query vector.
+	calcTruth := func(queryVector vector.T, data []vecstore.VectorWithKey) []vecstore.PrimaryKey {
+		distances := make([]float32, len(data))
+		offsets := make([]int, len(data))
+		for i := 0; i < len(data); i++ {
+			distances[i] = num32.L2SquaredDistance(queryVector, data[i].Vector)
+			offsets[i] = i
+		}
+		sort.SliceStable(offsets, func(i int, j int) bool {
+			res := cmp.Compare(distances[offsets[i]], distances[offsets[j]])
+			if res != 0 {
+				return res < 0
+			}
+			return data[offsets[i]].Key.Compare(data[offsets[j]].Key) < 0
+		})
+
+		truth := make([]vecstore.PrimaryKey, searchSet.MaxResults)
+		for i := 0; i < len(truth); i++ {
+			truth[i] = data[offsets[i]].Key.PrimaryKey
+		}
+		return truth
+	}
+
+	data := s.InMemStore.GetAllVectors()
+
+	// Search for last "samples" features.
+	var sumMAP float64
+	for feature := s.Features.Count - samples; feature < s.Features.Count; feature++ {
+		// Calculate truth set for the vector.
+		queryVector := s.Features.At(feature)
+		truth := calcTruth(queryVector, data)
+
+		// Calculate prediction set for the vector.
+		err = s.Index.Search(s.Ctx, txn, queryVector, &searchSet, options)
+		require.NoError(s.T, err)
+		results := searchSet.PopResults()
+
+		prediction := make([]vecstore.PrimaryKey, searchSet.MaxResults)
+		for res := 0; res < len(results); res++ {
+			prediction[res] = results[res].ChildKey.PrimaryKey
+		}
+
+		sumMAP += findMAP(prediction, truth)
+	}
+
+	recall := sumMAP / float64(samples) * 100
+	quantizedLeafVectors := float64(searchSet.Stats.QuantizedLeafVectorCount) / float64(samples)
+	quantizedVectors := float64(searchSet.Stats.QuantizedVectorCount) / float64(samples)
+	fullVectors := float64(searchSet.Stats.FullVectorCount) / float64(samples)
+	partitions := float64(searchSet.Stats.PartitionCount) / float64(samples)
+
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("%.2f%% recall@%d\n", recall, searchSet.MaxResults))
+	buf.WriteString(fmt.Sprintf("%.2f leaf vectors, ", quantizedLeafVectors))
+	buf.WriteString(fmt.Sprintf("%.2f vectors, ", quantizedVectors))
+	buf.WriteString(fmt.Sprintf("%.2f full vectors, ", fullVectors))
+	buf.WriteString(fmt.Sprintf("%.2f partitions", partitions))
+	return buf.String()
 }
 
 // parseVector parses a vector string in this form: (1.5, 6, -4).
@@ -327,4 +442,28 @@ func beginTransaction(ctx context.Context, t *testing.T, store vecstore.Store) v
 func commitTransaction(ctx context.Context, t *testing.T, store vecstore.Store, txn vecstore.Txn) {
 	err := store.CommitTransaction(ctx, txn)
 	require.NoError(t, err)
+}
+
+// findMAP returns mean average precision, which compares a set of predicted
+// results with the true set of results. Both sets are expected to be of equal
+// length. It returns the percentage overlap of the predicted set with the truth
+// set.
+func findMAP(prediction, truth []vecstore.PrimaryKey) float64 {
+	if len(prediction) != len(truth) {
+		panic(errors.AssertionFailedf("prediction and truth sets are not same length"))
+	}
+
+	predictionMap := make(map[string]bool, len(prediction))
+	for _, p := range prediction {
+		predictionMap[string(p)] = true
+	}
+
+	var intersect float64
+	for _, t := range truth {
+		_, ok := predictionMap[string(t)]
+		if ok {
+			intersect++
+		}
+	}
+	return intersect / float64(len(truth))
 }

@@ -257,6 +257,7 @@ type Config struct {
 	// CRDBVersion exposes the active version to Raft. This helps version-gating
 	// features.
 	CRDBVersion clusterversion.Handle
+	Metrics     *Metrics
 }
 
 func (c *Config) validate() error {
@@ -429,6 +430,7 @@ type raft struct {
 	logger        raftlogger.Logger
 	storeLiveness raftstoreliveness.StoreLiveness
 	crdbVersion   clusterversion.Handle
+	metrics       *Metrics
 }
 
 func newRaft(c *Config) *raft {
@@ -459,6 +461,7 @@ func newRaft(c *Config) *raft {
 		disableConfChangeValidation: c.DisableConfChangeValidation,
 		storeLiveness:               c.StoreLiveness,
 		crdbVersion:                 c.CRDBVersion,
+		metrics:                     c.Metrics,
 	}
 	lastID := r.raftLog.lastEntryID()
 
@@ -801,6 +804,8 @@ func (r *raft) maybeSendFortify(id pb.PeerID) {
 				"%x leader at term %d does not support itself in the liveness fabric", r.id, r.Term,
 			)
 		}
+
+		r.metrics.SkippedFortificationDueToLackOfSupport.Inc(1)
 		return
 	}
 
@@ -1376,8 +1381,10 @@ func (r *raft) hup(t CampaignType) {
 		return
 	}
 
-	// We shouldn't campaign if we don't have quorum support in store liveness.
-	if r.fortificationTracker.RequireQuorumSupportOnCampaign() &&
+	// We shouldn't campaign if we don't have quorum support in store liveness. We
+	// only make an exception if this is a leadership transfer, because otherwise
+	// the transfer might fail if the new leader doesn't already have support.
+	if t != campaignTransfer && r.fortificationTracker.RequireQuorumSupportOnCampaign() &&
 		!r.fortificationTracker.QuorumSupported() {
 		r.logger.Debugf("%x cannot campaign since it's not supported by a quorum in store liveness", r.id)
 		return
@@ -2458,8 +2465,11 @@ func (r *raft) handleFortifyResp(m pb.Message) {
 		// the follower isn't supporting the leader's store in StoreLiveness or the
 		// follower is down. We'll try to fortify the follower again later in
 		// tickHeartbeat.
+		r.metrics.RejectedFortificationResponses.Inc(1)
 		return
 	}
+
+	r.metrics.AcceptedFortificationResponses.Inc(1)
 	r.fortificationTracker.RecordFortification(m.From, m.LeadEpoch)
 }
 

@@ -4758,13 +4758,7 @@ func TestPartialPartition(t *testing.T) {
 				require.NoError(t, tc.WaitForFullReplication())
 
 				desc := tc.LookupRangeOrFatal(t, scratchKey)
-				err := tc.TransferRangeLease(desc, tc.Target(1))
-				if leaseType != roachpb.LeaseLeader {
-					// In leader leases, the leader won't campaign if it's not supported
-					// by a majority. We will keep trying to transfer the lease until it
-					// succeeds below.
-					require.NoError(t, err)
-				}
+				tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(1))
 
 				// TODO(baptist): This test should work without this block.
 				// After the lease is transferred, the lease might still be on
@@ -4778,16 +4772,6 @@ func TestPartialPartition(t *testing.T) {
 				// DistSender we will never succeed once we partition. Remove
 				// this block once #118943 is fixed.
 				testutils.SucceedsSoon(t, func() error {
-					if leaseType == roachpb.LeaseLeader {
-						// In leader leases, the leader won't campaign if it's not supported
-						// by a majority of voters. This causes a flake in this test
-						// where the new leader is not elected if it doesn't yet have
-						// support from a majority. We need to keep trying to transfer the
-						// lease until the new leader is elected.
-						if err := tc.TransferRangeLease(desc, tc.Target(1)); err != nil {
-							return err
-						}
-					}
 					sl := tc.StorageLayer(1)
 					store, err := sl.GetStores().(*kvserver.Stores).GetStore(sl.GetFirstStoreID())
 					require.NoError(t, err)
@@ -4805,7 +4789,7 @@ func TestPartialPartition(t *testing.T) {
 				// to fail faster.
 				cancelCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				defer cancel()
-				err = txn.Put(cancelCtx, scratchKey, "abc")
+				err := txn.Put(cancelCtx, scratchKey, "abc")
 				if test.useProxy {
 					require.NoError(t, err)
 					require.NoError(t, txn.Commit(cancelCtx))
@@ -4918,6 +4902,22 @@ func TestProxyTracing(t *testing.T) {
 			return nil
 		}
 
+		printTrace := func() {
+			t.Log("started printing a trace")
+			rows, err := conn.QueryContext(ctx, "SELECT message, tag, location FROM [SHOW TRACE FOR SESSION]")
+			require.NoError(t, err)
+			defer rows.Close()
+
+			// Iterate over the results and print them
+			for rows.Next() {
+				var msg, tag, loc string
+				err := rows.Scan(&msg, &tag, &loc)
+				require.NoError(t, err)
+				t.Logf("msg: %s, tag: %s, loc: %s", msg, tag, loc)
+			}
+			require.NoError(t, rows.Err())
+		}
+
 		// Wait until the leaseholder for the test table ranges are on n3.
 		testutils.SucceedsSoon(t, func() error {
 			return checkLeaseCount(3, numRanges)
@@ -4927,7 +4927,6 @@ func TestProxyTracing(t *testing.T) {
 
 		_, err = conn.Exec("SET TRACING = on; SELECT FROM t where i = 987654321; SET TRACING = off")
 		require.NoError(t, err)
-
 		// Expect the "proxy request complete" message to be in the trace and that it
 		// comes from the proxy node n2.
 		var msg, tag, loc string
@@ -4937,6 +4936,10 @@ func TestProxyTracing(t *testing.T) {
 			AND location LIKE '%server/node%'
 			AND tag LIKE '%n2%'`,
 		).Scan(&msg, &tag, &loc); err != nil {
+			// If we fail for any reason, print the trace to help debugging.
+			printTrace()
+			// Make sure that node 3 still holds the leases.
+			require.NoError(t, checkLeaseCount(3, numRanges))
 			if errors.Is(err, gosql.ErrNoRows) {
 				t.Fatalf("request succeeded without proxying")
 			}

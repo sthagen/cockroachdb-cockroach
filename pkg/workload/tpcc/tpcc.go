@@ -19,7 +19,6 @@ import (
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -29,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/pflag"
 	"golang.org/x/exp/rand"
@@ -47,9 +45,6 @@ const (
 
 	// Max rows that can be updated in a single txn, used while resetting the w_ytd values
 	maxRowsToUpdateTxn = 10_000
-
-	// The maximum number of times a transaction is retried.
-	maxRetries = 50
 )
 
 type tpcc struct {
@@ -59,7 +54,7 @@ type tpcc struct {
 
 	warehouses       int
 	activeWarehouses int
-	nowString        []byte
+	nowTime          time.Time
 	numConns         int
 	idleConns        int
 	txnRetries       bool
@@ -263,7 +258,7 @@ var tpccMeta = workload.Meta{
 			`conns`:                    {RuntimeOnly: true},
 			`idle-conns`:               {RuntimeOnly: true},
 			`txn-retries`:              {RuntimeOnly: true},
-			`order-id-repairs`:         {RuntimeOnly: true},
+			`repair-order-ids`:         {RuntimeOnly: true},
 			`expensive-checks`:         {RuntimeOnly: true, CheckConsistencyOnly: true},
 			`local-warehouses`:         {RuntimeOnly: true},
 			`regions`:                  {RuntimeOnly: true},
@@ -323,7 +318,11 @@ var tpccMeta = workload.Meta{
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		// Hardcode this since it doesn't seem like anyone will want to change
 		// it and it's really noisy in the generated fixture paths.
-		g.nowString = []byte(`2006-01-02 15:04:05`)
+		var err error
+		g.nowTime, err = time.Parse(`2006-01-02 15:04:05`, `2006-01-02 15:04:05`)
+		if err != nil {
+			panic(err) // unreachable.
+		}
 		return g
 	},
 }
@@ -1103,28 +1102,8 @@ func (w *tpcc) executeTx(
 		return fn(tx)
 	}
 
-	const warnEvery = 10
 	if w.txnRetries {
-		for i := 0; i <= maxRetries; i++ {
-			tx, err := conn.BeginTx(ctx, txOpts)
-			if err != nil {
-				return onTxnStartDuration, err
-			}
-			err = txnFuncWithStartFuncs(tx)
-			if err == nil {
-				return onTxnStartDuration, tx.Commit(ctx)
-			}
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && pgcode.MakeCode(pgErr.Code) == pgcode.SerializationFailure {
-				if i%warnEvery == 0 {
-					log.Warningf(ctx, "have retried transaction %d times, most recently because of the "+
-						"retryable error: %s. Is the transaction stuck in a retry loop?", i, err)
-				}
-				continue
-			}
-			return onTxnStartDuration, err
-		}
-		return onTxnStartDuration, err
+		return onTxnStartDuration, crdbpgx.ExecuteTx(ctx, conn, txOpts, txnFuncWithStartFuncs)
 	}
 
 	tx, err := conn.BeginTx(ctx, txOpts)

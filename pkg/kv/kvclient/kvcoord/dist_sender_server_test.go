@@ -4818,7 +4818,10 @@ func TestProxyTracing(t *testing.T) {
 	ctx := context.Background()
 
 	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
-		if leaseType == roachpb.LeaseEpoch {
+		if leaseType == roachpb.LeaseExpiration {
+			skip.UnderRace(t, "too slow")
+			skip.UnderDeadlock(t, "too slow")
+		} else if leaseType == roachpb.LeaseEpoch {
 			// With epoch leases this test doesn't work reliably. It passes
 			// in cases where it should fail and fails in cases where it
 			// should pass.
@@ -4833,6 +4836,9 @@ func TestProxyTracing(t *testing.T) {
 		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, leaseType)
 		kvserver.RangefeedEnabled.Override(ctx, &st.SV, true)
 		kvserver.RangeFeedRefreshInterval.Override(ctx, &st.SV, 10*time.Millisecond)
+		// Disable follower reads to ensure that the request is proxied, and not
+		// answered locally due to follower reads.
+		kvserver.FollowerReadsEnabled.Override(ctx, &st.SV, false)
 		closedts.TargetDuration.Override(ctx, &st.SV, 10*time.Millisecond)
 		closedts.SideTransportCloseInterval.Override(ctx, &st.SV, 10*time.Millisecond)
 

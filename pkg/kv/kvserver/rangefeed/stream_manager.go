@@ -91,6 +91,10 @@ func NewStreamManager(sender sender, metrics RangefeedMetricsRecorder) *StreamMa
 
 func (sm *StreamManager) NewStream(streamID int64, rangeID roachpb.RangeID) (sink Stream) {
 	switch sender := sm.sender.(type) {
+	case *BufferedSender:
+		return &BufferedPerRangeEventSink{
+			PerRangeEventSink: NewPerRangeEventSink(rangeID, streamID, sender),
+		}
 	case *UnbufferedSender:
 		return NewPerRangeEventSink(rangeID, streamID, sender)
 	default:
@@ -205,4 +209,11 @@ func (sm *StreamManager) Error() <-chan error {
 		log.Fatalf(context.Background(), "StreamManager.Error called before StreamManager.Start")
 	}
 	return sm.errCh
+}
+
+// For testing only.
+func (sm *StreamManager) activeStreamCount() int {
+	sm.streams.Lock()
+	defer sm.streams.Unlock()
+	return len(sm.streams.m)
 }

@@ -80,8 +80,6 @@ func registerRebalanceLoad(r registry.Registry) {
 		appNode := c.Node(c.Spec().NodeCount)
 		numNodes := len(roachNodes)
 		numStores := numNodes
-		startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs,
-			"--vmodule=store_rebalancer=5,allocator=5,allocator_scorer=5,replicate_queue=5")
 		if c.Spec().SSDs > 1 && !c.Spec().RAID0 {
 			numStores *= c.Spec().SSDs
 			startOpts.RoachprodOpts.StoreCount = c.Spec().SSDs
@@ -119,17 +117,8 @@ func registerRebalanceLoad(r registry.Registry) {
 				})
 			mvt.Run()
 		} else {
-			// Enable collecting CPU profiles when the CPU utilization exceeds 90%.
-			// This helps debug failures which occur as a result of mismatches
-			// between allocation (QPS/replica CPU) and hardware signals e.g. see
-			// #111900. The setting names changed between v22.2 and v23.1, we can't
-			// easily setup CPU profiling in mixed version tests.
-			//
-			// TODO(kvoli): Remove this setup once CPU profiling is enabled by default
-			// on perf roachtests #97699.
-			settings.ClusterSettings["server.cpu_profile.duration"] = "2s"
-			settings.ClusterSettings["server.cpu_profile.interval"] = "2"
-			settings.ClusterSettings["server.cpu_profile.cpu_usage_combined_threshold"] = "90"
+			// Note that CPU profiling is already enabled by default, should there be
+			// a failure it will be available in the artifacts.
 			c.Start(ctx, t.L(), startOpts, settings, roachNodes)
 			require.NoError(t, rebalanceByLoad(
 				ctx, t, t.L(), c, rebalanceMode, maxDuration,

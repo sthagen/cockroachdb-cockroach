@@ -150,7 +150,8 @@ func ResolveZoneSpecifier(
 		if id, ok := NamedZones[NamedZone(zs.NamedZone)]; ok {
 			return id, nil
 		}
-		return 0, fmt.Errorf("%q is not a built-in zone", string(zs.NamedZone))
+		return 0, pgerror.Newf(pgcode.InvalidName, "%q is not a built-in zone",
+			string(zs.NamedZone))
 	}
 
 	if zs.Database != "" {
@@ -1210,11 +1211,11 @@ func (z *ZoneConfig) MergeSubzoneSpans(subzoneSpans []SubzoneSpan) {
 }
 
 // FilterSubzoneSpansByIdx retrieves all subzone spans with the given
-// SubzoneIndex.
-func (z *ZoneConfig) FilterSubzoneSpansByIdx(subzoneIdx int32) []SubzoneSpan {
+// subzoneIndex.
+func (z *ZoneConfig) FilterSubzoneSpansByIdx(subzoneIndex int32) []SubzoneSpan {
 	filteredSpans := make([]SubzoneSpan, 0, len(z.SubzoneSpans))
 	for _, s := range z.SubzoneSpans {
-		if s.SubzoneIndex == subzoneIdx {
+		if s.SubzoneIndex == subzoneIndex {
 			filteredSpans = append(filteredSpans, s)
 		}
 	}

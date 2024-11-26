@@ -26,10 +26,10 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.TableZoneConfig) *scop.DiscardZoneConfig {
-					return &scop.DiscardZoneConfig{
-						DescID:     this.TableID,
-						ZoneConfig: this.ZoneConfig,
+				emit(func(this *scpb.TableZoneConfig, md *opGenContext) *scop.DiscardTableZoneConfig {
+					return &scop.DiscardTableZoneConfig{
+						TableID:    this.TableID,
+						ZoneConfig: *this.ZoneConfig,
 					}
 				}),
 			),

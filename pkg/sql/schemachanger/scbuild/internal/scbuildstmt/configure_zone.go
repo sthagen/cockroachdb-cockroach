@@ -6,10 +6,11 @@
 package scbuildstmt
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
@@ -94,14 +95,23 @@ func SetZoneConfig(b BuildCtx, n *tree.SetZoneConfig) {
 		if zco.isNoOp() {
 			return
 		}
-		toDrop, affectedSubzoneConfigsToUpdate := zco.getZoneConfigElemForDrop(b)
-		dropZoneConfigElem(b, toDrop, eventDetails)
-		addZoneConfigElem(b, affectedSubzoneConfigsToUpdate, oldZone, eventDetails)
+
+		toDropList, affectedSubzoneConfigsToUpdate := zco.getZoneConfigElemForDrop(b)
+		for i, e := range toDropList {
+			// Log the latest dropping element.
+			dropZoneConfigElem(b, e, eventDetails, i == len(toDropList)-1 /* isLoggingNeeded */)
+		}
+		for _, e := range affectedSubzoneConfigsToUpdate {
+			// No need to log the side effects.
+			addZoneConfigElem(b, e, oldZone, eventDetails, false /* isLoggingNeeded */)
+		}
 	} else {
 		toAdd, affectedSubzoneConfigsToUpdate := zco.getZoneConfigElemForAdd(b)
-		affectedSubzoneConfigsToUpdate = append([]scpb.Element{toAdd},
-			affectedSubzoneConfigsToUpdate...)
-		addZoneConfigElem(b, affectedSubzoneConfigsToUpdate, oldZone, eventDetails)
+		addZoneConfigElem(b, toAdd, oldZone, eventDetails, true)
+		for _, e := range affectedSubzoneConfigsToUpdate {
+			// No need to log the side effects.
+			addZoneConfigElem(b, e, oldZone, eventDetails, false /* isLoggingNeeded */)
+		}
 	}
 }
 
@@ -110,15 +120,14 @@ func astToZoneConfigObject(b BuildCtx, n *tree.SetZoneConfig) (zoneConfigObject,
 
 	// We are named range.
 	if zs.NamedZone != "" {
-		if n.Discard {
-			// TODO(annie): Support discard for named range.
-			return nil, scerrors.NotImplementedErrorf(n, "discarding a zone config on a named "+
-				"range is not supported in the DSC")
-		}
 		namedZone := zonepb.NamedZone(zs.NamedZone)
 		id, found := zonepb.NamedZones[namedZone]
 		if !found {
-			return nil, fmt.Errorf("%q is not a built-in zone", string(zs.NamedZone))
+			return nil, pgerror.Newf(pgcode.InvalidName, "%q is not a built-in zone",
+				string(zs.NamedZone))
+		}
+		if n.Discard && id == keys.RootNamespaceID {
+			return nil, pgerror.Newf(pgcode.CheckViolation, "cannot remove default zone")
 		}
 		return &namedRangeZoneConfigObj{rangeID: catid.DescID(id)}, nil
 	}
@@ -177,13 +186,6 @@ func astToZoneConfigObject(b BuildCtx, n *tree.SetZoneConfig) (zoneConfigObject,
 		return &tzo, nil
 	}
 
-	// TODO(annie): remove this when we add support for discarding subzone
-	// configs.
-	if n.Discard {
-		return nil, scerrors.NotImplementedErrorf(n, "discarding zone configurations on "+
-			"subzones are not supported in the DSC")
-	}
-
 	izo := indexZoneConfigObj{tableZoneConfigObj: tzo}
 	// We are an index object. Determine the index ID and fill this
 	// information out in our zoneConfigObject.
@@ -203,23 +205,26 @@ func astToZoneConfigObject(b BuildCtx, n *tree.SetZoneConfig) (zoneConfigObject,
 }
 
 func dropZoneConfigElem(
-	b BuildCtx, elem scpb.Element, eventDetails eventpb.CommonZoneConfigDetails,
+	b BuildCtx, elem scpb.Element, eventDetails eventpb.CommonZoneConfigDetails, isLoggingNeeded bool,
 ) {
-	info := &eventpb.RemoveZoneConfig{CommonZoneConfigDetails: eventDetails}
 	b.Drop(elem)
-	b.LogEventForExistingPayload(elem, info)
+	if isLoggingNeeded {
+		info := &eventpb.RemoveZoneConfig{CommonZoneConfigDetails: eventDetails}
+		b.LogEventForExistingPayload(elem, info)
+	}
 }
 
 func addZoneConfigElem(
 	b BuildCtx,
-	elems []scpb.Element,
+	elem scpb.Element,
 	oldZone *zonepb.ZoneConfig,
 	eventDetails eventpb.CommonZoneConfigDetails,
+	isLoggingNeeded bool,
 ) {
-	info := &eventpb.SetZoneConfig{CommonZoneConfigDetails: eventDetails,
-		ResolvedOldConfig: oldZone.String()}
-	for _, e := range elems {
-		b.Add(e)
-		b.LogEventForExistingPayload(e, info)
+	b.Add(elem)
+	if isLoggingNeeded {
+		info := &eventpb.SetZoneConfig{CommonZoneConfigDetails: eventDetails,
+			ResolvedOldConfig: oldZone.String()}
+		b.LogEventForExistingPayload(elem, info)
 	}
 }

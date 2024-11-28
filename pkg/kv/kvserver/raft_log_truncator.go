@@ -552,8 +552,9 @@ func (t *raftLogTruncator) tryEnactTruncations(
 	// (this subsumes all the preceding queued truncations).
 	batch := t.store.getEngine().NewUnindexedBatch()
 	defer batch.Close()
-	apply, err := handleTruncatedStateBelowRaftPreApply(ctx, &truncState,
-		&pendingTruncs.mu.truncs[enactIndex].RaftTruncatedState, stateLoader, batch)
+	apply, err := handleTruncatedStateBelowRaftPreApply(ctx, truncState,
+		&pendingTruncs.mu.truncs[enactIndex].RaftTruncatedState,
+		stateLoader.StateLoader, batch)
 	if err != nil || !apply {
 		if err != nil {
 			log.Errorf(ctx, "while attempting to truncate raft log: %+v", err)

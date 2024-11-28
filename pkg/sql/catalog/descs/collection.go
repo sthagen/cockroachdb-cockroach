@@ -350,7 +350,7 @@ func (tc *Collection) DeleteDescToBatch(
 func (tc *Collection) InsertNamespaceEntryToBatch(
 	ctx context.Context, kvTrace bool, e catalog.NameEntry, b *kv.Batch,
 ) error {
-	if ns := tc.cr.Cache().LookupNamespaceEntry(e); ns != nil {
+	if ns := tc.cr.Cache().LookupNamespaceEntry(catalog.MakeNameInfo(e)); ns != nil {
 		tc.markAsShadowedName(ns.GetID())
 	}
 	tc.markAsShadowedName(e.GetID())
@@ -373,7 +373,7 @@ func (tc *Collection) InsertNamespaceEntryToBatch(
 func (tc *Collection) UpsertNamespaceEntryToBatch(
 	ctx context.Context, kvTrace bool, e catalog.NameEntry, b *kv.Batch,
 ) error {
-	if ns := tc.cr.Cache().LookupNamespaceEntry(e); ns != nil {
+	if ns := tc.cr.Cache().LookupNamespaceEntry(catalog.MakeNameInfo(e)); ns != nil {
 		tc.markAsShadowedName(ns.GetID())
 	}
 	tc.markAsShadowedName(e.GetID())
@@ -396,7 +396,7 @@ func (tc *Collection) UpsertNamespaceEntryToBatch(
 func (tc *Collection) DeleteNamespaceEntryToBatch(
 	ctx context.Context, kvTrace bool, k catalog.NameKey, b *kv.Batch,
 ) error {
-	if ns := tc.cr.Cache().LookupNamespaceEntry(k); ns != nil {
+	if ns := tc.cr.Cache().LookupNamespaceEntry(catalog.MakeNameInfo(k)); ns != nil {
 		tc.markAsShadowedName(ns.GetID())
 	}
 	nameKey := catalogkeys.EncodeNameKey(tc.codec(), k)
@@ -422,21 +422,8 @@ func (tc *Collection) markAsShadowedName(id descpb.ID) {
 	}] = struct{}{}
 }
 
-func (tc *Collection) isShadowedName(nameKey catalog.NameKey) bool {
-	var k descpb.NameInfo
-	switch t := nameKey.(type) {
-	case descpb.NameInfo:
-		k = t
-	case *descpb.NameInfo:
-		k = *t
-	default:
-		k = descpb.NameInfo{
-			ParentID:       nameKey.GetParentID(),
-			ParentSchemaID: nameKey.GetParentSchemaID(),
-			Name:           nameKey.GetName(),
-		}
-	}
-	_, ok := tc.shadowedNames[k]
+func (tc *Collection) isShadowedName(nameKey descpb.NameInfo) bool {
+	_, ok := tc.shadowedNames[nameKey]
 	return ok
 }
 
@@ -659,7 +646,7 @@ func (tc *Collection) lookupDescriptorID(
 	if err != nil {
 		return descpb.InvalidID, err
 	}
-	if e := read.LookupNamespaceEntry(&key); e != nil {
+	if e := read.LookupNamespaceEntry(key); e != nil {
 		return e.GetID(), nil
 	}
 	return descpb.InvalidID, nil
@@ -976,7 +963,7 @@ func (tc *Collection) aggregateAllLayers(
 	})
 	// Add stored namespace entries which are not shadowed.
 	_ = stored.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
-		if tc.isShadowedName(e) {
+		if tc.isShadowedName(catalog.MakeNameInfo(e)) {
 			return nil
 		}
 		// Temporary schemas don't have descriptors and are persisted only
@@ -1269,6 +1256,22 @@ func (tc *Collection) GetIndexComment(
 	tableID descpb.ID, indexID catid.IndexID,
 ) (comment string, ok bool) {
 	return tc.GetComment(catalogkeys.MakeCommentKey(uint32(tableID), uint32(indexID), catalogkeys.IndexCommentType))
+}
+
+// MaybeSetReplicationSafeTS modifies a txn to apply the replication safe timestamp,
+// if we are executing against a PCR reader catalog.
+func (tc *Collection) MaybeSetReplicationSafeTS(ctx context.Context, txn *kv.Txn) error {
+	now := txn.DB().Clock().Now()
+	desc, err := tc.leased.lm.Acquire(ctx, now, keys.SystemDatabaseID)
+	if err != nil {
+		return err
+	}
+	defer desc.Release(ctx)
+
+	if desc.Underlying().(catalog.DatabaseDescriptor).GetReplicatedPCRVersion() == 0 {
+		return nil
+	}
+	return txn.SetFixedTimestamp(ctx, tc.leased.lm.GetSafeReplicationTS())
 }
 
 // GetConstraintComment implements the scdecomp.CommentGetter interface.

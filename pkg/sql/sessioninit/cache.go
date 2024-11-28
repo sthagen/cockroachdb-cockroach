@@ -123,6 +123,15 @@ func (a *Cache) GetAuthInfo(
 	err = db.DescsTxn(ctx, func(
 		ctx context.Context, txn descs.Txn,
 	) error {
+		// When running on a PCR reader catalog we need to ensure all descriptors
+		// have matching timestamps for external row data. Certain system tables
+		// like users and role_options are replicated, which can cause mixed
+		// external row data timestamps, which can lead to a retryable error.
+		// To avoid this we will set a replication safe AOST timestamp when running
+		// on a reader catalog.
+		if err := txn.Descriptors().MaybeSetReplicationSafeTS(ctx, txn.KV()); err != nil {
+			return err
+		}
 		_, usersTableDesc, err = descs.PrefixAndTable(ctx, txn.Descriptors().ByNameWithLeased(txn.KV()).Get(), UsersTableName)
 		if err != nil {
 			return err
@@ -152,23 +161,26 @@ func (a *Cache) GetAuthInfo(
 	val, err := a.loadValueOutsideOfCache(
 		ctx, fmt.Sprintf("authinfo-%s-%d-%d", username.Normalized(), usersTableVersion, roleOptionsTableVersion),
 		func(loadCtx context.Context) (interface{}, error) {
-			return readFromSystemTables(loadCtx, db, username)
-		})
+			authInfo, err := readFromSystemTables(loadCtx, db, username)
+			if err != nil {
+				return AuthInfo{}, err
+			}
+			// Write data back to the cache if the table version hasn't changed.
+			a.maybeWriteAuthInfoBackToCache(
+				ctx,
+				usersTableVersion,
+				roleOptionsTableVersion,
+				authInfo,
+				username,
+			)
+			return authInfo, nil
+		},
+	)
 	if err != nil {
-		return aInfo, err
+		return AuthInfo{}, err
 	}
 	aInfo = val.(AuthInfo)
-
-	// Write data back to the cache if the table version hasn't changed.
-	a.maybeWriteAuthInfoBackToCache(
-		ctx,
-		usersTableVersion,
-		roleOptionsTableVersion,
-		aInfo,
-		username,
-	)
-
-	return aInfo, err
+	return aInfo, nil
 }
 
 func (a *Cache) readAuthInfoFromCache(
@@ -223,12 +235,12 @@ func (a *Cache) maybeWriteAuthInfoBackToCache(
 	roleOptionsTableVersion descpb.DescriptorVersion,
 	aInfo AuthInfo,
 	user username.SQLUsername,
-) bool {
+) {
 	a.Lock()
 	defer a.Unlock()
 	// Table versions have changed while we were looking: don't cache the data.
 	if a.usersTableVersion != usersTableVersion || a.roleOptionsTableVersion != roleOptionsTableVersion {
-		return false
+		return
 	}
 	// Table version remains the same: update map, unlock, return.
 	const sizeOfUsername = int(unsafe.Sizeof(username.SQLUsername{}))
@@ -256,10 +268,9 @@ func (a *Cache) maybeWriteAuthInfoBackToCache(
 		// proceed with authentication so that users are not locked out of
 		// the database.
 		log.Ops.Warningf(ctx, "no memory available to cache authentication info: %v", err)
-	} else {
-		a.authInfoCache[user] = aInfo
+		return
 	}
-	return true
+	a.authInfoCache[user] = aInfo
 }
 
 // GetDefaultSettings consults the sessioninit.Cache and returns the list of
@@ -339,22 +350,25 @@ func (a *Cache) GetDefaultSettings(
 	val, err := a.loadValueOutsideOfCache(
 		ctx, fmt.Sprintf("defaultsettings-%s-%d-%d", userName.Normalized(), databaseID, dbRoleSettingsTableVersion),
 		func(loadCtx context.Context) (interface{}, error) {
-			return readFromSystemTables(loadCtx, db, userName, databaseID)
+			defaultSettings, err := readFromSystemTables(loadCtx, db, userName, databaseID)
+			if err != nil {
+				return nil, err
+			}
+			// Write the fetched data back to the cache if the table version hasn't
+			// changed.
+			a.maybeWriteDefaultSettingsBackToCache(
+				ctx,
+				dbRoleSettingsTableVersion,
+				defaultSettings,
+			)
+			return defaultSettings, nil
 		},
 	)
 	if err != nil {
 		return nil, err
 	}
 	settingsEntries = val.([]SettingsCacheEntry)
-
-	// Write the fetched data back to the cache if the table version hasn't
-	// changed.
-	a.maybeWriteDefaultSettingsBackToCache(
-		ctx,
-		dbRoleSettingsTableVersion,
-		settingsEntries,
-	)
-	return settingsEntries, err
+	return settingsEntries, nil
 }
 
 func (a *Cache) readDefaultSettingsFromCache(
@@ -403,12 +417,12 @@ func (a *Cache) maybeWriteDefaultSettingsBackToCache(
 	ctx context.Context,
 	dbRoleSettingsTableVersion descpb.DescriptorVersion,
 	settingsEntries []SettingsCacheEntry,
-) bool {
+) {
 	a.Lock()
 	defer a.Unlock()
 	// Table version has changed while we were looking: don't cache the data.
 	if a.dbRoleSettingsTableVersion > dbRoleSettingsTableVersion {
-		return false
+		return
 	}
 
 	// Table version remains the same: update map, unlock, return.
@@ -430,15 +444,14 @@ func (a *Cache) maybeWriteDefaultSettingsBackToCache(
 		// proceed with authentication so that users are not locked out of
 		// the database.
 		log.Ops.Warningf(ctx, "no memory available to cache authentication info: %v", err)
-	} else {
-		for _, sEntry := range settingsEntries {
-			// Avoid re-storing an existing key.
-			if _, ok := a.settingsCache[sEntry.SettingsCacheKey]; !ok {
-				a.settingsCache[sEntry.SettingsCacheKey] = sEntry.Settings
-			}
+		return
+	}
+	for _, sEntry := range settingsEntries {
+		// Avoid re-storing an existing key.
+		if _, ok := a.settingsCache[sEntry.SettingsCacheKey]; !ok {
+			a.settingsCache[sEntry.SettingsCacheKey] = sEntry.Settings
 		}
 	}
-	return true
 }
 
 // clearCacheIfStale compares the cached table versions to the current table

@@ -1331,7 +1331,8 @@ func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
 	}
 
 	st := cluster.MakeTestingClusterSettings()
-	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+	// This test is specifically designed for epoch based leases.
+	kvserver.OverrideLeaderLeaseMetamorphism(ctx, &st.SV)
 
 	manualClock := hlc.NewHybridManualClock()
 	clusterArgs := base.TestClusterArgs{
@@ -1867,160 +1868,175 @@ func TestLogGrowthWhenRefreshingPendingCommands(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	raftConfig := base.RaftConfig{
-		// Drop the raft tick interval so the Raft group is ticked more.
-		RaftTickInterval: 10 * time.Millisecond,
-		// Don't timeout raft leader. We don't want leadership moving.
-		RaftElectionTimeoutTicks: 1000000,
-		// Reduce the max uncommitted entry size.
-		RaftMaxUncommittedEntriesSize: 64 << 10, // 64 KB
-		// RaftProposalQuota cannot exceed RaftMaxUncommittedEntriesSize.
-		RaftProposalQuota: int64(64 << 10),
-		// RaftMaxInflightMsgs * RaftMaxSizePerMsg cannot exceed RaftProposalQuota.
-		RaftMaxInflightMsgs: 16,
-		RaftMaxSizePerMsg:   1 << 10, // 1 KB
-	}
+	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		ctx := context.Background()
+		settings := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
 
-	const numServers int = 5
-	stickyServerArgs := make(map[int]base.TestServerArgs)
-	for i := 0; i < numServers; i++ {
-		stickyServerArgs[i] = base.TestServerArgs{
-			StoreSpecs: []base.StoreSpec{
-				{
-					InMemory:    true,
-					StickyVFSID: strconv.FormatInt(int64(i), 10),
-				},
-			},
-			RaftConfig: raftConfig,
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					StickyVFSRegistry: fs.NewStickyRegistry(),
-				},
-				Store: &kvserver.StoreTestingKnobs{
-					// Disable leader transfers during leaseholder changes so that we
-					// can easily create leader-not-leaseholder scenarios.
-					DisableLeaderFollowsLeaseholder: true,
-					// Refresh pending commands on every Raft group tick instead of
-					// every RaftReproposalTimeoutTicks.
-					RefreshReasonTicksPeriod: 1,
-				},
-			},
+		raftConfig := base.RaftConfig{
+			// Drop the raft tick interval so the Raft group is ticked more.
+			RaftTickInterval: 10 * time.Millisecond,
+			// Reduce the max uncommitted entry size.
+			RaftMaxUncommittedEntriesSize: 64 << 10, // 64 KB
+			// RaftProposalQuota cannot exceed RaftMaxUncommittedEntriesSize.
+			RaftProposalQuota: int64(64 << 10),
+			// RaftMaxInflightMsgs * RaftMaxSizePerMsg cannot exceed RaftProposalQuota.
+			RaftMaxInflightMsgs: 16,
+			RaftMaxSizePerMsg:   1 << 10, // 1 KB
 		}
-	}
+		// Suppress timeout-based elections to avoid leadership changes in ways this
+		// test doesn't expect. For leader leases, fortification itself provides us
+		// this guarantee.
+		if leaseType != roachpb.LeaseLeader {
+			raftConfig.RaftElectionTimeoutTicks = 1000000
+		}
 
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numServers,
-		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
-		})
-	defer tc.Stopper().Stop(ctx)
-	store := tc.GetFirstStoreFromServer(t, 0)
-
-	key := []byte("a")
-	tc.SplitRangeOrFatal(t, key)
-	tc.AddVotersOrFatal(t, key, tc.Targets(1, 2, 3, 4)...)
-
-	// Raft leadership is kept on node 0.
-	leaderRepl := store.LookupReplica(key)
-	require.NotNil(t, leaderRepl)
-
-	// Put some data in the range so we'll have something to test for.
-	incArgs := incrementArgs(key, 5)
-	if _, err := kv.SendWrapped(ctx, store.TestSender(), incArgs); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for all nodes to catch up.
-	tc.WaitForValues(t, key, []int64{5, 5, 5, 5, 5})
-
-	// Test proposing on leader and proposing on follower. Neither should result
-	// in unbounded raft log growth.
-	testutils.RunTrueAndFalse(t, "proposeOnFollower", func(t *testing.T, proposeOnFollower bool) {
-		// Restart any nodes that are down, we dont need to restart 2 since
-		// it started to finish the test case.
-		for _, s := range []int{3, 4} {
-			if tc.ServerStopped(s) {
-				require.NoError(t, tc.RestartServer(s))
+		const numServers int = 5
+		stickyServerArgs := make(map[int]base.TestServerArgs)
+		for i := 0; i < numServers; i++ {
+			stickyServerArgs[i] = base.TestServerArgs{
+				Settings: settings,
+				StoreSpecs: []base.StoreSpec{
+					{
+						InMemory:    true,
+						StickyVFSID: strconv.FormatInt(int64(i), 10),
+					},
+				},
+				RaftConfig: raftConfig,
+				Knobs: base.TestingKnobs{
+					Server: &server.TestingKnobs{
+						StickyVFSRegistry: fs.NewStickyRegistry(),
+					},
+					Store: &kvserver.StoreTestingKnobs{
+						// Disable leader transfers during leaseholder changes so that we
+						// can easily create leader-not-leaseholder scenarios.
+						DisableLeaderFollowsLeaseholder: true,
+						// Refresh pending commands on every Raft group tick instead of
+						// every RaftReproposalTimeoutTicks.
+						RefreshReasonTicksPeriod: 1,
+					},
+				},
 			}
 		}
-		// Determine which node to propose on. Transfer lease to that node.
-		propIdx := 0
-		if proposeOnFollower {
-			propIdx = 1
-		}
-		propNode := tc.GetFirstStoreFromServer(t, propIdx).TestSender()
-		tc.TransferRangeLeaseOrFatal(t, *leaderRepl.Desc(), tc.Target(propIdx))
-		tc.MaybeWaitForLeaseUpgrade(ctx, t, *leaderRepl.Desc())
-		testutils.SucceedsSoon(t, func() error {
-			// Lease transfers may not be immediately observed by the new
-			// leaseholder. Wait until the new leaseholder is aware.
-			repl, err := tc.GetFirstStoreFromServer(t, propIdx).GetReplica(leaderRepl.RangeID)
-			require.NoError(t, err)
-			repDesc, err := repl.GetReplicaDescriptor()
-			require.NoError(t, err)
-			if lease, _ := repl.GetLease(); !lease.Replica.Equal(repDesc) {
-				return errors.Errorf("lease not transferred yet; found %v", lease)
-			}
-			return nil
-		})
 
-		// Stop enough nodes to prevent a quorum.
-		for i := 2; i < len(tc.Servers); i++ {
-			tc.StopServer(i)
+		tc := testcluster.StartTestCluster(t, numServers,
+			base.TestClusterArgs{
+				ReplicationMode:   base.ReplicationManual,
+				ServerArgsPerNode: stickyServerArgs,
+			})
+		defer tc.Stopper().Stop(ctx)
+		store := tc.GetFirstStoreFromServer(t, 0)
+
+		key := []byte("a")
+		tc.SplitRangeOrFatal(t, key)
+		tc.AddVotersOrFatal(t, key, tc.Targets(1, 2, 3, 4)...)
+
+		// Raft leadership is kept on node 0.
+		leaderRepl := store.LookupReplica(key)
+		require.NotNil(t, leaderRepl)
+
+		// Put some data in the range so we'll have something to test for.
+		incArgs := incrementArgs(key, 5)
+		if _, err := kv.SendWrapped(ctx, store.TestSender(), incArgs); err != nil {
+			t.Fatal(err)
 		}
 
-		// Determine the current raft log size.
-		initLogSize, _ := leaderRepl.GetRaftLogSize()
+		// Wait for all nodes to catch up.
+		tc.WaitForValues(t, key, []int64{5, 5, 5, 5, 5})
 
-		// While a majority nodes are down, write some data.
-		putRes := make(chan *kvpb.Error)
-		go func() {
-			putArgs := putArgs([]byte("b"), make([]byte, raftConfig.RaftMaxUncommittedEntriesSize/8))
-			_, err := kv.SendWrapped(ctx, propNode, putArgs)
-			putRes <- err
-		}()
+		// Test proposing on leader and proposing on follower. Neither should result
+		// in unbounded raft log growth.
+		testutils.RunTrueAndFalse(t, "proposeOnFollower", func(t *testing.T, proposeOnFollower bool) {
 
-		// Wait for a bit and watch for Raft log growth.
-		wait := time.After(500 * time.Millisecond)
-		ticker := time.Tick(50 * time.Millisecond)
-	Loop:
-		for {
-			select {
-			case <-wait:
-				break Loop
-			case <-ticker:
-				// Verify that the leader is node 0.
-				status := leaderRepl.RaftStatus()
-				if status == nil || status.RaftState != raftpb.StateLeader {
-					t.Fatalf("raft leader should be node 0, but got status %+v", status)
+			// Restart any nodes that are down, we dont need to restart 2 since
+			// it started to finish the test case.
+			for _, s := range []int{3, 4} {
+				if tc.ServerStopped(s) {
+					require.NoError(t, tc.RestartServer(s))
 				}
-
-				// Check the raft log size. We allow GetRaftLogSize to grow up
-				// to twice RaftMaxUncommittedEntriesSize because its total
-				// includes a little more state (the roachpb.Value checksum,
-				// etc.). The important thing here is that the log doesn't grow
-				// forever.
-				logSizeLimit := int64(2 * raftConfig.RaftMaxUncommittedEntriesSize)
-				curlogSize, _ := leaderRepl.GetRaftLogSize()
-				logSize := curlogSize - initLogSize
-				logSizeStr := humanizeutil.IBytes(logSize)
-				// Note that logSize could be negative if something got truncated.
-				if logSize > logSizeLimit {
-					t.Fatalf("raft log size grew to %s", logSizeStr)
-				}
-				t.Logf("raft log size grew to %s", logSizeStr)
-			case err := <-putRes:
-				t.Fatalf("write finished with quorum unavailable; err=%v", err)
 			}
-		}
+			// Determine which node to propose on. Transfer lease to that node.
+			propIdx := 0
+			if proposeOnFollower {
+				propIdx = 1
+			}
+			propNode := tc.GetFirstStoreFromServer(t, propIdx).TestSender()
+			tc.TransferRangeLeaseOrFatal(t, *leaderRepl.Desc(), tc.Target(propIdx))
+			// The test disables leader follows leaseholder, so we will never be able
+			// to upgrade to a leader lease.
+			if !(leaseType == roachpb.LeaseLeader && proposeOnFollower) {
+				tc.MaybeWaitForLeaseUpgrade(ctx, t, *leaderRepl.Desc())
+			}
+			testutils.SucceedsSoon(t, func() error {
+				// Lease transfers may not be immediately observed by the new
+				// leaseholder. Wait until the new leaseholder is aware.
+				repl, err := tc.GetFirstStoreFromServer(t, propIdx).GetReplica(leaderRepl.RangeID)
+				require.NoError(t, err)
+				repDesc, err := repl.GetReplicaDescriptor()
+				require.NoError(t, err)
+				if lease, _ := repl.GetLease(); !lease.Replica.Equal(repDesc) {
+					return errors.Errorf("lease not transferred yet; found %v", lease)
+				}
+				return nil
+			})
 
-		// Start enough nodes to establish a quorum.
-		require.NoError(t, tc.RestartServer(2))
+			// Stop enough nodes to prevent a quorum.
+			for i := 2; i < len(tc.Servers); i++ {
+				tc.StopServer(i)
+			}
 
-		// The write should now succeed.
-		err := <-putRes
-		require.NoError(t, err.GoError())
+			// Determine the current raft log size.
+			initLogSize, _ := leaderRepl.GetRaftLogSize()
+
+			// While a majority nodes are down, write some data.
+			putRes := make(chan *kvpb.Error)
+			go func() {
+				putArgs := putArgs([]byte("b"), make([]byte, raftConfig.RaftMaxUncommittedEntriesSize/8))
+				_, err := kv.SendWrapped(ctx, propNode, putArgs)
+				putRes <- err
+			}()
+
+			// Wait for a bit and watch for Raft log growth.
+			wait := time.After(500 * time.Millisecond)
+			ticker := time.Tick(50 * time.Millisecond)
+		Loop:
+			for {
+				select {
+				case <-wait:
+					break Loop
+				case <-ticker:
+					// Verify that the leader is node 0.
+					status := leaderRepl.RaftStatus()
+					if status == nil || status.RaftState != raftpb.StateLeader {
+						t.Fatalf("raft leader should be node 0, but got status %+v", status)
+					}
+
+					// Check the raft log size. We allow GetRaftLogSize to grow up
+					// to twice RaftMaxUncommittedEntriesSize because its total
+					// includes a little more state (the roachpb.Value checksum,
+					// etc.). The important thing here is that the log doesn't grow
+					// forever.
+					logSizeLimit := int64(2 * raftConfig.RaftMaxUncommittedEntriesSize)
+					curlogSize, _ := leaderRepl.GetRaftLogSize()
+					logSize := curlogSize - initLogSize
+					logSizeStr := humanizeutil.IBytes(logSize)
+					// Note that logSize could be negative if something got truncated.
+					if logSize > logSizeLimit {
+						t.Fatalf("raft log size grew to %s", logSizeStr)
+					}
+					t.Logf("raft log size grew to %s", logSizeStr)
+				case err := <-putRes:
+					t.Fatalf("write finished with quorum unavailable; err=%v", err)
+				}
+			}
+
+			// Start enough nodes to establish a quorum.
+			require.NoError(t, tc.RestartServer(2))
+
+			// The write should now succeed.
+			err := <-putRes
+			require.NoError(t, err.GoError())
+		})
 	})
 }
 
@@ -2641,135 +2657,147 @@ func TestWedgedReplicaDetection(t *testing.T) {
 
 	const numReplicas = 3
 
-	ctx := context.Background()
-	manual := hlc.NewHybridManualClock()
-	tc := testcluster.StartTestCluster(t, numReplicas,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs: base.TestServerArgs{
-				RaftConfig: base.RaftConfig{
-					// Suppress timeout-based elections to avoid leadership changes in ways
-					// this test doesn't expect.
-					RaftElectionTimeoutTicks: 100000,
-				},
-				Knobs: base.TestingKnobs{
-					Server: &server.TestingKnobs{
-						WallClock: manual,
+	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		ctx := context.Background()
+		manual := hlc.NewHybridManualClock()
+
+		settings := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
+
+		// Suppress timeout-based elections to avoid leadership changes in ways this
+		// test doesn't expect. For leader leases, fortification itself provides us
+		// this guarantee.
+		var raftConfig base.RaftConfig
+		if leaseType != roachpb.LeaseLeader {
+			raftConfig = base.RaftConfig{
+				RaftElectionTimeoutTicks: 100000,
+			}
+		}
+
+		tc := testcluster.StartTestCluster(t, numReplicas,
+			base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+				ServerArgs: base.TestServerArgs{
+					RaftConfig: raftConfig,
+					Knobs: base.TestingKnobs{
+						Server: &server.TestingKnobs{
+							WallClock: manual,
+						},
 					},
 				},
-			},
-		})
-	defer tc.Stopper().Stop(ctx)
+			})
+		defer tc.Stopper().Stop(ctx)
 
-	// Pause the manual clock so that we can carefully control the perceived
-	// timing of the follower replica's activity.
-	manual.Pause()
-	t.Logf("paused clock at %s", manual.Now())
+		// Pause the manual clock so that we can carefully control the perceived
+		// timing of the follower replica's activity.
+		manual.Pause()
+		t.Logf("paused clock at %s", manual.Now())
 
-	key := []byte("a")
-	tc.SplitRangeOrFatal(t, key)
-	tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+		key := []byte("a")
+		tc.SplitRangeOrFatal(t, key)
+		tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
 
-	// Do a write; we'll use it to determine when the dust has settled.
-	_, err := tc.Servers[0].DB().Inc(ctx, key, 1)
-	require.Nil(t, err)
-	tc.WaitForValues(t, key, []int64{1, 1, 1})
+		// Do a write; we'll use it to determine when the dust has settled.
+		_, err := tc.Servers[0].DB().Inc(ctx, key, 1)
+		require.Nil(t, err)
+		tc.WaitForValues(t, key, []int64{1, 1, 1})
 
-	// Get a handle on the leader and the follower replicas.
-	leaderRepl := tc.GetRaftLeader(t, key)
-	leaderClock := leaderRepl.Clock()
-	followerRepl := func() *kvserver.Replica {
-		for i := range tc.Servers {
-			repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(key)
-			require.NotNil(t, repl)
-			if repl == leaderRepl {
-				continue
+		// Get a handle on the leader and the follower replicas.
+		leaderRepl := tc.GetRaftLeader(t, key)
+		leaderClock := leaderRepl.Clock()
+		followerRepl := func() *kvserver.Replica {
+			for i := range tc.Servers {
+				repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(key)
+				require.NotNil(t, repl)
+				if repl == leaderRepl {
+					continue
+				}
+				return repl
 			}
-			return repl
-		}
-		return nil
-	}()
-	if followerRepl == nil {
-		t.Fatal("could not get a handle on a follower replica")
-	}
-
-	// Wait for the leader replica to have three entries in its lastUpdateTimes
-	// map. It should already by this time because it was able to replicate a log
-	// entry to its two followers, but we wait here to be sure and to avoid
-	// flakiness. It is possible that the WaitForValues call above returned as
-	// soon as one of the followers appended and applied a log entry, but before
-	// its response was delivered to the leader.
-	testutils.SucceedsSoon(t, func() error {
-		lastUpdateTimes := leaderRepl.LastUpdateTimes()
-		if len(lastUpdateTimes) == 3 {
 			return nil
+		}()
+		if followerRepl == nil {
+			t.Fatal("could not get a handle on a follower replica")
 		}
-		return errors.Errorf("expected leader replica to have 3 entries in lastUpdateTimes map, found %s", lastUpdateTimes)
-	})
 
-	// Lock the follower replica to prevent it from making progress from now
-	// on. NB: See TestRaftBlockedReplica/#9914 for why we use a separate
-	// goroutine.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		followerRepl.RaftLock()
-		wg.Done()
-	}()
-	wg.Wait()
-	defer followerRepl.RaftUnlock()
+		// Wait for the leader replica to have three entries in its lastUpdateTimes
+		// map. It should already by this time because it was able to replicate a
+		// log entry to its two followers, but we wait here to be sure and to avoid
+		// flakiness. It is possible that the WaitForValues call above returned as
+		// soon as one of the followers appended and applied a log entry, but before
+		// its response was delivered to the leader.
+		testutils.SucceedsSoon(t, func() error {
+			lastUpdateTimes := leaderRepl.LastUpdateTimes()
+			if len(lastUpdateTimes) == 3 {
+				return nil
+			}
+			return errors.Errorf("expected leader replica to have 3 entries in lastUpdateTimes map, found %s", lastUpdateTimes)
+		})
 
-	// inactivityThreshold is the test's duration of inactivity after which the
-	// follower replica is considered inactive. In practice, this is set to the
-	// range lease duration.
-	inactivityThreshold := time.Second
+		// Lock the follower replica to prevent it from making progress from now
+		// on. NB: See TestRaftBlockedReplica/#9914 for why we use a separate
+		// goroutine.
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			followerRepl.RaftLock()
+			wg.Done()
+		}()
+		wg.Wait()
+		defer followerRepl.RaftUnlock()
 
-	// Increment the clock to be close to inactivityThreshold, but not past it.
-	manual.Increment(inactivityThreshold.Nanoseconds() - 1)
+		// inactivityThreshold is the test's duration of inactivity after which the
+		// follower replica is considered inactive. In practice, this is set to the
+		// range lease duration.
+		inactivityThreshold := time.Second
 
-	// Send a request to the leader replica. followerRepl is locked so it will
-	// not respond.
-	value := []byte("value")
-	ba := &kvpb.BatchRequest{}
-	ba.Add(putArgs(key, value))
-	if err := ba.SetActiveTimestamp(leaderClock); err != nil {
-		t.Fatal(err)
-	}
-	if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
-		t.Fatal(pErr)
-	}
+		// Increment the clock to be close to inactivityThreshold, but not past it.
+		manual.Increment(inactivityThreshold.Nanoseconds() - 1)
 
-	// The follower should still be active.
-	followerID := followerRepl.ReplicaID()
-	leaderNow := leaderClock.PhysicalTime()
-	if !leaderRepl.IsFollowerActiveSince(followerID, leaderNow, inactivityThreshold) {
-		t.Fatalf("expected follower to still be considered active; "+
-			"follower id: %d, last update times: %s, leader clock: %s",
-			followerID, leaderRepl.LastUpdateTimes(), leaderNow)
-	}
-
-	// It is possible that there are in-flight heartbeat responses from
-	// followerRepl from before it was locked. The receipt of one of these
-	// would bump the last active timestamp on the leader. Because of this,
-	// we check whether the follower is eventually considered inactive.
-	testutils.SucceedsSoon(t, func() error {
-		// Increment the clock to past inactivityThreshold.
-		manual.Increment(inactivityThreshold.Nanoseconds() + 1)
-
-		// Send another request to the leader replica. followerRepl is locked
-		// so it will not respond.
+		// Send a request to the leader replica. followerRepl is locked so it will
+		// not respond.
+		value := []byte("value")
+		ba := &kvpb.BatchRequest{}
+		ba.Add(putArgs(key, value))
+		if err := ba.SetActiveTimestamp(leaderClock); err != nil {
+			t.Fatal(err)
+		}
 		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 
-		// The follower should no longer be considered active.
-		leaderNow = leaderClock.PhysicalTime()
-		if leaderRepl.IsFollowerActiveSince(followerID, leaderNow, inactivityThreshold) {
-			return errors.Errorf("expected follower to be considered inactive; "+
+		// The follower should still be active.
+		followerID := followerRepl.ReplicaID()
+		leaderNow := leaderClock.PhysicalTime()
+		if !leaderRepl.IsFollowerActiveSince(followerID, leaderNow, inactivityThreshold) {
+			t.Fatalf("expected follower to still be considered active; "+
 				"follower id: %d, last update times: %s, leader clock: %s",
 				followerID, leaderRepl.LastUpdateTimes(), leaderNow)
 		}
-		return nil
+
+		// It is possible that there are in-flight heartbeat responses from
+		// followerRepl from before it was locked. The receipt of one of these
+		// would bump the last active timestamp on the leader. Because of this,
+		// we check whether the follower is eventually considered inactive.
+		testutils.SucceedsSoon(t, func() error {
+			// Increment the clock to past inactivityThreshold.
+			manual.Increment(inactivityThreshold.Nanoseconds() + 1)
+
+			// Send another request to the leader replica. followerRepl is locked
+			// so it will not respond.
+			if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
+				t.Fatal(pErr)
+			}
+
+			// The follower should no longer be considered active.
+			leaderNow = leaderClock.PhysicalTime()
+			if leaderRepl.IsFollowerActiveSince(followerID, leaderNow, inactivityThreshold) {
+				return errors.Errorf("expected follower to be considered inactive; "+
+					"follower id: %d, last update times: %s, leader clock: %s",
+					followerID, leaderRepl.LastUpdateTimes(), leaderNow)
+			}
+			return nil
+		})
 	})
 }
 
@@ -6615,9 +6643,7 @@ func TestRaftCheckQuorum(t *testing.T) {
 // from the range. n3 should acquire leadership.
 //
 // We disable election timeouts, such that the only way n3 can become leader is
-// by campaigning explicitly. Furthermore, it must skip pre-votes, since with
-// PreVote+CheckQuorum n2 wouldn't vote for it (it would think n1 was still the
-// leader).
+// by campaigning explicitly.
 func TestRaftLeaderRemovesItself(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -6629,83 +6655,108 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationManual,
-		ServerArgs: base.TestServerArgs{
-			RaftConfig: base.RaftConfig{
-				RaftEnableCheckQuorum: true,
-				RaftTickInterval:      100 * time.Millisecond, // speed up test
-				// Set a large election timeout. We don't want replicas to call
-				// elections due to timeouts, we want them to campaign and obtain
-				// votes despite PreVote+CheckQuorum.
-				RaftElectionTimeoutTicks: 300,
-			},
-			Knobs: base.TestingKnobs{
-				Store: &kvserver.StoreTestingKnobs{
-					DisableLeaderFollowsLeaseholder: true, // the leader should stay put
+	testutils.RunValues(t, "leaseType", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		settings := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
+
+		raftCfg := base.RaftConfig{
+			RaftEnableCheckQuorum: true,
+			RaftTickInterval:      100 * time.Millisecond, // speed up test
+		}
+
+		if leaseType != roachpb.LeaseLeader {
+			// Set a large election timeout. We don't want replicas to call
+			// elections due to timeouts, instead, we want leadership to get
+			// transferred.
+			//
+			// We only need to do this if we're not running with leader leases. With
+			// leader leases, we won't have elections due to timeouts because of
+			// fortification. Unlike other lease types, which rely on per-range
+			// heartbeats which are affected by leader step-down, leader leases use
+			// per-store StoreLiveness heartbeats which are not affected by leader
+			// step-down.
+			//
+			// In fact, we can't use a high value of RaftElectionTimeoutTicks when
+			// using leader leases as the first attempt to establish raft leadership
+			// is guaranteed to fail because we won't have StoreLiveness support (so
+			// we won't campaign). The test will timeout if we set a high value for
+			// RaftElectionTimeoutTicks, as it'll take too long for us to come back
+			// a second time around to call an election.
+			raftCfg.RaftElectionTimeoutTicks = 300
+		}
+
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				RaftConfig: raftCfg,
+				Settings:   settings,
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						DisableLeaderFollowsLeaseholder: true, // the leader should stay put
+					},
 				},
 			},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
+		})
+		defer tc.Stopper().Stop(ctx)
 
-	logStatus := func(s *raft.Status) {
-		t.Helper()
-		require.NotNil(t, s)
-		t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
-	}
-
-	send1 := tc.GetFirstStoreFromServer(t, 0).TestSender()
-	send3 := tc.GetFirstStoreFromServer(t, 2).TestSender()
-
-	// Create a range, upreplicate it, and replicate a write.
-	key := tc.ScratchRange(t)
-	desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
-	_, pErr := kv.SendWrapped(ctx, send1, incrementArgs(key, 1))
-	require.NoError(t, pErr.GoError())
-	tc.WaitForValues(t, key, []int64{1, 1, 1})
-
-	repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
-	require.NoError(t, err)
-	repl2, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
-	require.NoError(t, err)
-	repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(desc.RangeID)
-	require.NoError(t, err)
-
-	// Move the lease to n3, and make sure everyone has applied it.
-	tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(2))
-	require.Eventually(t, func() bool {
-		lease, _ := repl3.GetLease()
-		return lease.Replica.ReplicaID == repl3.ReplicaID()
-	}, 10*time.Second, 500*time.Millisecond)
-	_, pErr = kv.SendWrapped(ctx, send3, incrementArgs(key, 1))
-	require.NoError(t, pErr.GoError())
-	tc.WaitForValues(t, key, []int64{2, 2, 2})
-	t.Logf("n3 has lease")
-
-	// Make sure n1 is still leader.
-	st := repl1.RaftStatus()
-	require.Equal(t, raftpb.StateLeader, st.RaftState)
-	logStatus(st)
-
-	// Remove n1 and wait for n3 to become leader.
-	tc.RemoveVotersOrFatal(t, key, tc.Target(0))
-	t.Logf("n1 removed from range")
-
-	// Make sure we didn't time out on the above.
-	require.NoError(t, ctx.Err())
-
-	require.Eventually(t, func() bool {
-		logStatus(repl2.RaftStatus())
-		logStatus(repl3.RaftStatus())
-		if repl3.RaftStatus().RaftState == raftpb.StateLeader {
-			t.Logf("n3 is leader")
-			return true
+		logStatus := func(s *raft.Status) {
+			t.Helper()
+			require.NotNil(t, s)
+			t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
 		}
-		return false
-	}, 10*time.Second, 500*time.Millisecond)
 
-	require.NoError(t, ctx.Err())
+		send1 := tc.GetFirstStoreFromServer(t, 0).TestSender()
+		send3 := tc.GetFirstStoreFromServer(t, 2).TestSender()
+
+		// Create a range, upreplicate it, and replicate a write.
+		key := tc.ScratchRange(t)
+		desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+		_, pErr := kv.SendWrapped(ctx, send1, incrementArgs(key, 1))
+		require.NoError(t, pErr.GoError())
+		tc.WaitForValues(t, key, []int64{1, 1, 1})
+
+		repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		repl2, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+
+		// Move the lease to n3, and make sure everyone has applied it.
+		tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(2))
+		require.Eventually(t, func() bool {
+			lease, _ := repl3.GetLease()
+			return lease.Replica.ReplicaID == repl3.ReplicaID()
+		}, 10*time.Second, 500*time.Millisecond)
+		_, pErr = kv.SendWrapped(ctx, send3, incrementArgs(key, 1))
+		require.NoError(t, pErr.GoError())
+		tc.WaitForValues(t, key, []int64{2, 2, 2})
+		t.Logf("n3 has lease")
+
+		// Make sure n1 is still leader.
+		st := repl1.RaftStatus()
+		require.Equal(t, raftpb.StateLeader, st.RaftState)
+		logStatus(st)
+
+		// Remove n1 and wait for n3 to become leader.
+		tc.RemoveVotersOrFatal(t, key, tc.Target(0))
+		t.Logf("n1 removed from range")
+
+		// Make sure we didn't time out on the above.
+		require.NoError(t, ctx.Err())
+
+		require.Eventually(t, func() bool {
+			logStatus(repl2.RaftStatus())
+			logStatus(repl3.RaftStatus())
+			if repl3.RaftStatus().RaftState == raftpb.StateLeader {
+				t.Logf("n3 is leader")
+				return true
+			}
+			return false
+		}, 10*time.Second, 500*time.Millisecond)
+
+		require.NoError(t, ctx.Err())
+	})
 }
 
 // TestRaftUnquiesceLeaderNoProposal tests that unquiescing a Raft leader does
@@ -6817,10 +6868,11 @@ func TestRaftUnquiesceLeaderNoProposal(t *testing.T) {
 	t.Logf("n1 still leader with no new proposals at log index %d", status.Progress[1].Match)
 }
 
-// TestRaftPreVoteUnquiesceDeadLeader tests that if a quorum of replicas independently
-// consider the leader dead, they can successfully hold an election despite
-// having recently heard from a leader under the PreVote+CheckQuorum condition.
-// It also tests that it does not result in an election tie.
+// TestRaftPreVoteUnquiesceDeadLeader tests that if a quorum of replicas
+// independently consider the leader dead, they can successfully hold an
+// election despite having recently heard from a leader under the
+// PreVote+CheckQuorum condition. It also tests that it does not result in an
+// election tie.
 //
 // We quiesce the range and partition away the leader as such:
 //
@@ -6844,10 +6896,11 @@ func TestRaftPreVoteUnquiesceDeadLeader(t *testing.T) {
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 
-	// Disable expiration-based leases, since these prevent quiescence.
+	// This test is specifically designed for epoch based leases, as they're the
+	// only lease type for which we have quiescence.
 	st := cluster.MakeTestingClusterSettings()
+	kvserver.OverrideLeaderLeaseMetamorphism(ctx, &st.SV)
 	kvserver.TransferExpirationLeasesFirstEnabled.Override(ctx, &st.SV, false)
-	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false)
 
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,

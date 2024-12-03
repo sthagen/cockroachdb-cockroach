@@ -18,7 +18,7 @@ import (
 
 // storeStatsAlpha specifies the ratio of new values to existing values in EMA
 // calculations.
-const storeStatsAlpha = 0.1
+const storeStatsAlpha = 0.05
 
 // lockType specifies the type of lock that transactions have acquired.
 type lockType int
@@ -58,10 +58,10 @@ type InMemoryStore struct {
 	txnLock syncutil.RWMutex
 	mu      struct {
 		syncutil.Mutex
-		index   map[PartitionKey]*Partition
-		nextKey PartitionKey
-		vectors map[string]vector.T
-		stats   IndexStats
+		partitions map[PartitionKey]*Partition
+		nextKey    PartitionKey
+		vectors    map[string]vector.T
+		stats      IndexStats
 	}
 }
 
@@ -76,9 +76,21 @@ func NewInMemoryStore(dims int, seed int64) *InMemoryStore {
 		dims: dims,
 		seed: seed,
 	}
-	st.mu.index = make(map[PartitionKey]*Partition)
+	st.mu.partitions = make(map[PartitionKey]*Partition)
+
+	// Create empty root partition.
+	var empty vector.Set
+	quantizer := quantize.NewUnQuantizer(dims)
+	quantizedSet := quantizer.Quantize(context.Background(), &empty)
+	st.mu.partitions[RootKey] = &Partition{
+		quantizer:    quantizer,
+		quantizedSet: quantizedSet,
+		level:        LeafLevel,
+	}
+
 	st.mu.nextKey = RootKey + 1
 	st.mu.vectors = make(map[string]vector.T)
+	st.mu.stats.NumPartitions = 1
 	return st
 }
 
@@ -98,7 +110,7 @@ func (s *InMemoryStore) CommitTransaction(ctx context.Context, txn Txn) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		partition, ok := s.mu.index[inMemTxn.unbalancedKey]
+		partition, ok := s.mu.partitions[inMemTxn.unbalancedKey]
 		if ok && partition.Count() == 0 && partition.Level() > LeafLevel {
 			panic(errors.AssertionFailedf(
 				"K-means tree is unbalanced, with empty non-leaf partition %d", inMemTxn.unbalancedKey))
@@ -135,7 +147,7 @@ func (s *InMemoryStore) GetPartition(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partition, ok := s.mu.index[partitionKey]
+	partition, ok := s.mu.partitions[partitionKey]
 	if !ok {
 		return nil, ErrPartitionNotFound
 	}
@@ -152,10 +164,11 @@ func (s *InMemoryStore) SetRootPartition(ctx context.Context, txn Txn, partition
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, ok := s.mu.index[RootKey]
+	_, ok := s.mu.partitions[RootKey]
 	if !ok {
-		s.mu.stats.NumPartitions++
+		panic(errors.AssertionFailedf("the root partition cannot be found"))
 	}
+	s.reportPartitionSizeLocked(partition.Count())
 
 	// Grow or shrink CVStats slice if a new level is being added or removed.
 	expectedLevels := int(partition.Level() - 1)
@@ -164,7 +177,7 @@ func (s *InMemoryStore) SetRootPartition(ctx context.Context, txn Txn, partition
 	}
 	s.mu.stats.CVStats = s.mu.stats.CVStats[:expectedLevels]
 
-	s.mu.index[RootKey] = partition
+	s.mu.partitions[RootKey] = partition
 	return nil
 }
 
@@ -179,8 +192,9 @@ func (s *InMemoryStore) InsertPartition(
 
 	partitionKey := s.mu.nextKey
 	s.mu.nextKey++
-	s.mu.index[partitionKey] = partition
+	s.mu.partitions[partitionKey] = partition
 	s.mu.stats.NumPartitions++
+	s.reportPartitionSizeLocked(partition.Count())
 	return partitionKey, nil
 }
 
@@ -193,11 +207,15 @@ func (s *InMemoryStore) DeletePartition(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, ok := s.mu.index[partitionKey]
+	if partitionKey == RootKey {
+		panic(errors.AssertionFailedf("cannot delete the root partition"))
+	}
+
+	_, ok := s.mu.partitions[partitionKey]
 	if !ok {
 		return ErrPartitionNotFound
 	}
-	delete(s.mu.index, partitionKey)
+	delete(s.mu.partitions, partitionKey)
 	s.mu.stats.NumPartitions--
 	return nil
 }
@@ -211,14 +229,16 @@ func (s *InMemoryStore) AddToPartition(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partition, ok := s.mu.index[partitionKey]
+	partition, ok := s.mu.partitions[partitionKey]
 	if !ok {
 		return 0, ErrPartitionNotFound
 	}
+
 	if partition.Add(ctx, vector, childKey) {
-		return partition.Count(), nil
+		s.reportPartitionSizeLocked(partition.Count())
 	}
-	return -1, nil
+
+	return partition.Count(), nil
 }
 
 // RemoveFromPartition implements the Store interface.
@@ -230,24 +250,23 @@ func (s *InMemoryStore) RemoveFromPartition(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	partition, ok := s.mu.index[partitionKey]
+	partition, ok := s.mu.partitions[partitionKey]
 	if !ok {
 		return 0, ErrPartitionNotFound
 	}
 
-	if !partition.ReplaceWithLastByKey(childKey) {
-		// Key cannot be found.
-		return -1, nil
+	if partition.ReplaceWithLastByKey(childKey) {
+		s.reportPartitionSizeLocked(partition.Count())
 	}
 
-	count := partition.Count()
-	if count == 0 && partition.Level() > LeafLevel {
+	if partition.Count() == 0 && partition.Level() > LeafLevel {
 		// A non-leaf partition has zero vectors. If this is still true at the
 		// end of the transaction, the K-means tree will be unbalanced, which
 		// violates a key constraint.
 		txn.(*inMemoryTxn).unbalancedKey = partitionKey
 	}
-	return count, nil
+
+	return partition.Count(), nil
 }
 
 // SearchPartitions implements the Store interface.
@@ -265,7 +284,7 @@ func (s *InMemoryStore) SearchPartitions(
 	defer s.mu.Unlock()
 
 	for i := 0; i < len(partitionKeys); i++ {
-		partition, ok := s.mu.index[partitionKeys[i]]
+		partition, ok := s.mu.partitions[partitionKeys[i]]
 		if !ok {
 			return 0, ErrPartitionNotFound
 		}
@@ -295,7 +314,7 @@ func (s *InMemoryStore) GetFullVectors(ctx context.Context, txn Txn, refs []Vect
 		ref := &refs[i]
 		if ref.Key.PartitionKey != InvalidKey {
 			// Return the partition's centroid.
-			partition, ok := s.mu.index[ref.Key.PartitionKey]
+			partition, ok := s.mu.partitions[ref.Key.PartitionKey]
 			if !ok {
 				return ErrPartitionNotFound
 			}
@@ -319,15 +338,6 @@ func (s *InMemoryStore) MergeStats(ctx context.Context, stats *IndexStats, skipM
 	defer s.mu.Unlock()
 
 	if !skipMerge {
-		// Merge VectorsPerPartition.
-		if s.mu.stats.VectorsPerPartition == 0 {
-			// Use first value if this is the first update.
-			s.mu.stats.VectorsPerPartition = stats.VectorsPerPartition
-		} else {
-			s.mu.stats.VectorsPerPartition = (1 - storeStatsAlpha) * s.mu.stats.VectorsPerPartition
-			s.mu.stats.VectorsPerPartition += stats.VectorsPerPartition * storeStatsAlpha
-		}
-
 		// Merge CVStats.
 		for i := range stats.CVStats {
 			if i >= len(s.mu.stats.CVStats) {
@@ -342,8 +352,8 @@ func (s *InMemoryStore) MergeStats(ctx context.Context, stats *IndexStats, skipM
 			if cvstats.Mean == 0 {
 				cvstats.Mean = sample.Mean
 			} else {
-				cvstats.Mean = sample.Mean*storeStatsAlpha + (1-storeStatsAlpha)*cvstats.Mean
-				cvstats.Variance = sample.Variance*storeStatsAlpha + (1-storeStatsAlpha)*cvstats.Variance
+				cvstats.Mean = storeStatsAlpha*sample.Mean + (1-storeStatsAlpha)*cvstats.Mean
+				cvstats.Variance = storeStatsAlpha*sample.Variance + (1-storeStatsAlpha)*cvstats.Variance
 			}
 		}
 	}
@@ -417,14 +427,14 @@ func (s *InMemoryStore) MarshalBinary() (data []byte, err error) {
 	storeProto := StoreProto{
 		Dims:       s.dims,
 		Seed:       s.seed,
-		Partitions: make([]PartitionProto, 0, len(s.mu.index)),
+		Partitions: make([]PartitionProto, 0, len(s.mu.partitions)),
 		NextKey:    s.mu.nextKey,
 		Vectors:    make([]VectorProto, 0, len(s.mu.vectors)),
 		Stats:      s.mu.stats,
 	}
 
 	// Remap partitions to protobufs.
-	for partitionKey, partition := range s.mu.index {
+	for partitionKey, partition := range s.mu.partitions {
 		partitionProto := PartitionProto{
 			PartitionKey: partitionKey,
 			ChildKeys:    partition.ChildKeys(),
@@ -451,24 +461,24 @@ func (s *InMemoryStore) MarshalBinary() (data []byte, err error) {
 	return protoutil.Marshal(&storeProto)
 }
 
-// UnmarshalBinary loads the in-memory store from bytes that were previously
+// LoadInMemoryStore loads the in-memory store from bytes that were previously
 // saved by MarshalBinary.
-func (s *InMemoryStore) UnmarshalBinary(data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func LoadInMemoryStore(data []byte) (*InMemoryStore, error) {
 	// Unmarshal bytes into a protobuf.
 	var storeProto StoreProto
 	if err := protoutil.Unmarshal(data, &storeProto); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Construct the InMemoryStore object.
-	s.seed = storeProto.Seed
-	s.mu.index = make(map[PartitionKey]*Partition, len(storeProto.Partitions))
-	s.mu.nextKey = storeProto.NextKey
-	s.mu.vectors = make(map[string]vector.T, len(storeProto.Vectors))
-	s.mu.stats = storeProto.Stats
+	inMemStore := &InMemoryStore{
+		dims: storeProto.Dims,
+		seed: storeProto.Seed,
+	}
+	inMemStore.mu.partitions = make(map[PartitionKey]*Partition, len(storeProto.Partitions))
+	inMemStore.mu.nextKey = storeProto.NextKey
+	inMemStore.mu.vectors = make(map[string]vector.T, len(storeProto.Vectors))
+	inMemStore.mu.stats = storeProto.Stats
 
 	raBitQuantizer := quantize.NewRaBitQuantizer(storeProto.Dims, storeProto.Seed)
 	unquantizer := quantize.NewUnQuantizer(storeProto.Dims)
@@ -487,16 +497,31 @@ func (s *InMemoryStore) UnmarshalBinary(data []byte) error {
 			partition.quantizer = unquantizer
 			partition.quantizedSet = partitionProto.UnQuantized
 		}
-		s.mu.index[partitionProto.PartitionKey] = &partition
+		inMemStore.mu.partitions[partitionProto.PartitionKey] = &partition
 	}
 
 	// Insert vectors into the in-memory store.
 	for i := range storeProto.Vectors {
 		vectorProto := storeProto.Vectors[i]
-		s.mu.vectors[string(vectorProto.PrimaryKey)] = vectorProto.Vector
+		inMemStore.mu.vectors[string(vectorProto.PrimaryKey)] = vectorProto.Vector
 	}
 
-	return nil
+	return inMemStore, nil
+}
+
+// reportPartitionSizeLocked updates the vectors per partition statistic. It is
+// called with the count of vectors in a partition when a partition is inserted
+// or updated.
+// NOTE: Callers must have acquired the s.mu lock before calling.
+func (s *InMemoryStore) reportPartitionSizeLocked(count int) {
+	if s.mu.stats.VectorsPerPartition == 0 {
+		// Use first value if this is the first update.
+		s.mu.stats.VectorsPerPartition = float64(count)
+	} else {
+		// Calculate exponential moving average.
+		s.mu.stats.VectorsPerPartition = (1 - storeStatsAlpha) * s.mu.stats.VectorsPerPartition
+		s.mu.stats.VectorsPerPartition += storeStatsAlpha * float64(count)
+	}
 }
 
 // acquireTxnLock acquires a data or partition lock within the scope of the

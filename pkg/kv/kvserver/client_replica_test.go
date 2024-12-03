@@ -3307,7 +3307,7 @@ func TestChangeReplicasSwapVoterWithNonVoter(t *testing.T) {
 // written at sane values.
 func TestReplicaTombstone(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(),
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(),
 		func(t *testing.T, leaseType roachpb.LeaseType) {
 			t.Run("(1) ChangeReplicasTrigger", func(t *testing.T) {
 				defer leaktest.AfterTest(t)()

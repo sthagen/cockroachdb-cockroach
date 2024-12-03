@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	raft "github.com/cockroachdb/cockroach/pkg/raft"
@@ -620,40 +619,28 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 	index := repl.GetLastIndex()
 
 	// Verifies the recomputed log size against what we track in `r.mu.raftLogSize`.
-	assertCorrectRaftLogSize := func() error {
-		// Recompute under raft lock so that the log doesn't change while we
-		// compute its size.
+	assertCorrectRaftLogSize := func() {
+		// Lock raftMu so that the log doesn't change while we compute its size.
 		repl.RaftLock()
-		realSize, err := logstore.ComputeRaftLogSize(
-			ctx, repl.RangeID, repl.Store().TODOEngine(), repl.SideloadedRaftMuLocked(),
-		)
+		realSize, err := repl.LogStorageRaftMuLocked().ComputeSize(ctx)
 		size, _ := repl.GetRaftLogSize()
 		repl.RaftUnlock()
-
-		if err != nil {
-			t.Fatal(err)
-		}
-
+		require.NoError(t, err)
 		// If the size isn't trusted, it won't have to match (and in fact
 		// likely won't). In this test, this is because the upreplication
 		// elides old Raft log entries in the snapshot it uses.
-		if size != realSize {
-			return fmt.Errorf("%s: raft log claims size %d, but is in fact %d", repl, size, realSize)
-		}
-		return nil
+		require.Equal(t, size, realSize)
 	}
 
-	assert.NoError(t, assertCorrectRaftLogSize())
-
+	assertCorrectRaftLogSize()
 	truncArgs := truncateLogArgs(index+1, repl.GetRangeID())
 	if _, err := kv.SendWrapped(ctx, store.TestSender(), truncArgs); err != nil {
 		t.Fatal(err)
 	}
-
 	// Note that if there were multiple nodes, the Raft log sizes would not
 	// be correct for the followers as they would have received a shorter
 	// Raft log than the leader.
-	assert.NoError(t, assertCorrectRaftLogSize())
+	assertCorrectRaftLogSize()
 }
 
 // TestSnapshotAfterTruncation tests that Raft will properly send a snapshot
@@ -1868,7 +1855,7 @@ func TestLogGrowthWhenRefreshingPendingCommands(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
 		ctx := context.Background()
 		settings := cluster.MakeTestingClusterSettings()
 		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
@@ -2657,7 +2644,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 
 	const numReplicas = 3
 
-	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
 		ctx := context.Background()
 		manual := hlc.NewHybridManualClock()
 
@@ -2678,6 +2665,7 @@ func TestWedgedReplicaDetection(t *testing.T) {
 			base.TestClusterArgs{
 				ReplicationMode: base.ReplicationManual,
 				ServerArgs: base.TestServerArgs{
+					Settings:   settings,
 					RaftConfig: raftConfig,
 					Knobs: base.TestingKnobs{
 						Server: &server.TestingKnobs{
@@ -4220,7 +4208,7 @@ func TestTransferRaftLeadership(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(),
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(),
 		func(t *testing.T, leaseType roachpb.LeaseType) {
 			ctx := context.Background()
 			st := cluster.MakeTestingClusterSettings()
@@ -4420,7 +4408,7 @@ func TestUninitializedReplicaRemainsQuiesced(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testutils.RunValues(t, "leaseType", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+	testutils.RunValues(t, "leaseType", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
 		ctx := context.Background()
 		st := cluster.MakeTestingClusterSettings()
 		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, leaseType)
@@ -5273,7 +5261,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
 		noopProposalFilter := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 			return nil
 		})
@@ -5735,6 +5723,8 @@ func TestElectionAfterRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.OverrideLeaderLeaseMetamorphism(ctx, &st.SV)
 
 	// We use a single node to avoid rare flakes due to dueling elections.
 	// The code is set up to support multiple nodes, though the test will
@@ -5756,6 +5746,7 @@ func TestElectionAfterRestart(t *testing.T) {
 			ReplicationMode: replMode,
 			ParallelStart:   parallel,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				RaftConfig: base.RaftConfig{
 					RaftElectionTimeoutTicks: electionTimeoutTicks,
 					RaftTickInterval:         raftTickInterval,
@@ -6655,7 +6646,7 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	testutils.RunValues(t, "leaseType", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+	testutils.RunValues(t, "leaseType", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
 		settings := cluster.MakeTestingClusterSettings()
 		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
 

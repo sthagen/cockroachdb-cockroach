@@ -314,7 +314,17 @@ type Replica struct {
 		// depending on which lock is being held.
 		stateLoader stateloader.StateLoader
 		// on-disk storage for sideloaded SSTables. Always non-nil.
+		// TODO(pav-kv): remove, since this is duplicated in logStorage.
 		sideloaded logstore.SideloadStorage
+		// logStorage provides access to the raft log storage. Set once upon Replica
+		// creation, and is never nil.
+		//
+		// TODO(pav-kv): move log state (such as shMu.lastIndexNotDurable) into the
+		// log storage type. Make the log storage type observe the writes and
+		// maintain this state, as opposed to doing it from a few places in Replica
+		// (like handleRaftReady).
+		logStorage *logstore.LogStore
+
 		// stateMachine is used to apply committed raft entries.
 		stateMachine replicaStateMachine
 		// decoder is used to decode committed raft entries.
@@ -1004,6 +1014,12 @@ func (r *Replica) ReplicaID() roachpb.ReplicaID {
 // ID returns the FullReplicaID for the Replica.
 func (r *Replica) ID() storage.FullReplicaID {
 	return storage.FullReplicaID{RangeID: r.RangeID, ReplicaID: r.replicaID}
+}
+
+// LogStorageRaftMuLocked returns the Replica's log storage.
+// raftMu must be held when using the returned object.
+func (r *Replica) LogStorageRaftMuLocked() *logstore.LogStore {
+	return r.raftMu.logStorage
 }
 
 // cleanupFailedProposal cleans up after a proposal that has failed. It

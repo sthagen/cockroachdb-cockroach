@@ -916,9 +916,13 @@ func TestLeaseholderRelocate(t *testing.T) {
 		locality("us"),
 	}
 
+	// TODO(arul): figure out why this test is flaky under leader leases.
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.OverrideLeaderLeaseMetamorphism(ctx, &st.SV)
 	const numNodes = 4
 	for i := 0; i < numNodes; i++ {
 		serverArgs[i] = base.TestServerArgs{
+			Settings: st,
 			Locality: localities[i],
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
@@ -1682,7 +1686,7 @@ func TestLeaseRequestBumpsEpoch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testutils.RunValues(t, "lease-type", roachpb.LeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
 		ctx := context.Background()
 		st := cluster.MakeTestingClusterSettings()
 		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseEpoch)

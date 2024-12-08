@@ -55,11 +55,11 @@ import (
 // steps of background jobs and schema changes. Each session variable is
 // initialized using the correct default value.
 func NewInternalSessionData(
-	ctx context.Context, settings *cluster.Settings, opName string,
+	ctx context.Context, settings *cluster.Settings, opName redact.SafeString,
 ) *sessiondata.SessionData {
 	appName := catconstants.InternalAppNamePrefix
 	if opName != "" {
-		appName = catconstants.InternalAppNamePrefix + "-" + opName
+		appName = catconstants.InternalAppNamePrefix + "-" + string(opName)
 	}
 
 	sd := &sessiondata.SessionData{}
@@ -180,7 +180,7 @@ func MakeInternalExecutorMemMonitor(
 	memMetrics MemoryMetrics, settings *cluster.Settings,
 ) *mon.BytesMonitor {
 	return mon.NewMonitor(mon.Options{
-		Name:       "internal SQL executor",
+		Name:       mon.MakeMonitorName("internal SQL executor"),
 		CurCount:   memMetrics.CurBytesCount,
 		MaxHist:    memMetrics.MaxBytesHist,
 		Settings:   settings,

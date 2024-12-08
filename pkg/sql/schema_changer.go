@@ -64,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 var schemaChangeJobMaxRetryBackoff = settings.RegisterDurationSetting(
@@ -300,7 +301,11 @@ func (sc *SchemaChanger) refreshMaterializedView(
 const schemaChangerBackfillTxnDebugName = "schemaChangerBackfill"
 
 func (sc *SchemaChanger) backfillQueryIntoTable(
-	ctx context.Context, table catalog.TableDescriptor, query string, ts hlc.Timestamp, desc string,
+	ctx context.Context,
+	table catalog.TableDescriptor,
+	query string,
+	ts hlc.Timestamp,
+	opName redact.SafeString,
 ) (err error) {
 	if fn := sc.testingKnobs.RunBeforeQueryBackfill; fn != nil {
 		if err := fn(); err != nil {
@@ -335,7 +340,7 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 		// Create an internal planner as the planner used to serve the user query
 		// would have committed by this point.
 		p, cleanup := NewInternalPlanner(
-			desc,
+			opName,
 			txn.KV(),
 			username.NodeUserName(),
 			&MemoryMetrics{},
@@ -1932,11 +1937,16 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 			return err
 		}
 
+		startTime := timeutil.FromUnixMicros(sc.job.Payload().StartedMicros)
 		var info logpb.EventPayload
 		if isRollback {
-			info = &eventpb.FinishSchemaChangeRollback{}
+			info = &eventpb.FinishSchemaChangeRollback{
+				LatencyNanos: timeutil.Since(startTime).Nanoseconds(),
+			}
 		} else {
-			info = &eventpb.FinishSchemaChange{}
+			info = &eventpb.FinishSchemaChange{
+				LatencyNanos: timeutil.Since(startTime).Nanoseconds(),
+			}
 		}
 
 		// Log "Finish Schema Change" or "Finish Schema Change Rollback"
@@ -2217,14 +2227,16 @@ func (sc *SchemaChanger) maybeReverseMutations(ctx context.Context, causingError
 		// Log "Reverse Schema Change" event. Only the causing error and the
 		// mutation ID are logged; this can be correlated with the DDL statement
 		// that initiated the change using the mutation id.
+		startTime := timeutil.FromUnixMicros(sc.job.Payload().StartedMicros)
 		return logEventInternalForSchemaChanges(
 			ctx, sc.execCfg, txn,
 			sc.sqlInstanceID,
 			sc.descID,
 			sc.mutationID,
 			&eventpb.ReverseSchemaChange{
-				Error:    fmt.Sprintf("%+v", causingError),
-				SQLSTATE: pgerror.GetPGCode(causingError).String(),
+				Error:        fmt.Sprintf("%+v", causingError),
+				SQLSTATE:     pgerror.GetPGCode(causingError).String(),
+				LatencyNanos: timeutil.Since(startTime).Nanoseconds(),
 			})
 	})
 	if err != nil || alreadyReversed {

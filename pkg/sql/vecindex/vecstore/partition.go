@@ -32,7 +32,7 @@ type PrimaryKey []byte
 
 // Level specifies a level in the K-means tree. Levels are numbered from leaf to
 // root, in ascending order, with the leaf level always equal to one.
-type Level uint64
+type Level uint32
 
 const (
 	// InvalidLevel is the default (invalid) value for a K-means tree level.
@@ -103,6 +103,7 @@ func (p *Partition) QuantizedSet() quantize.QuantizedVectorSet {
 }
 
 // Centroid is the full-sized centroid vector for this partition.
+// NOTE: The centroid is immutable and therefore this method is thread-safe.
 func (p *Partition) Centroid() vector.T {
 	return p.quantizedSet.GetCentroid()
 }

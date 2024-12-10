@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/backup/backuputils"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvfollowerreadsccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -773,10 +772,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		}
 
 		// Collect telemetry, once per backup after resolving its destination.
-		lic := utilccl.CheckEnterpriseEnabled(
-			p.ExecCfg().Settings, "",
-		) != nil
-		collectTelemetry(ctx, backupManifest, initialDetails, details, lic, b.job.ID())
+		collectTelemetry(ctx, backupManifest, initialDetails, details, true, b.job.ID())
 	}
 
 	// For all backups, partitioned or not, the main BACKUP manifest is stored at
@@ -1678,7 +1674,7 @@ func createBackupManifest(
 	elide := execinfrapb.ElidePrefix_None
 	if len(prevBackups) > 0 {
 		elide = prevBackups[0].ElidedPrefix
-	} else if execCfg.Settings.Version.IsActive(ctx, clusterversion.V24_1) && elidePrefixes.Get(&execCfg.Settings.SV) {
+	} else if elidePrefixes.Get(&execCfg.Settings.SV) {
 		if len(tenants) > 0 {
 			elide = execinfrapb.ElidePrefix_Tenant
 		} else {
@@ -1795,9 +1791,6 @@ func getBackupDetailAndManifest(
 			return jobspb.BackupDetails{}, backuppb.BackupManifest{}, errors.Errorf("cannot append a backup of specific tables or databases to a cluster backup")
 		}
 
-		if err := requireEnterprise(execCfg, "incremental"); err != nil {
-			return jobspb.BackupDetails{}, backuppb.BackupManifest{}, err
-		}
 		lastEndTime := prevBackups[len(prevBackups)-1].EndTime
 		if lastEndTime.Compare(initialDetails.EndTime) > 0 {
 			return jobspb.BackupDetails{}, backuppb.BackupManifest{},

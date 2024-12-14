@@ -8,6 +8,7 @@ package tests_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
@@ -398,7 +400,7 @@ func (s *sysbenchKV) IndexUpdate(t tableNum, id rowID) {
 	// Construct the old and new index keys, plus the new index value.
 	oldIndexKey := s.indexKey(t, oldK, id)
 	newIndexKey := s.indexKey(t, newK, id)
-	newIndexValue := s.indexValue(newIndexKey)
+	newIndexValue := s.indexValue()
 
 	// Issue the mutation batch.
 	var b kv.Batch
@@ -406,6 +408,11 @@ func (s *sysbenchKV) IndexUpdate(t tableNum, id rowID) {
 	b.Del(oldIndexKey)
 	b.Put(newIndexKey, newIndexValue)
 	try0(s.txn.Run(s.ctx, &b))
+
+	// Verify that the old secondary index key was found and deleted.
+	if len(b.Results[1].Keys) != 1 {
+		panic(errors.New("key not found and deleted"))
+	}
 }
 
 func (s *sysbenchKV) NonIndexUpdate(t tableNum, id rowID, _ cValue) {
@@ -437,14 +444,21 @@ func (s *sysbenchKV) DeleteInsert(t tableNum, id rowID, newK kValue, _ cValue, _
 	b1.Del(oldIndexKey)
 	try0(s.txn.Run(s.ctx, &b1))
 
+	// Verify that both keys were found and deleted.
+	for _, res := range b1.Results {
+		if len(res.Keys) != 1 {
+			panic(errors.New("key not found and deleted"))
+		}
+	}
+
 	// Insert the new row.
 	s.encodePKValue(pkValue, newK)
 	newIndexKey := s.indexKey(t, newK, id)
-	newIndexValue := s.indexValue(newIndexKey)
+	newIndexValue := s.indexValue()
 
 	var b2 kv.Batch
 	b2.CPut(pkKey, pkValue, nil /* expValue */)
-	b2.InitPut(oldIndexKey, newIndexValue, false /* failOnTombstones */)
+	b2.InitPut(newIndexKey, newIndexValue, false /* failOnTombstones */)
 	try0(s.txn.Run(s.ctx, &b2))
 }
 
@@ -463,36 +477,26 @@ func (s *sysbenchKV) indexKey(t tableNum, k kValue, id rowID) []byte {
 	return key
 }
 
-func (s *sysbenchKV) pkValue(rng *rand.Rand, pkKey roachpb.Key, k kValue) []byte {
+func (s *sysbenchKV) pkValue(rng *rand.Rand, k kValue) []byte {
 	const pkValueSize = 185 // measured from sysbenchSQL
 	b := randutil.RandBytes(rng, pkValueSize)
 	s.encodePKValue(b, k)
-	var v roachpb.Value
-	v.SetBytes(b)
-	v.InitChecksum(pkKey)
-	return v.RawBytes
+	return b
 }
 
 func (s *sysbenchKV) encodePKValue(b []byte, k kValue) {
 	// Replace the first 8 bytes with the k value, so that we can decode k to keep
 	// the secondary index in sync.
-	encoding.EncodeUint64Ascending(b[:8], uint64(k))
+	binary.BigEndian.PutUint64(b, uint64(k))
 }
 
 func (s *sysbenchKV) decodePKValue(b []byte) kValue {
 	// Extract the k value from the first 8 bytes. The rest is random.
-	_, k, err := encoding.DecodeUint64Ascending(b[:8])
-	if err != nil {
-		panic(errors.Wrapf(err, "decoding primary key value"))
-	}
-	return kValue(k)
+	return kValue(binary.BigEndian.Uint64(b))
 }
 
-func (s *sysbenchKV) indexValue(indexKey roachpb.Key) []byte {
-	var v roachpb.Value
-	v.SetBytes(nil)
-	v.InitChecksum(indexKey)
-	return v.RawBytes
+func (s *sysbenchKV) indexValue() []byte {
+	return make([]byte, 0)
 }
 
 func (s *sysbenchKV) prep(rng *rand.Rand) {
@@ -518,9 +522,9 @@ func (s *sysbenchKV) prepDataset(rng *rand.Rand) {
 			id := rowID(j)
 			k := randKValue(rng)
 			pkKey := s.pkKey(t, id)
-			pkValue := s.pkValue(rng, pkKey, k)
+			pkValue := s.pkValue(rng, k)
 			indexKey := s.indexKey(t, k, id)
-			indexValue := s.indexValue(indexKey)
+			indexValue := s.indexValue()
 			b.Put(pkKey, pkValue)
 			b.Put(indexKey, indexValue)
 		}
@@ -530,6 +534,13 @@ func (s *sysbenchKV) prepDataset(rng *rand.Rand) {
 	// Scan across all tables to ensure that intent resolution has completed.
 	for i := range sysbenchTables {
 		try(s.db.Scan(s.ctx, s.pkPrefix[i], s.indexPrefix[i].PrefixEnd(), 0))
+	}
+
+	// Split between each table and index to ensure cross-range transactions.
+	for i := range sysbenchTables {
+		noExpiration := hlc.Timestamp{}
+		try0(s.db.AdminSplit(s.ctx, s.pkPrefix[i], noExpiration))
+		try0(s.db.AdminSplit(s.ctx, s.indexPrefix[i], noExpiration))
 	}
 }
 

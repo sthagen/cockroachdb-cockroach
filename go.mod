@@ -133,7 +133,7 @@ require (
 	github.com/cockroachdb/errors v1.11.3
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
-	github.com/cockroachdb/logtags v0.0.0-20241205023844-89a8856d99be
+	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506
 	github.com/cockroachdb/pebble v0.0.0-20241206160845-91e091aa3637
 	github.com/cockroachdb/redact v1.1.5
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
@@ -483,4 +483,4 @@ replace github.com/docker/docker => github.com/moby/moby v24.0.6+incompatible
 
 replace golang.org/x/time => github.com/cockroachdb/x-time v0.3.1-0.20230525123634-71747adb5d5c
 
-replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.3.3-0.20241118145159-46874edb1b83
+replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.3.3-0.20241216150617-2358cdb156a1

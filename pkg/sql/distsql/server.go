@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 )
 
@@ -268,13 +269,20 @@ func (ds *ServerImpl) setupFlow(
 		// this allows us to avoid an unnecessary deserialization of the eval
 		// context proto.
 		evalCtx = localState.EvalContext
+		// We create an eval context variable scoped to this block and reference
+		// it in the onFlowCleanupEnd closure. If the closure referenced
+		// evalCtx, then the pointer would be heap allocated because it is
+		// modified in the other branch of the conditional, and Go's escape
+		// analysis cannot determine that the capture and modification are
+		// mutually exclusive.
+		localEvalCtx := evalCtx
 		// We're about to mutate the evalCtx and we want to restore its original
 		// state once the flow cleans up. Note that we could have made a copy of
 		// the whole evalContext, but that isn't free, so we choose to restore
 		// the original state in order to avoid performance regressions.
-		origTxn := evalCtx.Txn
+		origTxn := localEvalCtx.Txn
 		onFlowCleanupEnd = func() {
-			evalCtx.Txn = origTxn
+			localEvalCtx.Txn = origTxn
 			reserved.Close(ctx)
 		}
 		if localState.MustUseLeafTxn() {
@@ -285,7 +293,7 @@ func (ds *ServerImpl) setupFlow(
 			}
 			// Update the Txn field early (before f.SetTxn() below) since some
 			// processors capture the field in their constructor (see #41992).
-			evalCtx.Txn = leafTxn
+			localEvalCtx.Txn = leafTxn
 		}
 	} else {
 		onFlowCleanupEnd = func() {
@@ -366,20 +374,23 @@ func (ds *ServerImpl) setupFlow(
 	}
 
 	if !f.IsLocal() {
-		flowCtx.AmbientContext.AddLogTag("f", flowCtx.ID.Short().String())
+		bld := logtags.BuildBuffer()
+		bld.Add("f", flowCtx.ID.Short().String())
 		if req.JobTag != "" {
-			flowCtx.AmbientContext.AddLogTag("job", req.JobTag)
+			bld.Add("job", req.JobTag)
 		}
 		if req.StatementSQL != "" {
-			flowCtx.AmbientContext.AddLogTag("distsql.stmt", req.StatementSQL)
+			bld.Add("distsql.stmt", req.StatementSQL)
 		}
-		flowCtx.AmbientContext.AddLogTag("distsql.gateway", req.Flow.Gateway)
+		bld.Add("distsql.gateway", req.Flow.Gateway)
 		if req.EvalContext.SessionData.ApplicationName != "" {
-			flowCtx.AmbientContext.AddLogTag("distsql.appname", req.EvalContext.SessionData.ApplicationName)
+			bld.Add("distsql.appname", req.EvalContext.SessionData.ApplicationName)
 		}
 		if leafTxn != nil {
-			flowCtx.AmbientContext.AddLogTag("distsql.txn", leafTxn.ID())
+			// TODO(radu): boxing the UUID requires an allocation.
+			bld.Add("distsql.txn", leafTxn.ID())
 		}
+		flowCtx.AmbientContext.AddLogTags(bld.Finish())
 		ctx = flowCtx.AmbientContext.AnnotateCtx(ctx)
 		telemetry.Inc(sqltelemetry.DistSQLExecCounter)
 	}

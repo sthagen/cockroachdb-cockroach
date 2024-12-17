@@ -1821,10 +1821,10 @@ def go_deps():
         name = "com_github_cockroachdb_logtags",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/logtags",
-        sha256 = "ff8b3d36873cfff78669000d194cbaa96520549a62408c52b538380d953b99d7",
-        strip_prefix = "github.com/cockroachdb/logtags@v0.0.0-20241205023844-89a8856d99be",
+        sha256 = "920068af09e3846d9ebb4e4a7787ff1dd10f3989c5f940ad861b0f6a9f824f6e",
+        strip_prefix = "github.com/cockroachdb/logtags@v0.0.0-20241215232642-bb51bb14a506",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/logtags/com_github_cockroachdb_logtags-v0.0.0-20241205023844-89a8856d99be.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/logtags/com_github_cockroachdb_logtags-v0.0.0-20241215232642-bb51bb14a506.zip",
         ],
     )
     go_repository(
@@ -3880,10 +3880,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_gogo_protobuf.patch",
         ],
-        sha256 = "1382d1ef3a015855f8268c595e2afeef7ae7374b7e27c2181b27a42c2fb639a7",
-        strip_prefix = "github.com/cockroachdb/gogoproto@v1.3.3-0.20241118145159-46874edb1b83",
+        sha256 = "bf052c9a7f9e23fb3ec7e9f3b7201cfc264c18ed6da0d662952d276dbc339003",
+        strip_prefix = "github.com/cockroachdb/gogoproto@v1.3.3-0.20241216150617-2358cdb156a1",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/gogoproto/com_github_cockroachdb_gogoproto-v1.3.3-0.20241118145159-46874edb1b83.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/gogoproto/com_github_cockroachdb_gogoproto-v1.3.3-0.20241216150617-2358cdb156a1.zip",
         ],
     )
     go_repository(

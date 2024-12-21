@@ -36,6 +36,7 @@ import (
 )
 
 type createIndexNode struct {
+	zeroInputPlanNode
 	n         *tree.CreateIndex
 	tableDesc *tabledesc.Mutable
 }
@@ -141,6 +142,9 @@ func makeIndexDescriptor(
 			pgcode.InvalidParameterValue,
 			`"bucket_count" storage param should only be set with "USING HASH" for hash sharded index`,
 		)
+	}
+	if n.Vector {
+		return nil, unimplemented.NewWithIssuef(137370, "VECTOR indexes are not yet supported")
 	}
 	// Since we mutate the columns below, we make copies of them
 	// here so that on retry we do not attempt to validate the

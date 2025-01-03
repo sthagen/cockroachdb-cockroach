@@ -1845,10 +1845,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "25073429469d7b0dfc4e5eba83e37684d2fd4231c37b870db8e087fa51071b95",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20241219030037-d5339521b84f",
+        sha256 = "b6cf1ef9bf0bf48c854723a3a0f324d005960ebe8cfe84b951afc36697b1fdec",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250101001021-f87b4ded6864",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20241219030037-d5339521b84f.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250101001021-f87b4ded6864.zip",
         ],
     )
     go_repository(
@@ -2405,10 +2405,10 @@ def go_deps():
         name = "com_github_dataexmachina_dev_side_eye_go",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/DataExMachina-dev/side-eye-go",
-        sha256 = "8702e7d34a166207ca2329d9780681edfb18ef6a5a9120d35fe33526d418bc4f",
-        strip_prefix = "github.com/DataExMachina-dev/side-eye-go@v0.0.0-20240528211710-5eb9c7a69e1d",
+        sha256 = "ea5676af6abb1965ba70c24a9090932c9e45a002411e9c86298f60f60f16a10a",
+        strip_prefix = "github.com/DataExMachina-dev/side-eye-go@v0.0.0-20250102012104-645b45402adf",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/DataExMachina-dev/side-eye-go/com_github_dataexmachina_dev_side_eye_go-v0.0.0-20240528211710-5eb9c7a69e1d.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/DataExMachina-dev/side-eye-go/com_github_dataexmachina_dev_side_eye_go-v0.0.0-20250102012104-645b45402adf.zip",
         ],
     )
     go_repository(
@@ -6503,6 +6503,16 @@ def go_deps():
         strip_prefix = "github.com/minio/c2goasm@v0.0.0-20190812172519-36a3d3bbc4f3",
         urls = [
             "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/minio/c2goasm/com_github_minio_c2goasm-v0.0.0-20190812172519-36a3d3bbc4f3.zip",
+        ],
+    )
+    go_repository(
+        name = "com_github_minio_highwayhash",
+        build_file_proto_mode = "disable_global",
+        importpath = "github.com/minio/highwayhash",
+        sha256 = "3ab23da1595a6b8543edf3de80e31afacfba2b1bc9e9f4cf60c6f54ce3f66fa9",
+        strip_prefix = "github.com/minio/highwayhash@v1.0.2",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/minio/highwayhash/com_github_minio_highwayhash-v1.0.2.zip",
         ],
     )
     go_repository(

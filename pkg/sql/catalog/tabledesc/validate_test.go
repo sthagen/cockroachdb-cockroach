@@ -143,6 +143,8 @@ var validationMap = []struct {
 			"ReplicatedPCRVersion": {status: thisFieldReferencesNoObjects},
 			"Triggers":             {status: iSolemnlySwearThisFieldIsValidated},
 			"NextTriggerID":        {status: thisFieldReferencesNoObjects},
+			"Policies":             {status: iSolemnlySwearThisFieldIsValidated},
+			"NextPolicyID":         {status: iSolemnlySwearThisFieldIsValidated},
 		},
 	},
 	{
@@ -3078,6 +3080,105 @@ func TestValidateTableDesc(t *testing.T) {
 				},
 				NextColumnID: 2,
 			}},
+		{err: `policy ID was missing for policy "pol"`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 1
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:   0,
+						Name: "pol",
+					},
+				}
+			}),
+		},
+		{err: `empty policy name`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 2
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:   1,
+						Name: "",
+					},
+				}
+			}),
+		},
+		{err: `duplicate policy name: "pol"`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 3
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:      1,
+						Name:    "pol",
+						Type:    catpb.PolicyType_PERMISSIVE,
+						Command: catpb.PolicyCommand_ALL,
+					},
+					{
+						ID:      2,
+						Name:    "pol",
+						Type:    catpb.PolicyType_RESTRICTIVE,
+						Command: catpb.PolicyCommand_INSERT,
+					},
+				}
+			}),
+		},
+		{err: `policy ID 10 in policy "pol_new" already in use by "pol_old"`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 11
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:      10,
+						Name:    "pol_old",
+						Type:    catpb.PolicyType_RESTRICTIVE,
+						Command: catpb.PolicyCommand_UPDATE,
+					},
+					{
+						ID:      10,
+						Name:    "pol_new",
+						Type:    catpb.PolicyType_PERMISSIVE,
+						Command: catpb.PolicyCommand_DELETE,
+					},
+				}
+			}),
+		},
+		{err: `policy "pol" has ID 20, which is not less than the NextPolicyID value 5 for the table`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 5
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:      20,
+						Name:    "pol",
+						Type:    catpb.PolicyType_PERMISSIVE,
+						Command: catpb.PolicyCommand_SELECT,
+					},
+				}
+			}),
+		},
+		{err: `policy "pol" has an unknown policy type POLICYTYPE_UNUSED`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 2
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:      1,
+						Name:    "pol",
+						Type:    0,
+						Command: catpb.PolicyCommand_ALL,
+					},
+				}
+			}),
+		},
+		{err: `policy "pol" has an unknown policy command POLICYCOMMAND_UNUSED`,
+			desc: ModifyDescriptor(func(desc *descpb.TableDescriptor) {
+				desc.NextPolicyID = 2
+				desc.Policies = []descpb.PolicyDescriptor{
+					{
+						ID:      1,
+						Name:    "pol",
+						Type:    catpb.PolicyType_PERMISSIVE,
+						Command: 0,
+					},
+				}
+			}),
+		},
 	}
 
 	for i, d := range testData {

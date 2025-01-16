@@ -2250,11 +2250,9 @@ SELECT
   description,
   statement,
   user_name,
-  descriptor_ids,
   status,
   running_status,
   created,
-  started,
   finished,
   modified,
   fraction_completed,
@@ -2366,11 +2364,9 @@ func scanRowIntoJob(scanner resultScanner, row tree.Datums, job *serverpb.JobRes
 		&job.Description,
 		&job.Statement,
 		&job.Username,
-		&job.DescriptorIDs,
 		&job.Status,
 		&runningStatusOrNil,
 		&job.Created,
-		&job.Started,
 		&job.Finished,
 		&job.Modified,
 		&fractionCompletedOrNil,
@@ -2395,23 +2391,6 @@ func scanRowIntoJob(scanner resultScanner, row tree.Datums, job *serverpb.JobRes
 	}
 	if runningStatusOrNil != nil {
 		job.RunningStatus = *runningStatusOrNil
-	}
-	if executionFailuresOrNil != nil {
-		failures, err := jobs.ParseRetriableExecutionErrorLogFromJSON([]byte(*executionFailuresOrNil))
-		if err != nil {
-			return errors.Wrap(err, "parse")
-		}
-		job.ExecutionFailures = make([]*serverpb.JobResponse_ExecutionFailure, len(failures))
-		for i, f := range failures {
-			start := time.UnixMicro(f.ExecutionStartMicros)
-			end := time.UnixMicro(f.ExecutionEndMicros)
-			job.ExecutionFailures[i] = &serverpb.JobResponse_ExecutionFailure{
-				Status: f.Status,
-				Start:  &start,
-				End:    &end,
-				Error:  f.TruncatedError,
-			}
-		}
 	}
 	if coordinatorOrNil != nil {
 		job.CoordinatorID = *coordinatorOrNil
@@ -2444,8 +2423,8 @@ func jobHelper(
 	sqlServer *SQLServer,
 ) (_ *serverpb.JobResponse, retErr error) {
 	const query = `
-	        SELECT job_id, job_type, description, statement, user_name, descriptor_ids, status,
-	  						 running_status, created, started, finished, modified,
+	        SELECT job_id, job_type, description, statement, user_name, status,
+	  						 running_status, created, finished, modified,
 	  						 fraction_completed, high_water_timestamp, error, execution_events::string, coordinator_id
 	          FROM crdb_internal.jobs
 	         WHERE job_id = $1`

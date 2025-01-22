@@ -16,8 +16,10 @@ go_library(
     deps = [
         "//pkg/ccl/kvccl/kvfollowerreadsccl",
         "//pkg/ccl/utilccl",
+        "//pkg/clusterversion",
         "//pkg/crosscluster",
         "//pkg/crosscluster/replicationutils",
+        "//pkg/crosscluster/streamclient",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
         "//pkg/jobs/jobsprotectedts",

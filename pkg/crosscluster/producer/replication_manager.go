@@ -11,7 +11,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationutils"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -66,8 +68,16 @@ func (r *replicationStreamManagerImpl) StartReplicationStreamForTables(
 
 	execConfig := r.evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig)
 
+	if !execConfig.Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V25_1.Version()) {
+		return streampb.ReplicationProducerSpec{}, errors.New("source of ldr stream be finalized on 25.1")
+	}
+
 	if execConfig.Codec.IsSystem() && !kvserver.RangefeedEnabled.Get(&execConfig.Settings.SV) {
 		return streampb.ReplicationProducerSpec{}, errors.Errorf("kv.rangefeed.enabled must be enabled on the source cluster for logical replication")
+	}
+
+	if err := maybeValidateReverseURI(ctx, req.UnvalidatedReverseStreamURI, r.evalCtx.Planner.ExecutorConfig().(*sql.ExecutorConfig).InternalDB); err != nil {
+		return streampb.ReplicationProducerSpec{}, errors.Wrap(err, "reverse stream uri failed validation")
 	}
 
 	var replicationStartTime hlc.Timestamp
@@ -136,6 +146,33 @@ func (r *replicationStreamManagerImpl) StartReplicationStreamForTables(
 		ReplicationStartTime: replicationStartTime,
 		ExternalCatalog:      externalCatalog,
 	}, nil
+}
+
+func maybeValidateReverseURI(ctx context.Context, reverseURI string, db *sql.InternalDB) error {
+	if reverseURI == "" {
+		return nil
+	}
+	configUri, err := streamclient.ParseConfigUri(reverseURI)
+	if err != nil {
+		return err
+	}
+	if !configUri.IsExternalOrTestScheme() {
+		return errors.New("uri must be an external connection")
+	}
+
+	clusterUri, err := configUri.AsClusterUri(ctx, db)
+	if err != nil {
+		return err
+	}
+
+	client, err := streamclient.NewStreamClient(ctx, clusterUri, db, streamclient.WithLogical())
+	if err != nil {
+		return err
+	}
+	if err := client.Close(ctx); err != nil {
+		return err
+	}
+	return nil
 }
 
 func getUDTs(

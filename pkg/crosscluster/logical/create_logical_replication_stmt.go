@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
@@ -161,6 +162,10 @@ func createLogicalReplicationStreamPlanHook(
 			return errors.New("cannot CREATE LOGICAL REPLICATION STREAM in a multi-statement transaction")
 		}
 
+		if !p.ExecCfg().Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V25_1.Version()) {
+			return errors.New("cannot create ldr stream until finalizing on 25.1")
+		}
+
 		// Commit the planner txn because several operations below may take several
 		// seconds, which we would like to conduct outside the scope of the planner
 		// txn to prevent txn refresh errors.
@@ -196,6 +201,9 @@ func createLogicalReplicationStreamPlanHook(
 		if err != nil {
 			return err
 		}
+		if !configUri.IsExternalOrTestScheme() {
+			return errors.New("uri must be an external connection")
+		}
 
 		clusterUri, err := configUri.AsClusterUri(ctx, p.ExecCfg().InternalDB)
 		if err != nil {
@@ -220,8 +228,9 @@ func createLogicalReplicationStreamPlanHook(
 			srcTableNames[i] = tb.String()
 		}
 		spec, err := client.CreateForTables(ctx, &streampb.ReplicationProducerRequest{
-			TableNames:   srcTableNames,
-			AllowOffline: options.ParentID != 0,
+			TableNames:                  srcTableNames,
+			AllowOffline:                options.ParentID != 0,
+			UnvalidatedReverseStreamURI: options.BidirectionalURI(),
 		})
 		if err != nil {
 			return err
@@ -289,8 +298,6 @@ func createLogicalReplicationStreamPlanHook(
 		jobID := p.ExecCfg().JobRegistry.MakeJobID()
 		var reverseStreamCmd string
 		if stmt.CreateTable && options.BidirectionalURI() != "" {
-			// TODO: validate URI.
-
 			reverseStmt := *stmt
 			reverseStmt.From, reverseStmt.Into = reverseStmt.Into, reverseStmt.From
 			reverseStmt.CreateTable = false

@@ -20,8 +20,7 @@ const (
 )
 
 // rulesVersionKey version of elements used by this rule set.
-// TODO(spilchen): Need to update this to V25_2 when it is available.
-var rulesVersionKey = clusterversion.V25_1
+var rulesVersionKey = clusterversion.V25_2
 
 // descriptorIsNotBeingDropped creates a clause which leads to the outer clause
 // failing to unify if the passed element is part of a descriptor and
@@ -184,6 +183,16 @@ func getExpression(element scpb.Element) (*scpb.Expression, error) {
 			return nil, nil
 		}
 		return &e.Expression, nil
+	case *scpb.PolicyUsingExpr:
+		if e == nil {
+			return nil, nil
+		}
+		return &e.Expression, nil
+	case *scpb.PolicyWithCheckExpr:
+		if e == nil {
+			return nil, nil
+		}
+		return &e.Expression, nil
 	}
 	return nil, errors.AssertionFailedf("element %T does not have an embedded scpb.Expression", element)
 }
@@ -319,7 +328,8 @@ func isTriggerDependent(e scpb.Element) bool {
 
 func isPolicyDependent(e scpb.Element) bool {
 	switch e.(type) {
-	case *scpb.PolicyName, *scpb.PolicyRole:
+	case *scpb.PolicyName, *scpb.PolicyRole, *scpb.PolicyUsingExpr,
+		*scpb.PolicyWithCheckExpr, *scpb.PolicyDeps:
 		return true
 	}
 	return false

@@ -1237,49 +1237,66 @@ func TestProposalByProxy(t *testing.T) {
 }
 
 func TestCommit(t *testing.T) {
-	tests := []struct {
-		matches []uint64
-		logs    []pb.Entry
-		smTerm  uint64
-		w       uint64
+	m := func(indices ...uint64) []uint64 { return indices }
+	for _, tt := range []struct {
+		term  uint64     // term before becoming leader
+		log   []pb.Entry // log before becoming leader
+		app   []pb.Entry // appended entries after becoming leader
+		match []uint64   // match indices for all peers
+		want  uint64     // expected commit index
 	}{
-		// single
-		{[]uint64{1}, index(1).terms(1), 1, 1},
-		{[]uint64{1}, index(1).terms(1), 2, 0},
-		{[]uint64{2}, index(1).terms(1, 2), 2, 2},
-		{[]uint64{1}, index(1).terms(2), 2, 1},
+		// single node
+		{term: 0, match: m(0), want: 0},
+		{term: 0, match: m(1), want: 1},
+		{term: 1, log: index(1).terms(1), match: m(1), want: 0},
+		{term: 1, log: index(1).terms(1), match: m(2), want: 2},
+		{term: 1, log: index(1).terms(1), app: index(3).terms(2), match: m(1), want: 0},
+		{term: 1, log: index(1).terms(1), app: index(3).terms(2), match: m(2), want: 2},
+		{term: 1, log: index(1).terms(1), app: index(3).terms(2), match: m(3), want: 3},
 
-		// odd
-		{[]uint64{2, 1, 1}, index(1).terms(1, 2), 1, 1},
-		{[]uint64{2, 1, 1}, index(1).terms(1, 1), 2, 0},
-		{[]uint64{2, 1, 2}, index(1).terms(1, 2), 2, 2},
-		{[]uint64{2, 1, 2}, index(1).terms(1, 1), 2, 0},
+		// odd number of nodes
+		{term: 1, log: index(1).terms(1), match: m(1, 1, 1), want: 0},
+		{term: 1, log: index(1).terms(1), match: m(2, 1, 1), want: 0},
+		{term: 1, log: index(1).terms(1), match: m(2, 1, 2), want: 2},
+		{term: 1, log: index(1).terms(1), match: m(2, 2, 2), want: 2},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(2, 2, 2), want: 0},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(3, 3, 2), want: 3},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(4, 4, 5), want: 4},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(5, 4, 5), want: 5},
 
-		// even
-		{[]uint64{2, 1, 1, 1}, index(1).terms(1, 2), 1, 1},
-		{[]uint64{2, 1, 1, 1}, index(1).terms(1, 1), 2, 0},
-		{[]uint64{2, 1, 1, 2}, index(1).terms(1, 2), 1, 1},
-		{[]uint64{2, 1, 1, 2}, index(1).terms(1, 1), 2, 0},
-		{[]uint64{2, 1, 2, 2}, index(1).terms(1, 2), 2, 2},
-		{[]uint64{2, 1, 2, 2}, index(1).terms(1, 1), 2, 0},
-	}
+		// even number of nodes
+		{term: 1, log: index(1).terms(1), match: m(1, 1), want: 0},
+		{term: 1, log: index(1).terms(1), match: m(2, 1, 1, 1), want: 0},
+		{term: 1, log: index(1).terms(1), match: m(2, 1, 2, 1), want: 0},
+		{term: 1, log: index(1).terms(1), match: m(2, 1, 2, 2), want: 2},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(2, 2, 2, 1), want: 0},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(3, 2, 2, 3), want: 0},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(3, 3, 1, 3), want: 3},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(4, 4, 4, 5), want: 4},
+		{term: 1, log: index(1).terms(1, 1), app: index(4).terms(2, 2), match: m(5, 4, 5, 5), want: 5},
+	} {
+		t.Run("", func(t *testing.T) {
+			storage := newTestMemoryStorage(withPeers(1))
+			require.NoError(t, storage.Append(tt.log))
+			require.NoError(t, storage.SetHardState(pb.HardState{Term: tt.term}))
+			sm := newTestRaft(1, 10, 2, storage)
+			sm.becomeCandidate()
+			sm.becomeLeader()
+			require.Equal(t, tt.term+1, sm.Term)
+			require.True(t, sm.appendEntry(tt.app...))
 
-	for i, tt := range tests {
-		storage := newTestMemoryStorage(withPeers(1))
-		storage.Append(tt.logs)
-		storage.hardState = pb.HardState{Term: tt.smTerm}
-
-		sm := newTestRaft(1, 10, 2, storage)
-		for j := 0; j < len(tt.matches); j++ {
-			id := pb.PeerID(j + 1)
-			if id > 1 {
-				sm.applyConfChange(pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: id}.AsV2())
+			for i, match := range tt.match {
+				id := pb.PeerID(i + 1)
+				if id > 1 {
+					sm.applyConfChange(pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: id}.AsV2())
+				}
+				require.LessOrEqual(t, match, sm.raftLog.lastIndex())
+				pr := sm.trk.Progress(id)
+				pr.MaybeUpdate(match)
 			}
-			pr := sm.trk.Progress(id)
-			pr.Match, pr.Next = tt.matches[j], tt.matches[j]+1
-		}
-		sm.maybeCommit()
-		assert.Equal(t, tt.w, sm.raftLog.committed, "#%d", i)
+			sm.maybeCommit()
+			assert.Equal(t, tt.want, sm.raftLog.committed)
+		})
 	}
 }
 
@@ -2548,8 +2565,9 @@ func TestPreCandidateIgnoresDefortification(t *testing.T) {
 }
 
 func TestLeaderAppResp(t *testing.T) {
-	// initial progress: match = 0; next = 3
-	tests := []struct {
+	// The test creates a leader node at term 2, with raft log [1 1 1 2 2 2].
+	// Initial progress: match = 0, next = 4.
+	for _, tt := range []struct {
 		index  uint64
 		reject bool
 		// progress
@@ -2560,46 +2578,45 @@ func TestLeaderAppResp(t *testing.T) {
 		windex     uint64
 		wcommitted uint64
 	}{
-		{3, true, 0, 3, 0, 0, 0},  // stale resp; no replies
-		{2, true, 0, 2, 1, 1, 0},  // denied resp; leader does not commit; decrease next and send probing msg
-		{2, false, 2, 4, 2, 2, 2}, // accept resp; leader commits; broadcast with commit index
-		// Follower is StateProbing at 0, it sends MsgAppResp for 0 (which
-		// matches the pr.Match) so it is moved to StateReplicate and as many
-		// entries as possible are sent to it (1, 2, and 3). Correspondingly the
-		// Next is then 4 (an Entry at 4 does not exist, indicating the follower
-		// will be up to date should it process the emitted MsgApp).
-		{0, false, 0, 4, 1, 0, 0},
-	}
+		{2, true, 0, 4, 0, 0, 0}, // stale resp; no replies
+		{6, true, 0, 4, 0, 0, 0}, // stale resp; no replies
+		{3, true, 0, 3, 1, 2, 0}, // denied resp; leader does not commit; decrease next and send probing msg
 
-	for _, tt := range tests {
+		{4, false, 4, 7, 1, 4, 4}, // accept resp; leader commits; broadcast with commit index
+		// Follower is StateProbing at 4, it sends MsgAppResp for 4, and is moved to
+		// StateReplicate and as many entries as possible are sent to it (5, 6).
+		// Correspondingly the Next is then 7 (entry 7 does not exist, indicating
+		// the follower will be up to date should it process the emitted MsgApp).
+		{4, false, 4, 7, 1, 4, 4},
+	} {
 		t.Run("", func(t *testing.T) {
-			// sm term is 1 after it becomes the leader.
-			// thus the last log term must be 1 to be committed.
-			sm := newTestRaft(1, 10, 1, newTestMemoryStorage(withPeers(1, 2, 3)))
-			sm.raftLog = newLog(&MemoryStorage{ls: LogSlice{
-				term:    1,
-				entries: index(1).terms(1, 1),
-			}}, nil)
+			storage := newTestMemoryStorage(withPeers(1, 2, 3))
+			require.NoError(t, storage.Append(index(1).terms(1, 1, 1)))
+			require.NoError(t, storage.SetHardState(pb.HardState{Term: 1}))
+			sm := newTestRaft(1, 10, 1, storage)
 			sm.becomeCandidate()
+			require.Equal(t, uint64(2), sm.Term)
+			require.Equal(t, uint64(3), sm.raftLog.lastIndex())
 			sm.becomeLeader()
+			require.Equal(t, uint64(4), sm.raftLog.lastIndex()) // appended a dummy
+			sm.appendEntry(index(5).terms(2, 2)...)
+			sm.bcastAppend()
+
 			sm.readMessages()
-			require.NoError(t, sm.Step(
-				pb.Message{
-					From:       2,
-					Type:       pb.MsgAppResp,
-					Index:      tt.index,
-					Term:       sm.Term,
-					Reject:     tt.reject,
-					RejectHint: tt.index,
-				},
-			))
+			require.NoError(t, sm.Step(pb.Message{
+				From:       2,
+				Type:       pb.MsgAppResp,
+				Index:      tt.index,
+				Term:       sm.Term,
+				Reject:     tt.reject,
+				RejectHint: tt.index,
+			}))
 
 			p := sm.trk.Progress(2)
 			require.Equal(t, tt.wmatch, p.Match)
 			require.Equal(t, tt.wnext, p.Next)
 
 			msgs := sm.readMessages()
-
 			require.Len(t, msgs, tt.wmsgNum)
 			for _, msg := range msgs {
 				require.Equal(t, tt.windex, msg.Index, "%v", DescribeMessage(msg, nil))

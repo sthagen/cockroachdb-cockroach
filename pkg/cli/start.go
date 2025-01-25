@@ -6,7 +6,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -1172,6 +1171,10 @@ func startShutdownAsync(
 	}()
 }
 
+// cgoAllocConfStr is populated from start_jemalloc.go if we are using jemalloc.
+// Otherwise, it stays empty.
+var cgoAllocConfStr string
+
 // reportServerInfo prints out the server version and network details
 // in a standardized format.
 func reportServerInfo(
@@ -1189,6 +1192,9 @@ func reportServerInfo(
 	buf.Printf("CockroachDB %s starting at %s (took %0.1fs)\n", serverType, timeutil.Now(), timeutil.Since(startTime).Seconds())
 	buf.Printf("build:\t%s %s @ %s (%s)\n",
 		redact.Safe(info.Distribution), redact.Safe(info.Tag), redact.Safe(info.Time), redact.Safe(info.GoVersion))
+	if cgoAllocConfStr != "" {
+		buf.Printf("malloc_conf:\t%s\n", redact.Safe(cgoAllocConfStr))
+	}
 	buf.Printf("webui:\t%s\n", log.SafeManaged(serverCfg.AdminURL()))
 
 	// (Re-)compute the client connection URL. We cannot do this
@@ -1349,16 +1355,16 @@ func reportConfiguration(ctx context.Context) {
 func maybeWarnMemorySizes(ctx context.Context) {
 	// Is the cache configuration OK?
 	if !startCtx.cacheSizeValue.IsSet() {
-		var buf bytes.Buffer
-		fmt.Fprintf(&buf, "Using the default setting for --cache (%s).\n", &startCtx.cacheSizeValue)
-		fmt.Fprintf(&buf, "  A significantly larger value is usually needed for good performance.\n")
+		var buf redact.StringBuilder
+		buf.Printf("Using the default setting for --cache (%s).\n", &startCtx.cacheSizeValue)
+		buf.Printf("  A significantly larger value is usually needed for good performance.\n")
 		if size, err := status.GetTotalMemory(ctx); err == nil {
-			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is --cache=.25 (%s).",
+			buf.Printf("  If you have a dedicated server a reasonable setting is --cache=.25 (%s).",
 				humanizeutil.IBytes(size/4))
 		} else {
-			fmt.Fprintf(&buf, "  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
+			buf.Printf("  If you have a dedicated server a reasonable setting is 25%% of physical memory.")
 		}
-		log.Ops.Warningf(ctx, "%s", redact.Safe(buf.String()))
+		log.Ops.Warningf(ctx, "%s", buf.RedactableString())
 	}
 
 	// Check that the total suggested "max" memory is well below the available memory.
@@ -1451,8 +1457,8 @@ func setupAndInitializeLoggingAndProfiling(
 				"consider --accept-sql-without-tls instead. For other options, see:\n\n"+
 				"- %s\n"+
 				"- %s",
-			redact.Safe(build.MakeIssueURL(53404)),
-			redact.Safe(docs.URL("secure-a-cluster.html")),
+			redact.SafeString(build.MakeIssueURL(53404)),
+			redact.SafeString(docs.URL("secure-a-cluster.html")),
 		)
 	}
 
@@ -1475,7 +1481,7 @@ func setupAndInitializeLoggingAndProfiling(
 	// We log build information to stdout (for the short summary), but also
 	// to stderr to coincide with the full logs.
 	info := build.GetInfo()
-	log.Ops.Infof(ctx, "%s", log.SafeManaged(info.Short()))
+	log.Ops.Infof(ctx, "%s", info.Short())
 
 	// Disable Stopper task tracking as performing that call site tracking is
 	// moderately expensive (certainly outweighing the infrequent benefit it

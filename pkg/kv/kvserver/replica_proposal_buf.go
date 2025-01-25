@@ -925,11 +925,13 @@ func maybeDeductFlowTokens(
 			// free up all tracked tokens as a result of this leadership change.
 			return
 		}
-		log.VInfof(ctx, 1, "bound index/log terms for proposal entry: %s",
-			raft.DescribeEntry(ents[i], func(bytes []byte) string {
-				return "<omitted>"
-			}),
-		)
+		if log.ExpensiveLogEnabled(ctx, 1) {
+			log.VInfof(ctx, 1, "bound index/log terms for proposal entry: %s",
+				raft.DescribeEntry(ents[i], func(bytes []byte) string {
+					return "<omitted>"
+				}),
+			)
+		}
 		h.DeductTokensFor(
 			admitHandle.pCtx,
 			admissionpb.WorkPriority(admitHandle.handle.AdmissionPriority),
@@ -1276,6 +1278,7 @@ func (rp *replicaProposer) verifyLeaseRequestSafetyRLocked(
 		PrevLeaseExpired:   !r.ownsValidLeaseRLocked(ctx, r.Clock().NowAsClockTimestamp()),
 		NextLeaseHolder:    nextLease.Replica,
 		BypassSafetyChecks: bypassSafetyChecks,
+		DesiredLeaseType:   r.desiredLeaseTypeRLocked(),
 	}
 	if err := leases.Verify(ctx, st, in); err != nil {
 		if in.Transfer() {

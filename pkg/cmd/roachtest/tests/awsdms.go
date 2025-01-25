@@ -32,7 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -583,7 +583,7 @@ func setupDMSReplicationInstance(
 		createReplOut, err := dmsCli.CreateReplicationInstance(
 			ctx,
 			&dms.CreateReplicationInstanceInput{
-				ReplicationInstanceClass:      proto.String("dms.c4.large"),
+				ReplicationInstanceClass:      proto.String("dms.c5.large"),
 				ReplicationInstanceIdentifier: proto.String(awsdmsRoachtestDMSReplicationInstanceName(t.BuildVersion())),
 			},
 		)

@@ -12,7 +12,7 @@ Schema change plan for ALTER TABLE ‹defaultdb›.‹public›.‹roaches› DI
  │         ├── 1 element transitioning toward ABSENT
  │         │    └── PUBLIC → ABSENT RowLevelSecurityEnabled:{DescID: 104 (roaches)}
  │         └── 1 Mutation operation
- │              └── ToggleRowLevelSecurityMode {"TableID":104}
+ │              └── EnableRowLevelSecurityMode {"TableID":104}
  └── PreCommitPhase
       ├── Stage 1 of 2 in PreCommitPhase
       │    ├── 1 element transitioning toward ABSENT
@@ -23,4 +23,4 @@ Schema change plan for ALTER TABLE ‹defaultdb›.‹public›.‹roaches› DI
            ├── 1 element transitioning toward ABSENT
            │    └── PUBLIC → ABSENT RowLevelSecurityEnabled:{DescID: 104 (roaches)}
            └── 1 Mutation operation
-                └── ToggleRowLevelSecurityMode {"TableID":104}
+                └── EnableRowLevelSecurityMode {"TableID":104}

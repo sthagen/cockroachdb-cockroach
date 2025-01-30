@@ -2679,9 +2679,6 @@ func (st *SessionTracing) StartTracing(
 	if _, ok := st.ex.machine.CurState().(stateNoTxn); !ok {
 		txnCtx := st.ex.state.Ctx
 		sp := tracing.SpanFromContext(txnCtx)
-		if sp == nil {
-			return errors.Errorf("no txn span for SessionTracing")
-		}
 		// We're hijacking this span and we're never going to un-hijack it, so it's
 		// up to us to finish it.
 		sp.Finish()
@@ -4005,6 +4002,10 @@ func (m *sessionDataMutator) SetLegacyVarcharTyping(val bool) {
 
 func (m *sessionDataMutator) SetCatalogDigestStalenessCheckEnabled(b bool) {
 	m.data.CatalogDigestStalenessCheckEnabled = b
+}
+
+func (m *sessionDataMutator) SetOptimizerPreferBoundedCardinality(b bool) {
+	m.data.OptimizerPreferBoundedCardinality = b
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

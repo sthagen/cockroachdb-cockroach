@@ -1895,10 +1895,10 @@ def go_deps():
         name = "com_github_cockroachdb_redact",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/redact",
-        sha256 = "11b30528eb0dafc8bc1a5ba39d81277c257cbe6946a7564402f588357c164560",
-        strip_prefix = "github.com/cockroachdb/redact@v1.1.5",
+        sha256 = "018eccb5fb9ca52d43ec9eaf213539d01c1f2b94e0e822406ebfb2e9321ef6cf",
+        strip_prefix = "github.com/cockroachdb/redact@v1.1.6",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/redact/com_github_cockroachdb_redact-v1.1.5.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/redact/com_github_cockroachdb_redact-v1.1.6.zip",
         ],
     )
     go_repository(
@@ -5235,10 +5235,10 @@ def go_deps():
         name = "com_github_jackc_pgx_v4",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/jackc/pgx/v4",
-        sha256 = "5ca92c5bf58979d9e978f6b849e02eb319d2587565375fe875a29d10d84cfadc",
-        strip_prefix = "github.com/jackc/pgx/v4@v4.18.1",
+        sha256 = "1d5955dc65b8de8f72f9856865b33dcd9a2238f7cf9b1f2a00f1558e7d4965da",
+        strip_prefix = "github.com/jackc/pgx/v4@v4.18.3",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/jackc/pgx/v4/com_github_jackc_pgx_v4-v4.18.1.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/jackc/pgx/v4/com_github_jackc_pgx_v4-v4.18.3.zip",
         ],
     )
     go_repository(

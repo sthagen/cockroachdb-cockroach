@@ -202,13 +202,13 @@ func (fw *fixupWorker) splitPartition(
 				partitionKey, parentPartitionKey)
 		}
 
-		count, err := fw.index.removeFromPartition(ctx, txn, parentPartitionKey, childKey)
+		metadata, err := fw.index.removeFromPartition(ctx, txn, parentPartitionKey, childKey)
 		if err != nil {
 			return errors.Wrapf(err, "removing splitting partition %d from its parent %d",
 				partitionKey, parentPartitionKey)
 		}
 
-		if count != 0 {
+		if metadata.Count != 0 {
 			// Move any vectors to sibling partitions that have closer centroids.
 			// Lazily get parent vectors only if they're actually needed.
 			var parentVectors vector.Set
@@ -267,7 +267,7 @@ func (fw *fixupWorker) splitPartition(
 	if parentPartition == nil {
 		// Add a new level to the tree by setting a new root partition that points
 		// to the two new partitions.
-		centroids := vector.MakeSet(fw.index.rootQuantizer.GetRandomDims())
+		centroids := vector.MakeSet(fw.index.rootQuantizer.GetDims())
 		centroids.EnsureCapacity(2)
 		centroids.Add(leftSplit.Partition.Centroid())
 		centroids.Add(rightSplit.Partition.Centroid())
@@ -331,7 +331,7 @@ func (fw *fixupWorker) splitPartitionData(
 	centroidDistances := slices.Clone(splitPartition.QuantizedSet().GetCentroidDistances())
 	childKeys := slices.Clone(splitPartition.ChildKeys())
 
-	tempVector := fw.workspace.AllocFloats(fw.index.quantizer.GetRandomDims())
+	tempVector := fw.workspace.AllocFloats(fw.index.quantizer.GetDims())
 	defer fw.workspace.FreeFloats(tempVector)
 
 	// Any left offsets that point beyond the end of the left list indicate that
@@ -446,7 +446,8 @@ func (fw *fixupWorker) moveVectorsToSiblings(
 		// Found a sibling child partition that's closer, so insert the vector
 		// there instead.
 		childKey := split.Partition.ChildKeys()[i]
-		_, err = fw.index.addToPartition(ctx, txn, parentPartitionKey, siblingPartitionKey, vector, childKey)
+		err = fw.index.addToPartition(
+			ctx, txn, parentPartitionKey, siblingPartitionKey, vector, childKey)
 		if err != nil {
 			return errors.Wrapf(err, "moving vector to partition %d", siblingPartitionKey)
 		}
@@ -490,7 +491,7 @@ func (fw *fixupWorker) linkNearbyVectors(
 		return err
 	}
 
-	tempVector := fw.workspace.AllocVector(fw.index.quantizer.GetRandomDims())
+	tempVector := fw.workspace.AllocVector(fw.index.quantizer.GetDims())
 	defer fw.workspace.FreeVector(tempVector)
 
 	// Filter the results.
@@ -510,16 +511,17 @@ func (fw *fixupWorker) linkNearbyVectors(
 		// Leaf vectors from the primary index need to be randomized.
 		vector := result.Vector
 		if partition.Level() == vecstore.LeafLevel {
-			fw.index.quantizer.RandomizeVector(ctx, vector, tempVector, false /* invert */)
+			fw.index.randomizeVector(vector, tempVector)
 			vector = tempVector
 		}
 
 		// Remove the vector from the other partition.
-		count, err := fw.index.removeFromPartition(ctx, txn, result.ParentPartitionKey, result.ChildKey)
+		metadata, err := fw.index.removeFromPartition(
+			ctx, txn, result.ParentPartitionKey, result.ChildKey)
 		if err != nil {
 			return err
 		}
-		if count == 0 && partition.Level() > vecstore.LeafLevel {
+		if metadata.Count == 0 && partition.Level() > vecstore.LeafLevel {
 			// Removing the vector will result in an empty non-leaf partition, which
 			// is not allowed, as the K-means tree would not be fully balanced. Add
 			// the vector back to the partition. This is a very rare case and that
@@ -699,13 +701,12 @@ func (fw *fixupWorker) getFullVectorsForPartition(
 		i--
 	}
 
-	vectors := vector.MakeSet(fw.index.quantizer.GetRandomDims())
+	vectors := vector.MakeSet(fw.index.quantizer.GetDims())
 	vectors.AddUndefined(len(fw.tempVectorsWithKeys))
 	for i := range fw.tempVectorsWithKeys {
 		// Leaf vectors from the primary index need to be randomized.
 		if partition.Level() == vecstore.LeafLevel {
-			fw.index.quantizer.RandomizeVector(
-				ctx, fw.tempVectorsWithKeys[i].Vector, vectors.At(i), false /* invert */)
+			fw.index.randomizeVector(fw.tempVectorsWithKeys[i].Vector, vectors.At(i))
 		} else {
 			copy(vectors.At(i), fw.tempVectorsWithKeys[i].Vector)
 		}

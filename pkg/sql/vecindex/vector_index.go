@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"math/rand"
 	"runtime"
 	"strconv"
 	"strings"
@@ -58,10 +59,11 @@ type VectorIndexOptions struct {
 	// limit the number of results that need to be reranked. This is useful for
 	// testing and benchmarking.
 	DisableErrorBounds bool
-	// Seed is used to initialize a deterministic random number generator for
-	// testing purposes. If this is zero, then the global random number generator
-	// is used instead.
-	Seed int64
+	// IsDeterministic instructs the vector index to use a deterministic random
+	// number generator for performing operations and fixups. As long as the
+	// index is initialized with the same seed and fixups happen serially, the
+	// index will behave deterministically. This is useful for testing.
+	IsDeterministic bool
 	// MaxWorkers specifies the maximum number of background workers that can be
 	// created to process fixups for this vector index instance.
 	MaxWorkers int
@@ -106,11 +108,11 @@ type searchContext struct {
 	// method on VectorIndex.
 	Original vector.T
 
-	// Randomized is the original vector after being processed by the quantizer's
-	// RandomizeVector method. It can have a different number of dimensions than
-	// Original and different values in those dimensions.
+	// Randomized is the original vector after it has been randomized by applying
+	// a random orthogonal transformation (ROT).
 	Randomized vector.T
 
+	tempSearchSet       vecstore.SearchSet
 	tempResults         [1]vecstore.SearchResult
 	tempQualitySamples  [MaxQualitySamples]float64
 	tempKeys            []vecstore.PartitionKey
@@ -144,10 +146,17 @@ type VectorIndex struct {
 	// stats maintains locally-cached statistics about the vector index that are
 	// used by adaptive search to improve search accuracy.
 	stats statsManager
+	// rot is a square dims x dims matrix that performs random orthogonal
+	// transformations on input vectors, in order to distribute skew more evenly.
+	rot num32.Matrix
 }
 
 // NewVectorIndex constructs a new vector index instance. Typically, only one
 // VectorIndex instance should be created for each index in the process.
+//
+// NOTE: It's important that the index is always initialized with the same seed,
+// first at the time of creation and then every time it's used.
+//
 // NOTE: If "stopper" is not nil, then the vector index will start a background
 // goroutine to process index fixups. When the index is no longer needed, the
 // caller must call Close to shut down the background goroutine.
@@ -155,13 +164,14 @@ func NewVectorIndex(
 	ctx context.Context,
 	store vecstore.Store,
 	quantizer quantize.Quantizer,
+	seed int64,
 	options *VectorIndexOptions,
 	stopper *stop.Stopper,
 ) (*VectorIndex, error) {
 	vi := &VectorIndex{
 		options:       *options,
 		store:         store,
-		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetRandomDims()),
+		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims()),
 		quantizer:     quantizer,
 	}
 	if vi.options.MinPartitionSize == 0 {
@@ -184,12 +194,49 @@ func NewVectorIndex(
 		return nil, errors.Errorf(
 			"QualitySamples option %d exceeds max allowed value", vi.options.QualitySamples)
 	}
+
+	rng := rand.New(rand.NewSource(seed))
+
+	// Generate dims x dims random orthogonal matrix to mitigate the impact of
+	// skewed input data distributions:
+	//
+	//   1. Set skew: some dimensions can have higher variance than others. For
+	//      example, perhaps all vectors in a set have similar values for one
+	//      dimension but widely differing values in another dimension.
+	//   2. Vector skew: Individual vectors can have internal skew, such that
+	//      values higher than the mean are more spread out than values lower
+	//      than the mean.
+	//
+	// Multiplying vectors by this matrix helps with both forms of skew. While
+	// total skew does not change, the skew is more evenly distributed across
+	// the dimensions. Now quantizing the vector will have more uniform
+	// information loss across dimensions. Critically, none of this impacts
+	// distance calculations, as orthogonal transformations do not change
+	// distances or angles between vectors.
+	//
+	// Ultimately, performing a random orthogonal transformation (ROT) means that
+	// the index will work more consistently across a diversity of input data
+	// sets, even those with skewed data distributions. In addition, the RaBitQ
+	// algorithm depends on the statistical properties that are granted by the
+	// ROT.
+	vi.rot = num32.MakeRandomOrthoMatrix(rng, quantizer.GetDims())
+
+	// Initialize fixup processor.
+	var fixupSeed int64
+	if options.IsDeterministic {
+		// Fixups need to be deterministic, so set the seed and worker count.
+		fixupSeed = seed
+		if vi.options.MaxWorkers > 1 {
+			return nil, errors.AssertionFailedf(
+				"multiple asynchronous workers cannot be used with the IsDeterministic option")
+		}
+		vi.options.MaxWorkers = 1
+	}
 	if vi.options.MaxWorkers == 0 {
 		// Default to a max of one worker per processor.
 		vi.options.MaxWorkers = runtime.GOMAXPROCS(-1)
 	}
-
-	vi.fixups.Init(ctx, stopper, vi, options.Seed)
+	vi.fixups.Init(ctx, stopper, vi, fixupSeed)
 
 	if err := vi.stats.Init(ctx, store); err != nil {
 		return nil, err
@@ -243,25 +290,13 @@ func (vi *VectorIndex) Insert(
 		return err
 	}
 
-	// Search for the leaf partition with the closest centroid to the query
-	// vector.
-	parentSearchCtx := searchContext{
-		Txn:      txn,
-		Original: vector,
-		Level:    vecstore.LeafLevel + 1,
-		Options: SearchOptions{
-			BaseBeamSize: vi.options.BaseBeamSize,
-			SkipRerank:   vi.options.DisableErrorBounds,
-			UpdateStats:  true,
-		},
-	}
-	parentSearchCtx.Ctx = internal.WithWorkspace(ctx, &parentSearchCtx.Workspace)
+	var parentSearchCtx searchContext
+	vi.setupInsertContext(ctx, txn, vector, &parentSearchCtx)
 
-	// Randomize the vector if required by the quantizer.
-	tempRandomized := parentSearchCtx.Workspace.AllocVector(vi.quantizer.GetRandomDims())
+	// Randomize the vector.
+	tempRandomized := parentSearchCtx.Workspace.AllocVector(vi.quantizer.GetDims())
 	defer parentSearchCtx.Workspace.FreeVector(tempRandomized)
-	vi.quantizer.RandomizeVector(ctx, vector, tempRandomized, false /* invert */)
-	parentSearchCtx.Randomized = tempRandomized
+	parentSearchCtx.Randomized = vi.randomizeVector(vector, tempRandomized)
 
 	// Insert the vector into the secondary index.
 	childKey := vecstore.ChildKey{PrimaryKey: key}
@@ -296,11 +331,10 @@ func (vi *VectorIndex) Delete(
 	}
 	searchCtx.Ctx = internal.WithWorkspace(ctx, &searchCtx.Workspace)
 
-	// Randomize the vector if required by the quantizer.
-	tempRandomized := searchCtx.Workspace.AllocVector(vi.quantizer.GetRandomDims())
+	// Randomize the vector.
+	tempRandomized := searchCtx.Workspace.AllocVector(vi.quantizer.GetDims())
 	defer searchCtx.Workspace.FreeVector(tempRandomized)
-	vi.quantizer.RandomizeVector(ctx, vector, tempRandomized, false /* invert */)
-	searchCtx.Randomized = tempRandomized
+	searchCtx.Randomized = vi.randomizeVector(vector, tempRandomized)
 
 	searchSet := vecstore.SearchSet{MaxResults: 1, MatchKey: key}
 
@@ -355,13 +389,53 @@ func (vi *VectorIndex) Search(
 	}
 	searchCtx.Ctx = internal.WithWorkspace(ctx, &searchCtx.Workspace)
 
-	// Randomize the vector if required by the quantizer.
-	tempRandomized := searchCtx.Workspace.AllocVector(vi.quantizer.GetRandomDims())
+	// Randomize the vector.
+	tempRandomized := searchCtx.Workspace.AllocVector(vi.quantizer.GetDims())
 	defer searchCtx.Workspace.FreeVector(tempRandomized)
-	vi.quantizer.RandomizeVector(ctx, queryVector, tempRandomized, false /* invert */)
-	searchCtx.Randomized = tempRandomized
+	searchCtx.Randomized = vi.randomizeVector(queryVector, tempRandomized)
 
 	return vi.searchHelper(&searchCtx, searchSet)
+}
+
+// SearchForInsert finds the best partition in which to insert the given vector.
+// It always returns a single search result containing the key of that
+// partition, as well as the centroid of the partition (in the Vector field).
+// This is useful for callers that directly insert KV rows rather than using
+// this library to do it.
+func (vi *VectorIndex) SearchForInsert(
+	ctx context.Context, txn vecstore.Txn, vector vector.T,
+) (*vecstore.SearchResult, error) {
+	// Potentially throttle operation if background work is falling behind.
+	if err := vi.fixups.DelayInsertOrDelete(ctx); err != nil {
+		return nil, err
+	}
+
+	var parentSearchCtx searchContext
+	vi.setupInsertContext(ctx, txn, vector, &parentSearchCtx)
+
+	// Randomize the vector.
+	tempRandomized := parentSearchCtx.Workspace.AllocVector(vi.quantizer.GetDims())
+	defer parentSearchCtx.Workspace.FreeVector(tempRandomized)
+	parentSearchCtx.Randomized = vi.randomizeVector(vector, tempRandomized)
+
+	result, err := vi.searchForInsertHelper(&parentSearchCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Now fetch the centroid of the insert partition. This has the side effect
+	// of checking the size of the partition, in case it's over-sized.
+	partitionKey := result.ChildKey.PartitionKey
+	metadata, err := txn.GetPartitionMetadata(ctx, partitionKey, true /* forUpdate */)
+	if err != nil {
+		return nil, err
+	}
+	if metadata.Count > vi.options.MaxPartitionSize {
+		vi.fixups.AddSplit(ctx, result.ParentPartitionKey, partitionKey)
+	}
+
+	result.Vector = metadata.Centroid
+	return result, nil
 }
 
 // SuspendFixups suspends background fixup processing until ProcessFixups is
@@ -390,31 +464,64 @@ func (vi *VectorIndex) ForceMerge(
 	vi.fixups.AddMerge(ctx, parentPartitionKey, partitionKey)
 }
 
+// setupInsertContext sets up the given search context for an insert operation.
+// Before performing an insert, we need to search for the best partition with
+// the closest centroid to the query vector. The partition in which to insert
+// the vector is at the parent of of the leaf level.
+func (vi *VectorIndex) setupInsertContext(
+	ctx context.Context, txn vecstore.Txn, vector vector.T, parentSearchCtx *searchContext,
+) {
+	// Perform the search using quantized vectors rather than full vectors (i.e.
+	// skip reranking).
+	*parentSearchCtx = searchContext{
+		Txn:      txn,
+		Original: vector,
+		Level:    vecstore.SecondLevel,
+		Options: SearchOptions{
+			BaseBeamSize: vi.options.BaseBeamSize,
+			SkipRerank:   vi.options.DisableErrorBounds,
+			UpdateStats:  true,
+		},
+	}
+	parentSearchCtx.Ctx = internal.WithWorkspace(ctx, &parentSearchCtx.Workspace)
+}
+
 // insertHelper looks for the best partition in which to add the vector and then
-// adds the vector to that partition.
+// adds the vector to that partition. This is an internal helper method that can
+// be used by callers once they have set up a search context.
 func (vi *VectorIndex) insertHelper(
 	parentSearchCtx *searchContext, childKey vecstore.ChildKey,
 ) error {
-	// The partition in which to insert the vector is at the parent level
-	// (level+1). Return enough results to have good candidates for inserting
-	// the vector into another partition.
-	searchSet := vecstore.SearchSet{MaxResults: 1}
-	err := vi.searchHelper(parentSearchCtx, &searchSet)
+	result, err := vi.searchForInsertHelper(parentSearchCtx)
 	if err != nil {
 		return err
 	}
-	results := searchSet.PopUnsortedResults()
-	parentPartitionKey := results[0].ParentPartitionKey
-	partitionKey := results[0].ChildKey.PartitionKey
-	_, err = vi.addToPartition(parentSearchCtx.Ctx, parentSearchCtx.Txn, parentPartitionKey,
+	parentPartitionKey := result.ParentPartitionKey
+	partitionKey := result.ChildKey.PartitionKey
+	err = vi.addToPartition(parentSearchCtx.Ctx, parentSearchCtx.Txn, parentPartitionKey,
 		partitionKey, parentSearchCtx.Randomized, childKey)
 	if errors.Is(err, vecstore.ErrRestartOperation) {
 		return vi.insertHelper(parentSearchCtx, childKey)
-	} else if err != nil {
-		return err
 	}
+	return err
+}
 
-	return nil
+// searchForInsertHelper searches for the best partition in which to add a
+// vector and returns that as exactly one search result (never nil).
+func (vi *VectorIndex) searchForInsertHelper(
+	parentSearchCtx *searchContext,
+) (*vecstore.SearchResult, error) {
+	parentSearchCtx.tempSearchSet = vecstore.SearchSet{MaxResults: 1}
+	err := vi.searchHelper(parentSearchCtx, &parentSearchCtx.tempSearchSet)
+	if err != nil {
+		return nil, err
+	}
+	results := parentSearchCtx.tempSearchSet.PopUnsortedResults()
+	if len(results) != 1 {
+		return nil, errors.AssertionFailedf(
+			"SearchForInsert should return exactly one result, got %d", len(results))
+	}
+	return &results[0], err
 }
 
 // addToPartition calls the store to add the given vector to an existing
@@ -427,17 +534,15 @@ func (vi *VectorIndex) addToPartition(
 	partitionKey vecstore.PartitionKey,
 	vector vector.T,
 	childKey vecstore.ChildKey,
-) (int, error) {
-	count, err := txn.AddToPartition(ctx, partitionKey, vector, childKey)
+) error {
+	metadata, err := txn.AddToPartition(ctx, partitionKey, vector, childKey)
 	if err != nil {
-		return 0, errors.Wrapf(err, "adding vector to partition %d", partitionKey)
+		return errors.Wrapf(err, "adding vector to partition %d", partitionKey)
 	}
-	if count > vi.options.MaxPartitionSize {
+	if metadata.Count > vi.options.MaxPartitionSize {
 		vi.fixups.AddSplit(ctx, parentPartitionKey, partitionKey)
 	}
-
-	err = vi.stats.OnAddOrRemoveVector(ctx)
-	return count, err
+	return vi.stats.OnAddOrRemoveVector(ctx)
 }
 
 // removeFromPartition calls the store to remove a vector, by its key, from an
@@ -447,14 +552,16 @@ func (vi *VectorIndex) removeFromPartition(
 	txn vecstore.Txn,
 	partitionKey vecstore.PartitionKey,
 	childKey vecstore.ChildKey,
-) (int, error) {
-	count, err := txn.RemoveFromPartition(ctx, partitionKey, childKey)
+) (metadata vecstore.PartitionMetadata, err error) {
+	metadata, err = txn.RemoveFromPartition(ctx, partitionKey, childKey)
 	if err != nil {
-		return 0, errors.Wrapf(err, "removing vector from partition %d", partitionKey)
+		return vecstore.PartitionMetadata{},
+			errors.Wrapf(err, "removing vector from partition %d", partitionKey)
 	}
-
-	err = vi.stats.OnAddOrRemoveVector(ctx)
-	return count, err
+	if err := vi.stats.OnAddOrRemoveVector(ctx); err != nil {
+		return vecstore.PartitionMetadata{}, err
+	}
+	return metadata, nil
 }
 
 // searchHelper contains the core search logic for the K-means tree. It begins
@@ -524,6 +631,7 @@ func (vi *VectorIndex) searchHelper(searchCtx *searchContext, searchSet *vecstor
 		}
 
 		if searchLevel <= searchCtx.Level {
+			// We've reached the end of the search.
 			if searchLevel != searchCtx.Level {
 				// This indicates index corruption, since each lower level should
 				// be one less than its parent level.
@@ -704,10 +812,9 @@ func (vi *VectorIndex) rerankSearchResults(
 		if searchCtx.Original != nil {
 			queryVector = searchCtx.Original
 		} else {
-			queryVector = searchCtx.Workspace.AllocVector(vi.quantizer.GetOriginalDims())
+			queryVector = searchCtx.Workspace.AllocVector(vi.quantizer.GetDims())
 			defer searchCtx.Workspace.FreeVector(queryVector)
-			vi.quantizer.RandomizeVector(
-				searchCtx.Ctx, searchCtx.Randomized, queryVector, true /* invert */)
+			vi.unRandomizeVector(searchCtx.Randomized, queryVector)
 		}
 	}
 
@@ -761,6 +868,26 @@ func (vi *VectorIndex) getRerankVectors(
 	return candidates, nil
 }
 
+// randomizeVector performs a random orthogonal transformation (ROT) on the
+// "original" vector and writes it to the "randomized" vector. The caller is
+// responsible for allocating the randomized vector with length equal to the
+// index's dimensions.
+//
+// Randomizing vectors distributes skew more evenly across dimensions and
+// across vectors in a set. Distance and angle between any two vectors
+// remains unchanged, as long as the same ROT is applied to both.
+func (vi *VectorIndex) randomizeVector(original vector.T, randomized vector.T) vector.T {
+	return num32.MulMatrixByVector(&vi.rot, original, randomized, num32.NoTranspose)
+}
+
+// unRandomizeVector inverts the random orthogonal transformation performed by
+// randomizeVector, in order to recover the original vector from its randomized
+// form. The caller is responsible for allocating the original vector with
+// length equal to the index's dimensions.
+func (vi *VectorIndex) unRandomizeVector(randomized vector.T, original vector.T) vector.T {
+	return num32.MulMatrixByVector(&vi.rot, randomized, original, num32.Transpose)
+}
+
 // FormatOptions modifies the behavior of the Format method.
 type FormatOptions struct {
 	// PrimaryKeyStrings, if true, indicates that primary key bytes should be
@@ -788,44 +915,6 @@ func (vi *VectorIndex) Format(
 	// Write formatted bytes to this buffer.
 	var buf bytes.Buffer
 
-	// Format each number to 4 decimal places, removing unnecessary trailing
-	// zeros. Don't print negative zero, since this causes diffs when running on
-	// Linux vs. Mac.
-	formatFloat := func(value float32) string {
-		s := strconv.FormatFloat(float64(value), 'f', 4, 32)
-		if strings.Contains(s, ".") {
-			s = strings.TrimRight(s, "0")
-			s = strings.TrimRight(s, ".")
-		}
-		if s == "-0" {
-			return "0"
-		}
-		return s
-	}
-
-	writeVector := func(vector vector.T) {
-		buf.WriteByte('(')
-		if len(vector) > 4 {
-			// Show first 2 numbers, '...', and last 2 numbers.
-			buf.WriteString(formatFloat(vector[0]))
-			buf.WriteString(", ")
-			buf.WriteString(formatFloat(vector[1]))
-			buf.WriteString(", ..., ")
-			buf.WriteString(formatFloat(vector[len(vector)-2]))
-			buf.WriteString(", ")
-			buf.WriteString(formatFloat(vector[len(vector)-1]))
-		} else {
-			// Show all numbers if there are 4 or fewer.
-			for i, val := range vector {
-				if i != 0 {
-					buf.WriteString(", ")
-				}
-				buf.WriteString(formatFloat(val))
-			}
-		}
-		buf.WriteByte(')')
-	}
-
 	writePrimaryKey := func(key vecstore.PrimaryKey) {
 		if options.PrimaryKeyStrings {
 			buf.WriteString(string(key))
@@ -849,12 +938,12 @@ func (vi *VectorIndex) Format(
 		// the original vector.
 		random := partition.Centroid()
 		original := make(vector.T, len(random))
-		vi.quantizer.RandomizeVector(ctx, random, original, true /* invert */)
+		vi.unRandomizeVector(random, original)
 		buf.WriteString(parentPrefix)
 		buf.WriteString("• ")
 		buf.WriteString(strconv.FormatInt(int64(partitionKey), 10))
 		buf.WriteByte(' ')
-		writeVector(original)
+		writeVector(&buf, original, 4)
 		buf.WriteByte('\n')
 
 		if partition.Count() == 0 {
@@ -882,7 +971,7 @@ func (vi *VectorIndex) Format(
 				writePrimaryKey(childKey.PrimaryKey)
 				if refs[0].Vector != nil {
 					buf.WriteByte(' ')
-					writeVector(refs[0].Vector)
+					writeVector(&buf, refs[0].Vector, 4)
 				} else {
 					buf.WriteString(" (MISSING)")
 				}
@@ -912,6 +1001,46 @@ func (vi *VectorIndex) Format(
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// formatFloat formats each number to the specified number of decimal places,
+// removing unnecessary zeros. Don't print negative zero, since this causes
+// diffs when running on Linux vs. Mac.
+func formatFloat(value float32, prec int) string {
+	s := strconv.FormatFloat(float64(value), 'f', prec, 32)
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+	}
+	if s == "-0" {
+		return "0"
+	}
+	return s
+}
+
+// writeVector formats the given vector like "(1, 2, ..., 9, 10)" and writes it
+// to the given buffer, using the specified precision.
+func writeVector(buf *bytes.Buffer, vector vector.T, prec int) {
+	buf.WriteString("(")
+	if len(vector) > 4 {
+		// Show first 2 numbers, '...', and last 2 numbers.
+		buf.WriteString(formatFloat(vector[0], prec))
+		buf.WriteString(", ")
+		buf.WriteString(formatFloat(vector[1], prec))
+		buf.WriteString(", ..., ")
+		buf.WriteString(formatFloat(vector[len(vector)-2], prec))
+		buf.WriteString(", ")
+		buf.WriteString(formatFloat(vector[len(vector)-1], prec))
+	} else {
+		// Show all numbers if there are 4 or fewer.
+		for i, val := range vector {
+			if i != 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(formatFloat(val, prec))
+		}
+	}
+	buf.WriteString(")")
 }
 
 // ensureSliceLen returns a slice of the given length and generic type. If the

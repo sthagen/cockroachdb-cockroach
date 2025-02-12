@@ -3870,7 +3870,7 @@ func TestChangefeedEnriched(t *testing.T) {
 				sqlDB.Exec(t, `INSERT INTO foo values (0, 'dog')`)
 
 				foo := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='%s'`,
-					strings.Join(tc.enrichedProperties, ", ")))
+					strings.Join(tc.enrichedProperties, ",")))
 				defer closeFeed(t, foo)
 				// TODO(#139660): the webhook sink forces topic_in_value, but
 				// this is not supported by the enriched envelope type. We should adapt
@@ -3880,9 +3880,18 @@ func TestChangefeedEnriched(t *testing.T) {
 					topic = ""
 				}
 
-				msg := fmt.Sprintf(`%s: [0]->{"after": {"a": 0, "b": "dog"}, "op": "c"}`, topic)
+				var jobID int64
+				// Fetching the jobId this way is not supported by the sinkless sink.
+				// In that case we will assert the job_id is 0, so we don't need this query.
+				if _, ok := foo.(*sinklessFeed); !ok {
+					sqlDB.QueryRow(t, `SELECT job_id FROM [SHOW JOBS] where job_type='CHANGEFEED'`).Scan(&jobID)
+				}
+				sourceMsg := fmt.Sprintf(`, "source": {"job_id": "%d"}`, jobID)
+
+				msg := fmt.Sprintf(`%s: {"a": 0}->{"after": {"a": 0, "b": "dog"}, "op": "c"%s}`, topic, sourceMsg)
 				if slices.Contains(tc.enrichedProperties, "schema") {
-					msg = fmt.Sprintf(`%s: [0]->{"payload": {"after": {"a": 0, "b": "dog"}, "op": "c"}}`, topic)
+					// TODO(#139658): add the schema to the key and the value here
+					msg = fmt.Sprintf(`%s: {"payload": {"a": 0}}->{"payload": {"after": {"a": 0, "b": "dog"}, "op": "c"%s}}`, topic, sourceMsg)
 				}
 
 				assertPayloadsEnvelopeStripTs(t, foo, changefeedbase.OptEnvelopeEnriched, []string{msg})

@@ -205,7 +205,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	// Job still running, waiting for GC.
 	// TODO (lucy): Maybe this test API should use an offset starting
 	// from the most recent job instead.
-	if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeNewSchemaChange, jobs.StateSucceeded, jobs.Record{
 		Username:      username.RootUserName(),
 		Description:   "DROP DATABASE t CASCADE",
 		DescriptorIDs: nil,
@@ -267,17 +267,26 @@ func TestDropDatabaseDeleteData(t *testing.T) {
 	// Speed up mvcc queue scan.
 	params.ScanMaxIdleTime = time.Millisecond
 
+	// fullReconcilierStarted is used to block the full reconciliation from
+	// starting before we drop the database. This is used to avoid a race
+	// condition where the full reconciliation starts after we drop the database,
+	// it will ignore the dropped database. Then, there is a race between the
+	// SQLWatcher and the GC job where the SQLWatcher might write a zone config
+	// of table1 before table2, while the GC queue might not know that this range
+	// needs to be split because it has different span config.
+	//
 	// zoneCfgRangeFeedStarted is used to signal that the zone config range feed
-	// started. This is used to avoid a race where we update `system.zones` before
-	// the full reconciliation of zone configs has started. The full
-	// reconciliation ignores dropped databases, and if we write to
-	// `system.zones` before that, our write will not be reconciled. By delaying
-	// the test until the zone config range feed starts, we ensure that the full
-	// reconciliation has finished, and the range feed is ready to stream our
-	// changes.
-	var zoneCfgRangeFeedStarted sync.WaitGroup
+	// started and that the full reconciliation has finished. This is used to
+	// avoid a race where we update `system.zones` before the full reconciliation
+	// of zone configs has finished. If we write to `system.zones` before that,
+	// our write will not be reconciled.
+	var fullReconcilierStarted, zoneCfgRangeFeedStarted sync.WaitGroup
+	fullReconcilierStarted.Add(1)
 	zoneCfgRangeFeedStarted.Add(1)
 	params.Knobs.SpanConfig = &spanconfig.TestingKnobs{
+		OnFullReconcilerStart: func() {
+			fullReconcilierStarted.Wait()
+		},
 		OnWatchForZoneConfigUpdatesEstablished: func() {
 			zoneCfgRangeFeedStarted.Done()
 		},
@@ -305,9 +314,6 @@ func TestDropDatabaseDeleteData(t *testing.T) {
 	require.NoError(t, err)
 	_, err = systemDB.Exec(`SET CLUSTER SETTING spanconfig.tenant_coalesce_adjacent.enabled = 'false';`)
 	require.NoError(t, err)
-
-	// Wait for the zone config range feed to start.
-	zoneCfgRangeFeedStarted.Wait()
 
 	// Disable strict GC TTL enforcement because we're going to shove a zero-value
 	// TTL into the system with AddImmediateGCZoneConfig.
@@ -347,6 +353,12 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		t.Fatal(err)
 	}
 
+	// Unblock the full reconciliation.
+	fullReconcilierStarted.Done()
+
+	// Wait for the zone config range feed to start.
+	zoneCfgRangeFeedStarted.Wait()
+
 	if _, err := sqlDB.Exec(`DROP DATABASE t CASCADE`); err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +368,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, 0,
-		jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
+		jobspb.TypeNewSchemaChange, jobs.StateSucceeded, jobs.Record{
 			Username:    username.RootUserName(),
 			Description: "DROP DATABASE t CASCADE",
 		}); err != nil {
@@ -386,7 +398,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	}
 
 	testutils.SucceedsSoon(t, func() error {
-		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusRunning, jobs.Record{
+		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StateRunning, jobs.Record{
 			Username:    username.NodeUserName(),
 			Description: "GC for DROP DATABASE t CASCADE",
 			DescriptorIDs: descpb.IDs{
@@ -414,7 +426,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCountIncludingTombstoned(t, srv.StorageLayer(), table2Span, 0)
 
 	testutils.SucceedsSoon(t, func() error {
-		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
+		return jobutils.VerifySystemJob(t, sqlRun, 0, jobspb.TypeSchemaChangeGC, jobs.StateSucceeded, jobs.Record{
 			Username:    username.NodeUserName(),
 			Description: "GC for DROP DATABASE t CASCADE",
 			DescriptorIDs: descpb.IDs{
@@ -483,7 +495,7 @@ func TestDropIndex(t *testing.T) {
 		t.Fatalf("table descriptor still contains index after index is dropped")
 	}
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
+	if err := jobutils.VerifySystemJob(t, sqlRun, 1, jobspb.TypeNewSchemaChange, jobs.StateSucceeded, jobs.Record{
 		Username:    username.RootUserName(),
 		Description: `DROP INDEX t.public.kv@foo`,
 	}); err != nil {
@@ -523,7 +535,7 @@ func TestDropIndex(t *testing.T) {
 			},
 		}); err != nil {
 			// If the job is not running, check if it already succeeded.
-			if secondErr := jobutils.VerifySystemJob(t, sqlRun, 2, jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
+			if secondErr := jobutils.VerifySystemJob(t, sqlRun, 2, jobspb.TypeSchemaChangeGC, jobs.StateSucceeded, jobs.Record{
 				Username:    username.NodeUserName(),
 				Description: `GC for CREATE INDEX foo ON t.public.kv (v)`,
 				DescriptorIDs: descpb.IDs{
@@ -686,7 +698,7 @@ func TestDropTable(t *testing.T) {
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifySystemJob(t, sqlRun, 1,
-		jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
+		jobspb.TypeNewSchemaChange, jobs.StateSucceeded, jobs.Record{
 			Username:      username.RootUserName(),
 			Description:   `DROP TABLE t.public.kv`,
 			DescriptorIDs: nil,
@@ -801,7 +813,7 @@ func TestDropTableDeleteData(t *testing.T) {
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	for i := 0; i < numTables; i++ {
 		if err := jobutils.VerifySystemJob(t, sqlRun, numTables+i,
-			jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
+			jobspb.TypeNewSchemaChange, jobs.StateSucceeded, jobs.Record{
 				Username:    username.RootUserName(),
 				Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			}); err != nil {
@@ -827,7 +839,7 @@ func TestDropTableDeleteData(t *testing.T) {
 
 		// Ensure that the job is marked as succeeded.
 		if err := jobutils.VerifySystemJob(t, sqlRun, numTables+i,
-			jobspb.TypeNewSchemaChange, jobs.StatusSucceeded, jobs.Record{
+			jobspb.TypeNewSchemaChange, jobs.StateSucceeded, jobs.Record{
 				Username:    username.RootUserName(),
 				Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			}); err != nil {
@@ -837,7 +849,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		// Ensure that the gc job is marked as succeeded.
 		testutils.SucceedsSoon(t, func() error {
 			return jobutils.VerifySystemJob(t, sqlRun, numTables+i,
-				jobspb.TypeSchemaChangeGC, jobs.StatusSucceeded, jobs.Record{
+				jobspb.TypeSchemaChangeGC, jobs.StateSucceeded, jobs.Record{
 					Username:    username.NodeUserName(),
 					Description: fmt.Sprintf(`GC for DROP TABLE t.public.%s`, descs[i].GetName()),
 					DescriptorIDs: descpb.IDs{

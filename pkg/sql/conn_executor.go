@@ -3210,6 +3210,10 @@ func (ex *connExecutor) execCopyIn(
 
 	// The connExecutor state machine has already set us up with a txn at this
 	// point.
+	//
+	// Disable the buffered writes for COPY since there is no benefit in this
+	// ability here.
+	ex.state.mu.txn.SetBufferedWritesEnabled(false /* enabled */)
 	txnOpt := copyTxnOpt{
 		txn:           ex.state.mu.txn,
 		txnTimestamp:  ex.state.sqlTimestamp,
@@ -4202,10 +4206,14 @@ func (ex *connExecutor) waitForTxnJobs() error {
 			}
 			jobList.WriteString(j.String())
 		}
-		if err := ex.planner.noticeSender.SendNotice(ex.ctxHolder.connCtx,
-			pgnotice.Newf("The statement has timed out, but the following "+
-				"background jobs have been created and will continue running: %s.",
-				jobList.String())); err != nil {
+		if err := ex.planner.noticeSender.SendNotice(
+			ex.ctxHolder.connCtx,
+			pgnotice.Newf(
+				"The statement has timed out, but the following "+
+					"background jobs have been created and will continue running: %s.",
+				jobList.String()),
+			false, /* immediateFlush */
+		); err != nil {
 			return err
 		}
 	}

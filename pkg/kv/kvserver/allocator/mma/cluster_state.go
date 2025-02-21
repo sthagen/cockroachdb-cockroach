@@ -94,9 +94,8 @@ type pendingReplicaChange struct {
 	startTime time.Time
 
 	// When the change is known to be enacted based on the authoritative
-	// information received from the leaseholder, this value is set, so that
-	// even if the store with a replica affected by this pending change does not
-	// tell us about the enactment, we can garbage collect this change.
+	// information received from the leaseholder, this value is set, so that we
+	// can garbage collect this change.
 	enactedAtTime time.Time
 }
 
@@ -293,8 +292,9 @@ type storeState struct {
 	storeLoad
 	adjusted struct {
 		load loadVector
-		// loadReplicas is computed from storeLoadMsg.storeRanges, and adjusted
-		// for pending changes.
+		// loadReplicas is computed from the authoritative information provided by
+		// various leaseholders in storeLeaseholderMsgs, and adjusted for
+		// loadPendingChanges.
 		loadReplicas map[roachpb.RangeID]replicaType
 		// Pending changes for computing loadReplicas and load.
 		// Added to at the same time as clusterState.pendingChanges.
@@ -309,20 +309,15 @@ type storeState struct {
 		// - leaseholder provided state shows that the change has been enacted, it
 		//   will set enactedAtTime, but not remove from loadPendingChanges since
 		//   this pending change is still needed to compensate for the store
-		//   reported load.
-		//
-		// Unilateral removal from loadPendingChanges happens if the load reported
-		// by the store shows that this pending change has been enacted. We no
-		// longer need to adjust the load for this pending change.
-		//
-		// Removal from loadPendingChanges also happens if sufficient duration has
-		// elapsed from enactedAtTime.
+		//   reported load. Once computePendingChangesReflectedInLatestLoad
+		//   determines that the latest load state must include the pending
+		//   change, it will be removed.
 		//
 		// In summary, guaranteed removal of a load pending change because of
 		// failure of enactment or GC happens via clusterState.pendingChanges.
 		// Only the case where enactment happened is where a load pending change
 		// can live on -- but since that will set enactedAtTime, we are guaranteed
-		// to always remove it.
+		// to eventually remove it.
 		loadPendingChanges map[changeID]*pendingReplicaChange
 
 		enactedHistory storeEnactedHistory
@@ -331,8 +326,22 @@ type storeState struct {
 
 		// replicas is computed from the authoritative information provided by
 		// various leaseholders in storeLeaseholderMsgs and adjusted for pending
-		// changes in cluserState.pendingChanges/rangeState.pendingChanges.
+		// changes in clusterState.pendingChanges/rangeState.pendingChanges.
 		replicas map[roachpb.RangeID]replicaState
+
+		// topKRanges along some load dimensions. If the store is closer to
+		// hitting the resource limit on some resource ranges that are higher in
+		// that resource dimension should be over-represented in this map. It
+		// includes ranges whose replicas are being removed via pending changes,
+		// since those pending changes may be reversed, and we don't want to
+		// bother recomputing the top-k.
+		//
+		// We need to keep this top-k up-to-date incrementally. Since
+		// storeLeaseholderMsg is incremental about the ranges it reports, that
+		// may provide a building block for the incremental computation.
+		// TODO(sumeer): figure out at least one reasonable way to do this, even
+		// if we postpone it to a later code iteration.
+		topKRanges map[roachpb.RangeID]rangeLoad
 	}
 	// This is a locally incremented seqnum which is incremented whenever the
 	// adjusted or reported load information for this store or the containing
@@ -423,6 +432,9 @@ type rangeState struct {
 	// the storeState.adjusted.replicas in the corresponding stores.
 	replicas []storeIDAndReplicaState
 	conf     *normalizedSpanConfig
+
+	load rangeLoad
+
 	// Only 1 or 2 changes (latter represents a least transfer or rebalance that
 	// adds and removes replicas).
 	//
@@ -437,12 +449,6 @@ type rangeState struct {
 
 	// TODO(sumeer): populate and use.
 	diversityIncreaseLastFailedAttempt time.Time
-
-	// lastHeardTime is the latest time when this range was heard about from any
-	// store, via storeLeaseholderMsg or storeLoadMsg. Despite the best-effort
-	// GC it is possible we will miss something. If this lastHeardTime is old
-	// enough, use some other source to verify that this range still exists.
-	lastHeardTime time.Time
 }
 
 // clusterState is the state of the cluster known to the allocator, including
@@ -480,9 +486,11 @@ func newClusterState(interner *stringInterner) *clusterState {
 // clusterState mutators
 //======================================================================
 
-func (cs *clusterState) processNodeLoadResponse(resp *nodeLoadResponse) {
+func (cs *clusterState) processNodeLoadMsg(msg *nodeLoadMsg) {
 	// TODO(sumeer):
 }
+
+func (cs *clusterState) processStoreLeaseholderMsg(msg *storeLeaseholderMsg) {}
 
 func (cs *clusterState) addNodeID(nodeID roachpb.NodeID) {
 	// TODO(sumeer):
@@ -577,7 +585,8 @@ func (cs *clusterState) computeLoadSummary(
 // Avoid unused lint errors.
 
 var _ = (&pendingChangesOldestFirst{}).removeChangeAtIndex
-var _ = (&clusterState{}).processNodeLoadResponse
+var _ = (&clusterState{}).processNodeLoadMsg
+var _ = (&clusterState{}).processStoreLeaseholderMsg
 var _ = (&clusterState{}).addNodeID
 var _ = (&clusterState{}).addStore
 var _ = (&clusterState{}).changeStore
@@ -631,10 +640,10 @@ var _ = storeIDAndReplicaState{}.StoreID
 var _ = storeIDAndReplicaState{}.replicaState
 var _ = rangeState{}.replicas
 var _ = rangeState{}.conf
+var _ = rangeState{}.load
 var _ = rangeState{}.pendingChanges
 var _ = rangeState{}.constraints
 var _ = rangeState{}.diversityIncreaseLastFailedAttempt
-var _ = rangeState{}.lastHeardTime
 var _ = clusterState{}.nodes
 var _ = clusterState{}.stores
 var _ = clusterState{}.ranges

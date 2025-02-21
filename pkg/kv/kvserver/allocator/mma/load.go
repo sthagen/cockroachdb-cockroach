@@ -52,6 +52,7 @@ func (lv *loadVector) subtract(other loadVector) {
 // A resource can have a capacity, which is also expressed using loadValue.
 // There are some special case capacity values, enumerated here.
 const (
+	// unknownCapacity is currenly only used for writeBandwidth.
 	unknownCapacity loadValue = math.MaxInt64
 	// parentCapacity is currently only used for cpu at the store level.
 	parentCapacity loadValue = math.MaxInt64 - 1
@@ -125,29 +126,21 @@ type storeLoad struct {
 	//
 	// capacity[cpu] is parentCapacity.
 	//
-	// capacity[writeBandwidth] is typically unknownCapacity. However, if the
-	// LSM on the store is getting overloaded, whether it is because of disk
-	// bandwidth being reached or some other resource bottleneck (compactions
-	// not keeping up), the store can set this to a synthesized value that
-	// indicates high utilization, in order to shed some load.
+	// capacity[writeBandwidth] is unknownCapacity.
+	//
+	// TODO(sumeer): add diskBandwidth, since we will become more aware of
+	// provisioned disk bandwidth in the near future.
+	//
+	// TODO(sumeer): should the LSM getting overloaded result in some capacity
+	// signal? We had earlier considered having the store set the capacity to a
+	// synthesized value that indicates high utilization, in order to shed some
+	// load. However, the code below assumes homogeneity across stores/nodes in
+	// terms of whether they use a real capacity or not for a loadDimension.
 	//
 	// capacity[byteSize] is the actual capacity.
 	capacity loadVector
 
 	reportedSecondaryLoad secondaryLoadVector
-
-	// top-k ranges along some dimensions, chosen by the store. If the store is
-	// closer to hitting the resource limit on some resource it should choose to
-	// use that resource consumption to choose the top-k.
-	//
-	// This is extremely important: the allocator does not try to make a
-	// decision on what ranges to shed for an overloaded node -- it simply tries
-	// to find new homes for the ranges in this top-k. We decentralize this
-	// decision to reduce the time complexity of rebalancing.
-	topKRanges map[roachpb.RangeID]rangeLoad
-	// Mean load for the non-top-k ranges. This is used to estimate the load
-	// change for transferring them.
-	meanNonTopKRangeLoad rangeLoad
 }
 
 // nodeLoad is the load information for a node. Roughly, this is the
@@ -205,9 +198,7 @@ type meansForStoreSet struct {
 var _ mapEntry = &meansForStoreSet{}
 
 func (mss *meansForStoreSet) clear() {
-	for k := range mss.storeSummaries {
-		delete(mss.storeSummaries, k)
-	}
+	clear(mss.storeSummaries)
 	*mss = meansForStoreSet{
 		stores:         mss.stores[:0],
 		storeSummaries: mss.storeSummaries,
@@ -309,9 +300,7 @@ func (mm *meansMemo) getMeans(expr constraintsDisj) *meansForStoreSet {
 	means.constraintsDisj = expr
 	mm.constraintMatcher.constrainStoresForExpr(expr, &means.stores)
 	n := len(means.stores)
-	for k := range mm.scratchNodes {
-		delete(mm.scratchNodes, k)
-	}
+	clear(mm.scratchNodes)
 	for _, storeID := range means.stores {
 		sload := mm.loadInfoProvider.getStoreReportedLoad(storeID)
 		for j := range sload.reportedLoad {
@@ -415,15 +404,8 @@ func loadSummaryForDimension(
 	// more severe.
 	//
 	// The capacity may be unknownCapacity. Even if we have a known capacity, we
-	// may want to consider how far we are away from mean. The mean isn't very
-	// useful when there are heterogeneous nodeLoad. It also does not help when
-	// there are constraints only satisfied by a subset of nodeLoad that have much
-	// higher utilization. Even though we permit very general constraint and
-	// locality specifications, it may be that the set of attributes used in
-	// constraints and lease preferences are such that we can partition stores
-	// into sets that share the same attributes and have the same locality
-	// tiers, and use the means for each set. But even that is not very helpful
-	// because some ranges may have fewer constraints than others.
+	// consider how far we are from the mean. The mean isn't very useful when
+	// there are heterogeneous nodes/stores.
 	fractionAbove := float64(load)/float64(meanLoad) - 1.0
 	if fractionAbove > 0.2 {
 		loadSummary = overloadSlow
@@ -471,8 +453,6 @@ var _ = storeLoad{}.NodeID
 var _ = storeLoad{}.reportedLoad
 var _ = storeLoad{}.capacity
 var _ = storeLoad{}.reportedSecondaryLoad
-var _ = storeLoad{}.topKRanges
-var _ = storeLoad{}.meanNonTopKRangeLoad
 var _ = nodeLoad{}.nodeID
 var _ = nodeLoad{}.reportedCPU
 var _ = nodeLoad{}.capacityCPU

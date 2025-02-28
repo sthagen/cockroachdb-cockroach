@@ -260,8 +260,11 @@ func (ex *connExecutor) startIdleInSessionTimeout() {
 
 func (ex *connExecutor) recordFailure(p eventNonRetriableErrPayload) {
 	ex.metrics.EngineMetrics.FailureCount.Inc(1)
-	if errors.Is(p.errorCause(), sqlerrors.QueryTimeoutError) {
+	switch {
+	case errors.Is(p.errorCause(), sqlerrors.QueryTimeoutError):
 		ex.metrics.EngineMetrics.StatementTimeoutCount.Inc(1)
+	case errors.Is(p.errorCause(), sqlerrors.TxnTimeoutError):
+		ex.metrics.EngineMetrics.TransactionTimeoutCount.Inc(1)
 	}
 }
 
@@ -2618,6 +2621,9 @@ func (ex *connExecutor) createJobs(ctx context.Context) error {
 func (ex *connExecutor) rollbackSQLTransaction(
 	ctx context.Context, stmt tree.Statement,
 ) (fsm.Event, fsm.EventPayload) {
+	ex.extraTxnState.idleLatency += ex.statsCollector.PhaseTimes().
+		GetIdleLatency(ex.statsCollector.PreviousPhaseTimes())
+
 	if err := ex.extraTxnState.sqlCursors.closeAll(&ex.planner, cursorCloseForTxnRollback); err != nil {
 		return ex.makeErrEvent(err, stmt)
 	}

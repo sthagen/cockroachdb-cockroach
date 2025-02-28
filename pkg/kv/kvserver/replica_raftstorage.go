@@ -38,11 +38,6 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-// invalidLastTerm is an out-of-band value for r.mu.lastTermNotDurable that
-// invalidates lastTermNotDurable caching and forces retrieval of
-// Term(lastIndexNotDurable) from the raftEntryCache/Pebble.
-const invalidLastTerm = 0
-
 var snapshotIngestAsWriteThreshold = settings.RegisterByteSizeSetting(
 	settings.SystemOnly,
 	"kv.snapshot.ingest_as_write_threshold",
@@ -527,9 +522,15 @@ func (r *Replica) applySnapshot(
 		log.Infof(ctx, "applied %s %s(%s)", inSnap, appliedAsWriteStr, logDetails)
 	}(timeutil.Now())
 
+	// Clear the raft state and reset it. The log starts from the applied entry ID
+	// of the snapshot.
+	truncState := kvserverpb.RaftTruncatedState{
+		Index: kvpb.RaftIndex(nonemptySnap.Metadata.Index),
+		Term:  kvpb.RaftTerm(nonemptySnap.Metadata.Term),
+	}
 	clearedSpans := inSnap.clearedSpans
 	unreplicatedSSTFile, clearedSpan, err := writeUnreplicatedSST(
-		ctx, r.ID(), r.ClusterSettings(), nonemptySnap.Metadata, hs, &r.raftMu.stateLoader.StateLoader,
+		ctx, r.ID(), r.ClusterSettings(), truncState, hs, &r.raftMu.stateLoader.StateLoader,
 	)
 	if err != nil {
 		return err
@@ -664,10 +665,6 @@ func (r *Replica) applySnapshot(
 	if err != nil {
 		log.Fatalf(ctx, "unable to load replica state: %s", err)
 	}
-	truncState, err := sl.LoadRaftTruncatedState(ctx, r.store.TODOEngine())
-	if err != nil {
-		log.Fatalf(ctx, "unable to load raft truncated state: %s", err)
-	}
 
 	if uint64(state.RaftAppliedIndex) != nonemptySnap.Metadata.Index {
 		log.Fatalf(ctx, "snapshot RaftAppliedIndex %d doesn't match its metadata index %d",
@@ -731,22 +728,11 @@ func (r *Replica) applySnapshot(
 	// without risking a lock-ordering deadlock.
 	r.store.mu.Unlock()
 
-	// We set the persisted last index to the last applied index. This is
-	// not a correctness issue, but means that we may have just transferred
-	// some entries we're about to re-request from the leader and overwrite.
-	// However, raft.MultiNode currently expects this behavior, and the
-	// performance implications are not likely to be drastic. If our
-	// feelings about this ever change, we can add a LastIndex field to
-	// raftpb.SnapshotMetadata.
-	// TODO(pav-kv): the above comment seems stale, and needs an update.
-	//
-	// TODO(sumeer): We should be able to set the last term to
-	// nonemptySnap.Metadata.Term. See
-	// https://github.com/cockroachdb/cockroach/pull/75675#pullrequestreview-867926687
-	// for a discussion regarding this.
+	// The log has been cleared and reset to start at the snapshot's applied
+	// index/term. Update the in-memory metadata accordingly.
 	r.asLogStorage().updateStateRaftMuLockedMuLocked(logstore.RaftState{
-		LastIndex: state.RaftAppliedIndex,
-		LastTerm:  invalidLastTerm,
+		LastIndex: truncState.Index,
+		LastTerm:  truncState.Term,
 		ByteSize:  0, // the log is empty now
 	})
 	r.shMu.raftTruncState = truncState
@@ -828,7 +814,7 @@ func writeUnreplicatedSST(
 	ctx context.Context,
 	id storage.FullReplicaID,
 	st *cluster.Settings,
-	meta raftpb.SnapshotMetadata,
+	ts kvserverpb.RaftTruncatedState,
 	hs raftpb.HardState,
 	sl *logstore.StateLoader,
 ) (_ *storage.MemObject, clearedSpan roachpb.Span, _ error) {
@@ -837,14 +823,9 @@ func writeUnreplicatedSST(
 		ctx, st, unreplicatedSSTFile,
 	)
 	defer unreplicatedSST.Close()
-
-	// Clear the raft state/log, and initialize the truncation state to match the
-	// entry ID of the snapshot. Subsequent log appends will be contiguous with
-	// the snapshot.
-	clearedSpan, err := rewriteRaftState(ctx, id, hs, kvserverpb.RaftTruncatedState{
-		Index: kvpb.RaftIndex(meta.Index),
-		Term:  kvpb.RaftTerm(meta.Term),
-	}, sl, &unreplicatedSST)
+	// Clear the raft state/log, and initialize it again with the provided
+	// HardState and RaftTruncatedState.
+	clearedSpan, err := rewriteRaftState(ctx, id, hs, ts, sl, &unreplicatedSST)
 	if err != nil {
 		return nil, roachpb.Span{}, err
 	}

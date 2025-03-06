@@ -300,6 +300,8 @@ var gossipSubscriptionPatternAllowlist = []string{
 	"cluster-id",
 	"node:.*",
 	"store:.*",
+	// This "system-db" exception can be removed once we fully remove
+	// gossip.KeyDeprecatedSystemConfig from the gossip network.
 	"system-db",
 }
 

@@ -9,8 +9,9 @@ import (
 	"context"
 	gosql "database/sql"
 	"encoding/base64"
-	"encoding/json"
+	gojson "encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand"
 	"net/http"
@@ -32,7 +33,9 @@ import (
 	"github.com/IBM/sarama"
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/checkpoint"
@@ -86,6 +89,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/cidr"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
@@ -1337,7 +1341,7 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 			for i, id := range expectedRowIDs {
 				assertedPayloads[i] = fmt.Sprintf(`seed: [%s]->{"rowid": %s}`, id, id)
 			}
-			err = assertPayloadsBaseErr(context.Background(), seedFeed, assertedPayloads, false, false, changefeedbase.OptEnvelopeWrapped)
+			err = assertPayloadsBaseErr(context.Background(), seedFeed, assertedPayloads, false, false, nil, changefeedbase.OptEnvelopeWrapped)
 			closeFeedIgnoreError(t, seedFeed)
 			if err != nil {
 				// Skip errors that may come up during SQL execution. If the SQL query
@@ -3881,18 +3885,131 @@ func TestChangefeedBareAvro(t *testing.T) {
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
+func toJSON(t *testing.T, x any) string {
+	t.Helper()
+	// Our json library formats differently than the stdlib, and json.MakeJSON()
+	// chokes on some inputs, so marshal it twice.
+	bs, err := gojson.Marshal(x)
+	require.NoError(t, err)
+	j, err := json.ParseJSON(string(bs))
+	require.NoError(t, err)
+	return j.String()
+}
+
 func TestChangefeedEnriched(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	key := map[string]any{"a": 0}
+	keySchema := map[string]any{
+		"name": "foo.key",
+		"fields": []map[string]any{
+			{"field": "a", "optional": false, "type": "int64"},
+		},
+		"optional": false,
+		"type":     "struct",
+	}
+
+	afterVal := map[string]any{"a": 0, "b": "dog"}
+	afterSchema := map[string]any{
+		"name":  "foo.after.value",
+		"field": "after",
+		"fields": []map[string]any{
+			{"field": "a", "optional": false, "type": "int64"},
+			{"field": "b", "optional": true, "type": "string"},
+		},
+		"optional": false,
+		"type":     "struct",
+	}
+
+	payload := map[string]any{
+		"after": afterVal,
+		"op":    "c",
+		// TODO(#139662): add `before`
+		// NOTE: ts_ns is stripped by the test framework, and source is specified separately
+	}
+
+	// Create an enriched source provider with no data. The contents of source
+	// will be tested in another test, we just want to make sure the structure &
+	// schema is right here.
+	esp := newEnrichedSourceProvider(changefeedbase.EncodingOptions{}, enrichedSourceData{})
+	source, err := esp.GetJSON(cdcevent.Row{})
+	require.NoError(t, err)
+
+	var sourceMap map[string]any
+	require.NoError(t, gojson.Unmarshal([]byte(source.String()), &sourceMap))
+
+	sourceSchema := esp.KafkaConnectJSONSchema().AsJSON()
+	var sourceSchemaMap map[string]any
+	require.NoError(t, gojson.Unmarshal([]byte(sourceSchema.String()), &sourceSchemaMap))
+	sourceSchemaMap["field"] = "source"
+
+	tsNsSchema := map[string]any{"field": "ts_ns", "optional": false, "type": "int64"}
+	opSchema := map[string]any{"field": "op", "optional": false, "type": "string"}
+
 	cases := []struct {
-		name               string
-		enrichedProperties []string
+		name                 string
+		enrichedProperties   []string
+		messageWithoutSource map[string]any
+		withSource           bool
+		expectedKey          map[string]any
 	}{
-		{name: "solo"},
-		{name: "with schema", enrichedProperties: []string{"schema"}},
-		{name: "with source", enrichedProperties: []string{"source"}},
-		{name: "with schema and source", enrichedProperties: []string{"schema", "source"}},
+		{
+			name:                 "with nothing",
+			messageWithoutSource: payload,
+			expectedKey:          key,
+		},
+		{
+			name:               "with schema",
+			enrichedProperties: []string{"schema"},
+			messageWithoutSource: map[string]any{
+				"payload": payload,
+				"schema": map[string]any{
+					"name":     "cockroachdb.envelope",
+					"optional": false,
+					"fields": []map[string]any{
+						afterSchema,
+						tsNsSchema,
+						opSchema,
+					},
+					"type": "struct",
+				},
+			},
+			expectedKey: map[string]any{
+				"payload": key,
+				"schema":  keySchema,
+			},
+		},
+		{
+			name:                 "with source",
+			enrichedProperties:   []string{"source"},
+			messageWithoutSource: payload,
+			withSource:           true,
+			expectedKey:          key,
+		},
+		{
+			name:               "with schema and source",
+			enrichedProperties: []string{"schema", "source"},
+			messageWithoutSource: map[string]any{
+				"payload": payload,
+				"schema": map[string]any{
+					"name":     "cockroachdb.envelope",
+					"optional": false,
+					"fields": []map[string]any{
+						afterSchema,
+						sourceSchemaMap,
+						tsNsSchema,
+						opSchema,
+					},
+					"type": "struct",
+				},
+			},
+			withSource: true,
+			expectedKey: map[string]any{
+				"payload": key,
+				"schema":  keySchema,
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -3914,25 +4031,16 @@ func TestChangefeedEnriched(t *testing.T) {
 					topic = ""
 				}
 
-				var jobID int64
-				// Fetching the jobId this way is not supported by the sinkless sink.
-				// In that case we will assert the job_id is 0, so we don't need this query.
-				if _, ok := foo.(*sinklessFeed); !ok {
-					sqlDB.QueryRow(t, `SELECT job_id FROM [SHOW JOBS] where job_type='CHANGEFEED'`).Scan(&jobID)
+				assertion := fmt.Sprintf("%s: %s->%s", topic, toJSON(t, tc.expectedKey), toJSON(t, tc.messageWithoutSource))
+				sourceAssertion := func(actualSource map[string]any) {
+					if tc.withSource {
+						// Just check the source's structure.
+						require.ElementsMatch(t, slices.Collect(maps.Keys(sourceMap)), slices.Collect(maps.Keys(actualSource)))
+					} else {
+						require.Empty(t, actualSource)
+					}
 				}
-
-				var sourceMsg string
-				if slices.Contains(tc.enrichedProperties, "source") {
-					sourceMsg = fmt.Sprintf(`, "source": {"job_id": "%d"}`, jobID)
-				}
-
-				msg := fmt.Sprintf(`%s: {"a": 0}->{"after": {"a": 0, "b": "dog"}, "op": "c"%s}`, topic, sourceMsg)
-				if slices.Contains(tc.enrichedProperties, "schema") {
-					// TODO(#139658): add the schema to the key and the value here
-					msg = fmt.Sprintf(`%s: {"payload": {"a": 0}}->{"payload": {"after": {"a": 0, "b": "dog"}, "op": "c"%s}}`, topic, sourceMsg)
-				}
-
-				assertPayloadsEnvelopeStripTs(t, foo, changefeedbase.OptEnvelopeEnriched, []string{msg})
+				assertPayloadsEnriched(t, foo, []string{assertion}, sourceAssertion)
 			}
 			supportedSinks := []string{"kafka", "pubsub", "sinkless", "webhook"}
 			for _, sink := range supportedSinks {
@@ -3940,7 +4048,6 @@ func TestChangefeedEnriched(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestChangefeedEnrichedAvro(t *testing.T) {
@@ -3962,14 +4069,131 @@ func TestChangefeedEnrichedAvro(t *testing.T) {
 
 		assertionKey := `{"a":{"long":0}}`
 		assertionAfter := `"after": {"foo": {"a": {"long": 0}, "b": {"string": "dog"}}}`
-		assertionSource := fmt.Sprintf(`"source": {"source": {"job_id": {"string": "%d"}}}`, jobID)
 
-		assertPayloadsEnvelopeStripTs(t, foo, changefeedbase.OptEnvelopeEnriched, []string{
-			fmt.Sprintf(`foo: %s->{%s, "op": {"string": "c"}, %s}`,
-				assertionKey, assertionAfter, assertionSource),
-		})
+		assertPayloadsEnriched(t, foo, []string{
+			fmt.Sprintf(`foo: %s->{%s, "op": {"string": "c"}}`,
+				assertionKey, assertionAfter),
+		}, nil)
 	}
 	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
+func TestChangefeedEnrichedSourceWithNodeAndClusterInfo(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cases := []struct {
+		name            string
+		format          string
+		expectedMessage string
+		supportedSinks  []string
+	}{
+		{
+			name:            "json",
+			format:          "json",
+			expectedMessage: `foo: {"i": 0}->{"after": {"i": 0}, "op": "c"}`,
+			supportedSinks:  []string{"kafka", "pubsub", "sinkless"},
+		},
+		{
+			// TODO(#139660): the webhook sink forces topic_in_value, but
+			// this is not supported by the enriched envelope type. We should adapt
+			// the test framework to account for this.
+			name:            "json-webhook",
+			format:          "json",
+			expectedMessage: `: {"i": 0}->{"after": {"i": 0}, "op": "c"}`,
+			supportedSinks:  []string{"webhook"},
+		},
+		{
+			name:            "avro",
+			format:          "avro",
+			expectedMessage: `foo: {"i":{"long":0}}->{"after": {"foo": {"i": {"long": 0}}}, "op": {"string": "c"}}`,
+			supportedSinks:  []string{"kafka"},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clusterName := "clusterName123"
+			dbVersion := "v999.0.0"
+			defer build.TestingOverrideVersion(dbVersion)()
+			testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+				clusterID := s.Server.ExecutorConfig().(sql.ExecutorConfig).NodeInfo.LogicalClusterID().String()
+
+				sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+				sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY)`)
+				sqlDB.Exec(t, `INSERT INTO foo values (0)`)
+				testFeed := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source', format=%s`, testCase.format))
+				defer closeFeed(t, testFeed)
+
+				var jobID int64
+				var nodeName string
+				var sourceAssertion func(actualSource map[string]any)
+				if ef, ok := testFeed.(cdctest.EnterpriseTestFeed); ok {
+					jobID = int64(ef.JobID())
+				}
+				sqlDB.QueryRow(t, `SELECT value FROM crdb_internal.node_runtime_info where component = 'DB' and field = 'Host'`).Scan(&nodeName)
+
+				sourceAssertion = func(actualSource map[string]any) {
+					var nodeID any
+					if testCase.format == "avro" {
+						actualSourceValue := actualSource["source"].(map[string]any)
+						nodeID = actualSourceValue["node_id"].(map[string]any)["string"]
+					} else {
+						nodeID = actualSource["node_id"]
+					}
+					require.NotNil(t, nodeID)
+
+					sourceNodeLocality := fmt.Sprintf(`region=%s`, testServerRegion)
+
+					var assertion string
+					if testCase.format == "avro" {
+						assertion = fmt.Sprintf(
+							`{
+								"source": {
+									"cluster_id": {"string": "%s"},
+									"cluster_name": {"string": "%s"},
+									"db_version": {"string": "%s"},
+									"job_id": {"string": "%d"},
+									"node_id": {"string": "%s"},
+									"node_name": {"string": "%s"},
+									"source_node_locality": {"string": "%s"}
+								}
+							}`,
+							clusterID, clusterName, dbVersion, jobID, nodeID, nodeName, sourceNodeLocality)
+					} else {
+						assertion = fmt.Sprintf(
+							`{
+								"cluster_id": "%s",
+								"cluster_name": "%s",
+								"db_version": "%s",
+								"job_id": "%d",
+								"node_id": "%s",
+								"node_name": "%s",
+								"source_node_locality": "%s"
+							}`,
+							clusterID, clusterName, dbVersion, jobID, nodeID, nodeName, sourceNodeLocality)
+					}
+
+					value, err := reformatJSON(actualSource)
+					require.NoError(t, err)
+					require.JSONEq(t, assertion, string(value))
+				}
+
+				assertPayloadsEnriched(t, testFeed, []string{testCase.expectedMessage}, sourceAssertion)
+			}
+
+			for _, sink := range testCase.supportedSinks {
+				testLocality := roachpb.Locality{
+					Tiers: []roachpb.Tier{{
+						Key:   "region",
+						Value: testServerRegion,
+					}}}
+				cdcTest(t, testFn, feedTestForceSink(sink), feedTestUseClusterName(clusterName),
+					feedTestUseLocality(testLocality))
+			}
+		})
+	}
 }
 
 func TestChangefeedExpressionUsesSerializedSessionData(t *testing.T) {
@@ -5361,7 +5585,7 @@ func TestChangefeedDataTTL(t *testing.T) {
 						B int
 					}
 				}
-				err = json.Unmarshal(msg.Value, &decodedMessage)
+				err = gojson.Unmarshal(msg.Value, &decodedMessage)
 				require.NoError(t, err)
 				delete(upsertedValues, decodedMessage.After.B)
 				if len(upsertedValues) == 0 {
@@ -9254,7 +9478,7 @@ func TestChangefeedTestTimesOut(t *testing.T) {
 					nada, expectTimeout,
 					func(ctx context.Context) error {
 						return assertPayloadsBaseErr(
-							ctx, nada, []string{`nada: [2]->{"after": {}}`}, false, false, changefeedbase.OptEnvelopeWrapped)
+							ctx, nada, []string{`nada: [2]->{"after": {}}`}, false, false, nil, changefeedbase.OptEnvelopeWrapped)
 					})
 				return nil
 			}, 20*expectTimeout))
@@ -10064,7 +10288,7 @@ func (s *changefeedLogSpy) Intercept(entry []byte) {
 	s.Lock()
 	defer s.Unlock()
 	var j map[string]any
-	if err := json.Unmarshal(entry, &j); err != nil {
+	if err := gojson.Unmarshal(entry, &j); err != nil {
 		panic(err)
 	}
 	if !strings.Contains(j["file"].(string), "ccl/changefeedccl/") {

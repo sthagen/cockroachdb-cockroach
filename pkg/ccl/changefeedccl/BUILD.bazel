@@ -56,6 +56,7 @@ go_library(
         "//pkg/ccl/changefeedccl/changefeedvalidators",
         "//pkg/ccl/changefeedccl/checkpoint",
         "//pkg/ccl/changefeedccl/kafkaauth",
+        "//pkg/ccl/changefeedccl/kcjsonschema",
         "//pkg/ccl/changefeedccl/kvevent",
         "//pkg/ccl/changefeedccl/kvfeed",
         "//pkg/ccl/changefeedccl/resolvedspan",
@@ -226,6 +227,7 @@ go_test(
     deps = [
         "//pkg/base",
         "//pkg/blobs",
+        "//pkg/build",
         "//pkg/ccl",
         "//pkg/ccl/changefeedccl/cdceval",
         "//pkg/ccl/changefeedccl/cdcevent",

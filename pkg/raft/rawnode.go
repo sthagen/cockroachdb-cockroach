@@ -206,7 +206,7 @@ func (rn *RawNode) LogSnapshot() LogSnapshot {
 //   - the first slice index matches the Next index to send to this peer
 //
 // Returns false if the message can not be sent.
-func (rn *RawNode) SendMsgApp(to pb.PeerID, slice LogSlice) (pb.Message, bool) {
+func (rn *RawNode) SendMsgApp(to pb.PeerID, slice LeadSlice) (pb.Message, bool) {
 	return rn.raft.maybePrepareMsgApp(to, slice)
 }
 
@@ -598,6 +598,12 @@ func (rn *RawNode) BasicStatus() BasicStatus {
 // Progress.Inflights, which are expensive to copy.
 func (rn *RawNode) SparseStatus() SparseStatus {
 	return getSparseStatus(rn.raft)
+}
+
+// ReplicaProgress returns the progress for the replica with the given ID.
+// It returns nil if the replica is not being tracked.
+func (rn *RawNode) ReplicaProgress(id pb.PeerID) *tracker.Progress {
+	return getReplicaProgress(rn.raft, id)
 }
 
 // SupportingFortifiedLeader indicates if this peer supports a fortified leader.

@@ -232,6 +232,8 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			dropCascadeDescriptor(next, t.TypeID)
 		case *scpb.FunctionBody:
 			dropCascadeDescriptor(next, t.FunctionID)
+		case *scpb.TriggerFunctionCall:
+			dropCascadeDescriptor(next, t.FuncID)
 		case *scpb.TriggerDeps:
 			dropCascadeDescriptor(next, t.TableID)
 		case *scpb.PolicyDeps:
@@ -1867,4 +1869,16 @@ func failIfSafeUpdates(b BuildCtx, n tree.NodeFormatter) {
 			),
 		)
 	}
+}
+
+func hasSubzonesForIndex(b BuildCtx, tableID descpb.ID, indexID catid.IndexID) bool {
+	numIdxSubzones := b.QueryByID(tableID).FilterIndexZoneConfig().
+		Filter(func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.IndexZoneConfig) bool {
+			return e.IndexID == indexID
+		}).Size()
+	numPartSubzones := b.QueryByID(tableID).FilterPartitionZoneConfig().
+		Filter(func(_ scpb.Status, _ scpb.TargetStatus, e *scpb.PartitionZoneConfig) bool {
+			return e.IndexID == indexID
+		}).Size()
+	return numIdxSubzones > 0 || numPartSubzones > 0
 }

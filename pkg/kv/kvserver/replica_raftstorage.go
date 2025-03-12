@@ -194,24 +194,14 @@ func (r *Replica) GetSnapshot(
 	// Get a snapshot while holding raftMu to make sure we're not seeing "half
 	// an AddSSTable" (i.e. a state in which an SSTable has been linked in, but
 	// the corresponding Raft command not applied yet).
-	var snap storage.Reader
 	r.raftMu.Lock()
 	startKey := r.shMu.state.Desc.StartKey
-	if r.store.cfg.SharedStorageEnabled || storage.ShouldUseEFOS(&r.ClusterSettings().SV) {
-		var ss *spanset.SpanSet
-		spans := rditer.MakeAllKeySpans(r.shMu.state.Desc) // needs unreplicated to access Raft state
-		if util.RaceEnabled {
-			ss = rditer.MakeAllKeySpanSet(r.shMu.state.Desc)
-			defer ss.Release()
-		}
-		efos := r.store.TODOEngine().NewEventuallyFileOnlySnapshot(spans)
-		if util.RaceEnabled {
-			snap = spanset.NewEventuallyFileOnlySnapshot(efos, ss)
-		} else {
-			snap = efos
-		}
-	} else {
-		snap = r.store.TODOEngine().NewSnapshot()
+	spans := rditer.MakeAllKeySpans(r.shMu.state.Desc) // needs unreplicated to access Raft state
+	snap := r.store.TODOEngine().NewSnapshot(spans...)
+	if util.RaceEnabled {
+		ss := rditer.MakeAllKeySpanSet(r.shMu.state.Desc)
+		defer ss.Release()
+		snap = spanset.NewReader(snap, ss, hlc.Timestamp{})
 	}
 	r.raftMu.Unlock()
 
@@ -296,7 +286,6 @@ type IncomingSnapshot struct {
 	msgAppRespCh                chan raftpb.Message // receives MsgAppResp if/when snap is applied
 	sharedSSTs                  []pebble.SharedSSTMeta
 	externalSSTs                []pebble.ExternalFile
-	doExcise                    bool
 	includesRangeDelForLastSpan bool
 	// clearedSpans represents the key spans in the existing store that will be
 	// cleared by doing the Ingest*. This is tracked so that we can convert the
@@ -510,9 +499,7 @@ func (r *Replica) applySnapshot(
 		if len(inSnap.sharedSSTs) > 0 {
 			logDetails.Printf(" shared=%d sharedSize=%s", len(inSnap.sharedSSTs), humanizeutil.IBytes(inSnap.SharedSize))
 		}
-		if inSnap.doExcise {
-			logDetails.Printf(" excise=true")
-		}
+		logDetails.Printf(" excise=true")
 		logDetails.Printf(" ingestion=%d@%0.0fms", len(inSnap.SSTStorageScratch.SSTs()),
 			stats.ingestion.Sub(stats.subsumedReplicas).Seconds()*1000)
 		var appliedAsWriteStr string
@@ -594,9 +581,6 @@ func (r *Replica) applySnapshot(
 	//
 	// https://github.com/cockroachdb/cockroach/issues/93251
 	if len(inSnap.externalSSTs) > 0 || len(inSnap.sharedSSTs) > 0 {
-		if !inSnap.doExcise {
-			return errors.AssertionFailedf("expected snapshot with remote files to have excise=true")
-		}
 		exciseSpan := desc.KeySpan().AsRawSpanWithNoLocals()
 		if ingestStats, err = r.store.TODOEngine().IngestAndExciseFiles(
 			ctx,
@@ -611,24 +595,17 @@ func (r *Replica) applySnapshot(
 		}
 	} else {
 		if inSnap.SSTSize > snapshotIngestAsWriteThreshold.Get(&r.ClusterSettings().SV) {
-			if inSnap.doExcise {
-				exciseSpan := desc.KeySpan().AsRawSpanWithNoLocals()
-				if ingestStats, err = r.store.TODOEngine().IngestAndExciseFiles(
-					ctx,
-					inSnap.SSTStorageScratch.SSTs(),
-					nil, /* sharedSSTs */
-					nil, /* externalSSTs */
-					exciseSpan,
-					inSnap.includesRangeDelForLastSpan,
-				); err != nil {
-					return errors.Wrapf(err, "while ingesting %s and excising %s-%s",
-						inSnap.SSTStorageScratch.SSTs(), exciseSpan.Key, exciseSpan.EndKey)
-				}
-			} else {
-				if ingestStats, err =
-					r.store.TODOEngine().IngestLocalFilesWithStats(ctx, inSnap.SSTStorageScratch.SSTs()); err != nil {
-					return errors.Wrapf(err, "while ingesting %s", inSnap.SSTStorageScratch.SSTs())
-				}
+			exciseSpan := desc.KeySpan().AsRawSpanWithNoLocals()
+			if ingestStats, err = r.store.TODOEngine().IngestAndExciseFiles(
+				ctx,
+				inSnap.SSTStorageScratch.SSTs(),
+				nil, /* sharedSSTs */
+				nil, /* externalSSTs */
+				exciseSpan,
+				inSnap.includesRangeDelForLastSpan,
+			); err != nil {
+				return errors.Wrapf(err, "while ingesting %s and excising %s-%s",
+					inSnap.SSTStorageScratch.SSTs(), exciseSpan.Key, exciseSpan.EndKey)
 			}
 		} else {
 			appliedAsWrite = true

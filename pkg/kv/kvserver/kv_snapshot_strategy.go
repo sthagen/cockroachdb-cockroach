@@ -100,7 +100,6 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 	// TODO(jeffreyxiao): Re-evaluate as the default range size grows.
 	keyRanges := rditer.MakeReplicatedKeySpans(header.State.Desc)
 
-	doExcise := header.SharedReplicate || header.ExternalReplicate || storage.UseExciseForSnapshots.Get(&s.ClusterSettings().SV)
 	if header.SharedReplicate && !s.cfg.SharedStorageEnabled {
 		return noSnap, sendSnapshotError(ctx, s, stream, errors.New("cannot accept shared sstables"))
 	}
@@ -112,15 +111,41 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 	// opaque slice of keyRanges, we just tell it to add a rangedel for the last
 	// span. To avoid bugs, assert on the last span in keyRanges actually being
 	// equal to the user key span.
-	if doExcise {
-		if !keyRanges[len(keyRanges)-1].Equal(header.State.Desc.KeySpan().AsRawSpanWithNoLocals()) {
-			return noSnap, errors.AssertionFailedf("last span in multiSSTWriter did not equal the user key span: %s", keyRanges[len(keyRanges)-1].String())
-		}
+	if !keyRanges[len(keyRanges)-1].Equal(header.State.Desc.KeySpan().AsRawSpanWithNoLocals()) {
+		return noSnap, errors.AssertionFailedf("last span in multiSSTWriter did not equal the user key span: %s", keyRanges[len(keyRanges)-1].String())
 	}
 
 	// TODO(aaditya): Remove once we support flushableIngests for shared and
 	// external files in the engine.
-	skipClearForMVCCSpan := doExcise && (header.SharedReplicate || header.ExternalReplicate)
+
+	// TODO(tbg): skipClearForMVCCSpan should equal true (since we always excise
+	// the MVCC span), but there appear to be bugs in this code as demonstrated by
+	// TestRaftSnapshotsWithMVCCRangeKeysEverywhere failing with the proposed
+	// change:
+	//
+	// * panic: failed to put range key in sst: pebble: spans must be added in order: /Local/RangeID/75/r":a"/0,0 > /Local/RangeID/75/r""/0,0
+	// ^- we added the ":a" key first, now we're trying to add the r"" key.
+	//
+	// My basic understanding of this failure mode is:
+	// - first, a range del covering the range-local replicated key span `/Range/75/{r-s}` is added in (msstw.initSST)
+	// - the fragmenter's start key is now `/Range/75/r`.
+	// - when the `/Range/75/r/{:a-:z}` rangedel, is handled, it enters through `msstw.PutRangeKey`
+	//    - since  `skipClearForMVCCSpan` is set, this does not update the fragmenter.
+	//    - the range deletion is added to the current SST.
+	// - when the first key >= `/Range/75/r` is added, `msstw.finalizeSST` flushes
+	//   the fragmenter to the current SST.
+	// - we hit the above error, since the SST already contains the rangedel
+	//   starting at `/Range/75/r:a` and we're not attempting to add a rangedel
+	//   `/Range/75/r` with smaller start key.
+	//
+	// The crucial problem is skipping the fragmenter. This seems to have to do with
+	// wanting to allow callers to use `skipClearForMVCCSpan`, but this is going to
+	// be dead code.
+	//
+	// Another note: CI passes when this is unconditionally set to `false`,
+	// indicating that we have poor coverage of the shared and external code paths.
+	skipClearForMVCCSpan := header.SharedReplicate || header.ExternalReplicate
+
 	// The last key range is the user key span.
 	localRanges := keyRanges[:len(keyRanges)-1]
 	mvccRange := keyRanges[len(keyRanges)-1]
@@ -158,12 +183,8 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			return noSnap, sendSnapshotError(snapshotCtx, s, stream, err)
 		}
 		if req.TransitionFromSharedToRegularReplicate {
-			doExcise = false
 			sharedSSTs = nil
 			externalSSTs = nil
-			if err := msstw.addClearForMVCCSpan(); err != nil {
-				return noSnap, errors.Wrap(err, "adding tombstone for last span")
-			}
 		}
 
 		if req.KVBatch != nil {
@@ -197,69 +218,9 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 						return noSnap, errors.Wrap(err, "verifying value checksum")
 					}
 				}
-				switch batchReader.KeyKind() {
-				case pebble.InternalKeyKindSet, pebble.InternalKeyKindSetWithDelete:
-					if err := msstw.Put(ctx, ek, batchReader.Value()); err != nil {
-						return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
-					}
-				case pebble.InternalKeyKindDelete, pebble.InternalKeyKindDeleteSized:
-					if !doExcise {
-						return noSnap, errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
-					}
-					if err := msstw.PutInternalPointKey(ctx, batchReader.Key(), batchReader.KeyKind(), nil); err != nil {
-						return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
-					}
-				case pebble.InternalKeyKindRangeDelete:
-					if !doExcise {
-						return noSnap, errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
-					}
-					start := batchReader.Key()
-					end, err := batchReader.EndKey()
-					if err != nil {
-						return noSnap, err
-					}
-					if err := msstw.PutInternalRangeDelete(ctx, start, end); err != nil {
-						return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
-					}
 
-				case pebble.InternalKeyKindRangeKeyUnset, pebble.InternalKeyKindRangeKeyDelete:
-					if !doExcise {
-						return noSnap, errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
-					}
-					start := batchReader.Key()
-					end, err := batchReader.EndKey()
-					if err != nil {
-						return noSnap, err
-					}
-					rangeKeys, err := batchReader.RawRangeKeys()
-					if err != nil {
-						return noSnap, err
-					}
-					for _, rkv := range rangeKeys {
-						err := msstw.PutInternalRangeKey(ctx, start, end, rkv)
-						if err != nil {
-							return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
-						}
-					}
-				case pebble.InternalKeyKindRangeKeySet:
-					start := ek
-					end, err := batchReader.EngineEndKey()
-					if err != nil {
-						return noSnap, err
-					}
-					rangeKeys, err := batchReader.EngineRangeKeys()
-					if err != nil {
-						return noSnap, err
-					}
-					for _, rkv := range rangeKeys {
-						err := msstw.PutRangeKey(ctx, start.Key, end.Key, rkv.Version, rkv.Value)
-						if err != nil {
-							return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
-						}
-					}
-
-				default:
-					return noSnap, errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
+				if err := kvSS.readOneToBatch(ctx, ek, header.SharedReplicate, batchReader, msstw); err != nil {
+					return noSnap, err
 				}
 			}
 			if batchReader.Error() != nil {
@@ -267,42 +228,39 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			}
 			timingTag.stop("sst")
 		}
-		if len(req.SharedTables) > 0 && doExcise {
-			for i := range req.SharedTables {
-				sst := req.SharedTables[i]
-				pbToInternalKey := func(k *kvserverpb.SnapshotRequest_SharedTable_InternalKey) pebble.InternalKey {
-					return pebble.InternalKey{UserKey: k.UserKey, Trailer: pebble.InternalKeyTrailer(k.Trailer)}
-				}
-				sharedSSTs = append(sharedSSTs, pebble.SharedSSTMeta{
-					Backing:          stubBackingHandle{sst.Backing},
-					Smallest:         pbToInternalKey(sst.Smallest),
-					Largest:          pbToInternalKey(sst.Largest),
-					SmallestRangeKey: pbToInternalKey(sst.SmallestRangeKey),
-					LargestRangeKey:  pbToInternalKey(sst.LargestRangeKey),
-					SmallestPointKey: pbToInternalKey(sst.SmallestPointKey),
-					LargestPointKey:  pbToInternalKey(sst.LargestPointKey),
-					Level:            uint8(sst.Level),
-					Size:             sst.Size_,
-				})
+
+		for i := range req.SharedTables {
+			sst := req.SharedTables[i]
+			pbToInternalKey := func(k *kvserverpb.SnapshotRequest_SharedTable_InternalKey) pebble.InternalKey {
+				return pebble.InternalKey{UserKey: k.UserKey, Trailer: pebble.InternalKeyTrailer(k.Trailer)}
 			}
+			sharedSSTs = append(sharedSSTs, pebble.SharedSSTMeta{
+				Backing:          stubBackingHandle{sst.Backing},
+				Smallest:         pbToInternalKey(sst.Smallest),
+				Largest:          pbToInternalKey(sst.Largest),
+				SmallestRangeKey: pbToInternalKey(sst.SmallestRangeKey),
+				LargestRangeKey:  pbToInternalKey(sst.LargestRangeKey),
+				SmallestPointKey: pbToInternalKey(sst.SmallestPointKey),
+				LargestPointKey:  pbToInternalKey(sst.LargestPointKey),
+				Level:            uint8(sst.Level),
+				Size:             sst.Size_,
+			})
 		}
-		if len(req.ExternalTables) > 0 && doExcise {
-			for i := range req.ExternalTables {
-				sst := req.ExternalTables[i]
-				externalSSTs = append(externalSSTs, pebble.ExternalFile{
-					Locator:           remote.Locator(sst.Locator),
-					ObjName:           sst.ObjectName,
-					StartKey:          sst.StartKey,
-					EndKey:            sst.EndKey,
-					EndKeyIsInclusive: sst.EndKeyIsInclusive,
-					HasPointKey:       sst.HasPointKey,
-					HasRangeKey:       sst.HasRangeKey,
-					SyntheticPrefix:   sst.SyntheticPrefix,
-					SyntheticSuffix:   sst.SyntheticSuffix,
-					Level:             uint8(sst.Level),
-					Size:              sst.Size_,
-				})
-			}
+		for i := range req.ExternalTables {
+			sst := req.ExternalTables[i]
+			externalSSTs = append(externalSSTs, pebble.ExternalFile{
+				Locator:           remote.Locator(sst.Locator),
+				ObjName:           sst.ObjectName,
+				StartKey:          sst.StartKey,
+				EndKey:            sst.EndKey,
+				EndKeyIsInclusive: sst.EndKeyIsInclusive,
+				HasPointKey:       sst.HasPointKey,
+				HasRangeKey:       sst.HasRangeKey,
+				SyntheticPrefix:   sst.SyntheticPrefix,
+				SyntheticSuffix:   sst.SyntheticSuffix,
+				Level:             uint8(sst.Level),
+				Size:              sst.Size_,
+			})
 		}
 		if req.Final {
 			// We finished receiving all batches and log entries. It's possible that
@@ -347,7 +305,6 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 				msgAppRespCh:                make(chan raftpb.Message, 1),
 				sharedSSTs:                  sharedSSTs,
 				externalSSTs:                externalSSTs,
-				doExcise:                    doExcise,
 				includesRangeDelForLastSpan: !skipClearForMVCCSpan,
 				clearedSpans:                keyRanges,
 			}
@@ -358,6 +315,79 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			return inSnap, nil
 		}
 	}
+}
+
+func (kvSS *kvBatchSnapshotStrategy) readOneToBatch(
+	ctx context.Context,
+	ek storage.EngineKey,
+	shared bool, // may receive shared SSTs
+	batchReader *storage.BatchReader,
+	msstw *multiSSTWriter,
+) error {
+	switch batchReader.KeyKind() {
+	case pebble.InternalKeyKindSet, pebble.InternalKeyKindSetWithDelete:
+		if err := msstw.Put(ctx, ek, batchReader.Value()); err != nil {
+			return errors.Wrapf(err, "writing sst for raft snapshot")
+		}
+	case pebble.InternalKeyKindDelete, pebble.InternalKeyKindDeleteSized:
+		if !shared {
+			return errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
+		}
+		if err := msstw.PutInternalPointKey(ctx, batchReader.Key(), batchReader.KeyKind(), nil); err != nil {
+			return errors.Wrapf(err, "writing sst for raft snapshot")
+		}
+	case pebble.InternalKeyKindRangeDelete:
+		if !shared {
+			return errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
+		}
+		start := batchReader.Key()
+		end, err := batchReader.EndKey()
+		if err != nil {
+			return err
+		}
+		if err := msstw.PutInternalRangeDelete(ctx, start, end); err != nil {
+			return errors.Wrapf(err, "writing sst for raft snapshot")
+		}
+
+	case pebble.InternalKeyKindRangeKeyUnset, pebble.InternalKeyKindRangeKeyDelete:
+		if !shared {
+			return errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
+		}
+		start := batchReader.Key()
+		end, err := batchReader.EndKey()
+		if err != nil {
+			return err
+		}
+		rangeKeys, err := batchReader.RawRangeKeys()
+		if err != nil {
+			return err
+		}
+		for _, rkv := range rangeKeys {
+			err := msstw.PutInternalRangeKey(ctx, start, end, rkv)
+			if err != nil {
+				return errors.Wrapf(err, "writing sst for raft snapshot")
+			}
+		}
+	case pebble.InternalKeyKindRangeKeySet:
+		start := ek
+		end, err := batchReader.EngineEndKey()
+		if err != nil {
+			return err
+		}
+		rangeKeys, err := batchReader.EngineRangeKeys()
+		if err != nil {
+			return err
+		}
+		for _, rkv := range rangeKeys {
+			err := msstw.PutRangeKey(ctx, start.Key, end.Key, rkv.Version, rkv.Value)
+			if err != nil {
+				return errors.Wrapf(err, "writing sst for raft snapshot")
+			}
+		}
+	default:
+		return errors.AssertionFailedf("unexpected batch entry key kind %d", batchReader.KeyKind())
+	}
+	return nil
 }
 
 // Send implements the snapshotStrategy interface.
@@ -545,6 +575,7 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 				return nil
 			}
 		}
+		kvsBefore := kvs
 		err := rditer.IterateReplicaKeySpansShared(ctx, snap.State.Desc, kvSS.st, kvSS.clusterID, snap.EngineSnap, func(key *pebble.InternalKey, value pebble.LazyValue, _ pebble.IteratorLevel) error {
 			kvs++
 			if b == nil {
@@ -590,6 +621,23 @@ func (kvSS *kvBatchSnapshotStrategy) Send(
 			return maybeFlushBatch()
 		}, sharedVisitor, externalVisitor)
 		if err != nil && errors.Is(err, pebble.ErrInvalidSkipSharedIteration) {
+			// IterateReplicaKeySpansShared will return ErrInvalidSkipSharedIteration
+			// before visiting user keys. This is a subtle contract.
+			// See also:
+			//
+			// https://cockroachlabs.slack.com/archives/CAC6K3SLU/p1741360036808799?thread_ts=1741356670.269679&cid=CAC6K3S
+			if kvsBefore != kvs {
+				return 0, errors.AssertionFailedf(
+					"unable to transition from shared to regular replicate: %d user keys were already sent",
+					kvs-kvsBefore,
+				)
+			}
+			// TODO(tbg): the shared and external visitors never flush, so at this
+			// point the receiver hasn't gotten any shared/external SST references
+			// sent to it. This implies that an explicit transition is unnecessary
+			// and we can remove this.
+			//
+			// See: https://github.com/cockroachdb/cockroach/issues/142673
 			transitionFromSharedToRegularReplicate = true
 			err = rditer.IterateReplicaKeySpans(ctx, snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */
 				rditer.ReplicatedSpansUserOnly, iterateRKSpansVisitor)

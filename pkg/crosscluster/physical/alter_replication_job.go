@@ -110,10 +110,6 @@ func (r *resolvedTenantReplicationOptions) GetExpirationWindow() (time.Duration,
 	return *r.expirationWindow, true
 }
 
-func (r *resolvedTenantReplicationOptions) DestinationOptionsSet() bool {
-	return r != nil && (r.retention != nil || r.resumeTimestamp.IsSet())
-}
-
 func (r *resolvedTenantReplicationOptions) ReaderTenantEnabled() bool {
 	if r == nil || !r.enableReaderTenant {
 		return false
@@ -226,6 +222,10 @@ func alterReplicationJobHook(
 		if err != nil {
 			return err
 		}
+		jobRegistry := p.ExecCfg().JobRegistry
+		if alterTenantStmt.Producer {
+			return alterTenantSetReplicationSource(ctx, p.InternalSQLTxn(), jobRegistry, options, tenInfo)
+		}
 
 		// If a source uri is being provided, we're enabling replication into an
 		// existing virtual cluster. It must be inactive, and we'll verify that it
@@ -244,7 +244,7 @@ func alterReplicationJobHook(
 				options,
 			)
 		}
-		jobRegistry := p.ExecCfg().JobRegistry
+
 		if !alterTenantStmt.Options.IsDefault() {
 			// If the statement contains options, then the user provided the ALTER
 			// TENANT ... SET REPLICATION [options] form of the command.
@@ -284,6 +284,21 @@ func alterReplicationJobHook(
 	return fn, nil, false, nil
 }
 
+func alterTenantSetReplicationSource(
+	ctx context.Context,
+	txn isql.Txn,
+	jobRegistry *jobs.Registry,
+	options *resolvedTenantReplicationOptions,
+	tenInfo *mtinfopb.TenantInfo,
+) error {
+	if expirationWindow, ok := options.GetExpirationWindow(); ok {
+		if err := alterTenantExpirationWindow(ctx, txn, jobRegistry, expirationWindow, tenInfo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func alterTenantSetReplication(
 	ctx context.Context,
 	txn isql.Txn,
@@ -291,19 +306,11 @@ func alterTenantSetReplication(
 	options *resolvedTenantReplicationOptions,
 	tenInfo *mtinfopb.TenantInfo,
 ) error {
-
-	if expirationWindow, ok := options.GetExpirationWindow(); ok {
-		if err := alterTenantExpirationWindow(ctx, txn, jobRegistry, expirationWindow, tenInfo); err != nil {
-			return err
-		}
+	if err := checkForActiveIngestionJob(tenInfo); err != nil {
+		return err
 	}
-	if options.DestinationOptionsSet() {
-		if err := checkForActiveIngestionJob(tenInfo); err != nil {
-			return err
-		}
-		if err := alterTenantConsumerOptions(ctx, txn, jobRegistry, options, tenInfo); err != nil {
-			return err
-		}
+	if err := alterTenantConsumerOptions(ctx, txn, jobRegistry, options, tenInfo); err != nil {
+		return err
 	}
 	return nil
 }
@@ -350,10 +357,6 @@ func alterTenantRestartReplication(
 			dstTenantID,
 			tenInfo.DataState,
 		)
-	}
-
-	if alterTenantStmt.Options.ExpirationWindowSet() {
-		return CannotSetExpirationWindowErr
 	}
 
 	configUri, err := streamclient.ParseConfigUri(srcUri)
@@ -491,14 +494,6 @@ func pickReplicationResume(
 func checkReplicationStartTime(
 	ctx context.Context, p sql.PlanHookState, tenInfo *mtinfopb.TenantInfo, ts hlc.Timestamp,
 ) error {
-	// TODO(az): remove the conditional once we figure out how to validate PTS on the
-	// source cluster when it has no producer jobs.
-	// When starting a replication job for a tenant with BACKUP and RESTORE instead
-	// of an initial scan, the source will not have producer jobs associated with
-	// the tenant, thus no PTS to validate.
-	if tenInfo.PreviousSourceTenant != nil && tenInfo.PreviousSourceTenant.CutoverTimestamp.Equal(ts) {
-		return nil
-	}
 
 	pts := p.ExecCfg().ProtectedTimestampProvider.WithTxn(p.InternalSQLTxn())
 

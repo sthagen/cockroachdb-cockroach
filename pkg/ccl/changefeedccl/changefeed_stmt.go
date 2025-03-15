@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
@@ -329,6 +330,14 @@ func changefeedPlanHook(
 		err := rowFn(ctx, resultsCh)
 		if err != nil {
 			logChangefeedFailedTelemetryDuringStartup(ctx, description, failureTypeForStartupError(err))
+			var e *kvpb.BatchTimestampBeforeGCError
+			if errors.As(err, &e) && opts.HasStartCursor() {
+				err = errors.Wrapf(err,
+					"could not create changefeed: cursor %s is older than the GC threshold %d",
+					opts.GetCursor(), e.Threshold.WallTime)
+				err = errors.WithHint(err,
+					"use a more recent cursor")
+			}
 		}
 		return err
 	}
@@ -604,7 +613,10 @@ func createChangefeedJobRecord(
 	if err != nil {
 		return nil, err
 	}
-	sourceProvider := newEnrichedSourceProvider(encodingOpts, enrichedSourceData{})
+	sourceProvider, err := newEnrichedSourceProvider(encodingOpts, enrichedSourceData{})
+	if err != nil {
+		return nil, err
+	}
 	if _, err := getEncoder(ctx, encodingOpts, AllTargets(details), details.Select != "",
 		makeExternalConnectionProvider(ctx, p.ExecCfg().InternalDB), nil, sourceProvider); err != nil {
 		return nil, err

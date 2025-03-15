@@ -799,14 +799,13 @@ func (ca *changeAggregator) computeTrailingMetadata(meta *execinfrapb.Changefeed
 	}
 
 	// Build out the list of frontier spans.
-	ca.frontier.Entries(func(r roachpb.Span, ts hlc.Timestamp) (done span.OpResult) {
+	for sp, ts := range ca.frontier.Entries() {
 		meta.Checkpoint = append(meta.Checkpoint,
 			execinfrapb.ChangefeedMeta_FrontierSpan{
-				Span:      r,
+				Span:      sp,
 				Timestamp: ts,
 			})
-		return span.ContinueMatch
-	})
+	}
 }
 
 // tick is the workhorse behind Next(). It retrieves the next event from
@@ -1258,7 +1257,10 @@ func newChangeFrontierProcessor(
 
 	// This changeFrontier's encoder will only be used for resolved events which
 	// never have a source field, so we pass an empty enriched source provider.
-	sourceProvider := newEnrichedSourceProvider(encodingOpts, enrichedSourceData{})
+	sourceProvider, err := newEnrichedSourceProvider(encodingOpts, enrichedSourceData{})
+	if err != nil {
+		return nil, err
+	}
 	if cf.encoder, err = getEncoder(
 		ctx, encodingOpts, AllTargets(spec.Feed), spec.Feed.Select != "",
 		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMetrics,
@@ -1937,17 +1939,12 @@ func frontierIsBehind(frontier hlc.Timestamp, sv *settings.Values) bool {
 	return timeutil.Since(frontier.GoTime()) > slownessThreshold(sv)
 }
 
-type behindSpanFrontier interface {
-	Frontier() hlc.Timestamp
-	PeekFrontierSpan() roachpb.Span
-}
-
 // Potentially log the most behind span in the frontier for debugging if the
 // frontier is behind
 func maybeLogBehindSpan(
 	ctx context.Context,
 	description string,
-	frontier behindSpanFrontier,
+	frontier span.Frontier,
 	frontierChanged bool,
 	sv *settings.Values,
 ) {

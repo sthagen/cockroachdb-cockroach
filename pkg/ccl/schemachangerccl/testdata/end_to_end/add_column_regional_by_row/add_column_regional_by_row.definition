@@ -18,6 +18,11 @@ USE multiregion_db;
 SELECT crdb_internal.validate_multi_region_zone_configs()
 ----
 
+stage-exec phase=PostCommitNonRevertiblePhase stage=:
+USE multiregion_db;
+SELECT crdb_internal.validate_multi_region_zone_configs()
+----
+
 test
 ALTER TABLE multiregion_db.public.table_regional_by_row ADD COLUMN w TEXT NOT NULL DEFAULT 's';
 ----

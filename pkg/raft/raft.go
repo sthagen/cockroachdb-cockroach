@@ -2258,11 +2258,11 @@ func stepCandidate(r *raft, m pb.Message) error {
 
 func stepFollower(r *raft, m pb.Message) error {
 	if IsMsgFromLeader(m.Type) {
-		r.setLead(m.From)
 		if m.Type != pb.MsgDeFortifyLeader {
 			// If we receive any message from the leader except a MsgDeFortifyLeader,
 			// we know that the leader is still alive and still acting as the leader,
 			// so reset the election timer.
+			r.setLead(m.From)
 			r.electionElapsed = 0
 		}
 	}
@@ -2356,7 +2356,7 @@ func (r *raft) checkQuorumActive() {
 		r.logger.Debugf("%x does not have store liveness support from a quorum of peers", r.id)
 	}
 	if !quorumActiveByHeartbeats && !quorumActiveByFortification {
-		r.logger.Warningf("%x stepped down to follower since quorum is not active", r.id)
+		r.logger.Infof("%x stepped down to follower since quorum is not active", r.id)
 		r.becomeFollower(r.Term, None)
 	}
 	// Mark everyone (but ourselves) as inactive in preparation for the next

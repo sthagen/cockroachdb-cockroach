@@ -219,6 +219,10 @@ message GetRequest {
   // This option is not compatible for reads over inline values (see
   // https://github.com/cockroachdb/cockroach/issues/131667)
   bool return_raw_mvcc_values = 4 [(gogoproto.customname) = "ReturnRawMVCCValues"];
+
+  // LockNonExisting indicates whether the Get request should acquire a lock
+  // on keys that don't exist.
+  bool lock_non_existing = 5;
 }
 
 // A GetResponse is the return value from the Get() method.
@@ -368,13 +372,7 @@ message ConditionalPutRequest {
   // Used by logical data replication.
   util.hlc.Timestamp origin_timestamp = 8 [(gogoproto.nullable) = false];
 
-  // ShouldWinOriginTimestampTie, if true, indicates that if the "comparison
-  // timestamp" (see comment on OriginTimestamp) and OriginTimestamp are equal,
-  // then the ConditionalPut should succeed (assuming the expected and actual
-  // bytes also match).
-  //
-  // This must only be used in conjunction with OriginTimestamp.
-  bool should_win_origin_timestamp_tie = 9;
+  reserved 9;
 }
 
 // A ConditionalPutResponse is the return value from the

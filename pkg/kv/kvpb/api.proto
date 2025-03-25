@@ -408,7 +408,11 @@ message DeleteRequest {
   RequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // MustAcquireExclusiveLock, if set, indicates that a lock with the strength
   // no lower than "exclusive" needs to be acquired on the key, even if it
-  // doesn't exist.
+  // doesn't exist. Note that when MustAcquireExclusiveLock is false, the
+  // FoundKey field in the DeleteResponse may be incorrect when the kvclient has
+  // been configured to buffer writes.
+  //
+  // TODO(ssd): Separate the behaviour of FoundKey to not depend on this flag.
   bool must_acquire_exclusive_lock = 2;
 }
 
@@ -3737,6 +3741,9 @@ message ContentionEvent {
   // Duration spent contending against the other transaction.
   google.protobuf.Duration duration = 3 [(gogoproto.nullable) = false,
                                          (gogoproto.stdduration) = true];
+  // IsLatch, if true, indicates that the contention event was due to waiting to
+  // acquire a latch.
+  bool is_latch = 4;
 }
 
 // ScanStats is a message that tracks miscellaneous statistics of all Gets,

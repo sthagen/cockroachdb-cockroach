@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -92,11 +94,12 @@ type keyBatch struct {
 // IndexBackfillMerger is a processor that merges entries from the corresponding
 // temporary index to a new index.
 type IndexBackfillMerger struct {
-	processorID    int32
-	spec           execinfrapb.IndexBackfillMergerSpec
-	desc           catalog.TableDescriptor
-	flowCtx        *execinfra.FlowCtx
-	muBoundAccount muBoundAccount
+	processorID         int32
+	spec                execinfrapb.IndexBackfillMergerSpec
+	desc                catalog.TableDescriptor
+	skipNewerTimestamps bool
+	flowCtx             *execinfra.FlowCtx
+	muBoundAccount      muBoundAccount
 }
 
 // OutputTypes is always nil.
@@ -115,11 +118,16 @@ const indexBackfillMergeProgressReportInterval = 10 * time.Second
 func (ibm *IndexBackfillMerger) Run(ctx context.Context, output execinfra.RowReceiver) {
 	opName := "IndexBackfillMerger"
 	ctx = logtags.AddTag(ctx, opName, int(ibm.spec.Table.ID))
+	// Starting 25.2 we can skip newer timestamps in the temporary index because
+	// of new logic to always write values to the newly created index during
+	// the merge process.
+	ibm.skipNewerTimestamps = ibm.flowCtx.Cfg.Settings.Version.IsActive(ctx, clusterversion.V25_2)
 	ctx, span := execinfra.ProcessorSpan(ctx, ibm.flowCtx, opName, ibm.processorID)
 	defer span.Finish()
 	// This method blocks until all worker goroutines exit, so it's safe to
 	// close memory monitoring infra in defers.
-	mergerMon := execinfra.NewMonitor(ctx, ibm.flowCtx.Cfg.BackfillerMonitor, "index-backfiller-merger-mon")
+	mergerMon := execinfra.NewMonitor(ctx, ibm.flowCtx.Cfg.BackfillerMonitor,
+		mon.MakeName("index-backfiller-merger-mon"))
 	defer mergerMon.Stop(ctx)
 	ibm.muBoundAccount.boundAccount = mergerMon.MakeBoundAccount()
 	defer func() {
@@ -488,7 +496,8 @@ func (ibm *IndexBackfillMerger) constructMergeBatch(
 		}
 		// If the timestamp we are looking at is after the merge timestamp,
 		// then no work needs to be done for this row.
-		if !sourceKV.Value.Timestamp.LessEq(ibm.spec.MergeTimestamp) {
+		if ibm.skipNewerTimestamps &&
+			!sourceKV.Value.Timestamp.LessEq(ibm.spec.MergeTimestamp) {
 			batch.markKeyAsSkipped(sourceOffset)
 			keysToSkip++
 			continue

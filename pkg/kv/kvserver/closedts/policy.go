@@ -8,7 +8,7 @@ package closedts
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
@@ -16,9 +16,10 @@ const (
 	defaultMaxNetworkRTT = 150 * time.Millisecond
 )
 
-// computeLeadTimeForGlobalReads calculates how far ahead of the current time a node should
-// publish closed timestamps to ensure that followers can serve global reads. It accounts for
-// network latency, clock offset, and both Raft and side-transport propagation delays.
+// computeLeadTimeForGlobalReads calculates how far ahead of the current time a
+// node should publish closed timestamps to ensure that followers can serve
+// global reads. It accounts for network latency, clock offset, and both Raft
+// and side-transport propagation delays.
 func computeLeadTimeForGlobalReads(
 	networkRTT time.Duration, maxClockOffset time.Duration, sideTransportCloseInterval time.Duration,
 ) time.Duration {
@@ -104,14 +105,14 @@ func TargetForPolicy(
 	lagTargetDuration time.Duration,
 	leadTargetOverride time.Duration,
 	sideTransportCloseInterval time.Duration,
-	policy roachpb.RangeClosedTimestampPolicy,
+	policy ctpb.RangeClosedTimestampPolicy,
 ) hlc.Timestamp {
 	var targetOffsetTime time.Duration
 	switch policy {
-	case roachpb.LAG_BY_CLUSTER_SETTING:
+	case ctpb.LAG_BY_CLUSTER_SETTING:
 		// Simple calculation: lag now by desired duration.
 		targetOffsetTime = -lagTargetDuration
-	case roachpb.LEAD_FOR_GLOBAL_READS:
+	case ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO:
 		// Override entirely with cluster setting, if necessary.
 		if leadTargetOverride != 0 {
 			targetOffsetTime = leadTargetOverride

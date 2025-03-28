@@ -639,7 +639,7 @@ func (fw *fixupWorker) linkNearbyVectors(
 	defer fw.workspace.FreeVector(tempVector)
 
 	// Filter the results.
-	results := idxCtx.tempSearchSet.PopUnsortedResults()
+	results := idxCtx.tempSearchSet.PopResults()
 	for i := range results {
 		result := &results[i]
 
@@ -797,6 +797,19 @@ func (fw *fixupWorker) deleteVector(
 	if fw.tempVectorsWithKeys[0].Vector != nil {
 		log.VEventf(ctx, 2, "primary key row exists, do not delete vector")
 		return nil
+	}
+
+	// If removing from a root partition, check that it's level is LeafLevel. It
+	// might not be if it was recently split.
+	if partitionKey == RootKey {
+		metadata, err := fw.txn.GetPartitionMetadata(
+			ctx, fw.treeKey, partitionKey, false /* forUpdate */)
+		if metadata.Level != LeafLevel {
+			// Root partition's level has been updated, so just abort.
+			return nil
+		} else if err != nil {
+			return errors.Wrapf(err, "getting root partition's level")
+		}
 	}
 
 	err = fw.index.removeFromPartition(ctx, fw.txn, fw.treeKey, partitionKey, LeafLevel, childKey)

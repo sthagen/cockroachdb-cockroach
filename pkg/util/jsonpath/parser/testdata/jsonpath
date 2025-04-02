@@ -494,6 +494,31 @@ parse
 ----
 (1 + (2 * (-4))) -- normalized!
 
+error
+$ ? (@ like_regex "(invalid pattern")
+----
+at or near ")": syntax error: invalid regular expression: error parsing regexp: missing closing ): `(invalid pattern`
+DETAIL: source SQL:
+$ ? (@ like_regex "(invalid pattern")
+                                    ^
+
+# TODO(normanchenn): This shouldn't be parsed, as the last keyword isn't within
+# array subscripts.
+parse
+last
+----
+last
+
+parse
+$[last]
+----
+$[last]
+
+parse
+$[1 to last, last to last]
+----
+$[1 to last,last to last] -- normalized!
+
 # postgres allows floats as array indexes
 # parse
 # $.abc[1.0]

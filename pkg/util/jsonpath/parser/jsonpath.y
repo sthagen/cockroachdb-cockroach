@@ -4,6 +4,8 @@ package parser
 import (
   "strconv"
 
+  "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+  "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
   "github.com/cockroachdb/cockroach/pkg/sql/scanner"
   "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
   "github.com/cockroachdb/cockroach/pkg/util/json"
@@ -124,6 +126,16 @@ func unaryOp(op jsonpath.OperationType, left jsonpath.Path) jsonpath.Operation {
   }
 }
 
+func regexBinaryOp(left jsonpath.Path, regex string) (jsonpath.Operation, error) {
+  r := jsonpath.Regex{Regex: regex}
+  _, err := ReCache.GetRegexp(r)
+  if err != nil {
+    return jsonpath.Operation{}, pgerror.Wrapf(err, pgcode.InvalidRegularExpression,
+      "invalid regular expression")
+  }
+  return binaryOp(jsonpath.OpLikeRegex, left, r), nil
+}
+
 %}
 
 %union{
@@ -176,6 +188,8 @@ func unaryOp(op jsonpath.OperationType, left jsonpath.Path) jsonpath.Operation {
 
 %token <str> LIKE_REGEX
 %token <str> FLAG
+
+%token <str> LAST
 
 %type <jsonpath.Jsonpath> jsonpath
 %type <jsonpath.Path> expr_or_predicate
@@ -303,7 +317,10 @@ path_primary:
   {
     $$.val = $1.path()
   }
-// TODO(normanchenn): support LAST for array ranges.
+| LAST
+  {
+    $$.val = jsonpath.Last{}
+  }
 ;
 
 accessor_op:
@@ -398,8 +415,11 @@ predicate:
   }
 | expr LIKE_REGEX STRING
   {
-    regex := jsonpath.Regex{Regex: $3}
-    $$.val = binaryOp(jsonpath.OpLikeRegex, $1.path(), regex)
+    regex, err := regexBinaryOp($1.path(), $3)
+    if err != nil {
+      return setErr(jsonpathlex, err)
+    }
+    $$.val = regex
   }
 | expr LIKE_REGEX STRING FLAG STRING
   {
@@ -494,6 +514,7 @@ any_identifier:
 unreserved_keyword:
   FALSE
 | FLAG
+| LAST
 | LAX
 | LIKE_REGEX
 | NULL

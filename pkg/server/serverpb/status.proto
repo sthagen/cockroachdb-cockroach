@@ -1383,6 +1383,10 @@ message HotRangesRequest {
     (gogoproto.customname) = "TenantID",
     (gogoproto.nullable) = true
   ];
+  repeated string nodes = 5 [
+    (gogoproto.customname) = "Nodes",
+    (gogoproto.nullable) = true
+  ];
 }
 
 // HotRangesResponseV2 is a response payload returned by `HotRangesV2` service.
@@ -1782,8 +1786,8 @@ message StatementDiagnosticsReport {
     [ (gogoproto.nullable) = false, (gogoproto.stdduration) = true ];
   google.protobuf.Timestamp expires_at = 7
     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
-  // TODO(yuzefovich): should we populate plan_gist, anti_plan_gist, and
-  // redacted fields?
+  // TODO(yuzefovich): should we populate plan_gist, anti_plan_gist, redacted,
+  // and username fields?
 }
 
 message CreateStatementDiagnosticsReportRequest {

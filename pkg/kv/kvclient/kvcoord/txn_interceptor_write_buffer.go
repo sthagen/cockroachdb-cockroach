@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"slices"
+	"sort"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -178,6 +179,33 @@ func (twb *txnWriteBuffer) SendLocked(
 			// anything.
 			return twb.wrapped.SendLocked(ctx, ba)
 		}
+		return twb.flushBufferAndSendBatch(ctx, ba)
+	}
+
+	if _, ok := ba.GetArg(kvpb.DeleteRange); ok {
+		// DeleteRange requests can delete an arbitrary number of keys over a
+		// given keyspan. We won't know the exact scope of the delete until
+		// we've scanned the keyspan, which must happen on the server. We've got
+		// a couple of options here:
+		// 1. We decompose the DeleteRange request into a (potentially locking)
+		// Scan followed by buffered point Deletes for each key in the scan's
+		// result.
+		// 2. We flush the buffer[1] and send the DeleteRange request to the KV
+		// layer.
+		//
+		// We choose option 2, as typically the number of keys deleted is large,
+		// and we may realize we're over budget after performing the initial
+		// scan of the keyspan. At that point, we'll have to flush the buffer
+		// anyway. Moreover, buffered writes are most impactful when a
+		// transaction is writing to a small number of keys. As such, it's fine
+		// to not optimize the DeleteRange case, as typically it results in a
+		// large writing transaction.
+		//
+		// [1] Technically, we only need to flush the overlapping portion of the
+		// buffer. However, for simplicity, the txnWriteBuffer doesn't support
+		// transactions with partially buffered writes and partially flushed
+		// writes. We could change this in the future if there's benefit to
+		// doing so.
 		return twb.flushBufferAndSendBatch(ctx, ba)
 	}
 
@@ -396,7 +424,36 @@ func (twb *txnWriteBuffer) epochBumpedLocked() {}
 func (twb *txnWriteBuffer) createSavepointLocked(context.Context, *savepoint) {}
 
 // rollbackToSavepointLocked is part of the txnInterceptor interface.
-func (twb *txnWriteBuffer) rollbackToSavepointLocked(ctx context.Context, s savepoint) {}
+func (twb *txnWriteBuffer) rollbackToSavepointLocked(ctx context.Context, s savepoint) {
+	toDelete := make([]*bufferedWrite, 0)
+	it := twb.buffer.MakeIter()
+	for it.First(); it.Valid(); it.Next() {
+		bufferedVals := it.Cur().vals
+		// NB: the savepoint is being rolled back to s.seqNum (inclusive). So,
+		// idx is the index of the first value that is considered rolled back.
+		idx := sort.Search(len(bufferedVals), func(i int) bool {
+			return bufferedVals[i].seq >= s.seqNum
+		})
+		if idx == len(bufferedVals) {
+			// No writes are being rolled back.
+			continue
+		}
+		// Update size bookkeeping for the values we're rolling back.
+		for i := idx; i < len(bufferedVals); i++ {
+			twb.bufferSize -= bufferedVals[i].size()
+		}
+		// Rollback writes by truncating the buffered values.
+		it.Cur().vals = bufferedVals[:idx]
+		if len(it.Cur().vals) == 0 {
+			// All writes have been rolled back; we should remove this key from
+			// the buffer entirely.
+			toDelete = append(toDelete, it.Cur())
+		}
+	}
+	for _, bw := range toDelete {
+		twb.removeFromBuffer(bw)
+	}
+}
 
 // closeLocked implements the txnInterceptor interface.
 func (twb *txnWriteBuffer) closeLocked() {}
@@ -1030,6 +1087,12 @@ func (twb *txnWriteBuffer) addToBuffer(key roachpb.Key, val roachpb.Value, seq e
 	}
 }
 
+// removeFromBuffer removes all buffered writes on a given key from the buffer.
+func (twb *txnWriteBuffer) removeFromBuffer(bw *bufferedWrite) {
+	twb.buffer.Delete(bw)
+	twb.bufferSize -= bw.size()
+}
+
 // flushBufferAndSendBatch flushes all buffered writes when sending the supplied
 // batch request to the KV layer. This is done by pre-pending the buffered
 // writes to the requests in the batch.
@@ -1065,11 +1128,11 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 
 	reqs := make([]kvpb.RequestUnion, 0, numBuffered+len(ba.Requests))
 
-	// Next, remove the buffered writes from the buffer and collect them into requests.
+	// Next, remove the buffered writes from the buffer and collect them into
+	// requests.
 	for _, bw := range toFlushBufferedWrites {
 		reqs = append(reqs, bw.toRequest())
-		twb.buffer.Delete(&bw)
-		twb.bufferSize -= bw.size()
+		twb.removeFromBuffer(&bw)
 	}
 
 	// Layers below us expect that writes inside a batch are in sequence number

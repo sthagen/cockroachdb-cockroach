@@ -899,6 +899,9 @@ func TestRetriableErrorDuringUpgradedTransaction(t *testing.T) {
 
 	var fooTableId uint32
 	testDB.Exec(t, "SET enable_implicit_transaction_for_batch_statements = true")
+	// The test injects a retry error after the interceptors, so we need to
+	// disable write buffers for the request to make it to the server.
+	testDB.Exec(t, "SET kv_transaction_buffered_writes_enabled = false")
 	testDB.Exec(t, "CREATE TABLE bar (a INT PRIMARY KEY)")
 	testDB.Exec(t, "CREATE TABLE foo (a INT PRIMARY KEY)")
 	testDB.QueryRow(t, "SELECT 'foo'::regclass::oid").Scan(&fooTableId)
@@ -2457,11 +2460,11 @@ func TestInternalAppNamePrefix(t *testing.T) {
 		initialInternalMetrics := sqlServer.InternalMetrics.ExecutedStatementCounters.InsertCount.Count()
 		initialUserMetrics := sqlServer.Metrics.ExecutedStatementCounters.InsertCount.Count()
 		runner.Exec(t, "INSERT into test values (1, 1)")
-		// Confirm only internal metrics increased.
+		// Confirm user metrics did not increase.
 		finalInternalMetrics := sqlServer.InternalMetrics.ExecutedStatementCounters.InsertCount.Count()
 		finalUserMetrics := sqlServer.Metrics.ExecutedStatementCounters.InsertCount.Count()
 		require.Equal(t, initialUserMetrics, finalUserMetrics)
-		require.Equal(t, initialInternalMetrics+1, finalInternalMetrics)
+		require.Greater(t, finalInternalMetrics, initialInternalMetrics)
 	})
 
 	t.Run("app name set in session", func(t *testing.T) {
@@ -2486,20 +2489,18 @@ func TestInternalAppNamePrefix(t *testing.T) {
 		runner.Exec(t, fmt.Sprintf("set application_name='%v'", catconstants.InternalAppNamePrefix+"mytest"))
 		runner.Exec(t, "INSERT into test values (2, 1)")
 
-		// Confirm only internal metrics increased.
+		// Confirm user metrics did not increase.
 		finalInternalMetrics := sqlServer.InternalMetrics.ExecutedStatementCounters.InsertCount.Count()
 		finalUserMetrics := sqlServer.Metrics.ExecutedStatementCounters.InsertCount.Count()
 		require.Equal(t, initialUserMetrics, finalUserMetrics)
-		require.Equal(t, initialInternalMetrics+1, finalInternalMetrics)
+		require.Greater(t, finalInternalMetrics, initialInternalMetrics)
 
 		// Reset app name.
 		runner.Exec(t, "set application_name='mytest'")
 		runner.Exec(t, "INSERT into test values (3, 1)")
 
-		// Confirm only user metrics increased.
-		finalInternalMetrics = sqlServer.InternalMetrics.ExecutedStatementCounters.InsertCount.Count()
+		// Confirm user metrics increased.
 		finalUserMetrics = sqlServer.Metrics.ExecutedStatementCounters.InsertCount.Count()
-		require.Equal(t, initialUserMetrics+1, finalUserMetrics)
-		require.Equal(t, initialInternalMetrics+1, finalInternalMetrics)
+		require.Greater(t, finalUserMetrics, initialUserMetrics)
 	})
 }

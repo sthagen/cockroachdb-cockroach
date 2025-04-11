@@ -20,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/mvccencoding"
 	"github.com/cockroachdb/cockroach/pkg/storage/mvcceval"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -45,8 +47,8 @@ var bufferedWritesMaxBufferSize = settings.RegisterIntSetting(
 
 // txnWriteBuffer is a txnInterceptor that buffers transactional writes until
 // commit time. Moreover, it also decomposes read-write KV operations (e.g.
-// CPuts, InitPuts) into separate (locking) read and write operations, buffering
-// the latter until commit time.
+// CPuts) into separate (locking) read and write operations, buffering the
+// latter until commit time.
 //
 // Buffering writes until commit time has four main benefits:
 //
@@ -151,7 +153,17 @@ type txnWriteBuffer struct {
 	// that have been aborted by a conflicting transaction. As read-your-own-write
 	// semantics are upheld by the client, not the server, for transactions that
 	// use buffered writes, we can skip the AbortSpan check on the server.
+	//
+	// We currently track this via two state variables: `enabled` and `flushed`.
+	// Writes are only buffered if enabled && !flushed.
+	//
+	// `enabled` tracks whether buffering has been enabled/disabled externally via
+	// txn.SetBufferedWritesEnabled or because we are operating on a leaf
+	// transaction.
 	enabled bool
+	//
+	// `flushed` tracks whether the buffer has been previously flushed.
+	flushed bool
 
 	// flushOnNextBatch, if set, indicates that write buffering has just been
 	// disabled, and the interceptor should flush any buffered writes when it
@@ -188,7 +200,7 @@ func (twb *txnWriteBuffer) SendLocked(
 		return twb.flushBufferAndSendBatch(ctx, ba)
 	}
 
-	if !twb.enabled {
+	if !twb.shouldBuffer() {
 		return twb.wrapped.SendLocked(ctx, ba)
 	}
 
@@ -202,6 +214,7 @@ func (twb *txnWriteBuffer) SendLocked(
 	}
 
 	if _, ok := ba.GetArg(kvpb.DeleteRange); ok {
+		log.VEventf(ctx, 2, "DeleteRangeRequest forcing flush of write buffer")
 		// DeleteRange requests can delete an arbitrary number of keys over a
 		// given keyspan. We won't know the exact scope of the delete until
 		// we've scanned the keyspan, which must happen on the server. We've got
@@ -231,12 +244,26 @@ func (twb *txnWriteBuffer) SendLocked(
 	// Check if buffering writes from the supplied batch will run us over
 	// budget. If it will, we shouldn't buffer writes from the current batch,
 	// and flush the buffer.
-	if twb.estimateSize(ba)+twb.bufferSize > bufferedWritesMaxBufferSize.Get(&twb.st.SV) {
+	maxSize := bufferedWritesMaxBufferSize.Get(&twb.st.SV)
+	bufSize := twb.estimateSize(ba) + twb.bufferSize
+	if bufSize > maxSize {
 		// TODO(arul): add some metrics for this case.
+		log.VEventf(ctx, 2, "flushing buffer because buffer size (%s) exceeds max size (%s)",
+			humanizeutil.IBytes(bufSize),
+			humanizeutil.IBytes(maxSize))
 		return twb.flushBufferAndSendBatch(ctx, ba)
 	}
 
-	transformedBa, ts := twb.applyTransformations(ctx, ba)
+	if err := twb.validateBatch(ba); err != nil {
+		// We could choose to twb.flushBufferAndSendBatch
+		// here. For now, we return an error.
+		return nil, kvpb.NewError(err)
+	}
+
+	transformedBa, ts, pErr := twb.applyTransformations(ctx, ba)
+	if pErr != nil {
+		return nil, pErr
+	}
 
 	if len(transformedBa.Requests) == 0 {
 		// Lower layers (the DistSender and the KVServer) do not expect/handle empty
@@ -259,6 +286,80 @@ func (twb *txnWriteBuffer) SendLocked(
 	}
 
 	return twb.mergeResponseWithTransformations(ctx, ts, br)
+}
+
+// validateBatch returns an error if the batch is unsupported
+// by the txnWriteBuffer.
+func (twb *txnWriteBuffer) validateBatch(ba *kvpb.BatchRequest) error {
+	if ba.WriteOptions != nil {
+		// OriginTimestamp and OriginID are currently only used by Logical Data
+		// Replication (LDR). These options are unsupported at the moment as we
+		// don't store the inbound batch options in the buffer.
+		if ba.WriteOptions.OriginTimestamp.IsSet() {
+			return errors.AssertionFailedf("transaction write buffer does not support batches with OriginTimestamp set")
+		}
+		if ba.WriteOptions.OriginID != 0 {
+			return errors.AssertionFailedf("transaction write buffer does not support batches with OriginID set")
+		}
+	}
+	return twb.validateRequests(ba)
+}
+
+// validateRequests returns an error if any of the requests in the batch
+// are unsupported by the txnWriteBuffer.
+func (twb *txnWriteBuffer) validateRequests(ba *kvpb.BatchRequest) error {
+	for _, ru := range ba.Requests {
+		req := ru.GetInner()
+		switch t := req.(type) {
+		case *kvpb.ConditionalPutRequest:
+			// Our client side ConditionalPutRequest evaluation does not know how to
+			// handle the origin timestamp setting. Doing so would require sending a
+			// GetRequest with RawMVCCValues set and parsing the MVCCValueHeader.
+			if t.OriginTimestamp.IsSet() {
+				return unsupportedOptionError(t.Method(), "OriginTimestamp")
+			}
+		case *kvpb.PutRequest:
+		case *kvpb.DeleteRequest:
+		case *kvpb.GetRequest:
+			// ReturnRawMVCCValues is unsupported because we don't know how to serve
+			// such reads from the write buffer currently.
+			if t.ReturnRawMVCCValues {
+				return unsupportedOptionError(t.Method(), "ReturnRawMVCCValue")
+			}
+		case *kvpb.ScanRequest:
+			// ReturnRawMVCCValues is unsupported because we don't know how to serve
+			// such reads from the write buffer currently.
+			if t.ReturnRawMVCCValues {
+				return unsupportedOptionError(t.Method(), "ReturnRawMVCCValue")
+			}
+			if t.ScanFormat == kvpb.COL_BATCH_RESPONSE {
+				return unsupportedOptionError(t.Method(), "COL_BATCH_RESPONSE scan format")
+			}
+		case *kvpb.ReverseScanRequest:
+			// ReturnRawMVCCValues is unsupported because we don't know how to serve
+			// such reads from the write buffer currently.
+			if t.ReturnRawMVCCValues {
+				return unsupportedOptionError(t.Method(), "ReturnRawMVCCValue")
+			}
+			if t.ScanFormat == kvpb.COL_BATCH_RESPONSE {
+				return unsupportedOptionError(t.Method(), "COL_BATCH_RESPONSE scan format")
+			}
+		default:
+			// All other requests are unsupported. Note that we assume EndTxn and
+			// DeleteRange requests were handled explicitly before this method was
+			// called.
+			return unsupportedMethodError(t.Method())
+		}
+	}
+	return nil
+}
+
+func unsupportedMethodError(m kvpb.Method) error {
+	return errors.AssertionFailedf("transaction write buffer does not support %s requests", m)
+}
+
+func unsupportedOptionError(m kvpb.Method, option string) error {
+	return errors.AssertionFailedf("transaction write buffer does not support %s requests with %s", m, option)
 }
 
 // estimateSize returns a conservative estimate by which the buffer will grow in
@@ -325,12 +426,17 @@ func (twb *txnWriteBuffer) adjustError(
 				if ts[0].stripped {
 					numStripped++
 				} else {
-					// TODO(arul): If the error index points to a request that we've
-					// transformed, returning this back to the client is weird -- the
-					// client doesn't know we're making transformations. We should
-					// probably just log a warning and clear out the error index for such
-					// cases.
-					log.Fatal(ctx, "unhandled")
+					// This is a transformed request (for example a LockingGet that was
+					// sent instead of a Del). In this case, the error might be a bit
+					// confusing to the client since the request that had an error isn't
+					// exactly the request the user sent.
+					//
+					// For now, we handle this by logging and removing the error index.
+					if baIdx == pErr.Index.Index {
+						log.Warningf(ctx, "error index %d is part of a transformed request", pErr.Index.Index)
+						pErr.Index = nil
+						return pErr
+					}
 				}
 				ts = ts[1:]
 				continue
@@ -444,7 +550,14 @@ func (twb *txnWriteBuffer) importLeafFinalState(context.Context, *roachpb.LeafTx
 }
 
 // epochBumpedLocked implements the txnInterceptor interface.
-func (twb *txnWriteBuffer) epochBumpedLocked() {}
+func (twb *txnWriteBuffer) epochBumpedLocked() {
+	twb.resetBuffer()
+}
+
+func (twb *txnWriteBuffer) resetBuffer() {
+	twb.buffer.Reset()
+	twb.bufferSize = 0
+}
 
 // createSavepointLocked is part of the txnInterceptor interface.
 func (twb *txnWriteBuffer) createSavepointLocked(context.Context, *savepoint) {}
@@ -510,7 +623,7 @@ func (twb *txnWriteBuffer) closeLocked() {}
 // TODO(arul): Augment this comment as these expand.
 func (twb *txnWriteBuffer) applyTransformations(
 	ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchRequest, transformations) {
+) (*kvpb.BatchRequest, transformations, *kvpb.Error) {
 	baRemote := ba.ShallowCopy()
 	// TODO(arul): We could improve performance here by pre-allocating
 	// baRemote.Requests to the correct size by counting the number of Puts/Dels
@@ -670,9 +783,6 @@ func (twb *txnWriteBuffer) applyTransformations(
 				// We've constructed a response that we'll stitch together with the
 				// result on the response path; eschew sending the request to the KV
 				// layer.
-				//
-				// TODO(arul): if the ReturnRawMVCCValues flag is set, we'll need to
-				// flush the buffer.
 				continue
 			}
 			// Wasn't served locally; send the request to the KV layer.
@@ -707,10 +817,10 @@ func (twb *txnWriteBuffer) applyTransformations(
 			baRemote.Requests = append(baRemote.Requests, ru)
 
 		default:
-			baRemote.Requests = append(baRemote.Requests, ru)
+			return nil, nil, kvpb.NewError(unsupportedMethodError(t.Method()))
 		}
 	}
-	return baRemote, ts
+	return baRemote, ts, nil
 }
 
 // seekItemForSpan returns a bufferedWrite appropriate for use with a
@@ -1074,9 +1184,7 @@ func (t transformation) toResp(
 		ru.MustSetInner(reverseScanResp)
 
 	default:
-		// This is only possible once we start decomposing read-write requests into
-		// separate bits.
-		panic("unimplemented")
+		return ru, kvpb.NewError(unsupportedMethodError(req.Method()))
 	}
 
 	return ru, nil
@@ -1132,34 +1240,28 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 	defer func() {
 		assertTrue(twb.buffer.Len() == 0, "buffer should be empty after flush")
 		assertTrue(twb.bufferSize == 0, "buffer size should be 0 after flush")
+		assertTrue(twb.flushed, "flushed should be true after flush")
 	}()
+
+	// Once we've flushed the buffer, we disable write buffering going forward. We
+	// do this even if the buffer is empty since once we've called this function,
+	// our buffer no longer represents all of the writes in the transaction.
+	log.VEventf(ctx, 2, "disabling write buffering for this epoch")
+	twb.flushed = true
 
 	numBuffered := twb.buffer.Len()
 	if numBuffered == 0 {
 		return twb.wrapped.SendLocked(ctx, ba) // nothing to flush
 	}
 
-	// Once we've flushed the buffer, we disable write buffering going forward.
-	twb.enabled = false
-
 	// Flush all buffered writes by pre-pending them to the requests being sent
 	// in the batch.
-	// First, collect the requests we'll need to flush.
-	toFlushBufferedWrites := make([]bufferedWrite, 0, twb.buffer.Len())
-
+	reqs := make([]kvpb.RequestUnion, 0, numBuffered+len(ba.Requests))
 	it := twb.buffer.MakeIter()
 	for it.First(); it.Valid(); it.Next() {
-		toFlushBufferedWrites = append(toFlushBufferedWrites, *it.Cur())
+		reqs = append(reqs, it.Cur().toRequest())
 	}
-
-	reqs := make([]kvpb.RequestUnion, 0, numBuffered+len(ba.Requests))
-
-	// Next, remove the buffered writes from the buffer and collect them into
-	// requests.
-	for _, bw := range toFlushBufferedWrites {
-		reqs = append(reqs, bw.toRequest())
-		twb.removeFromBuffer(&bw)
-	}
+	twb.resetBuffer()
 
 	// Layers below us expect that writes inside a batch are in sequence number
 	// order but the iterator above returns data in key order. Here we re-sort it
@@ -1192,6 +1294,12 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 // locally.
 func (twb *txnWriteBuffer) hasBufferedWrites() bool {
 	return twb.buffer.Len() > 0
+}
+
+// shouldBuffer returns true if SendLocked() should attempt to buffer parts of
+// the batch.
+func (twb *txnWriteBuffer) shouldBuffer() bool {
+	return twb.enabled && !twb.flushed
 }
 
 // testingBufferedWritesAsSlice returns all buffered writes, in key order, as a
@@ -1696,7 +1804,7 @@ func (m *respMerger) toReverseScanResp(
 
 // assertTrue panics with a message if the supplied condition isn't true.
 func assertTrue(cond bool, msg string) {
-	if !cond {
+	if !cond && buildutil.CrdbTestBuild {
 		panic(msg)
 	}
 }

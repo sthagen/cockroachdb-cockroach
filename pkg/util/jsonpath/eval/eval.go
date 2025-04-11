@@ -6,6 +6,8 @@
 package eval
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -15,43 +17,51 @@ import (
 )
 
 var (
-	errUnimplemented = unimplemented.NewWithIssue(22513, "unimplemented")
-	errInternal      = errors.New("internal error")
+	errUnimplemented         = unimplemented.NewWithIssue(22513, "unimplemented")
+	errInternal              = errors.New("internal error")
+	errSingleBooleanRequired = pgerror.Newf(pgcode.SingletonSQLJSONItemRequired, "single boolean result is expected")
 )
 
 type jsonpathCtx struct {
 	// Root of the given JSON object ($). We store this because we will need to
 	// support queries with multiple root elements (ex. $.a ? ($.b == "hello").
-	root   json.JSON
-	vars   json.JSON
+	root json.JSON
+	// vars is the JSON object that contains the variables that may be used in
+	// the JSONPath query. It is a JSON object that contains key-value pairs of
+	// variable names to their corresponding values.
+	vars json.JSON
+	// strict variable is used to determine how structural errors within the
+	// JSON objects are handled. If strict is true, the query will error out on
+	// structural errors (ex. key accessors on arrays, key accessors on invalid
+	// keys, etc.). Otherwise, the query will attempt to continue execution.
+	// This is controlled by the strict or lax keywords at the start of the
+	// JSONPath query.
 	strict bool
+	// silent variable is used to determine how errors should be thrown during
+	// evaluation. If silent is true, the query will not throw most errors. If
+	// silent is false, the query will throw errors such as key accessors in
+	// strict mode on invalid keys. However, if silent is true, the query will
+	// return nothing. This is controlled by the optional silent variable in
+	// jsonb_path_* builtin functions.
+	silent bool
 
 	// innermostArrayLength stores the length of the innermost array. If the current
 	// evaluation context is not evaluating on an array, this value is -1.
 	innermostArrayLength int
 }
 
+// maybeThrowError should only be called for suppresible errors via ctx.silent.
+func maybeThrowError(ctx *jsonpathCtx, err error) error {
+	if ctx.silent {
+		return nil
+	}
+	return err
+}
+
 func JsonpathQuery(
 	target tree.DJSON, path tree.DJsonpath, vars tree.DJSON, silent tree.DBool,
 ) ([]tree.DJSON, error) {
-	parsedPath, err := parser.Parse(string(path))
-	if err != nil {
-		return []tree.DJSON{}, err
-	}
-	expr := parsedPath.AST
-
-	ctx := &jsonpathCtx{
-		root:                 target.JSON,
-		vars:                 vars.JSON,
-		strict:               expr.Strict,
-		innermostArrayLength: -1,
-	}
-	// When silent is true, overwrite the strict mode.
-	if bool(silent) {
-		ctx.strict = false
-	}
-
-	j, err := ctx.eval(expr.Path, ctx.root, !ctx.strict /* unwrap */)
+	j, err := jsonpathQuery(target, path, vars, silent)
 	if err != nil {
 		return nil, err
 	}
@@ -65,11 +75,81 @@ func JsonpathQuery(
 func JsonpathExists(
 	target tree.DJSON, path tree.DJsonpath, vars tree.DJSON, silent tree.DBool,
 ) (tree.DBool, error) {
-	j, err := JsonpathQuery(target, path, vars, silent)
+	j, err := jsonpathQuery(target, path, vars, silent)
 	if err != nil {
 		return false, err
 	}
 	return len(j) > 0, nil
+}
+
+func JsonpathQueryArray(
+	target tree.DJSON, path tree.DJsonpath, vars tree.DJSON, silent tree.DBool,
+) (tree.DJSON, error) {
+	j, err := jsonpathQuery(target, path, vars, silent)
+	if err != nil {
+		return tree.DJSON{}, err
+	}
+
+	b := json.NewArrayBuilder(len(j))
+	for _, j := range j {
+		b.Add(j)
+	}
+	return tree.DJSON{JSON: b.Build()}, nil
+}
+
+func JsonpathQueryFirst(
+	target tree.DJSON, path tree.DJsonpath, vars tree.DJSON, silent tree.DBool,
+) (tree.Datum, error) {
+	j, err := jsonpathQuery(target, path, vars, silent)
+	if err != nil {
+		return nil, err
+	}
+	if len(j) == 0 {
+		return tree.DNull, nil
+	}
+	return &tree.DJSON{JSON: j[0]}, nil
+}
+
+func JsonpathMatch(
+	target tree.DJSON, path tree.DJsonpath, vars tree.DJSON, silent tree.DBool,
+) (tree.Datum, error) {
+	j, err := jsonpathQuery(target, path, vars, silent)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(j) == 1 {
+		if b, ok := j[0].AsBool(); ok {
+			return tree.MakeDBool(tree.DBool(b)), nil
+		}
+		if j[0].Type() == json.NullJSONType {
+			return tree.DNull, nil
+		}
+	}
+	if !silent {
+		return nil, errSingleBooleanRequired
+	}
+	return tree.DNull, nil
+}
+
+func jsonpathQuery(
+	target tree.DJSON, path tree.DJsonpath, vars tree.DJSON, silent tree.DBool,
+) ([]json.JSON, error) {
+	parsedPath, err := parser.Parse(string(path))
+	if err != nil {
+		return []json.JSON{}, err
+	}
+	expr := parsedPath.AST
+
+	ctx := &jsonpathCtx{
+		root:                 target.JSON,
+		vars:                 vars.JSON,
+		strict:               expr.Strict,
+		silent:               bool(silent),
+		innermostArrayLength: -1,
+	}
+
+	return ctx.eval(expr.Path, ctx.root, !ctx.strict /* unwrap */)
 }
 
 func (ctx *jsonpathCtx) eval(
@@ -145,7 +225,7 @@ func (ctx *jsonpathCtx) executeAnyItem(
 	jsonPath jsonpath.Path, jsonValue json.JSON, unwrapNext bool,
 ) ([]json.JSON, error) {
 	if jsonValue.Len() == 0 {
-		return []json.JSON{}, nil
+		return nil, nil
 	}
 	var agg []json.JSON
 	processItem := func(item json.JSON) error {
@@ -160,8 +240,6 @@ func (ctx *jsonpathCtx) executeAnyItem(
 		agg = append(agg, evalResults...)
 		return nil
 	}
-	// TODO(normanchenn): Consider creating some kind of unified iterator interface
-	// for json arrays and objects.
 	switch jsonValue.Type() {
 	case json.ArrayJSONType:
 		for i := 0; i < jsonValue.Len(); i++ {

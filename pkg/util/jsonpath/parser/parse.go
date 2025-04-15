@@ -16,12 +16,12 @@ import (
 )
 
 func init() {
-	tree.ValidateJSONPath = func(jsonpath string) (string, error) {
+	tree.ValidateJSONPath = func(jsonpath string) (*jsonpath.Jsonpath, error) {
 		jp, err := Parse(jsonpath)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return jp.AST.String(), nil
+		return jp.AST, nil
 	}
 }
 
@@ -177,7 +177,7 @@ func walk(path jsonpath.Path, nestingLevel int, insideArraySubscript bool) error
 		}
 		return nil
 	case jsonpath.Root, jsonpath.Key, jsonpath.Wildcard, jsonpath.Regex,
-		jsonpath.AnyKey, jsonpath.Scalar:
+		jsonpath.AnyKey, jsonpath.Scalar, jsonpath.Method:
 		// These are leaf nodes that don't require any further checks.
 		return nil
 	default:

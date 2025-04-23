@@ -35,7 +35,7 @@ var BufferedWritesEnabled = settings.RegisterBoolSetting(
 	settings.WithPublic,
 )
 
-var bufferedWritesMaxBufferSize = settings.RegisterIntSetting(
+var bufferedWritesMaxBufferSize = settings.RegisterByteSizeSetting(
 	settings.ApplicationLevel,
 	"kv.transaction.write_buffering.max_buffer_size",
 	"if non-zero, defines that maximum size of the "+
@@ -176,7 +176,8 @@ type txnWriteBuffer struct {
 
 	bufferSeek bufferedWrite // re-use while seeking
 
-	wrapped lockedSender
+	wrapped    lockedSender
+	txnMetrics *TxnMetrics
 
 	// testingOverrideCPutEvalFn is used to mock the evaluation function for
 	// conditional puts. Intended only for tests.
@@ -188,6 +189,9 @@ func (twb *txnWriteBuffer) setEnabled(enabled bool) {
 		// When disabling write buffering, if we evaluated any requests, we need
 		// to ensure to flush the buffer.
 		twb.flushOnNextBatch = true
+	}
+	if enabled {
+		twb.txnMetrics.TxnWriteBufferEnabled.Inc(1)
 	}
 	twb.enabled = enabled
 }
@@ -246,8 +250,10 @@ func (twb *txnWriteBuffer) SendLocked(
 	// and flush the buffer.
 	maxSize := bufferedWritesMaxBufferSize.Get(&twb.st.SV)
 	bufSize := twb.estimateSize(ba) + twb.bufferSize
-	if bufSize > maxSize {
-		// TODO(arul): add some metrics for this case.
+	// NB: if bufferedWritesMaxBufferSize is set to 0 then we effectively disable
+	// any buffer limiting.
+	if maxSize != 0 && bufSize > maxSize {
+		twb.txnMetrics.TxnWriteBufferMemoryLimitExceeded.Inc(1)
 		log.VEventf(ctx, 2, "flushing buffer because buffer size (%s) exceeds max size (%s)",
 			humanizeutil.IBytes(bufSize),
 			humanizeutil.IBytes(maxSize))
@@ -277,6 +283,7 @@ func (twb *txnWriteBuffer) SendLocked(
 				return nil, pErr
 			}
 		}
+		twb.txnMetrics.TxnWriteBufferFullyHandledBatches.Inc(1)
 		return br, nil
 	}
 
@@ -923,6 +930,10 @@ func (twb *txnWriteBuffer) mergeBufferAndResp(
 		it.FirstOverlap(seek)
 	}
 	bufferNext := func() {
+		// NB: we must reset seek before every use, as it's shared across multiple
+		// methods on the txnWriteBuffer. In particular, it's used by
+		// maybeServeRead, which we may call below.
+		seek = twb.seekItemForSpan(respIter.startKey(), respIter.endKey())
 		if reverse {
 			it.PrevOverlap(seek)
 		} else {
@@ -1252,6 +1263,13 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 		return twb.wrapped.SendLocked(ctx, ba) // nothing to flush
 	}
 
+	if _, ok := ba.GetArg(kvpb.EndTxn); !ok {
+		// We're flushing the buffer even though the batch doesn't contain an EndTxn
+		// request. That means we buffered some writes and decided to disable write
+		// buffering mid-way through the transaction, thus necessitating this flush.
+		twb.txnMetrics.TxnWriteBufferDisabledAfterBuffering.Inc(1)
+	}
+
 	// Flush all buffered writes by pre-pending them to the requests being sent
 	// in the batch.
 	reqs := make([]kvpb.RequestUnion, 0, numBuffered+len(ba.Requests))
@@ -1473,6 +1491,11 @@ type respIter struct {
 	// BATCH_RESPONSE are supported right now.
 	scanFormat kvpb.ScanFormat
 
+	// resumeSpan, if set, is the ResumeSpan of the response. When non-nil, it
+	// means that the response is being paginated, so we need to overlap the
+	// buffer only with the part of the original span that was actually scanned.
+	resumeSpan *roachpb.Span
+
 	// rows is the Rows field of the corresponding response.
 	//
 	// Only set with KEY_VALUES scan format.
@@ -1510,6 +1533,7 @@ func newScanRespIter(req *kvpb.ScanRequest, resp *kvpb.ScanResponse) *respIter {
 	return &respIter{
 		scanReq:        req,
 		scanFormat:     req.ScanFormat,
+		resumeSpan:     resp.ResumeSpan,
 		rows:           resp.Rows,
 		batchResponses: resp.BatchResponses,
 	}
@@ -1526,6 +1550,7 @@ func newReverseScanRespIter(
 	return &respIter{
 		reverseScanReq: req,
 		scanFormat:     req.ScanFormat,
+		resumeSpan:     resp.ResumeSpan,
 		rows:           resp.Rows,
 		batchResponses: resp.BatchResponses,
 	}
@@ -1579,6 +1604,14 @@ func (s *respIter) startKey() roachpb.Key {
 	if s.scanReq != nil {
 		return s.scanReq.Key
 	}
+	// For ReverseScans, the EndKey of the ResumeSpan is updated to indicate the
+	// start key for the "next" page, which is exactly the last key that was
+	// reverse-scanned for the current response.
+	// TODO(yuzefovich): we should have some unit tests that exercise the
+	// ResumeSpan case.
+	if s.resumeSpan != nil {
+		return s.resumeSpan.EndKey
+	}
 	return s.reverseScanReq.Key
 }
 
@@ -1586,6 +1619,12 @@ func (s *respIter) startKey() roachpb.Key {
 // was created.
 func (s *respIter) endKey() roachpb.Key {
 	if s.scanReq != nil {
+		// For Scans, the Key of the ResumeSpan is updated to indicate the start
+		// key for the "next" page, which is exactly the last key that was
+		// scanned for the current response.
+		if s.resumeSpan != nil {
+			return s.resumeSpan.Key
+		}
 		return s.scanReq.EndKey
 	}
 	return s.reverseScanReq.EndKey

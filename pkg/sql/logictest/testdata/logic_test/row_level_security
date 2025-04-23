@@ -2176,6 +2176,202 @@ SET ROLE root
 statement ok
 DROP ROLE rls_cache_user;
 
+subtest computed_virtual_cols
+
+statement ok
+CREATE ROLE alice LOGIN;
+
+statement ok
+CREATE TABLE t (
+      k INT PRIMARY KEY,
+      a INT,
+      b INT,
+      c INT,
+      v INT AS (c + 1) VIRTUAL
+);
+
+statement ok
+INSERT INTO t VALUES (1,1,1,1),(-1,-1,-1,-1);
+
+statement ok
+GRANT SELECT, INSERT, UPDATE, DELETE ON t TO alice;
+
+statement ok
+ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+
+statement ok
+CREATE POLICY select_policy
+ON t
+FOR SELECT
+TO alice
+USING (v > 0);
+
+statement ok
+CREATE POLICY insert_policy
+ON t
+FOR INSERT
+TO alice
+WITH CHECK (v > 1);
+
+statement ok
+CREATE POLICY update_policy
+ON t
+FOR UPDATE
+TO alice
+USING (v > 2);
+
+statement ok
+CREATE POLICY delete_policy
+ON t
+FOR DELETE
+TO alice
+USING (v > 3);
+
+statement ok
+SET ROLE alice;
+
+query IIIII
+SELECT * FROM t;
+----
+1  1  1  1  2
+
+query II
+SELECT k,a FROM t WHERE b IS NOT NULL;;
+----
+1  1
+
+statement ok
+INSERT INTO t VALUES (2,2,2,2);
+
+statement error pq: new row violates row-level security policy for table "t"
+INSERT INTO t VALUES (3,0,0,0);
+
+query IIIII
+UPDATE t SET c = 4 WHERE k = 2 RETURNING *;
+----
+2  2  2  4  5
+
+statement error pq: new row violates row-level security policy for table "t"
+UPDATE t SET c = 0 WHERE k = 2 RETURNING *;
+
+query I
+DELETE FROM t RETURNING v;
+----
+5
+
+statement ok
+SET ROLE root;
+
+query IIIII
+SELECT * FROM t ORDER BY k;
+----
+-1  -1  -1  -1  0
+1   1   1   1   2
+
+statement ok
+DROP TABLE t;
+
+statement ok
+DROP USER ALICE;
+
+subtest computed_stored_cols
+
+statement ok
+CREATE ROLE pat LOGIN;
+
+statement ok
+CREATE TABLE t (
+      k INT PRIMARY KEY,
+      a INT,
+      b INT,
+      c INT,
+      v INT AS (c + 1) STORED
+);
+
+statement ok
+INSERT INTO t VALUES (1,1,1,1),(-1,-1,-1,-1);
+
+statement ok
+GRANT SELECT, INSERT, UPDATE, DELETE ON t TO pat;
+
+statement ok
+ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+
+statement ok
+CREATE POLICY select_policy
+ON t
+FOR SELECT
+TO pat
+USING (v > 0);
+
+statement ok
+CREATE POLICY insert_policy
+ON t
+FOR INSERT
+TO pat
+WITH CHECK (v > 1);
+
+statement ok
+CREATE POLICY update_policy
+ON t
+FOR UPDATE
+TO pat
+USING (v > 2);
+
+statement ok
+CREATE POLICY delete_policy
+ON t
+FOR DELETE
+TO pat
+USING (v > 3);
+
+statement ok
+SET ROLE pat;
+
+query IIIII
+SELECT * FROM t;
+----
+1  1  1  1  2
+
+query II
+SELECT k,a FROM t WHERE b IS NOT NULL;;
+----
+1  1
+
+statement ok
+INSERT INTO t VALUES (2,2,2,2);
+
+statement error pq: new row violates row-level security policy for table "t"
+INSERT INTO t VALUES (3,0,0,0);
+
+query IIIII
+UPDATE t SET c = 4 WHERE k = 2 RETURNING *;
+----
+2  2  2  4  5
+
+statement error pq: new row violates row-level security policy for table "t"
+UPDATE t SET c = 0 WHERE k = 2 RETURNING *;
+
+query I
+DELETE FROM t RETURNING v;
+----
+5
+
+statement ok
+SET ROLE root;
+
+query IIIII
+SELECT * FROM t ORDER BY k;
+----
+-1  -1  -1  -1  0
+1   1   1   1   2
+
+statement ok
+DROP TABLE t;
+
+statement ok
+DROP USER PAT;
+
 subtest block_invalid_expressions
 
 statement ok
@@ -2593,6 +2789,133 @@ DROP TABLE multip;
 
 statement ok
 DROP USER multi_user;
+
+subtest ctas_and_mqt
+
+# Test that RLS is enforced, even when users create CTAS and materialized views
+
+statement ok
+CREATE ROLE alice LOGIN;
+
+statement ok
+CREATE ROLE bob LOGIN;
+
+statement ok
+CREATE TABLE documents (
+    id INT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    content TEXT NOT NULL
+);
+
+statement ok
+INSERT INTO documents (id, owner, content) VALUES
+  (1, 'alice', 'Alice’s first document'),
+  (2, 'alice', 'Alice’s second document'),
+  (3, 'bob',   'Bob’s only document so far'),
+  (4, 'admin', 'Admin’s secret doc');
+
+statement ok
+GRANT ALL ON documents TO alice;
+
+statement ok
+GRANT ALL ON documents TO bob;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO alice;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO bob;
+
+statement ok
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+statement ok
+CREATE POLICY alice ON documents TO alice USING (owner = 'alice');
+
+statement ok
+CREATE POLICY bob ON documents TO bob USING (owner = 'bob');
+
+statement ok
+SET ROLE alice;
+
+query ITT
+SELECT * FROM documents ORDER BY ID;
+----
+1  alice  Alice’s first document
+2  alice  Alice’s second document
+
+statement ok
+CREATE TABLE ctas1 AS SELECT * FROM documents;
+
+query ITT
+SELECT * FROM ctas1 ORDER BY ID;
+----
+1  alice  Alice’s first document
+2  alice  Alice’s second document
+
+statement ok
+CREATE MATERIALIZED VIEW mqt_doc AS SELECT * FROM documents;
+
+query ITT
+SELECT * FROM mqt_doc ORDER BY ID;
+----
+1  alice  Alice’s first document
+2  alice  Alice’s second document
+
+statement ok
+GRANT ALL ON ctas1 TO bob;
+
+statement ok
+RESET ROLE;
+
+statement ok
+ALTER TABLE mqt_doc OWNER TO bob;
+
+statement ok
+SET ROLE bob;
+
+query ITT
+SELECT * FROM documents ORDER BY ID;
+----
+3  bob  Bob’s only document so far
+
+query ITT
+SELECT * FROM ctas1 ORDER BY ID;
+----
+1  alice  Alice’s first document
+2  alice  Alice’s second document
+
+query ITT
+SELECT * FROM mqt_doc ORDER BY ID;
+----
+1  alice  Alice’s first document
+2  alice  Alice’s second document
+
+statement ok
+REFRESH MATERIALIZED VIEW mqt_doc;
+
+query ITT
+SELECT * FROM mqt_doc ORDER BY ID;
+----
+3  bob  Bob’s only document so far
+
+statement ok
+RESET ROLE;
+
+statement ok
+DROP TABLE ctas1;
+
+statement ok
+DROP MATERIALIZED VIEW mqt_doc;
+
+statement ok
+DROP TABLE documents;
+
+statement ok
+REVOKE CREATE ON SCHEMA public FROM bob, alice;
+
+statement ok
+DROP ROLE alice, bob;
 
 subtest show_policies_edge_cases
 

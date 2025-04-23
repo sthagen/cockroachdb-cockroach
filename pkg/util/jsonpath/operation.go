@@ -74,13 +74,6 @@ func (o Operation) String() string {
 	if o.Type == OpLogicalNot {
 		return fmt.Sprintf("%s(%s)", OperationTypeStrings[o.Type], o.Left)
 	}
-	// TODO(normanchenn): Postgres normalizes unary +/- operators differently
-	// for numbers vs. non-numbers.
-	// Numbers:      '-1' -> '-1', '--1' -> '1'
-	// Non-numbers:  '-"hello"' -> '(-"hello")'
-	// We currently don't normalize numbers - we output `(-1)` and `(-(-1))`.
-	// See makeItemUnary in postgres/src/backend/utils/adt/jsonpath_gram.y. This
-	// can be done at parse time.
 	if o.Type == OpPlus || o.Type == OpMinus {
 		return fmt.Sprintf("(%s%s)", OperationTypeStrings[o.Type], o.Left)
 	}
@@ -91,4 +84,16 @@ func (o Operation) String() string {
 		return fmt.Sprintf("(%s) %s", o.Left, OperationTypeStrings[o.Type])
 	}
 	return fmt.Sprintf("(%s %s %s)", o.Left, OperationTypeStrings[o.Type], o.Right)
+}
+
+func (o Operation) Validate(nestingLevel int, insideArraySubscript bool) error {
+	if err := o.Left.Validate(nestingLevel, insideArraySubscript); err != nil {
+		return err
+	}
+	if o.Right != nil {
+		if err := o.Right.Validate(nestingLevel, insideArraySubscript); err != nil {
+			return err
+		}
+	}
+	return nil
 }

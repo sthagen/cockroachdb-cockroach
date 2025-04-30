@@ -1915,10 +1915,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "23d44c3d54c92fb354ddd445c17bebb09d159fe897e05c7b328b32efb2c5de68",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250425152833-b751e8763d7b",
+        sha256 = "37cf022e26e06aed9fceeaa5ba619d8b3fecc3a30b432db16cbd2f020e35db64",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250428185656-a909ca0112a8",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250425152833-b751e8763d7b.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250428185656-a909ca0112a8.zip",
         ],
     )
     go_repository(
@@ -7990,16 +7990,6 @@ def go_deps():
         strip_prefix = "github.com/RaduBerinde/axisds@v0.0.0-20250419182453-5135a0650657",
         urls = [
             "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/RaduBerinde/axisds/com_github_raduberinde_axisds-v0.0.0-20250419182453-5135a0650657.zip",
-        ],
-    )
-    go_repository(
-        name = "com_github_raduberinde_btree",
-        build_file_proto_mode = "disable_global",
-        importpath = "github.com/RaduBerinde/btree",
-        sha256 = "1c845dc6e77f27888fa66c8521df4d1d30f3ccf6892e8c1ba0aab4db24e717c1",
-        strip_prefix = "github.com/RaduBerinde/btree@v1.0.2-0.20250415192849-8beea01764ce",
-        urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/RaduBerinde/btree/com_github_raduberinde_btree-v1.0.2-0.20250415192849-8beea01764ce.zip",
         ],
     )
     go_repository(

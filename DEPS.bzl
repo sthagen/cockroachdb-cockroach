@@ -1915,10 +1915,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "37cf022e26e06aed9fceeaa5ba619d8b3fecc3a30b432db16cbd2f020e35db64",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250428185656-a909ca0112a8",
+        sha256 = "0f33543d6861086e7db30dade452a9ac334417664b6dce42ed976303c0c41e4b",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250429172450-e90517277fca",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250428185656-a909ca0112a8.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250429172450-e90517277fca.zip",
         ],
     )
     go_repository(
@@ -1965,10 +1965,10 @@ def go_deps():
         name = "com_github_cockroachdb_tokenbucket",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/tokenbucket",
-        sha256 = "150f3e8e5b515c0886cda0809f09b5d5173d7f2c30eb2f2c6045c2aeb2183aa3",
-        strip_prefix = "github.com/cockroachdb/tokenbucket@v0.0.0-20230807174530-cc333fc44b06",
+        sha256 = "2802e556b469d0989364cf8244bd4992e34e34a72a8c514df9dd787c694c3efd",
+        strip_prefix = "github.com/cockroachdb/tokenbucket@v0.0.0-20250429170803-42689b6311bb",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/tokenbucket/com_github_cockroachdb_tokenbucket-v0.0.0-20230807174530-cc333fc44b06.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/tokenbucket/com_github_cockroachdb_tokenbucket-v0.0.0-20250429170803-42689b6311bb.zip",
         ],
     )
     go_repository(

@@ -140,7 +140,7 @@ require (
 	github.com/cockroachdb/go-test-teamcity v0.0.0-20191211140407-cff980ad0a55
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506
-	github.com/cockroachdb/pebble v0.0.0-20250505205756-f875e84d49c8
+	github.com/cockroachdb/pebble v0.0.0-20250506020002-afff98cbf8be
 	github.com/cockroachdb/redact v1.1.6
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/stress v0.0.0-20220803192808-1806698b1b7b
@@ -506,7 +506,7 @@ replace golang.org/x/time => github.com/cockroachdb/x-time v0.3.1-0.202305251236
 
 replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.3.3-0.20241216150617-2358cdb156a1
 
-replace storj.io/drpc => github.com/cockroachdb/drpc v0.0.0-20240709171858-0075ac871661
+replace storj.io/drpc => github.com/cockroachdb/drpc v0.0.0-20250507084558-a793c5c40d3d
 
 // Note: This forked dependency adds a commit that opens up some
 // private APIs to enable us to make some perf improvements to

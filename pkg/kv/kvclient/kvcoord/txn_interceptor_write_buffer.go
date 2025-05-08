@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,7 +32,7 @@ var BufferedWritesEnabled = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
 	"kv.transaction.write_buffering.enabled",
 	"if enabled, transactional writes are buffered on the client",
-	false,
+	metamorphic.ConstantWithTestBool("kv.transactional.write_buffering.enabled", false /* defaultValue */),
 	settings.WithPublic,
 )
 
@@ -1193,9 +1194,16 @@ func (rr requestRecord) toResp(
 	case *kvpb.QueryLocksRequest, *kvpb.LeaseInfoRequest:
 		// These requests don't interact with buffered writes, so we simply
 		// let the response through unchanged.
+		ru = br
 
 	default:
 		return ru, kvpb.NewError(unsupportedMethodError(req.Method()))
+	}
+
+	if buildutil.CrdbTestBuild {
+		if ru.GetInner() == nil {
+			panic(errors.AssertionFailedf("expected response to be set for type %T", rr.origRequest))
+		}
 	}
 
 	return ru, nil

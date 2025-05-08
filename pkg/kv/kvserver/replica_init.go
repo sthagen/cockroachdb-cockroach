@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
@@ -146,6 +147,7 @@ func newUninitializedReplicaWithoutRaftGroup(
 		allocatorToken: &plan.AllocatorToken{},
 	}
 	r.sideTransportClosedTimestamp.init(store.cfg.ClosedTimestampReceiver, rangeID)
+	r.cachedClosedTimestampPolicy.Store(new(ctpb.RangeClosedTimestampPolicy))
 
 	r.mu.pendingLeaseRequest = makePendingLeaseRequest(r)
 	r.mu.stateLoader = stateloader.Make(rangeID)
@@ -222,7 +224,6 @@ func newUninitializedReplicaWithoutRaftGroup(
 		// NOTE: use the same SyncWaiter loop for all raft log writes performed by a
 		// given range ID, to ensure that callbacks are processed in order.
 		SyncWaiter: store.syncWaiters[int(rangeID)%len(store.syncWaiters)],
-		EntryCache: store.raftEntryCache,
 		Settings:   store.cfg.Settings,
 		DisableSyncLogWriteToss: buildutil.CrdbTestBuild &&
 			store.TestingKnobs().DisableSyncLogWriteToss,

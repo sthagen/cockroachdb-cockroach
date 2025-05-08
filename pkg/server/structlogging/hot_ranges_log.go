@@ -29,7 +29,7 @@ var ReportTopHottestRanges int32 = 5
 
 // CheckInterval is the interval at which the system checks
 // whether or not to log the hot ranges.
-var CheckInterval = time.Second
+var CheckInterval = time.Minute
 
 // TestLoopChannel triggers the hot ranges logging loop to start again.
 // It's useful in the context of a test, where we don't want to wait
@@ -117,8 +117,7 @@ func StartHotRangesLoggingScheduler(
 // installation.
 func (s *hotRangesLoggingScheduler) startTask(ctx context.Context, stopper *stop.Stopper) error {
 	return stopper.RunAsyncTask(ctx, "hot-ranges-stats", func(ctx context.Context) {
-		err := s.start(ctx, stopper)
-		log.Warningf(ctx, "hot ranges stats logging scheduler stopped: %s", err)
+		s.start(ctx, stopper)
 	})
 }
 
@@ -133,7 +132,7 @@ func (s *hotRangesLoggingScheduler) startJob() error {
 	return nil
 }
 
-func (s *hotRangesLoggingScheduler) start(ctx context.Context, stopper *stop.Stopper) error {
+func (s *hotRangesLoggingScheduler) start(ctx context.Context, stopper *stop.Stopper) {
 	for {
 		ci := CheckInterval
 		if s.multiTenant {
@@ -141,9 +140,9 @@ func (s *hotRangesLoggingScheduler) start(ctx context.Context, stopper *stop.Sto
 		}
 		select {
 		case <-stopper.ShouldQuiesce():
-			return nil
+			return
 		case <-ctx.Done():
-			return nil
+			return
 		case <-time.After(ci):
 			s.maybeLogHotRanges(ctx, stopper)
 		case <-TestLoopChannel:

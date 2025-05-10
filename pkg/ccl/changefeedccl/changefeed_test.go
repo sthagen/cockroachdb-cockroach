@@ -1005,6 +1005,7 @@ func TestChangefeedMultiTable(t *testing.T) {
 func TestChangefeedCursor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	require.NoError(t, log.SetVModule("event_processing=3,blocking_buffer=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -7975,7 +7976,7 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 
 		// Even though checkpointing was disabled, when we drain, an attempt is
 		// made to persist up-to-date checkpoint.
-		require.NoError(t, jf.TickHighWaterMark(beforeInsert))
+		require.NoError(t, jf.WaitForHighWaterMark(beforeInsert))
 
 		// Let the retry proceed.
 		ctx, cancel = context.WithTimeout(context.Background(), time.Second*60)

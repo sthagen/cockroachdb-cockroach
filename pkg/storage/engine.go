@@ -927,7 +927,7 @@ type Engine interface {
 	// Properties returns the low-level properties for the engine's underlying storage.
 	Properties() roachpb.StoreProperties
 	// Compact forces compaction over the entire database.
-	Compact() error
+	Compact(ctx context.Context) error
 	// Env returns the filesystem environment used by the Engine.
 	Env() *fs.Env
 	// Excise removes all data for the given span from the engine.
@@ -1074,7 +1074,7 @@ type Engine interface {
 	) error
 	// CompactRange ensures that the specified range of key value pairs is
 	// optimized for space efficiency.
-	CompactRange(start, end roachpb.Key) error
+	CompactRange(ctx context.Context, start, end roachpb.Key) error
 	// ScanStorageInternalKeys returns key level statistics for each level of a pebble store (that overlap start and end).
 	ScanStorageInternalKeys(start, end roachpb.Key, megabytesPerSecond int64) ([]enginepb.StorageInternalKeysMetrics, error)
 	// GetTableMetrics returns information about sstables that overlap start and end.
@@ -1339,7 +1339,7 @@ func (m *Metrics) NumSSTables() int64 {
 func (m *Metrics) IngestedBytes() uint64 {
 	var ingestedBytes uint64
 	for _, lm := range m.Metrics.Levels {
-		ingestedBytes += lm.BytesIngested
+		ingestedBytes += lm.TableBytesIngested
 	}
 	return ingestedBytes
 }
@@ -1348,8 +1348,8 @@ func (m *Metrics) IngestedBytes() uint64 {
 // compactions across all levels of the LSM.
 func (m *Metrics) CompactedBytes() (read, written uint64) {
 	for _, lm := range m.Metrics.Levels {
-		read += lm.BytesRead
-		written += lm.BytesCompacted
+		read += lm.TableBytesRead + lm.BlobBytesReadEstimate
+		written += lm.TableBytesCompacted + lm.BlobBytesWritten
 	}
 	return read, written
 }
@@ -1401,12 +1401,12 @@ func (m *Metrics) AsStoreStatsEvent() eventpb.StoreStats {
 			NumFiles:        l.TablesCount,
 			SizeBytes:       l.TablesSize,
 			Score:           float32(l.Score),
-			BytesIn:         l.BytesIn,
-			BytesIngested:   l.BytesIngested,
-			BytesMoved:      l.BytesMoved,
-			BytesRead:       l.BytesRead,
-			BytesCompacted:  l.BytesCompacted,
-			BytesFlushed:    l.BytesFlushed,
+			BytesIn:         l.TableBytesIn,
+			BytesIngested:   l.TableBytesIngested,
+			BytesMoved:      l.TableBytesMoved,
+			BytesRead:       l.TableBytesRead + l.BlobBytesReadEstimate,
+			BytesCompacted:  l.TableBytesCompacted + l.BlobBytesWritten,
+			BytesFlushed:    l.TableBytesFlushed + l.BlobBytesFlushed,
 			TablesCompacted: l.TablesCompacted,
 			TablesFlushed:   l.TablesFlushed,
 			TablesIngested:  l.TablesIngested,

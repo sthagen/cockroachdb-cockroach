@@ -45,6 +45,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/sqllivenesstestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatstestutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgurlutils"
@@ -511,6 +512,8 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	// Issue a query to be registered in stats.
 	sqlDB.Exec(t, "SELECT version()")
 
+	sqlstatstestutil.WaitForStatementEntriesAtLeast(t, sqlDB, 1)
+
 	// Verify the query shows up in stats.
 	rows := sqlDB.Query(t, "SELECT application_name, key FROM crdb_internal.node_statement_statistics")
 	defer rows.Close()
@@ -544,6 +547,7 @@ func TestPrepareStatisticsMetadata(t *testing.T) {
 	_, err = stmt.Exec(3)
 	require.NoError(t, err)
 
+	sqlstatstestutil.WaitForStatementEntriesAtLeast(t, sqlutils.MakeSQLRunner(sqlDB), 1)
 	// Verify that query and querySummary are equal in crdb_internal.statement_statistics.metadata.
 	rows, err := sqlDB.Query(`SELECT metadata->>'query', metadata->>'querySummary' FROM crdb_internal.statement_statistics WHERE metadata->>'query' LIKE 'SELECT _::INT8'`)
 	if err != nil {
@@ -1782,9 +1786,6 @@ func TestAbortedTxnLocks(t *testing.T) {
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	// TODO(#146238): either remove this or leave a comment for why it's ok.
-	s.SQLConn(t).QueryRow("SET CLUSTER SETTING kv.transaction.write_buffering.enabled = false")
-
 	var TransactionStatus string
 
 	conn1, err := s.SQLConn(t).Conn(ctx)
@@ -1971,7 +1972,18 @@ func TestAbortedTxnLocks(t *testing.T) {
 		require.ErrorContains(t, err, "query execution canceled due to statement timeout")
 
 		_, err = conn1.ExecContext(ctx, `RELEASE SAVEPOINT cockroach_restart`)
-		require.ErrorContains(t, err, "failed preemptive refresh due to encountered recently written committed value")
+		// When buffered writes are enabled the `UPDATE t SET v = 60 WHERE k = 6`
+		// above results in a locking Get (rather than an immediate Put). The Get
+		// does not observe the timestamp cache bump caused by conn 2's SELECT on
+		// the same key. As a result, we don't deal with the serialization failure
+		// until commit time. At commit time our WriteTimestamp is pushed when we
+		// finally evaluate the (buffered) Put and then the EndTxn returns an error
+		// because of the mismatch between the read and write timestamp.
+		if kvcoord.BufferedWritesEnabled.Get(&s.ClusterSettings().SV) {
+			require.ErrorContains(t, err, "RETRY_SERIALIZABLE")
+		} else {
+			require.ErrorContains(t, err, "failed preemptive refresh due to encountered recently written committed value")
+		}
 
 		// Confirm that a lock is still held after the RELEASE.
 		_, err = conn2.ExecContext(ctx, `UPDATE t SET v = 600 WHERE k = 6`)

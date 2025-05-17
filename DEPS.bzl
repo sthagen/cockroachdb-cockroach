@@ -1785,10 +1785,10 @@ def go_deps():
         name = "com_github_cockroachdb_cmux",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/cmux",
-        sha256 = "88f6f9cf33eb535658540b46f6222f029398e590a3ff9cc873d7d561ac6debf0",
-        strip_prefix = "github.com/cockroachdb/cmux@v0.0.0-20170110192607-30d10be49292",
+        sha256 = "c1cf4cd99a1ad6a00f2ccd4188cbcf004cb0d56895670b2c171061ce564cd791",
+        strip_prefix = "github.com/cockroachdb/cmux@v0.0.0-20250514152509-914d3bf9ec58",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/cmux/com_github_cockroachdb_cmux-v0.0.0-20170110192607-30d10be49292.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/cmux/com_github_cockroachdb_cmux-v0.0.0-20250514152509-914d3bf9ec58.zip",
         ],
     )
     go_repository(
@@ -1895,10 +1895,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "f0ef12a1f1d7accb903157e329c27343ed3e9317fc57353ebdd74235ba1a6eb2",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250512202715-3449cfbb4091",
+        sha256 = "58f688839269167a311f98875c6c4aced7a113e1af57ed392dc776289e1ff245",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250515202626-91ea4205afbc",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250512202715-3449cfbb4091.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250515202626-91ea4205afbc.zip",
         ],
     )
     go_repository(
@@ -2635,10 +2635,10 @@ def go_deps():
         name = "com_github_dgryski_go_metro",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/dgryski/go-metro",
-        sha256 = "3f97b3cdeaee7b4fbf4fa06b7c52e3ee6bca461a100077892e861c6c8fc03722",
-        strip_prefix = "github.com/dgryski/go-metro@v0.0.0-20180109044635-280f6062b5bc",
+        sha256 = "cbad2d78b4b3a5b14e14df7e61f96564351b664988aeb49582d12627ffb84550",
+        strip_prefix = "github.com/dgryski/go-metro@v0.0.0-20250106013310-edb8663e5e33",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/dgryski/go-metro/com_github_dgryski_go_metro-v0.0.0-20180109044635-280f6062b5bc.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/dgryski/go-metro/com_github_dgryski_go_metro-v0.0.0-20250106013310-edb8663e5e33.zip",
         ],
     )
     go_repository(

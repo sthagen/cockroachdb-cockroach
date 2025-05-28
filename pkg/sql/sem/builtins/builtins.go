@@ -8003,7 +8003,8 @@ in the current database. Returns an error if validation fails.`,
 
 	"crdb_internal.revalidate_unique_constraints_in_table": makeBuiltin(
 		tree.FunctionProperties{
-			Category: builtinconstants.CategorySystemInfo,
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "table_name", Typ: types.String}},
@@ -8027,7 +8028,8 @@ table. Returns an error if validation fails.`,
 
 	"crdb_internal.revalidate_unique_constraint": makeBuiltin(
 		tree.FunctionProperties{
-			Category: builtinconstants.CategorySystemInfo,
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "table_name", Typ: types.String}, {Name: "constraint_name", Typ: types.String}},
@@ -8053,7 +8055,8 @@ table. Returns an error if validation fails.`,
 	),
 	"crdb_internal.is_constraint_active": makeBuiltin(
 		tree.FunctionProperties{
-			Category: builtinconstants.CategorySystemInfo,
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
 		},
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "table_name", Typ: types.String}, {Name: "constraint_name", Typ: types.String}},
@@ -9328,7 +9331,7 @@ func makeSubStringImpls() builtinDefinition {
 				start := int(tree.MustBeDInt(args[1]))
 				length := int(tree.MustBeDInt(args[2]))
 
-				substring, err := getSubstringFromIndexOfLength(str, "substring", start, length)
+				substring, err := getSubstringFromIndexOfLength(str, start, length)
 				if err != nil {
 					return nil, err
 				}
@@ -9396,7 +9399,7 @@ func makeSubStringImpls() builtinDefinition {
 				start := int(tree.MustBeDInt(args[1]))
 				length := int(tree.MustBeDInt(args[2]))
 
-				substring, err := getSubstringFromIndexOfLength(bitString.BitArray.String(), "bit subarray", start, length)
+				substring, err := getSubstringFromIndexOfLength(bitString.BitArray.String(), start, length)
 				if err != nil {
 					return nil, err
 				}
@@ -9433,7 +9436,7 @@ func makeSubStringImpls() builtinDefinition {
 				start := int(tree.MustBeDInt(args[1]))
 				length := int(tree.MustBeDInt(args[2]))
 
-				substring, err := getSubstringFromIndexOfLengthBytes(byteString, "byte subarray", start, length)
+				substring, err := getSubstringFromIndexOfLengthBytes(byteString, start, length)
 				if err != nil {
 					return nil, err
 				}
@@ -9481,16 +9484,21 @@ func getSubstringFromIndex(str string, start int) string {
 	return string(runes[start:])
 }
 
+// NegativeSubstringLengthErr should be thrown when the substring builtin
+// is given a value of 'length' less than zero.
+var NegativeSubstringLengthErr = pgerror.New(
+	pgcode.InvalidParameterValue, "negative substring length not allowed",
+)
+
 // Returns a substring of given string starting at given position and
 // include up to a certain length.
-func getSubstringFromIndexOfLength(str, errMsg string, start, length int) (string, error) {
+func getSubstringFromIndexOfLength(str string, start, length int) (string, error) {
 	runes := []rune(str)
 	// SQL strings are 1-indexed.
 	start--
 
 	if length < 0 {
-		return "", pgerror.Newf(
-			pgcode.InvalidParameterValue, "negative %s length %d not allowed", errMsg, length)
+		return "", NegativeSubstringLengthErr
 	}
 
 	end := start + length
@@ -9528,14 +9536,13 @@ func getSubstringFromIndexBytes(str string, start int) string {
 
 // Returns a substring of given string starting at given position and include up
 // to a certain length by interpreting the string as raw bytes.
-func getSubstringFromIndexOfLengthBytes(str, errMsg string, start, length int) (string, error) {
+func getSubstringFromIndexOfLengthBytes(str string, start, length int) (string, error) {
 	bytes := []byte(str)
 	// SQL strings are 1-indexed.
 	start--
 
 	if length < 0 {
-		return "", pgerror.Newf(
-			pgcode.InvalidParameterValue, "negative %s length %d not allowed", errMsg, length)
+		return "", NegativeSubstringLengthErr
 	}
 
 	end := start + length

@@ -476,9 +476,9 @@ func TestReplicaStringAndSafeFormat(t *testing.T) {
 	// String.
 	assert.Equal(t, "[n1,s2,r3/4:{a-b}]", r.String())
 	// Redactable string.
-	assert.EqualValues(t, "[n1,s2,r3/4:‹{a-b}›]", redact.Sprint(r))
+	assert.EqualValues(t, "[n1,s2,r3/4:{‹a›-‹b›}]", redact.Sprint(r))
 	// Redacted string.
-	assert.EqualValues(t, "[n1,s2,r3/4:‹×›]", redact.Sprint(r).Redact())
+	assert.EqualValues(t, "[n1,s2,r3/4:{‹×›-‹×›}]", redact.Sprint(r).Redact())
 }
 
 // TestReplicaContains verifies that the range uses Key.Address() in
@@ -7007,8 +7007,17 @@ func TestReplicaDestroy(t *testing.T) {
 	expectedKeys := []roachpb.Key{keys.RangeTombstoneKey(tc.repl.RangeID)}
 	actualKeys := []roachpb.Key{}
 
+	selOpts := rditer.SelectOpts{
+		Ranged: rditer.SelectRangedOptions{
+			SystemKeys: true,
+			LockTable:  true,
+			UserKeys:   true,
+		},
+		ReplicatedByRangeID:   true,
+		UnreplicatedByRangeID: true,
+	}
 	require.NoError(t, rditer.IterateReplicaKeySpans(
-		ctx, tc.repl.Desc(), engSnapshot, false /* replicatedOnly */, rditer.ReplicatedSpansAll,
+		ctx, tc.repl.Desc(), engSnapshot, selOpts,
 		func(iter storage.EngineIterator, _ roachpb.Span) error {
 			var err error
 			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {

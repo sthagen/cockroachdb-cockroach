@@ -39,8 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/idalloc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowhandle"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/node_rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/replica_rac2"
@@ -1295,13 +1293,6 @@ type StoreConfig struct {
 
 	// KVAdmissionController is used for admission control.
 	KVAdmissionController kvadmission.Controller
-	// KVFlowController is used for replication admission control.
-	KVFlowController kvflowcontrol.Controller
-	// KVFlowHandles is used for replication admission control.
-	KVFlowHandles kvflowcontrol.Handles
-	// KVFlowHandleMetrics is a shared metrics struct for all
-	// kvflowcontrol.Handles.
-	KVFlowHandleMetrics *kvflowhandle.Metrics
 	// KVFlowAdmittedPiggybacker is used for replication AC (flow control) v2.
 	KVFlowAdmittedPiggybacker replica_rac2.AdmittedPiggybacker
 	// KVFlowStreamTokenProvider is used for replication AC (flow control) v2 to
@@ -3656,7 +3647,14 @@ func (s *Store) checkpointSpans(desc *roachpb.RangeDescriptor) []roachpb.Span {
 	}
 	// Include replicated user key span containing ranges left, desc, and right.
 	// TODO(tbg): rangeID is ignored here, make a rangeID-agnostic helper.
-	spans = append(spans, rditer.Select(0, rditer.SelectOpts{ReplicatedBySpan: userKeys})...)
+	spans = append(spans, rditer.Select(0, rditer.SelectOpts{
+		Ranged: rditer.SelectRangedOptions{
+			RSpan:      userKeys,
+			SystemKeys: true,
+			UserKeys:   true,
+			LockTable:  true,
+		},
+	})...)
 
 	return spans
 }

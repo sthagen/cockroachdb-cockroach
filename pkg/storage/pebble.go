@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -224,6 +225,19 @@ func RegisterCompressionAlgorithmClusterSetting(
 	)
 }
 
+var defaultCompressionAlgorithm = func() CompressionAlgorithm {
+	if runtime.GOARCH == "amd64" {
+		// We prefer MinLZ on amd64 because it is slightly superior to Snappy in
+		// almost all cases (both in terms of speed and compression ratio).
+		//
+		// Only amd64 has an optimized assembly MinLZ implementation; the Go
+		// implementation is significantly slower, especially when decompressing;
+		// see https://github.com/minio/minlz#protobuf-sample
+		return CompressionAlgorithmMinLZ
+	}
+	return CompressionAlgorithmSnappy
+}()
+
 // CompressionAlgorithmStorage determines the compression algorithm used to
 // compress data blocks when writing sstables for use in a Pebble store (written
 // directly, or constructed for ingestion on a remote store via AddSSTable).
@@ -232,7 +246,7 @@ func RegisterCompressionAlgorithmClusterSetting(
 var CompressionAlgorithmStorage = RegisterCompressionAlgorithmClusterSetting(
 	"storage.sstable.compression_algorithm",
 	`determines the compression algorithm to use when compressing sstable data blocks for use in a Pebble store;`,
-	CompressionAlgorithmMinLZ, // Default.
+	defaultCompressionAlgorithm,
 )
 
 // CompressionAlgorithmBackupStorage determines the compression algorithm used
@@ -242,7 +256,7 @@ var CompressionAlgorithmStorage = RegisterCompressionAlgorithmClusterSetting(
 var CompressionAlgorithmBackupStorage = RegisterCompressionAlgorithmClusterSetting(
 	"storage.sstable.compression_algorithm_backup_storage",
 	`determines the compression algorithm to use when compressing sstable data blocks for backup row data storage;`,
-	CompressionAlgorithmMinLZ, // Default.
+	defaultCompressionAlgorithm,
 )
 
 // CompressionAlgorithmBackupTransport determines the compression algorithm used
@@ -255,7 +269,7 @@ var CompressionAlgorithmBackupStorage = RegisterCompressionAlgorithmClusterSetti
 var CompressionAlgorithmBackupTransport = RegisterCompressionAlgorithmClusterSetting(
 	"storage.sstable.compression_algorithm_backup_transport",
 	`determines the compression algorithm to use when compressing sstable data blocks for backup transport;`,
-	CompressionAlgorithmMinLZ, // Default.
+	defaultCompressionAlgorithm,
 )
 
 func getCompressionAlgorithm(
@@ -410,7 +424,6 @@ func DefaultPebbleOptions() *pebble.Options {
 		L0CompactionThreshold:       2,
 		L0StopWritesThreshold:       1000,
 		LBaseMaxBytes:               64 << 20, // 64 MB
-		Levels:                      make([]pebble.LevelOptions, 7),
 		MemTableSize:                64 << 20, // 64 MB
 		MemTableStopWritesThreshold: 4,
 		Merger:                      MVCCMerger,
@@ -449,16 +462,21 @@ func DefaultPebbleOptions() *pebble.Options {
 
 	opts.Experimental.UserKeyCategories = userKeyCategories
 
-	for i := 0; i < len(opts.Levels); i++ {
+	opts.Levels[0] = pebble.LevelOptions{
+		BlockSize:      32 << 10,  // 32 KB
+		IndexBlockSize: 256 << 10, // 256 KB
+		FilterPolicy:   bloom.FilterPolicy(10),
+		FilterType:     pebble.TableFilter,
+	}
+	opts.Levels[0].EnsureL0Defaults()
+	for i := 1; i < len(opts.Levels); i++ {
 		l := &opts.Levels[i]
 		l.BlockSize = 32 << 10       // 32 KB
 		l.IndexBlockSize = 256 << 10 // 256 KB
 		l.FilterPolicy = bloom.FilterPolicy(10)
 		l.FilterType = pebble.TableFilter
-		if i > 0 {
-			l.TargetFileSize = opts.Levels[i-1].TargetFileSize * 2
-		}
-		l.EnsureDefaults()
+		l.TargetFileSize = opts.Levels[i-1].TargetFileSize * 2
+		l.EnsureL1PlusDefaults(&opts.Levels[i-1])
 	}
 
 	// These size classes are a subset of available size classes in jemalloc[1].

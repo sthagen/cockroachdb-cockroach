@@ -1952,6 +1952,13 @@ func TestRepeatableReadLogic_show_create_all_tables_builtin(
 	runLogicTest(t, "show_create_all_tables_builtin")
 }
 
+func TestRepeatableReadLogic_show_create_all_triggers(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_all_triggers")
+}
+
 func TestRepeatableReadLogic_show_create_all_types(
 	t *testing.T,
 ) {
@@ -2351,18 +2358,25 @@ func TestRepeatableReadLogic_udf_fk(
 	runLogicTest(t, "udf_fk")
 }
 
-func TestRepeatableReadLogic_udf_in_column_defaults(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "udf_in_column_defaults")
-}
-
 func TestRepeatableReadLogic_udf_in_constraints(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_in_constraints")
+}
+
+func TestRepeatableReadLogic_udf_in_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_index")
+}
+
+func TestRepeatableReadLogic_udf_in_table(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_table")
 }
 
 func TestRepeatableReadLogic_udf_insert(

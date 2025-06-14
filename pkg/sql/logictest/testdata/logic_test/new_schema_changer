@@ -828,7 +828,7 @@ SET experimental_computed_column_rewrites = "(ts :: STRING) -> (to_char(ts AT TI
 statement ok
 ALTER TABLE trewrite ADD COLUMN c STRING AS (ts::STRING) STORED
 
-skipif config local-schema-locked
+onlyif config schema-locked-disabled
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE trewrite]
 ----
@@ -840,7 +840,7 @@ CREATE TABLE public.trewrite (
   FAMILY fam_0_k_ts (k, ts, c)
 );
 
-onlyif config local-schema-locked
+skipif config schema-locked-disabled
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE trewrite]
 ----
@@ -1116,7 +1116,7 @@ statement ok
 DROP VIEW v1ev CASCADE;
 
 query IT
-SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'LatencyNanos'
+SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'TxnTimestamp' - 'LatencyNanos'
 FROM system.eventlog
 ORDER BY "timestamp", info DESC
 ----
@@ -1141,12 +1141,12 @@ statement ok
 DROP TABLE t1ev,t2ev CASCADE;
 
 query IT
-SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'LatencyNanos'
+SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'TxnTimestamp' - 'LatencyNanos'
 FROM system.eventlog
 ORDER BY timestamp, info DESC;
 ----
-1  {"CascadeDroppedViews": ["test.public.v2ev", "test.public.v3ev"], "EventType": "drop_table", "Statement": "DROP TABLE test.public.t1ev, test.public.t2ev CASCADE", "TableName": "test.public.t2ev", "Tag": "DROP TABLE", "User": "root"}
 1  {"CascadeDroppedViews": ["test.public.v1ev", "test.public.v4ev"], "EventType": "drop_table", "Statement": "DROP TABLE test.public.t1ev, test.public.t2ev CASCADE", "TableName": "test.public.t1ev", "Tag": "DROP TABLE", "User": "root"}
+1  {"CascadeDroppedViews": ["test.public.v2ev", "test.public.v3ev"], "EventType": "drop_table", "Statement": "DROP TABLE test.public.t1ev, test.public.t2ev CASCADE", "TableName": "test.public.t2ev", "Tag": "DROP TABLE", "User": "root"}
 1  {"EventType": "finish_schema_change", "InstanceID": 1}
 1  {"EventType": "finish_schema_change", "InstanceID": 1}
 
@@ -1160,7 +1160,7 @@ statement ok
 ALTER TABLE fooev ADD COLUMN j INT
 
 query IT
-SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'LatencyNanos'
+SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'TxnTimestamp' - 'LatencyNanos'
 FROM system.eventlog
 ORDER BY timestamp, info DESC;
 ----
@@ -1208,7 +1208,7 @@ statement ok
 DROP DATABASE db2 cascade;
 
 query IT
-SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'LatencyNanos'
+SELECT "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID' - 'TxnTimestamp' - 'LatencyNanos'
 FROM system.eventlog
 ORDER BY timestamp, info DESC;
 ----
@@ -1469,7 +1469,7 @@ ALTER TABLE t ADD COLUMN j INT DEFAULT 42;
 statement ok
 COMMIT
 
-skipif config local-schema-locked
+onlyif config schema-locked-disabled
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE t]
 ----
@@ -1481,7 +1481,7 @@ CREATE TABLE public.t (
   UNIQUE INDEX t_k_key (k ASC)
 );
 
-onlyif config local-schema-locked
+skipif config schema-locked-disabled
 query T
 SELECT create_statement FROM [SHOW CREATE TABLE t]
 ----

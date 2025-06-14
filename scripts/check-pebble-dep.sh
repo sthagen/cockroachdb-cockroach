@@ -9,17 +9,19 @@
 set -euo pipefail
 #set -x
 
-RELEASES="23.2 24.1 24.3 25.1 25.2 master"
+# Find all release-xx.y branches where xx >= 24.
+BRANCHES=$(git branch -r --format='%(refname)' \
+    | grep '^refs\/remotes/\origin\/release-2[4-9]\.[0-9]$' \
+    | sed 's/^refs\/remotes\/origin\///' \
+    | sort -V)
 
 EXIT_CODE=0
-for REL in $RELEASES; do
-  if [ "$REL" = "master" ]; then
-    BRANCH=master
-    PEBBLE_BRANCH=master
-  else
-    BRANCH="release-$REL"
-    PEBBLE_BRANCH="crl-release-$REL"
+for BRANCH in $BRANCHES; do
+  if [ "$BRANCH" = "release-24.2" ]; then
+    # Skip the release-24.2 branch, which is frozen.
+    continue
   fi
+  PEBBLE_BRANCH="crl-$BRANCH"
   DEP_SHA=$(git show "origin/$BRANCH:go.mod" |
     grep 'github.com/cockroachdb/pebble' |
     grep -o -E '[a-f0-9]{12}$')
@@ -27,16 +29,22 @@ for REL in $RELEASES; do
     grep "refs/heads/$PEBBLE_BRANCH" |
     grep -o -E '^[a-f0-9]{12}')
   
-  if [ "$DEP_SHA" != "$TIP_SHA" ]; then
-    echo Branch $BRANCH pebble dependency up to date.
+  if [ "$DEP_SHA" = "$TIP_SHA" ]; then
     continue
   fi
 
-  echo Branch $BRANCH pebble dependency not up to date: $DEP_SHA vs current $TIP_SHA
-  if [ "$REL" != "master" ]; then
-    # Return an error if a release branch is not up to date.
-    EXIT_CODE=1
+  if [ $EXIT_CODE -eq 0 ]; then
+    echo "Some release branches have out-of-date Pebble dependencies:"
   fi
+  echo "  - $BRANCH: dependency set at $DEP_SHA, but $PEBBLE_BRANCH tip is $TIP_SHA"
+  EXIT_CODE=1
 done
 
-exit $EXIT_CODE
+if [ $EXIT_CODE -ne 0 ]; then
+  exit $EXIT_CODE
+fi
+
+echo "All release branches have up-to-date Pebble dependencies:"
+for BRANCH in $BRANCHES; do
+  echo " - $BRANCH"
+done

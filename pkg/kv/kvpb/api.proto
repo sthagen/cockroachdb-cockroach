@@ -223,6 +223,15 @@ message GetRequest {
   // LockNonExisting indicates whether the Get request should acquire a lock
   // on keys that don't exist.
   bool lock_non_existing = 5;
+
+  // ExpectExclusionSince, if set, indicates that the request should return an
+  // error if this key has been written to at a timestamp at or after the given
+  // timestamp. This allows the request to verify that a previously acquired
+  // unreplicated lock has provided the required protection. Note that it does
+  // not check for the existence of the lock. It checks for a write that the
+  // lock should have prevented. If such a write is found an
+  // ExclusionViolationError is returned.
+  util.hlc.Timestamp expect_exclusion_since = 6 [(gogoproto.nullable) = false];
 }
 
 // A GetResponse is the return value from the Get() method.
@@ -1027,18 +1036,24 @@ message EndTxnResponse {
   // The commit timestamp of the STAGING transaction record written
   // by the request. Only set if the transaction record was staged.
   util.hlc.Timestamp staging_timestamp = 5 [(gogoproto.nullable) = false];
-  // ReplicatedLocksReleasedOnCommit, if non-empty, indicate that replicated
-  // locks with strength Shared or Exclusive were released in the referenced key
-  // spans when committing this transaction. Notably, this field is left unset
-  // if only write intents were resolved. The field is also left unset for
-  // transactions that aborted.
+  // ReplicatedLocalLocksReleasedOnCommit, if non-empty, indicate that
+  // replicated locks with strength Shared or Exclusive were released in the
+  // referenced key spans when committing this transaction. These locks are
+  // local to the range on which the EndTxn request evaluated. Notably, this
+  // field is left unset if only write intents were resolved. The field is only
+  // set when transactions are explicitly marked as committed.
   //
   // The caller must bump the timestamp cache across these spans to the
-  // transaction's commit timestamp. Doing so ensures that the released locks
-  // (acquired by the now committed transaction) continue to provide protection
-  // against other writers up to the commit timestamp, even after the locks have
-  // been released.
-  repeated Span replicated_locks_released_on_commit = 6 [(gogoproto.nullable) = false];
+  // transaction's commit timestamp. Doing so ensures that the released local[1]
+  // locks (acquired by the now committed transaction) continue to provide
+  // protection against other writers up to the commit timestamp, even after the
+  // locks have been released.
+  //
+  // [1] Non-local replicated locks provide the same protection, however, the
+  // mechanism of bumping the timestamp cache is different there. See the
+  // ReplicatedLocksReleasedCommitTimestamp field on
+  // ResolveIntent{,Range}Response.
+  repeated Span replicated_local_locks_released_on_commit = 6 [(gogoproto.nullable) = false];
 }
 
 // An AdminSplitRequest is the argument to the AdminSplit() method. The
@@ -2959,7 +2974,7 @@ message Header {
 
   // HasBufferedAllPrecedingWrites, if set, indicates that the batch belongs to
   // a transaction that has buffered all of its writes (from preceding batches)
-  // on the client. 
+  // on the client.
   //
   // The server may use this field to omit checking the AbortSpan. Transactions
   // use the AbortSpan to check whether they've been aborted or not. If they
@@ -2974,7 +2989,7 @@ message Header {
   // read-your-own-writes. As such, they can eschew checking the AbortSpan on
   // the server.
   bool has_buffered_all_preceding_writes = 37;
-  
+
   reserved 7, 10, 12, 14, 20;
 
   // Next ID: 38
@@ -3710,6 +3725,14 @@ service TenantSpanConfig {
   // SpanConfigConformance is used to determine whether ranges backing the given
   // keyspans conform to span configs that apply over them.
   rpc SpanConfigConformance(SpanConfigConformanceRequest) returns (SpanConfigConformanceResponse) {}
+}
+
+// Cluster service offers RPCs for inter-node communication essential for
+// cluster bootstrapping and operation.
+service Cluster {
+  // Join a bootstrapped cluster. If the target node is itself not part of a
+  // bootstrapped cluster, an appropriate error is returned.
+  rpc Join (JoinNodeRequest) returns (JoinNodeResponse) {}
 }
 
 // Batch and RangeFeed service implemented by nodes for KV API requests.

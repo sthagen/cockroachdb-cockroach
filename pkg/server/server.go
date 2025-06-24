@@ -986,6 +986,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 	if err := kvpb.DRPCRegisterKVBatch(drpcServer, node.AsDRPCKVBatchServer()); err != nil {
 		return nil, err
 	}
+	if err := kvpb.DRPCRegisterRangeFeed(drpcServer, node.AsDRPCRangeFeedServer()); err != nil {
+		return nil, err
+	}
 	if err := kvpb.DRPCRegisterTenantService(drpcServer, node.AsDRPCTenantServiceServer()); err != nil {
 		return nil, err
 	}
@@ -1251,6 +1254,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 			return nil, errors.Errorf("%d: nil", i)
 		}
 		gw.RegisterService(grpcServer.Server)
+	}
+
+	for _, s := range []drpcServiceRegistrar{sAdmin, sStatus, sAuth, &sTS} {
+		if err := s.RegisterDRPCService(drpcServer); err != nil {
+			return nil, err
+		}
 	}
 
 	// Tell the node event logger (join, restart) how to populate SQL entries

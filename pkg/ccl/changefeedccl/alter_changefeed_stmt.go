@@ -15,8 +15,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedvalidators"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/checkpoint"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -161,19 +159,7 @@ func alterChangefeedPlanHook(
 		if err != nil {
 			return err
 		}
-		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V25_2) {
-			changefeedProgress := newProgress.GetChangefeed()
-			if changefeedProgress != nil && !changefeedProgress.SpanLevelCheckpoint.IsEmpty() {
-				if !changefeedProgress.Checkpoint.IsEmpty() {
-					return errors.AssertionFailedf("both legacy and current checkpoint set on changefeed job progress")
-				}
-				legacyCheckpoint := checkpoint.ConvertToLegacyCheckpoint(changefeedProgress.SpanLevelCheckpoint)
-				if err := changefeedProgress.SetCheckpoint(legacyCheckpoint, nil); err != nil {
-					return err
-				}
-			}
-		}
-		newChangefeedStmt.Targets = newTargets
+		newChangefeedStmt.TableTargets = newTargets
 
 		if prevDetails.Select != "" {
 			query, err := cdceval.ParseChangefeedExpression(prevDetails.Select)
@@ -394,10 +380,10 @@ func generateAndValidateNewTargets(
 	prevProgress jobspb.Progress,
 	sinkURI string,
 ) (
-	tree.ChangefeedTargets,
+	tree.ChangefeedTableTargets,
 	*jobspb.Progress,
 	hlc.Timestamp,
-	map[tree.ChangefeedTarget]jobspb.ChangefeedTargetSpecification,
+	map[tree.ChangefeedTableTarget]jobspb.ChangefeedTargetSpecification,
 	error,
 ) {
 
@@ -405,8 +391,8 @@ func generateAndValidateNewTargets(
 		TableID    descpb.ID
 		FamilyName tree.Name
 	}
-	newTargets := make(map[targetKey]tree.ChangefeedTarget)
-	droppedTargets := make(map[targetKey]tree.ChangefeedTarget)
+	newTargets := make(map[targetKey]tree.ChangefeedTableTarget)
+	droppedTargets := make(map[targetKey]tree.ChangefeedTableTarget)
 	newTableDescs := make(map[descpb.ID]catalog.Descriptor)
 
 	// originalSpecs provides a mapping between tree.ChangefeedTargets that
@@ -414,7 +400,7 @@ func generateAndValidateNewTargets(
 	// jobspb.ChangefeedTargetSpecification. The purpose of this mapping is to ensure
 	// that the StatementTimeName of the existing targets are not modified when the
 	// name of the target was modified.
-	originalSpecs := make(map[tree.ChangefeedTarget]jobspb.ChangefeedTargetSpecification)
+	originalSpecs := make(map[tree.ChangefeedTableTarget]jobspb.ChangefeedTargetSpecification)
 
 	// We want to store the value of whether or not the original changefeed had
 	// initial_scan set to only so that we only do an initial scan on an alter
@@ -486,7 +472,7 @@ func generateAndValidateNewTargets(
 			return err
 		}
 
-		newTarget := tree.ChangefeedTarget{
+		newTarget := tree.ChangefeedTableTarget{
 			TableName:  tablePattern,
 			FamilyName: tree.Name(targetSpec.FamilyName),
 		}
@@ -653,12 +639,12 @@ func generateAndValidateNewTargets(
 			}
 		}
 		droppedTargetSpans := fetchSpansForDescs(p, droppedIDs)
-		if err := removeSpansFromProgress(newJobProgress, droppedTargetSpans, newJobStatementTime); err != nil {
+		if err := removeSpansFromProgress(newJobProgress, droppedTargetSpans); err != nil {
 			return nil, nil, hlc.Timestamp{}, nil, err
 		}
 	}
 
-	newTargetList := tree.ChangefeedTargets{}
+	newTargetList := tree.ChangefeedTableTargets{}
 
 	for _, target := range newTargets {
 		newTargetList = append(newTargetList, target)
@@ -688,7 +674,7 @@ func generateAndValidateNewTargets(
 func validateNewTargets(
 	ctx context.Context,
 	p sql.PlanHookState,
-	newTargets tree.ChangefeedTargets,
+	newTargets tree.ChangefeedTableTargets,
 	jobProgress jobspb.Progress,
 	jobStatementTime hlc.Timestamp,
 ) error {
@@ -759,8 +745,7 @@ func generateNewProgress(
 	haveHighwater := prevHighWater != nil && prevHighWater.IsSet()
 	// TODO(#142376): Whether a checkpoint exists seems orthogonal to what
 	// we do in this function. Consider removing this flag.
-	haveCheckpoint := changefeedProgress != nil &&
-		(!changefeedProgress.Checkpoint.IsEmpty() || !changefeedProgress.SpanLevelCheckpoint.IsEmpty())
+	haveCheckpoint := changefeedProgress != nil && !changefeedProgress.SpanLevelCheckpoint.IsEmpty()
 
 	// Check if the progress does not need to be updated. The progress does not
 	// need to be updated if:
@@ -834,7 +819,7 @@ func generateNewProgress(
 	// the events for the new table start at the ALTER CHANGEFEED statement
 	// time instead.
 
-	spanLevelCheckpoint, err := getSpanLevelCheckpointFromProgress(prevProgress, prevStatementTime)
+	spanLevelCheckpoint, err := getSpanLevelCheckpointFromProgress(prevProgress)
 	if err != nil {
 		return jobspb.Progress{}, hlc.Timestamp{}, err
 	}
@@ -857,10 +842,8 @@ func generateNewProgress(
 	return newProgress, prevStatementTime, nil
 }
 
-func removeSpansFromProgress(
-	progress jobspb.Progress, spansToRemove []roachpb.Span, statementTime hlc.Timestamp,
-) error {
-	spanLevelCheckpoint, err := getSpanLevelCheckpointFromProgress(progress, statementTime)
+func removeSpansFromProgress(progress jobspb.Progress, spansToRemove []roachpb.Span) error {
+	spanLevelCheckpoint, err := getSpanLevelCheckpointFromProgress(progress)
 	if err != nil {
 		return err
 	}
@@ -876,31 +859,18 @@ func removeSpansFromProgress(
 			checkpointSpansMap[ts] = spans
 		}
 	}
-	spanLevelCheckpoint = jobspb.NewTimestampSpansMap(checkpointSpansMap)
-	if err := progress.GetChangefeed().SetCheckpoint(nil, spanLevelCheckpoint); err != nil {
-		return err
-	}
+	progress.GetChangefeed().SpanLevelCheckpoint = jobspb.NewTimestampSpansMap(checkpointSpansMap)
 
 	return nil
 }
 
 func getSpanLevelCheckpointFromProgress(
-	progress jobspb.Progress, statementTime hlc.Timestamp,
+	progress jobspb.Progress,
 ) (*jobspb.TimestampSpansMap, error) {
 	changefeedProgress := progress.GetChangefeed()
 	if changefeedProgress == nil {
 		return nil, nil
 	}
-
-	if !changefeedProgress.Checkpoint.IsEmpty() && !changefeedProgress.SpanLevelCheckpoint.IsEmpty() {
-		return nil, errors.AssertionFailedf("both legacy and current checkpoint set on changefeed job progress")
-	}
-
-	if legacyCheckpoint := changefeedProgress.Checkpoint; !legacyCheckpoint.IsEmpty() {
-		hw := progress.GetHighWater()
-		return checkpoint.ConvertFromLegacyCheckpoint(legacyCheckpoint, statementTime, *hw), nil
-	}
-
 	return changefeedProgress.SpanLevelCheckpoint, nil
 }
 

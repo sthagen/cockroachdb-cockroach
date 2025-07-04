@@ -101,6 +101,7 @@ enable_implicit_transaction_for_batch_statements                 on
 enable_insert_fast_path                                          on
 enable_multiple_modifications_of_table                           off
 enable_multiregion_placement_policy                              off
+enable_scrub_job                                                 off
 enable_seqscan                                                   on
 enable_shared_locking_for_serializable                           off
 enable_super_regions                                             off
@@ -489,13 +490,14 @@ v           CREATE VIEW public.v (
             ) AS SELECT id FROM system.public.descriptor;
 
 
-query TTT colnames
+skipif config local-mixed-25.2
+query TTTT colnames
 SELECT * FROM [SHOW USERS] ORDER BY 1
 ----
-username  options  member_of
-admin     ·        {}
-root      ·        {admin}
-testuser  ·        {}
+username  options  member_of estimated_last_login_time
+admin     {}       {}        NULL
+root      {}       {admin}   NULL
+testuser  {}       {}        NULL
 
 
 query TTTI colnames

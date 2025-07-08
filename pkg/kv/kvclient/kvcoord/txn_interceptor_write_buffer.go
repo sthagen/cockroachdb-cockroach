@@ -189,9 +189,16 @@ type txnWriteBuffer struct {
 	flushOnNextBatch bool
 
 	// firstExplicitSavepointSeq tracks the lowest explicit savepoint that hasn't
-	// been released or rolled back. If this savepoint is non-zero, then a
-	// mid-transaction flush must flush all revisions required to roll back this
-	// (or a later) savepoint.
+	// been released or rolled back.
+	//
+	// NOTE(ssd): Our original intent was to use this to elide old revisions
+	// during a mid-transaction flush. However, we may still need old revisions if
+	// we are flushed in the middle of a statement where some reads should not be
+	// able to see modifications from other parts of the statement.
+	//
+	// I _think_ we could bring this optimization back, but it would require some
+	// cooperation with the conn executor to inform us when such statements had
+	// started and stopped execution.
 	firstExplicitSavepointSeq enginepb.TxnSeq
 
 	buffer        btree
@@ -442,8 +449,8 @@ func unsupportedOptionError(m kvpb.Method, option string) error {
 // size if the writes from the supplied batch request are buffered.
 func (twb *txnWriteBuffer) estimateSize(ba *kvpb.BatchRequest, transformScans bool) int64 {
 	var scratch bufferedWrite
+	scratch.vals = scratch.valsScratch[:1]
 	estimate := int64(0)
-	scratch.vals = make([]bufferedValue, 1)
 	for _, ru := range ba.Requests {
 		req := ru.GetInner()
 		switch t := req.(type) {
@@ -622,7 +629,6 @@ func (twb *txnWriteBuffer) populateLeafInputState(
 				continue
 			}
 		}
-		// TODO(yuzefovich): optimize allocation of vals slices.
 		vals := make([]roachpb.BufferedWrite_Val, 0, len(bw.vals))
 		for _, v := range bw.vals {
 			vals = append(vals, roachpb.BufferedWrite_Val{
@@ -650,7 +656,6 @@ func (twb *txnWriteBuffer) initializeLeaf(tis *roachpb.LeafTxnInputState) {
 	// We have some buffered writes, so they must be enabled on the root.
 	twb.enabled = true
 	for _, bw := range tis.BufferedWrites {
-		// TODO(yuzefovich): optimize allocation of vals slices.
 		vals := make([]bufferedValue, 0, len(bw.Vals))
 		for _, bv := range bw.Vals {
 			vals = append(vals, bufferedValue{
@@ -688,10 +693,6 @@ func (twb *txnWriteBuffer) epochBumpedLocked() {
 func (twb *txnWriteBuffer) resetBuffer() {
 	twb.buffer.Reset()
 	twb.bufferSize = 0
-}
-
-func (twb *txnWriteBuffer) hasActiveSavepoint() bool {
-	return twb.firstExplicitSavepointSeq != enginepb.TxnSeq(0)
 }
 
 // createSavepointLocked is part of the txnInterceptor interface.
@@ -751,6 +752,11 @@ func (twb *txnWriteBuffer) rollbackToSavepointLocked(ctx context.Context, s save
 		}
 		// Rollback writes by truncating the buffered values.
 		it.Cur().vals = bufferedVals[:idx]
+		if idx == 0 {
+			// Since we lost references to all values, ensure that the scratch
+			// space is also reset.
+			it.Cur().valsScratch[0] = bufferedValue{}
+		}
 		if it.Cur().empty() {
 			// All writes have been rolled back and we hold no locks; we should remove
 			// this key from the buffer entirely.
@@ -1606,10 +1612,11 @@ func (twb *txnWriteBuffer) addToBuffer(
 	} else {
 		twb.bufferIDAlloc++
 		bw := &bufferedWrite{
-			id:   twb.bufferIDAlloc,
-			key:  key,
-			vals: []bufferedValue{{val: val, seq: seq, kvNemesisSeq: kvNemSeq}},
+			id:          twb.bufferIDAlloc,
+			key:         key,
+			valsScratch: [1]bufferedValue{{val: val, seq: seq, kvNemesisSeq: kvNemSeq}},
 		}
+		bw.vals = bw.valsScratch[:1]
 		if lockInfo != nil {
 			bw.acquireLock(lockInfo)
 		}
@@ -1687,7 +1694,7 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 		twb.txnMetrics.TxnWriteBufferDisabledAfterBuffering.Inc(1)
 	}
 
-	midTxnFlushWithExplicitSavepoint := !hasEndTxn && twb.hasActiveSavepoint()
+	midTxnFlush := !hasEndTxn
 
 	// Flush all buffered writes by pre-pending them to the requests being sent
 	// in the batch.
@@ -1698,8 +1705,8 @@ func (twb *txnWriteBuffer) flushBufferAndSendBatch(
 	it := twb.buffer.MakeIter()
 	numRevisionsBuffered := 0
 	for it.First(); it.Valid(); it.Next() {
-		if midTxnFlushWithExplicitSavepoint {
-			revs := it.Cur().toAllRevisionRequests(twb.firstExplicitSavepointSeq)
+		if midTxnFlush {
+			revs := it.Cur().toAllRevisionRequests()
 			numRevisionsBuffered += len(revs)
 			reqs = append(reqs, revs...)
 		} else {
@@ -1755,9 +1762,10 @@ func (twb *txnWriteBuffer) testingBufferedWritesAsSlice() []bufferedWrite {
 	it := twb.buffer.MakeIter()
 	for it.First(); it.Valid(); it.Next() {
 		bw := *it.Cur()
-		// Scrub the id/endKey for the benefit of tests.
+		// Scrub the id/endKey/valsScratch for the benefit of tests.
 		bw.id = 0
 		bw.endKey = nil
+		bw.valsScratch[0] = bufferedValue{}
 		writes = append(writes, bw)
 	}
 	return writes
@@ -1782,10 +1790,9 @@ type bufferedWrite struct {
 
 	// lki stores information about locks that have been acquired for this key.
 	// NB: In the future it may also cache previously read values of this key.
-	lki *lockedKeyInfo
-	// TODO(arul): instead of this slice, consider adding a small (fixed size,
-	// maybe 1) array instead.
-	vals []bufferedValue // sorted in increasing sequence number order
+	lki         *lockedKeyInfo
+	vals        []bufferedValue  // sorted in increasing sequence number order
+	valsScratch [1]bufferedValue // used as initial space for vals
 }
 
 func (bw *bufferedWrite) size() int64 {
@@ -1951,33 +1958,28 @@ func (bw *bufferedWrite) toRequest() kvpb.RequestUnion {
 //
 // A write below the the minimum sequence number can be elided if there is a
 // subsequent write also below the minimum sequence number.
-func (bw *bufferedWrite) toAllRevisionRequests(minSeq enginepb.TxnSeq) []kvpb.RequestUnion {
+func (bw *bufferedWrite) toAllRevisionRequests() []kvpb.RequestUnion {
 	likelyLockRequestCount := len(unreplicatedHolderStrengths)
 	if bw.lki == nil {
 		likelyLockRequestCount = 0
 	}
 
 	rus := make([]kvpb.RequestUnion, 0, len(bw.vals)+likelyLockRequestCount)
-	maxIdx := len(bw.vals) - 1
 
 	// We track the smallest sequence of an intent write to potentially elide
 	// locking requests. See the comment on (*lockedKeyInfo).toAllRequestUnions
 	// for details.
 	minIntentWriteSeq := enginepb.TxnSeq(math.MaxInt32)
 
-	for i, val := range bw.vals {
-		nextWriteLessThanSeq := (i+1 < maxIdx) && (bw.vals[i+1].seq < minSeq)
-		canElideRevision := val.seq < minSeq && nextWriteLessThanSeq
-		if !canElideRevision {
-			if val.seq < minIntentWriteSeq {
-				minIntentWriteSeq = val.seq
-			}
-			rus = append(rus, val.toRequestUnion(bw.key, bw.exclusionExpectedSinceTimestamp()))
+	for _, val := range bw.vals {
+		if val.seq < minIntentWriteSeq {
+			minIntentWriteSeq = val.seq
 		}
+		rus = append(rus, val.toRequestUnion(bw.key, bw.exclusionExpectedSinceTimestamp()))
 	}
 
 	if bw.lki != nil {
-		rus = bw.lki.toAllRequestUnions(rus, bw.key, bw.exclusionExpectedSinceTimestamp(), minSeq, minIntentWriteSeq)
+		rus = bw.lki.toAllRequestUnions(rus, bw.key, bw.exclusionExpectedSinceTimestamp(), minIntentWriteSeq)
 	}
 	return rus
 }
@@ -2098,40 +2100,19 @@ func (li *lockedKeyInfo) toRequestUnion(key roachpb.Key, ts hlc.Timestamp) kvpb.
 }
 
 // toAllRequestUnions appends all of the requests that need to be sent for the
-// given minimum known savepoint to the dst slice.
+// given minIntentSequence to the dst slice.
 //
 // minIntentSequence is assumed to be the smallest sequence number of any intent
-// write and is used to elide requests. We assume that
-//
-// - A locking request can be elided if a stronger lock is held at a lower sequence number;
-// - If all locks are below the minKnownSavepoint, only the strongest needs to be sent.
+// write and is used to elide requests. We assume that a locking request can be
+// elided if a stronger lock is held at a lower sequence number.
 func (li *lockedKeyInfo) toAllRequestUnions(
-	dst []kvpb.RequestUnion,
-	key roachpb.Key,
-	ts hlc.Timestamp,
-	minKnownSavepoint enginepb.TxnSeq,
-	minIntentSequence enginepb.TxnSeq,
+	dst []kvpb.RequestUnion, key roachpb.Key, ts hlc.Timestamp, minIntentSequence enginepb.TxnSeq,
 ) []kvpb.RequestUnion {
-	if minIntentSequence < minKnownSavepoint {
-		// We have an intent write that can't be rolled back, no reason to return
-		// anything at all.
-		return dst
-	}
-
-	allBelowMinSavepoint := false
-	for _, str := range unreplicatedHolderStrengths {
-		heldSeq := li.heldStrengths[heldStrengthToIndexMap[str]]
-		if heldSeq != notHeldSentinel && heldSeq < minKnownSavepoint {
-			allBelowMinSavepoint = true
-			break
-		}
-	}
-
 	lastSeq := minIntentSequence
 	for _, str := range unreplicatedHolderStrengths {
 		heldSeq := li.heldStrengths[heldStrengthToIndexMap[str]]
 		if heldSeq != notHeldSentinel {
-			if heldSeq > lastSeq {
+			if heldSeq >= lastSeq {
 				// This lock is above a stronger lock and can be elided.
 				continue
 			}
@@ -2147,11 +2128,6 @@ func (li *lockedKeyInfo) toAllRequestUnions(
 			getAlloc.union.Get = &getAlloc.get
 			ru.Value = &getAlloc.union
 			dst = append(dst, ru)
-
-			// If everyone was below the min savepoint, we only need to send the strongest lock.
-			if allBelowMinSavepoint {
-				break
-			}
 		}
 	}
 	return dst

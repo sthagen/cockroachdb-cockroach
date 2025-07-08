@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/blobfixture"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
@@ -433,7 +434,7 @@ func registerRestore(r registry.Registry) {
 						}
 					}
 
-					if err := roachtestutil.WaitForReplication(ctx, t.L(), db, 3, roachtestutil.AtLeastReplicationFactor); err != nil {
+					if err := roachtestutil.WaitForReplication(ctx, t.L(), db, 3, roachprod.AtLeastReplicationFactor); err != nil {
 						return err
 					}
 					if err := waitForRebalance(
@@ -931,7 +932,7 @@ func (rd *restoreDriver) maybeValidateFingerprint(ctx context.Context) {
 	require.NoError(rd.t, err)
 	defer conn.Close()
 	fingerprint := fingerprintDatabase(
-		ctx, rd.t, conn, rd.sp.backup.fixture.DatabaseName(), "", /* aost */
+		rd.t, conn, rd.sp.backup.fixture.DatabaseName(), "", /* aost */
 	)
 	require.Equal(rd.t, rd.fixtureMetadata.Fingerprint, fingerprint, "fingerprint mismatch after restore")
 }

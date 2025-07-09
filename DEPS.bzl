@@ -1835,10 +1835,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "877549371ab3baba36d81ba2e10be21179453709b8f3f105e21017f3f0f561b4",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250701175647-a2947b4a9383",
+        sha256 = "23d6f7ca193051e5ba0317a0d6346f0e26ceb4965060fbc5b8cc6e16b7fda849",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250703175825-20e2cbcd70de",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250701175647-a2947b4a9383.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250703175825-20e2cbcd70de.zip",
         ],
     )
     go_repository(
@@ -10000,6 +10000,16 @@ def go_deps():
         strip_prefix = "cloud.google.com/go/privatecatalog@v0.8.0",
         urls = [
             "https://storage.googleapis.com/cockroach-godeps/gomod/cloud.google.com/go/privatecatalog/com_google_cloud_go_privatecatalog-v0.8.0.zip",
+        ],
+    )
+    go_repository(
+        name = "com_google_cloud_go_profiler",
+        build_file_proto_mode = "disable_global",
+        importpath = "cloud.google.com/go/profiler",
+        sha256 = "6026dcb7abd520ed3584a805333244b83673c28090d0e2208049178ddc757b4d",
+        strip_prefix = "cloud.google.com/go/profiler@v0.3.1",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/cloud.google.com/go/profiler/com_google_cloud_go_profiler-v0.3.1.zip",
         ],
     )
     go_repository(

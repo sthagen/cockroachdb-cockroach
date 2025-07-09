@@ -15,16 +15,15 @@ import (
 // disabled. For instance, defaultBasicRangesGen is only used if
 // randOption.range is false.
 const (
-	defaultNodes         = 3
-	defaultStoresPerNode = 1
+	defaultNodes             = 3
+	defaultStoresPerNode     = 1
+	defaultStoreByteCapacity = 256 << 30 // 256 GiB
 )
-
-const defaultKeyspace = 200000
 
 const (
 	defaultRwRatio, defaultRate      = 0.0, 0.0
 	defaultMinBlock, defaultMaxBlock = 1, 1
-	defaultMinKey, defaultMaxKey     = int64(1), int64(defaultKeyspace)
+	defaultMinKey, defaultMaxKey     = int64(0), int64(200000)
 	defaultSkewedAccess              = false
 )
 
@@ -43,6 +42,7 @@ const (
 type staticOptionSettings struct {
 	nodes             int
 	storesPerNode     int
+	storeByteCapacity int64
 	rwRatio           float64
 	rate              float64
 	minBlock          int
@@ -51,7 +51,6 @@ type staticOptionSettings struct {
 	maxKey            int64
 	skewedAccess      bool
 	ranges            int
-	keySpace          int
 	placementType     gen.PlacementType
 	replicationFactor int
 	bytes             int64
@@ -64,6 +63,7 @@ func getDefaultStaticOptionSettings() staticOptionSettings {
 	return staticOptionSettings{
 		nodes:             defaultNodes,
 		storesPerNode:     defaultStoresPerNode,
+		storeByteCapacity: defaultStoreByteCapacity,
 		rwRatio:           defaultRwRatio,
 		rate:              defaultRate,
 		minBlock:          defaultMinBlock,
@@ -72,7 +72,6 @@ func getDefaultStaticOptionSettings() staticOptionSettings {
 		maxKey:            defaultMaxKey,
 		skewedAccess:      defaultSkewedAccess,
 		ranges:            defaultRanges,
-		keySpace:          defaultKeyspace,
 		placementType:     defaultPlacementType,
 		replicationFactor: defaultReplicationFactor,
 		bytes:             defaultBytes,
@@ -84,8 +83,9 @@ func getDefaultStaticOptionSettings() staticOptionSettings {
 
 func (f randTestingFramework) defaultBasicClusterGen() gen.BasicCluster {
 	return gen.BasicCluster{
-		Nodes:         f.defaultStaticSettings.nodes,
-		StoresPerNode: f.defaultStaticSettings.storesPerNode,
+		Nodes:             f.defaultStaticSettings.nodes,
+		StoresPerNode:     f.defaultStaticSettings.storesPerNode,
+		StoreByteCapacity: f.defaultStaticSettings.storeByteCapacity,
 	}
 }
 
@@ -113,7 +113,8 @@ func (f randTestingFramework) defaultBasicRangesGen() gen.BasicRanges {
 	return gen.BasicRanges{
 		BaseRanges: gen.BaseRanges{
 			Ranges:            f.defaultStaticSettings.ranges,
-			KeySpace:          f.defaultStaticSettings.keySpace,
+			MinKey:            f.defaultStaticSettings.minKey,
+			MaxKey:            f.defaultStaticSettings.maxKey,
 			ReplicationFactor: f.defaultStaticSettings.replicationFactor,
 			Bytes:             f.defaultStaticSettings.bytes,
 		},

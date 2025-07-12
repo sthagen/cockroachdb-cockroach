@@ -2437,6 +2437,94 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	// CockroachDB extension.
+	`parallelize_multi_key_lookup_joins_avg_lookup_ratio`: {
+		GetStringVal: makeFloatGetStringValFn(`parallelize_multi_key_lookup_joins_avg_lookup_ratio`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return err
+			}
+			if f < 0 {
+				return pgerror.Newf(
+					pgcode.InvalidParameterValue, "parallelize_multi_key_lookup_joins_avg_lookup_ratio must be non-negative",
+				)
+			}
+			m.SetParallelizeMultiKeyLookupJoinsAvgLookupRatio(f)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatFloatAsPostgresSetting(evalCtx.SessionData().ParallelizeMultiKeyLookupJoinsAvgLookupRatio), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatFloatAsPostgresSetting(10)
+		},
+	},
+
+	// CockroachDB extension.
+	`parallelize_multi_key_lookup_joins_max_lookup_ratio`: {
+		GetStringVal: makeFloatGetStringValFn(`parallelize_multi_key_lookup_joins_max_lookup_ratio`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return err
+			}
+			if f < 0 {
+				return pgerror.Newf(
+					pgcode.InvalidParameterValue, "parallelize_multi_key_lookup_joins_max_lookup_ratio must be non-negative",
+				)
+			}
+			m.SetParallelizeMultiKeyLookupJoinsMaxLookupRatio(f)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatFloatAsPostgresSetting(evalCtx.SessionData().ParallelizeMultiKeyLookupJoinsMaxLookupRatio), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatFloatAsPostgresSetting(10000)
+		},
+	},
+
+	// CockroachDB extension.
+	`parallelize_multi_key_lookup_joins_avg_lookup_row_size`: {
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			size, err := humanizeutil.ParseBytes(s)
+			if err != nil {
+				return err
+			}
+			if size < 0 {
+				return errors.New("parallelize_multi_key_lookup_joins_avg_lookup_row_size must be non-negative")
+			}
+			m.SetParallelizeMultiKeyLookupJoinsAvgLookupRowSize(size)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return string(humanizeutil.IBytes(evalCtx.SessionData().ParallelizeMultiKeyLookupJoinsAvgLookupRowSize)), nil
+		},
+		Unit:         "B",
+		GetStringVal: makeByteSizeVarGetter("parallelize_multi_key_lookup_joins_avg_lookup_row_size"),
+		GlobalDefault: func(sv *settings.Values) string {
+			return string(humanizeutil.IBytes(100 << 10 /* 100 KiB */))
+		},
+	},
+
+	// CockroachDB extension.
+	`parallelize_multi_key_lookup_joins_only_on_mr_mutations`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`parallelize_multi_key_lookup_joins_only_on_mr_mutations`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("parallelize_multi_key_lookup_joins_only_on_mr_mutations", s)
+			if err != nil {
+				return err
+			}
+			m.SetParallelizeMultiKeyLookupJoinsOnlyOnMRMutations(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().ParallelizeMultiKeyLookupJoinsOnlyOnMRMutations), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
 	// TODO(harding): Remove this when costing scans based on average column size
 	// is fully supported.
 	// CockroachDB extension.
@@ -4047,9 +4135,9 @@ var varGen = map[string]sessionVar{
 			if err != nil {
 				return err
 			}
-			if b < 1 || b > 512 {
+			if b < 1 || b > 2048 {
 				return pgerror.Newf(pgcode.InvalidParameterValue,
-					"vector_search_beam_size cannot be less than 1 or greater than 512")
+					"vector_search_beam_size cannot be less than 1 or greater than 2048")
 			}
 			m.SetVectorSearchBeamSize(int32(b))
 			return nil
@@ -4059,6 +4147,29 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: func(sv *settings.Values) string {
 			return "32"
+		},
+	},
+
+	// CockroachDB extension.
+	`vector_search_rerank_multiplier`: {
+		GetStringVal: makeIntGetStringValFn(`vector_search_rerank_multiplier`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := strconv.ParseInt(s, 10, 32)
+			if err != nil {
+				return err
+			}
+			if b < 0 || b > 100 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"vector_search_rerank_multiplier cannot be less than 0 or greater than 100")
+			}
+			m.SetVectorSearchRerankMultiplier(int32(b))
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return strconv.FormatInt(int64(evalCtx.SessionData().VectorSearchRerankMultiplier), 10), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return "50"
 		},
 	},
 

@@ -3871,6 +3871,22 @@ func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsEnabled(val bool) 
 	m.data.ParallelizeMultiKeyLookupJoinsEnabled = val
 }
 
+func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsAvgLookupRatio(val float64) {
+	m.data.ParallelizeMultiKeyLookupJoinsAvgLookupRatio = val
+}
+
+func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsMaxLookupRatio(val float64) {
+	m.data.ParallelizeMultiKeyLookupJoinsMaxLookupRatio = val
+}
+
+func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsAvgLookupRowSize(val int64) {
+	m.data.ParallelizeMultiKeyLookupJoinsAvgLookupRowSize = val
+}
+
+func (m *sessionDataMutator) SetParallelizeMultiKeyLookupJoinsOnlyOnMRMutations(val bool) {
+	m.data.ParallelizeMultiKeyLookupJoinsOnlyOnMRMutations = val
+}
+
 // TODO(harding): Remove this when costing scans based on average column size
 // is fully supported.
 func (m *sessionDataMutator) SetCostScansWithDefaultColSize(val bool) {
@@ -4210,6 +4226,10 @@ func (m *sessionDataMutator) SetUsePre_25_2VariadicBuiltins(val bool) {
 
 func (m *sessionDataMutator) SetVectorSearchBeamSize(val int32) {
 	m.data.VectorSearchBeamSize = val
+}
+
+func (m *sessionDataMutator) SetVectorSearchRerankMultiplier(val int32) {
+	m.data.VectorSearchRerankMultiplier = val
 }
 
 func (m *sessionDataMutator) SetPropagateAdmissionHeaderToLeafTransactions(val bool) {

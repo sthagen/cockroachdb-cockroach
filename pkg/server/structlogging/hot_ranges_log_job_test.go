@@ -30,6 +30,7 @@ func TestHotRangesLoggingJobExitProcedure(t *testing.T) {
 
 	ctx := context.Background()
 	ts := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantAlwaysEnabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},

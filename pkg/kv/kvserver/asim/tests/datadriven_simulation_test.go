@@ -25,10 +25,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
 	"github.com/guptarohit/asciigraph"
 	"github.com/stretchr/testify/require"
 )
+
+var runAsimTests = envutil.EnvOrDefaultBool("COCKROACH_RUN_ASIM_TESTS", false)
 
 // TestDataDriven is a data-driven test for the allocation system using the
 // simulator. It gives contributors a way to understand how a cluster reacts to
@@ -168,6 +173,8 @@ import (
 //     ..US_3
 //     ....└── [11 12 13 14 15]
 func TestDataDriven(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	skip.UnderDuressWithIssue(t, 149875)
 	ctx := context.Background()
 	dir := datapathutils.TestDataPath(t, "non_rand")
@@ -186,6 +193,12 @@ func TestDataDriven(t *testing.T) {
 				require.Empty(t, d.CmdArgs, "leftover arguments for %s", d.Cmd)
 			}()
 			switch d.Cmd {
+			case "skip_under_ci":
+				if !runAsimTests {
+					t.Logf("skipping %s: skip_under_ci and COCKROACH_RUN_ASIM_TESTS is not set", path)
+					t.SkipNow()
+				}
+				return ""
 			case "gen_load":
 				var rwRatio, rate = 0.0, 0.0
 				var minBlock, maxBlock = 1, 1
@@ -372,6 +385,7 @@ func TestDataDriven(t *testing.T) {
 
 				return ""
 			case "eval":
+				t.Logf("running eval for %s", path)
 				samples := 1
 				seed := rand.Int63()
 				duration := 30 * time.Minute
@@ -495,15 +509,26 @@ func TestDataDriven(t *testing.T) {
 				}
 				return ""
 			case "setting":
-				scanIfExists(t, d, "replicate_queue_enabled", &settingsGen.Settings.ReplicateQueueEnabled)
-				scanIfExists(t, d, "lease_queue_enabled", &settingsGen.Settings.LeaseQueueEnabled)
-				scanIfExists(t, d, "split_queue_enabled", &settingsGen.Settings.SplitQueueEnabled)
-				scanIfExists(t, d, "rebalance_mode", &settingsGen.Settings.LBRebalancingMode)
-				scanIfExists(t, d, "rebalance_interval", &settingsGen.Settings.LBRebalancingInterval)
-				scanIfExists(t, d, "split_qps_threshold", &settingsGen.Settings.SplitQPSThreshold)
-				scanIfExists(t, d, "rebalance_range_threshold", &settingsGen.Settings.RangeRebalanceThreshold)
-				scanIfExists(t, d, "gossip_delay", &settingsGen.Settings.StateExchangeDelay)
-				scanIfExists(t, d, "range_size_split_threshold", &settingsGen.Settings.RangeSizeSplitThreshold)
+				var delay time.Duration
+				if isDelayed := scanIfExists(t, d, "delay", &delay); isDelayed {
+					var rebalanceMode int64
+					scanIfExists(t, d, "rebalance_mode", &rebalanceMode)
+					eventGen.ScheduleEvent(settingsGen.Settings.StartTime, delay, event.SetSimulationSettingsEvent{
+						Key:   "LBRebalancingMode",
+						Value: rebalanceMode,
+					})
+				} else {
+					scanIfExists(t, d, "replicate_queue_enabled", &settingsGen.Settings.ReplicateQueueEnabled)
+					scanIfExists(t, d, "lease_queue_enabled", &settingsGen.Settings.LeaseQueueEnabled)
+					scanIfExists(t, d, "split_queue_enabled", &settingsGen.Settings.SplitQueueEnabled)
+					scanIfExists(t, d, "rebalance_mode", &settingsGen.Settings.LBRebalancingMode)
+					scanIfExists(t, d, "rebalance_interval", &settingsGen.Settings.LBRebalancingInterval)
+					scanIfExists(t, d, "split_qps_threshold", &settingsGen.Settings.SplitQPSThreshold)
+					scanIfExists(t, d, "rebalance_range_threshold", &settingsGen.Settings.RangeRebalanceThreshold)
+					scanIfExists(t, d, "gossip_delay", &settingsGen.Settings.StateExchangeDelay)
+					scanIfExists(t, d, "range_size_split_threshold", &settingsGen.Settings.RangeSizeSplitThreshold)
+					scanIfExists(t, d, "rebalance_objective", &settingsGen.Settings.LBRebalancingObjective)
+				}
 				return ""
 			case "print":
 				var buf strings.Builder

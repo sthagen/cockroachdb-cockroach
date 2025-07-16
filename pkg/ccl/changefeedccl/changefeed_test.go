@@ -1905,9 +1905,9 @@ func TestNoStopAfterNonTargetColumnDrop(t *testing.T) {
 
 		// Check that dropping a watched column still stops the changefeed.
 		sqlDB.Exec(t, `ALTER TABLE hasfams DROP COLUMN b`)
-		if _, err := cf.Next(); !testutils.IsError(err, `schema change occurred at`) {
-			require.Regexp(t, `expected "schema change occurred at ..." got: %+v`, err)
-		}
+		msg, err := cf.Next()
+		require.True(t, testutils.IsError(err, `schema change occurred at`),
+			`expected "schema change occurred at ..." got: msg=%s, err=%+v`, msg, err)
 	}
 
 	runWithAndWithoutRegression141453(t, testFn, func(t *testing.T, testFn cdcTestFn) {
@@ -2003,27 +2003,32 @@ func TestNoBackfillAfterNonTargetColumnDrop(t *testing.T) {
 		}
 
 		// Open up the changefeed.
-		cf := feed(t, f, `CREATE CHANGEFEED FOR TABLE hasfams FAMILY b_and_c`, args...)
+		// We specify `updated` so that identical messages with different timestamps
+		// aren't filtered out as duplicates. The appearance of such messages would
+		// indicate that a backfill did happen even though it should not have.
+		cf := feed(t, f, `CREATE CHANGEFEED FOR TABLE hasfams FAMILY b_and_c WITH updated`, args...)
 		defer closeFeed(t, cf)
-		assertPayloads(t, cf, []string{
+		assertPayloadsStripTs(t, cf, []string{
 			`hasfams.b_and_c: [0]->{"after": {"b": "b", "c": "c"}}`,
 		})
 
 		sqlDB.Exec(t, `ALTER TABLE hasfams DROP COLUMN a`)
 		sqlDB.Exec(t, `INSERT INTO hasfams VALUES (1, 'b1', 'c1')`)
-		assertPayloads(t, cf, []string{
+		assertPayloadsStripTs(t, cf, []string{
 			`hasfams.b_and_c: [1]->{"after": {"b": "b1", "c": "c1"}}`,
 		})
 
 		// Check that dropping a watched column still backfills.
 		sqlDB.Exec(t, `ALTER TABLE hasfams DROP COLUMN c`)
-		assertPayloads(t, cf, []string{
+		assertPayloadsStripTs(t, cf, []string{
 			`hasfams.b_and_c: [0]->{"after": {"b": "b"}}`,
 			`hasfams.b_and_c: [1]->{"after": {"b": "b1"}}`,
 		})
 	}
 
-	cdcTest(t, testFn)
+	runWithAndWithoutRegression141453(t, testFn, func(t *testing.T, testFn cdcTestFn) {
+		cdcTest(t, testFn)
+	})
 }
 
 func TestChangefeedColumnDropsWithFamilyAndNonFamilyTargets(t *testing.T) {
@@ -12050,4 +12055,39 @@ func TestDatabaseLevelChangefeed(t *testing.T) {
 		expectErrCreatingFeed(t, f, `CREATE CHANGEFEED for DATABASE foo`, "database-level changefeed is not implemented")
 	}
 	cdcTest(t, testFn)
+}
+
+func TestChangefeedBareFullProtobuf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `
+			CREATE TABLE pricing (
+				id INT PRIMARY KEY,
+				name STRING,
+				discount FLOAT,
+				tax DECIMAL,
+				options STRING[]
+			)`)
+		sqlDB.Exec(t, `
+			INSERT INTO pricing VALUES
+				(1, 'Chair', 15.75, 2.500, ARRAY['Brown', 'Black']), 
+				(2, 'Table', 20.00, 1.23456789, ARRAY['Brown', 'Black'])
+		`)
+		pricingFeed := feed(t, f,
+			`CREATE CHANGEFEED FOR pricing WITH envelope='bare', format='protobuf', key_in_value, topic_in_value`)
+		defer closeFeed(t, pricingFeed)
+
+		expected := []string{
+			`pricing: {"id":1}->{"values":{"discount":15.75,"id":1,"name":"Chair","options":["Brown","Black"],"tax":"2.500"},"__crdb__":{"key":{"id":1},"topic":"pricing"}}`,
+			`pricing: {"id":2}->{"values":{"discount":20,"id":2,"name":"Table","options":["Brown","Black"],"tax":"1.23456789"},"__crdb__":{"key":{"id":2},"topic":"pricing"}}`,
+		}
+
+		assertPayloads(t, pricingFeed, expected)
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }

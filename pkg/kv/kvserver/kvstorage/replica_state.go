@@ -71,6 +71,10 @@ func LoadReplicaState(
 	return ls, nil
 }
 
+func (r LoadedReplicaState) FullReplicaID() roachpb.FullReplicaID {
+	return roachpb.FullReplicaID{RangeID: r.ReplState.Desc.RangeID, ReplicaID: r.ReplicaID}
+}
+
 // check makes sure that the replica invariants hold for the loaded state.
 func (r LoadedReplicaState) check(storeID roachpb.StoreID) error {
 	desc := r.ReplState.Desc
@@ -116,42 +120,32 @@ const CreateUninitReplicaTODO = 0
 // Returns kvpb.RaftGroupDeletedError if this replica can not be created
 // because it has been deleted.
 func CreateUninitializedReplica(
-	ctx context.Context,
-	eng storage.Engine,
-	storeID roachpb.StoreID,
-	rangeID roachpb.RangeID,
-	replicaID roachpb.ReplicaID,
+	ctx context.Context, eng storage.Engine, storeID roachpb.StoreID, id roachpb.FullReplicaID,
 ) error {
-	sl := stateloader.Make(rangeID)
+	sl := stateloader.Make(id.RangeID)
 	// Before creating the replica, see if there is a tombstone which would
 	// indicate that this replica has been removed.
 	// TODO(pav-kv): should also check that there is no existing replica, i.e.
 	// ReplicaID load should find nothing.
 	if ts, err := sl.LoadRangeTombstone(ctx, eng); err != nil {
 		return err
-	} else if replicaID < ts.NextReplicaID {
+	} else if id.ReplicaID < ts.NextReplicaID {
 		return &kvpb.RaftGroupDeletedError{}
 	}
 
 	// Write the RaftReplicaID for this replica. This is the only place in the
 	// CockroachDB code that we are creating a new *uninitialized* replica.
-	// Note that it is possible that we have already created the HardState for
-	// an uninitialized replica, then crashed, and on recovery are receiving a
-	// raft message for the same or later replica.
-	// - Same replica: we are overwriting the RaftReplicaID with the same
-	//   value, which is harmless.
-	// - Later replica: there may be an existing HardState for the older
-	//   uninitialized replica with Commit=0 and non-zero Term and Vote. Using
-	//   the Term and Vote values for that older replica in the context of
-	//   this newer replica is harmless since it just limits the votes for
-	//   this replica.
+	//
+	// Before this point, raft and state machine state of this replica are
+	// non-existent. The only RangeID-specific key that can be present is the
+	// RangeTombstone inspected above.
 	_ = CreateUninitReplicaTODO
-	if err := sl.SetRaftReplicaID(ctx, eng, replicaID); err != nil {
+	if err := sl.SetRaftReplicaID(ctx, eng, id.ReplicaID); err != nil {
 		return err
 	}
 
 	// Make sure that storage invariants for this uninitialized replica hold.
-	uninitDesc := roachpb.RangeDescriptor{RangeID: rangeID}
-	_, err := LoadReplicaState(ctx, eng, storeID, &uninitDesc, replicaID)
+	uninitDesc := roachpb.RangeDescriptor{RangeID: id.RangeID}
+	_, err := LoadReplicaState(ctx, eng, storeID, &uninitDesc, id.ReplicaID)
 	return err
 }

@@ -48,6 +48,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
@@ -127,7 +128,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	sentry "github.com/getsentry/sentry-go"
+	"github.com/getsentry/sentry-go"
 	"google.golang.org/grpc/codes"
 )
 
@@ -161,13 +162,14 @@ type topLevelServer struct {
 	appRegistry  *metric.Registry
 	sysRegistry  *metric.Registry
 
-	recorder         *status.MetricsRecorder
-	runtime          *status.RuntimeStatSampler
-	ruleRegistry     *metric.RuleRegistry
-	promRuleExporter *metric.PrometheusRuleExporter
-	updates          *diagnostics.UpdateChecker
-	ctSender         *sidetransport.Sender
-	policyRefresher  *policyrefresher.PolicyRefresher
+	recorder             *status.MetricsRecorder
+	runtime              *status.RuntimeStatSampler
+	ruleRegistry         *metric.RuleRegistry
+	promRuleExporter     *metric.PrometheusRuleExporter
+	updates              *diagnostics.UpdateChecker
+	ctSender             *sidetransport.Sender
+	policyRefresher      *policyrefresher.PolicyRefresher
+	nodeCapacityProvider *load.NodeCapacityProvider
 
 	http            *httpServer
 	adminAuthzCheck privchecker.CheckerForRPCHandlers
@@ -600,11 +602,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		storesForRACv2,
 		admissionKnobs,
 	)
-	db.SQLKVResponseAdmissionQ = gcoords.Regular.GetWorkQueue(admission.SQLKVResponseWork)
-	db.AdmissionPacerFactory = gcoords.Elastic
+	db.SQLKVResponseAdmissionQ = gcoords.RegularCPU.GetWorkQueue(admission.SQLKVResponseWork)
+	db.AdmissionPacerFactory = gcoords.ElasticCPU
 	goschedstats.RegisterSettings(st)
 	if goschedstats.Supported {
-		cbID := goschedstats.RegisterRunnableCountCallback(gcoords.Regular.CPULoad)
+		cbID := goschedstats.RegisterRunnableCountCallback(gcoords.RegularCPU.CPULoad)
 		stopper.AddCloser(stop.CloserFn(func() {
 			goschedstats.UnregisterRunnableCountCallback(cbID)
 		}))
@@ -618,12 +620,12 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		kvAdmissionController    kvadmission.Controller
 		racHandles               kvflowcontrol.ReplicationAdmissionHandles
 	}
-	admissionControl.schedulerLatencyListener = gcoords.Elastic.SchedulerLatencyListener
+	admissionControl.schedulerLatencyListener = gcoords.ElasticCPU.SchedulerLatencyListener
 	admissionControl.racHandles = kvserver.MakeRACHandles(stores)
 	admissionControl.kvAdmissionController = kvadmission.MakeController(
 		nodeIDContainer,
-		gcoords.Regular.GetWorkQueue(admission.KVWork),
-		gcoords.Elastic,
+		gcoords.RegularCPU.GetWorkQueue(admission.KVWork),
+		gcoords.ElasticCPU,
 		gcoords.Stores,
 		admissionControl.racHandles,
 		cfg.Settings,
@@ -688,6 +690,19 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		policyRefresher = policyrefresher.NewPolicyRefresher(stopper, st, ctSender.GetLeaseholders,
 			rpcContext.RemoteClocks.AllLatencies, knobs)
 	}
+
+	cpuUsageRefreshInterval := base.DefaultCPUUsageRefreshInterval
+	cpuCapacityRefreshInterval := base.DefaultCPUCapacityRefreshInterval
+	if ncpKnobs, _ := cfg.TestingKnobs.NodeCapacityProviderKnobs.(*load.NodeCapacityProviderTestingKnobs); ncpKnobs != nil {
+		cpuUsageRefreshInterval = ncpKnobs.CpuUsageRefreshInterval
+		cpuCapacityRefreshInterval = ncpKnobs.CpuCapacityRefreshInterval
+	}
+	nodeCapacityProviderConfig := load.NodeCapacityProviderConfig{
+		CPUUsageRefreshInterval:    cpuUsageRefreshInterval,
+		CPUCapacityRefreshInterval: cpuCapacityRefreshInterval,
+		CPUUsageMovingAverageAge:   base.DefaultCPUUsageMovingAverageAge,
+	}
+	nodeCapacityProvider := load.NewNodeCapacityProvider(stopper, stores, nodeCapacityProviderConfig)
 
 	// The Executor will be further initialized later, as we create more
 	// of the server's components. There's a circular dependency - many things
@@ -907,6 +922,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		ClosedTimestampSender:        ctSender,
 		ClosedTimestampReceiver:      ctReceiver,
 		PolicyRefresher:              policyRefresher,
+		NodeCapacityProvider:         nodeCapacityProvider,
 		ProtectedTimestampReader:     protectedTSReader,
 		EagerLeaseAcquisitionLimiter: eagerLeaseAcquisitionLimiter,
 		KVMemoryMonitor:              kvMemoryMonitor,
@@ -973,8 +989,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		txnMetrics,
 		stores,
 		cfg.ClusterIDContainer,
-		gcoords.Regular.GetWorkQueue(admission.KVWork),
-		gcoords.Elastic,
+		gcoords.RegularCPU.GetWorkQueue(admission.KVWork),
+		gcoords.ElasticCPU,
 		gcoords.Stores,
 		tenantUsage,
 		tenantSettingsWatcher,
@@ -1165,7 +1181,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 			externalStorage:          externalStorage,
 			externalStorageFromURI:   externalStorageFromURI,
 			isMeta1Leaseholder:       node.stores.IsMeta1Leaseholder,
-			sqlSQLResponseAdmissionQ: gcoords.Regular.GetWorkQueue(admission.SQLSQLResponseWork),
+			sqlSQLResponseAdmissionQ: gcoords.RegularCPU.GetWorkQueue(admission.SQLSQLResponseWork),
 			spanConfigKVAccessor:     spanConfig.kvAccessorForTenantRecords,
 			kvStoresIterator:         kvserver.MakeStoresIterator(node.stores),
 			inspectzServer:           inspectzServer,
@@ -1202,7 +1218,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		tenantUsageServer:        tenantUsage,
 		monitorAndMetrics:        sqlMonitorAndMetrics,
 		settingsStorage:          settingsWriter,
-		admissionPacerFactory:    gcoords.Elastic,
+		admissionPacerFactory:    gcoords.ElasticCPU,
 		rangeDescIteratorFactory: rangedesc.NewIteratorFactory(db),
 		tenantCapabilitiesReader: sql.MakeSystemTenantOnly[tenantcapabilities.Reader](tenantCapabilitiesWatcher),
 	})
@@ -1340,6 +1356,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		updates:                   updates,
 		ctSender:                  ctSender,
 		policyRefresher:           policyRefresher,
+		nodeCapacityProvider:      nodeCapacityProvider,
 		runtime:                   runtimeSampler,
 		http:                      sHTTP,
 		adminAuthzCheck:           adminAuthzCheck,
@@ -2176,6 +2193,10 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// Start the closed timestamp policy refresher in the background. It refreshes
 	// closed timestamp policies for ranges periodically.
 	s.policyRefresher.Run(workersCtx)
+
+	// Start node capacity provider in the background. It refreshes node cpu usage
+	// and capacity for store descriptor.
+	s.nodeCapacityProvider.Run(workersCtx)
 
 	// Start dispatching extant flow tokens.
 	if err := s.raftTransport.Start(workersCtx); err != nil {

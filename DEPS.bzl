@@ -6286,16 +6286,6 @@ def go_deps():
         ],
     )
     go_repository(
-        name = "com_github_mibk_dupl",
-        build_file_proto_mode = "disable_global",
-        importpath = "github.com/mibk/dupl",
-        sha256 = "73f61090c1cbee024b771fc60804cbedc5c2861f232bd34eff719afd9ac6e098",
-        strip_prefix = "github.com/mibk/dupl@v1.0.0",
-        urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/mibk/dupl/com_github_mibk_dupl-v1.0.0.zip",
-        ],
-    )
-    go_repository(
         name = "com_github_michaeltjones_walk",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/MichaelTJones/walk",
@@ -7329,10 +7319,10 @@ def go_deps():
         name = "com_github_petermattis_goid",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/petermattis/goid",
-        sha256 = "cfafcde2b7eba51fc9f08d45491de4f91d9b22a77d18ee5c491bf92f9d93a18a",
-        strip_prefix = "github.com/petermattis/goid@v0.0.0-20250211185408-f2b9d978cd7a",
+        sha256 = "bb1d3864c88e2dc7301bd9e8deb03609a5b6cdb16b21b74e6021aa60205e07b2",
+        strip_prefix = "github.com/petermattis/goid@v0.0.0-20250721140440-ea1c0173183e",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/petermattis/goid/com_github_petermattis_goid-v0.0.0-20250211185408-f2b9d978cd7a.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/petermattis/goid/com_github_petermattis_goid-v0.0.0-20250721140440-ea1c0173183e.zip",
         ],
     )
     go_repository(

@@ -128,6 +128,7 @@ require (
 	github.com/blevesearch/snowballstem v0.9.0
 	github.com/charmbracelet/bubbles v0.15.1-0.20230123181021-a6a12c4a31eb
 	github.com/cockroachdb/apd/v3 v3.2.1
+	github.com/cockroachdb/changefeedpb v0.0.0-20250807204158-c4f634c8d95c
 	github.com/cockroachdb/cmux v0.0.0-20250514152509-914d3bf9ec58
 	github.com/cockroachdb/cockroach-go/v2 v2.4.1
 	github.com/cockroachdb/crlib v0.0.0-20250718215705-7ff5051265b9
@@ -523,7 +524,7 @@ replace golang.org/x/time => github.com/cockroachdb/x-time v0.3.1-0.202305251236
 
 replace github.com/gogo/protobuf => github.com/cockroachdb/gogoproto v1.3.3-0.20241216150617-2358cdb156a1
 
-replace storj.io/drpc => github.com/cockroachdb/drpc v0.0.0-20250618091105-e79a954a2193
+replace storj.io/drpc => github.com/cockroachdb/drpc v0.0.0-20250807091527-65dcebaa113e
 
 // Note: This forked dependency adds a commit that opens up some
 // private APIs to enable us to make some perf improvements to

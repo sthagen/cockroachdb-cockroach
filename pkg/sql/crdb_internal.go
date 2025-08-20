@@ -235,29 +235,29 @@ var crdbInternal = virtualSchema{
 	validWithNoDatabaseContext: true,
 }
 
-// SupportedVTables are the crdb_internal tables that are "supported" for real
+// SupportedCRDBInternal are the crdb_internal tables that are "supported" for real
 // customer use in production for legacy reasons. Avoid adding to this list if
 // possible and prefer to add new customer-facing tables that should be public
 // under the non-"internal" namespace of information_schema.
-var SupportedVTables = map[string]struct{}{
-	`"".crdb_internal.cluster_contended_indexes`:     {},
-	`"".crdb_internal.cluster_contended_keys`:        {},
-	`"".crdb_internal.cluster_contended_tables`:      {},
-	`"".crdb_internal.cluster_contention_events`:     {},
-	`"".crdb_internal.cluster_locks`:                 {},
-	`"".crdb_internal.cluster_queries`:               {},
-	`"".crdb_internal.cluster_sessions`:              {},
-	`"".crdb_internal.cluster_transactions`:          {},
-	`"".crdb_internal.index_usage_statistics`:        {},
-	`"".crdb_internal.statement_statistics`:          {},
-	`"".crdb_internal.transaction_contention_events`: {},
-	`"".crdb_internal.transaction_statistics`:        {},
-	`"".crdb_internal.zones`:                         {},
+var SupportedCRDBInternalTables = map[string]struct{}{
+	`cluster_contended_indexes`:     {},
+	`cluster_contended_keys`:        {},
+	`cluster_contended_tables`:      {},
+	`cluster_contention_events`:     {},
+	`cluster_locks`:                 {},
+	`cluster_queries`:               {},
+	`cluster_sessions`:              {},
+	`cluster_transactions`:          {},
+	`index_usage_statistics`:        {},
+	`statement_statistics`:          {},
+	`transaction_contention_events`: {},
+	`transaction_statistics`:        {},
+	`zones`:                         {},
 }
 
 // Note that this map is currently unused but serves to document which vtables
 // are expected to be used in production setting.
-var _ = SupportedVTables
+var _ = SupportedCRDBInternalTables
 
 var crdbInternalBuildInfoTable = virtualSchemaTable{
 	comment: `detailed identification strings (RAM, local node only)`,
@@ -776,6 +776,7 @@ CREATE TABLE crdb_internal.table_row_statistics (
 			SELECT DISTINCT ON ("tableID") "tableID", "rowCount"
 			FROM system.table_statistics
 			AS OF SYSTEM TIME '%s'
+			WHERE "partialPredicate" IS NULL
 			ORDER BY "tableID", "createdAt" DESC, "rowCount" DESC`,
 			statsAsOfTimeClusterMode.String(&p.ExecCfg().Settings.SV))
 		statRows, err := p.ExtendedEvalContext().ExecCfg.InternalDB.Executor().QueryBufferedEx(
@@ -6665,10 +6666,23 @@ CREATE VIEW crdb_internal.kv_repairable_catalog_corruptions (
 				FROM
 					system.namespace AS ns FULL JOIN system.descriptor AS d ON ns.id = d.id
 			),
+		orphaned_comments
+				AS (
+					SELECT
+						0 AS parent_id,
+						0 AS parent_schema_id,
+						'' AS name,
+						object_id AS id,
+						'comment' AS corruption
+					FROM
+						system.comments
+					WHERE
+						object_id NOT IN (SELECT id FROM system.descriptor)
+        ),
 		diag
 			AS (
 				SELECT
-					*,
+					parent_id, parent_schema_id, name, id,
 					CASE
 					WHEN descriptor IS NULL AND id != 29 THEN 'namespace'
 					WHEN updated_descriptor != repaired_descriptor THEN 'descriptor'
@@ -6677,6 +6691,8 @@ CREATE VIEW crdb_internal.kv_repairable_catalog_corruptions (
 						AS corruption
 				FROM
 					data
+				UNION
+				SELECT * FROM orphaned_comments
 			)
 	SELECT
 		parent_id, parent_schema_id, name, id, corruption

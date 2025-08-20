@@ -213,6 +213,10 @@ const (
 	// V25_4_PebbleFormatV2BlobFiles bumps the pebble format to FormatV2BlobFiles.
 	V25_4_PebbleFormatV2BlobFiles
 
+	// V25_4_InspectErrorsTable adds the system.inspect_errors table. The table
+	// will be used to log the results of INSPECT jobs.
+	V25_4_InspectErrorsTable
+
 	// *************************************************
 	// Step (1) Add new versions above this comment.
 	// Do not add new versions to a patch release.
@@ -268,6 +272,8 @@ var versionTable = [numKeys]roachpb.Version{
 	V25_4_WriteInitialTruncStateBeforeSplitApplication: {Major: 25, Minor: 3, Internal: 4},
 	V25_4_PebbleFormatV2BlobFiles:                      {Major: 25, Minor: 3, Internal: 6},
 
+	V25_4_InspectErrorsTable: {Major: 25, Minor: 3, Internal: 8},
+
 	// *************************************************
 	// Step (2): Add new versions above this comment.
 	// Do not add new versions to a patch release.
@@ -283,7 +289,7 @@ const MinSupported Key = V25_2
 
 // PreviousRelease is the logical cluster version of the previous release (which must
 // have at least an RC build published).
-const PreviousRelease Key = V25_2
+const PreviousRelease Key = V25_3
 
 // V25_4 is a placeholder that will eventually be replaced by the actual 25.4
 // version Key, but in the meantime it points to the latest Key. The placeholder

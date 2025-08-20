@@ -8,6 +8,7 @@ package cli
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/gob"
 	"encoding/json"
@@ -27,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tsdumpmeta"
-	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -40,7 +40,6 @@ const (
 	UploadStatusPartialSuccess = "Partial Success"
 	UploadStatusFailure        = "Failed"
 	nodeKey                    = "node_id"
-	processDeltaEnvVar         = "COCKROACH_TSDUMP_DELTA"
 )
 
 var (
@@ -58,6 +57,7 @@ var (
 	datadogDashboardURLFormat = "https://us5.datadoghq.com/dashboard/zx7-9yt-dz9?" +
 		"tpl_var_cluster=%s&tpl_var_upload_id=%s&tpl_var_upload_day=%d&tpl_var_upload_month=%d&tpl_var_upload_year=%d&from_ts=%d&to_ts=%d"
 	zipFileSignature            = []byte{0x50, 0x4B, 0x03, 0x04}
+	gzipFileSignature           = []byte{0x1f, 0x8b}
 	logMessageFormat            = "tsdump upload to datadog is partially failed for metric: %s"
 	partialFailureMessageFormat = "The Tsdump upload to Datadog succeeded but %d metrics partially failed to upload." +
 		" These failures can be due to transient network errors.\nMetrics:\n%s\n" +
@@ -277,7 +277,7 @@ func (d *datadogWriter) dump(kv *roachpb.KeyValue) (*datadogV2.MetricSeries, err
 		previousTimestamp = currentTimestamp
 	}
 
-	if envutil.EnvOrDefaultInt(processDeltaEnvVar, 0) == 1 {
+	if !debugTimeSeriesDumpOpts.disableDeltaProcessing {
 		if err := d.cumulativeToDeltaProcessor.processCounterMetric(series, isSorted); err != nil {
 			return nil, err
 		}
@@ -863,7 +863,7 @@ func getFileReader(fileName string) (io.Reader, error) {
 		return nil, err
 	}
 
-	// Check if the file is a zip file by reading its magic number
+	// Read magic number to detect file type
 	buf := make([]byte, 4)
 	if _, err := file.Read(buf); err != nil {
 		return nil, err
@@ -874,27 +874,37 @@ func getFileReader(fileName string) (io.Reader, error) {
 		return nil, err
 	}
 
-	// Check for zip file signature
-	if bytes.HasPrefix(buf, zipFileSignature) {
+	switch {
+	case bytes.HasPrefix(buf, zipFileSignature):
 		zipReader, err := zip.NewReader(file, fileSize(file))
 		if err != nil {
 			return nil, err
 		}
 
-		if len(zipReader.File) > 0 {
-			if len(zipReader.File) > 1 {
-				fmt.Printf("tsdump datadog upload: warning: more than one file in zip archive, using the first file %s\n", zipReader.File[0].Name)
-			}
-			firstFile, err := zipReader.File[0].Open()
-			if err != nil {
-				return nil, err
-			}
-			return firstFile, nil
+		if len(zipReader.File) == 0 {
+			return nil, fmt.Errorf("zip archive is empty")
 		}
-		return nil, fmt.Errorf("zip archive is empty")
-	}
 
-	return file, nil
+		if len(zipReader.File) > 1 {
+			fmt.Printf("tsdump datadog upload: warning: more than one file in zip archive, using the first file %s\n", zipReader.File[0].Name)
+		}
+
+		firstFile, err := zipReader.File[0].Open()
+		if err != nil {
+			return nil, err
+		}
+		return firstFile, nil
+
+	case bytes.HasPrefix(buf, gzipFileSignature):
+		gzipReader, err := gzip.NewReader(file)
+		if err != nil {
+			return nil, err
+		}
+		return gzipReader, nil
+
+	default:
+		return file, nil
+	}
 }
 
 // fileSize returns the size of the file.

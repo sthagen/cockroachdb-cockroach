@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -78,8 +79,8 @@ func init() {
 	sql.AddPlanHook("changefeed", changefeedPlanHook, changefeedTypeCheck)
 	jobs.RegisterConstructor(
 		jobspb.TypeChangefeed,
-		func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
-			r := &changefeedResumer{job: job}
+		func(job *jobs.Job, s *cluster.Settings) jobs.Resumer {
+			r := &changefeedResumer{job: job, sv: &s.SV}
 			r.mu.perNodeAggregatorStats = make(bulk.ComponentAggregatorStats)
 			return r
 		},
@@ -282,7 +283,8 @@ func changefeedPlanHook(
 			p.ExtendedEvalContext().Descs.ReleaseAll(ctx)
 
 			telemetry.Count(`changefeed.create.core`)
-			logCreateChangefeedTelemetry(ctx, jr, changefeedStmt.Select != nil, targets.Size)
+			shouldMigrate := log.ShouldMigrateEvent(p.ExecCfg().SV())
+			logCreateChangefeedTelemetry(ctx, jr, changefeedStmt.Select != nil, targets.Size, shouldMigrate)
 			if err := maybeShowCursorAgeWarning(ctx, p, opts); err != nil {
 				return err
 			}
@@ -384,8 +386,8 @@ func changefeedPlanHook(
 		if err := maybeShowCursorAgeWarning(ctx, p, opts); err != nil {
 			return err
 		}
-
-		logCreateChangefeedTelemetry(ctx, jr, changefeedStmt.Select != nil, targets.Size)
+		shouldMigrate := log.ShouldMigrateEvent(p.ExecCfg().SV())
+		logCreateChangefeedTelemetry(ctx, jr, changefeedStmt.Select != nil, targets.Size, shouldMigrate)
 
 		select {
 		case <-ctx.Done():
@@ -400,7 +402,9 @@ func changefeedPlanHook(
 	rowFnLogErrors := func(ctx context.Context, resultsCh chan<- tree.Datums) error {
 		err := rowFn(ctx, resultsCh)
 		if err != nil {
-			logChangefeedFailedTelemetryDuringStartup(ctx, description, failureTypeForStartupError(err))
+
+			shouldMigrate := log.ShouldMigrateEvent(p.ExecCfg().SV())
+			logChangefeedFailedTelemetryDuringStartup(ctx, description, failureTypeForStartupError(err), shouldMigrate)
 			var e *kvpb.BatchTimestampBeforeGCError
 			if errors.As(err, &e) && opts.HasStartCursor() {
 				err = errors.Wrapf(err,
@@ -433,7 +437,7 @@ func coreChangefeed(
 	for r := getRetry(ctx, maxBackoff, backoffReset); ; {
 		if !r.Next() {
 			// Retry loop exits when context is canceled.
-			log.Infof(ctx, "core changefeed retry loop exiting: %s", ctx.Err())
+			log.Dev.Infof(ctx, "core changefeed retry loop exiting: %s", ctx.Err())
 			return ctx.Err()
 		}
 
@@ -443,7 +447,7 @@ func coreChangefeed(
 
 		err := distChangefeedFlow(ctx, p, 0 /* jobID */, details, description, localState, resultsCh, nil, targets)
 		if err == nil {
-			log.Infof(ctx, "core changefeed completed with no error")
+			log.Dev.Infof(ctx, "core changefeed completed with no error")
 			return nil
 		}
 
@@ -452,13 +456,13 @@ func coreChangefeed(
 		}
 
 		if err := changefeedbase.AsTerminalError(ctx, p.ExecCfg().LeaseManager, err); err != nil {
-			log.Infof(ctx, "core changefeed failed due to error: %s", err)
+			log.Dev.Infof(ctx, "core changefeed failed due to error: %s", err)
 			return err
 		}
 
 		// All other errors retry; but we'll use an up-to-date progress
 		// information which is saved in the localState.
-		log.Infof(ctx, "core changefeed retrying due to transient error: %s", err)
+		log.Dev.Infof(ctx, "core changefeed retrying due to transient error: %s", err)
 	}
 }
 
@@ -1320,6 +1324,7 @@ func validateAndNormalizeChangefeedExpression(
 
 type changefeedResumer struct {
 	job *jobs.Job
+	sv  *settings.Values
 
 	mu struct {
 		syncutil.Mutex
@@ -1413,7 +1418,7 @@ func (b *changefeedResumer) maybeRelocateJobExecution(
 			return err
 		}
 		if ok, missedTier := current.Locality.Matches(locality); !ok {
-			log.Infof(ctx,
+			log.Dev.Infof(ctx,
 				"CHANGEFEED job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
 				b.job.ID(), current.NodeID, missedTier.String(),
 			)
@@ -1597,7 +1602,7 @@ func (b *changefeedResumer) resumeWithRetries(
 			}
 
 			if errors.Is(flowErr, replanErr) {
-				log.Infof(ctx, "restarting changefeed due to updated configuration")
+				log.Dev.Infof(ctx, "restarting changefeed due to updated configuration")
 				continue
 			}
 
@@ -1608,7 +1613,7 @@ func (b *changefeedResumer) resumeWithRetries(
 
 		// Terminate changefeed if needed.
 		if err := changefeedbase.AsTerminalError(ctx, jobExec.ExecCfg().LeaseManager, flowErr); err != nil {
-			log.Infof(ctx, "CHANGEFEED %d shutting down (cause: %v)", jobID, err)
+			log.Dev.Infof(ctx, "CHANGEFEED %d shutting down (cause: %v)", jobID, err)
 			// Best effort -- update job status to make it clear why changefeed shut down.
 			// This won't always work if this node is being shutdown/drained.
 			if ctx.Err() == nil {
@@ -1753,7 +1758,7 @@ func reconcileJobStateWithLocalState(
 		}
 		localState.SetCheckpoint(checkpoint)
 		if log.V(1) {
-			log.Infof(ctx, "Applying checkpoint to job record:  hw=%v, cf=%v",
+			log.Dev.Infof(ctx, "Applying checkpoint to job record:  hw=%v, cf=%v",
 				localState.progress.GetHighWater(), localState.progress.GetChangefeed())
 		}
 		return reloadedJob.NoTxn().Update(ctx,
@@ -1792,17 +1797,17 @@ func (b *changefeedResumer) OnFailOrCancel(
 		}
 		numTargets = targets.Size
 	}
-
+	shouldMigrate := log.ShouldMigrateEvent(b.sv)
 	// If this job has failed (not canceled), increment the counter.
 	if jobs.HasErrJobCanceled(
 		errors.DecodeError(ctx, *b.job.Payload().FinalResumeError),
 	) {
 		telemetry.Count(`changefeed.enterprise.cancel`)
-		logChangefeedCanceledTelemetry(ctx, b.job, numTargets)
+		logChangefeedCanceledTelemetry(ctx, b.job, numTargets, shouldMigrate)
 	} else {
 		telemetry.Count(`changefeed.enterprise.fail`)
 		exec.ExecCfg().JobRegistry.MetricsStruct().Changefeed.(*Metrics).Failures.Inc(1)
-		logChangefeedFailedTelemetry(ctx, b.job, changefeedbase.UnknownError, numTargets)
+		logChangefeedFailedTelemetry(ctx, b.job, changefeedbase.UnknownError, numTargets, shouldMigrate)
 	}
 	return nil
 }
@@ -1890,7 +1895,7 @@ func getChangefeedTargetName(
 }
 
 func logCreateChangefeedTelemetry(
-	ctx context.Context, jr *jobs.Record, isTransformation bool, numTargets uint,
+	ctx context.Context, jr *jobs.Record, isTransformation bool, numTargets uint, migrateEvent bool,
 ) {
 	var changefeedEventDetails eventpb.CommonChangefeedEventDetails
 	if jr != nil {
@@ -1903,11 +1908,11 @@ func logCreateChangefeedTelemetry(
 		Transformation:               isTransformation,
 	}
 
-	log.StructuredEvent(ctx, severity.INFO, createChangefeedEvent)
+	getChangefeedEventMigrator(migrateEvent).StructuredEvent(ctx, severity.INFO, createChangefeedEvent)
 }
 
 func logAlterChangefeedTelemetry(
-	ctx context.Context, job *jobs.Job, prevDescription string, numTargets uint,
+	ctx context.Context, job *jobs.Job, prevDescription string, numTargets uint, migrateEvent bool,
 ) {
 	var changefeedEventDetails eventpb.CommonChangefeedEventDetails
 	if job != nil {
@@ -1921,11 +1926,15 @@ func logAlterChangefeedTelemetry(
 		PreviousDescription:          prevDescription,
 	}
 
-	log.StructuredEvent(ctx, severity.INFO, alterChangefeedEvent)
+	getChangefeedEventMigrator(migrateEvent).StructuredEvent(ctx, severity.INFO, alterChangefeedEvent)
 }
 
 func logChangefeedFailedTelemetry(
-	ctx context.Context, job *jobs.Job, failureType changefeedbase.FailureType, numTargets uint,
+	ctx context.Context,
+	job *jobs.Job,
+	failureType changefeedbase.FailureType,
+	numTargets uint,
+	migrateEvent bool,
 ) {
 	var changefeedEventDetails eventpb.CommonChangefeedEventDetails
 	if job != nil {
@@ -1938,21 +1947,26 @@ func logChangefeedFailedTelemetry(
 		FailureType:                  failureType,
 	}
 
-	log.StructuredEvent(ctx, severity.INFO, changefeedFailedEvent)
+	getChangefeedEventMigrator(migrateEvent).StructuredEvent(ctx, severity.INFO, changefeedFailedEvent)
 }
 
 func logChangefeedFailedTelemetryDuringStartup(
-	ctx context.Context, description string, failureType changefeedbase.FailureType,
+	ctx context.Context,
+	description string,
+	failureType changefeedbase.FailureType,
+	migrateEvent bool,
 ) {
 	changefeedFailedEvent := &eventpb.ChangefeedFailed{
 		CommonChangefeedEventDetails: eventpb.CommonChangefeedEventDetails{Description: description},
 		FailureType:                  failureType,
 	}
 
-	log.StructuredEvent(ctx, severity.INFO, changefeedFailedEvent)
+	getChangefeedEventMigrator(migrateEvent).StructuredEvent(ctx, severity.INFO, changefeedFailedEvent)
 }
 
-func logChangefeedCanceledTelemetry(ctx context.Context, job *jobs.Job, numTargets uint) {
+func logChangefeedCanceledTelemetry(
+	ctx context.Context, job *jobs.Job, numTargets uint, migrateEvent bool,
+) {
 	var changefeedEventDetails eventpb.CommonChangefeedEventDetails
 	if job != nil {
 		changefeedDetails := job.Details().(jobspb.ChangefeedDetails)
@@ -1962,7 +1976,7 @@ func logChangefeedCanceledTelemetry(ctx context.Context, job *jobs.Job, numTarge
 	changefeedCanceled := &eventpb.ChangefeedCanceled{
 		CommonChangefeedEventDetails: changefeedEventDetails,
 	}
-	log.StructuredEvent(ctx, severity.INFO, changefeedCanceled)
+	getChangefeedEventMigrator(migrateEvent).StructuredEvent(ctx, severity.INFO, changefeedCanceled)
 }
 
 func makeCommonChangefeedEventDetails(
@@ -2100,4 +2114,13 @@ func maybeUpgradePreProductionReadyExpression(
 		"Existing changefeed needs to be recreated using new syntax. "+
 		"Please see CDC documentation on the use of new cdc_prev tuple.",
 		tree.AsString(oldExpression), tree.AsString(newExpression))
+}
+
+func getChangefeedEventMigrator(migrateEvent bool) log.StructuredEventMigrator {
+	return log.NewStructuredEventMigrator(
+		func() bool {
+			return migrateEvent
+		},
+		channel.CHANGEFEED,
+	)
 }

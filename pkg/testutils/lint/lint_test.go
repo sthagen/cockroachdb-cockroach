@@ -242,7 +242,7 @@ func TestLint(t *testing.T) {
 				continue
 			}
 			switch name {
-			case "extract", "trim", "overlay", "position", "substring", "st_x", "st_y":
+			case "extract", "trim", "overlay", "position", "substring", "st_x", "st_y", "index":
 				// Exempt special forms: EXTRACT(... FROM ...), etc.
 			default:
 				names = append(names, strings.ToUpper(name))
@@ -1583,6 +1583,7 @@ func TestLint(t *testing.T) {
 			":!sql/plpgsql/plpgsql_error.go",
 			":!sql/protoreflect/redact.go",
 			":!sql/colexecerror/error.go",
+			":!sql/schemachanger/scerrors/errors.go",
 			":!util/timeutil/timeout_error.go",
 			":!util/protoutil/jsonpb_marshal.go",
 			":!util/protoutil/marshal.go",

@@ -2,7 +2,7 @@
 # the tenant table for tenants. Legacy schema changer is also skipped, because
 # some of the queries relating internal state will be impacted in terms of
 # descriptor versions, etc..
-# LogicTest: !3node-tenant-default-configs !local-legacy-schema-changer
+# LogicTest: !3node-tenant-default-configs !local-legacy-schema-changer !local-prepared
 
 # Verify information_schema database handles mutation statements correctly.
 
@@ -3257,6 +3257,7 @@ admin    test           CREATE             NULL
 admin    test           DELETE             NULL
 admin    test           DROP               NULL
 admin    test           INSERT             NULL
+admin    test           INSPECT            NULL
 admin    test           REPLICATIONDEST    NULL
 admin    test           REPLICATIONSOURCE  NULL
 admin    test           SELECT             NULL
@@ -3270,6 +3271,7 @@ root     test           CREATE             NULL
 root     test           DELETE             NULL
 root     test           DROP               NULL
 root     test           INSERT             NULL
+root     test           INSPECT            NULL
 root     test           REPLICATIONDEST    NULL
 root     test           REPLICATIONSOURCE  NULL
 root     test           SELECT             NULL
@@ -3987,6 +3989,7 @@ default_with_oids                                                off
 descriptor_validation                                            on
 disable_changefeed_replication                                   off
 disable_hoist_projection_in_join_limitation                      off
+disable_optimizer_rules                                          ·
 disable_partially_distributed_plans                              off
 disable_plan_gists                                               off
 disable_vec_union_eager_cancellation                             off

@@ -6141,7 +6141,7 @@ SELECT
 					return nil, errors.Newf("expected string value, got %T", args[0])
 				}
 				msg := string(s)
-				log.Fatalf(ctx, "force_log_fatal(): %s", msg)
+				log.Dev.Fatalf(ctx, "force_log_fatal(): %s", msg)
 				return nil, nil
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
@@ -9670,14 +9670,11 @@ WHERE object_id = table_descriptor_id
 				if array.Len() == 0 {
 					return tree.DNull, nil
 				}
-				if array.HasNulls {
+				if array.HasNulls() {
 					return nil, pgerror.New(pgcode.NullValueNotAllowed, "array must not contain nulls")
 				}
 				ltrees := make([]ltree.T, array.Len())
 				for i, l := range array.Array {
-					if l == tree.DNull {
-						return l, nil
-					}
 					ltrees[i] = tree.MustBeDLTree(l).LTree
 				}
 				lca, isNull := ltree.LCA(ltrees) // lint: uppercase function OK
@@ -10442,7 +10439,7 @@ func darrayToStringSlice(d tree.DArray) (result []string, ok bool) {
 
 // checkHasNulls returns an appropriate error if the array contains a NULL.
 func checkHasNulls(ary tree.DArray) error {
-	if ary.HasNulls {
+	if ary.HasNulls() {
 		for i := range ary.Array {
 			if ary.Array[i] == tree.DNull {
 				return pgerror.Newf(pgcode.NullValueNotAllowed, "path element at position %d is null", i+1)

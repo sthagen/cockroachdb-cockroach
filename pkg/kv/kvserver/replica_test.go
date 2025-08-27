@@ -10308,7 +10308,7 @@ func TestConsistenctQueueErrorFromCheckConsistency(t *testing.T) {
 	}
 	for i := 0; i < 2; i++ {
 		// Do this twice because it used to deadlock. See #25456.
-		processed, err := tc.store.consistencyQueue.process(ctx, tc.repl, confReader)
+		processed, err := tc.store.consistencyQueue.process(ctx, tc.repl, confReader, -1 /*priorityAtEnqueue*/)
 		if !testutils.IsError(err, "boom") {
 			t.Fatal(err)
 		}
@@ -13781,9 +13781,13 @@ func TestAdminScatterDestroyedReplica(t *testing.T) {
 	tc.Start(ctx, t, stopper)
 
 	errBoom := errors.New("boom")
-	tc.repl.mu.Lock()
-	tc.repl.mu.destroyStatus.Set(errBoom, destroyReasonMergePending)
-	tc.repl.mu.Unlock()
+	func() {
+		tc.repl.readOnlyCmdMu.Lock()
+		defer tc.repl.readOnlyCmdMu.Unlock()
+		tc.repl.mu.Lock()
+		defer tc.repl.mu.Unlock()
+		tc.repl.shMu.destroyStatus.Set(errBoom, destroyReasonMergePending)
+	}()
 
 	desc := tc.repl.Desc()
 	resp, err := tc.repl.adminScatter(ctx, kvpb.AdminScatterRequest{

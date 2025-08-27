@@ -1674,32 +1674,17 @@ https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 		}
 		pgProcDesc, err := vt.getVirtualTableDesc(&pgProcTableName, p)
 		if err != nil {
-			return errors.New("could not find pg_catalog.pg_rewrite")
+			return errors.New("could not find pg_catalog.pg_proc")
 		}
 		h := makeOidHasher()
+		pgConstraintTableOid := tableOid(pgConstraintsDesc.GetID())
+		pgClassTableOid := tableOid(pgClassDesc.GetID())
+		pgRewriteTableOid := tableOid(pgRewriteDesc.GetID())
+
 		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /*virtual tables have no constraints*/
 		err = forEachTableDesc(ctx, p, dbContext, opts, func(
 			ctx context.Context, descCtx tableDescContext) error {
 			db, sc, table, tableLookup := descCtx.database, descCtx.schema, descCtx.table, descCtx.tableLookup
-			pgConstraintTableOid := tableOid(pgConstraintsDesc.GetID())
-			pgClassTableOid := tableOid(pgClassDesc.GetID())
-			pgRewriteTableOid := tableOid(pgRewriteDesc.GetID())
-			if table.IsSequence() &&
-				!table.GetSequenceOpts().SequenceOwner.Equal(descpb.TableDescriptor_SequenceOpts_SequenceOwner{}) {
-				refObjID := tableOid(table.GetSequenceOpts().SequenceOwner.OwnerTableID)
-				refObjSubID := tree.NewDInt(tree.DInt(table.GetSequenceOpts().SequenceOwner.OwnerColumnID))
-				objID := tableOid(table.GetID())
-				return addRow(
-					pgClassTableOid, // classid
-					objID,           // objid
-					zeroVal,         // objsubid
-					pgClassTableOid, // refclassid
-					refObjID,        // refobjid
-					refObjSubID,     // refobjsubid
-					depTypeAuto,     // deptype
-				)
-			}
-
 			// In the case of table/view relationship, In PostgreSQL pg_depend.objid refers to
 			// pg_rewrite.oid, then pg_rewrite ev_class refers to the dependent object.
 			reportViewDependency := func(dep *descpb.TableDescriptor_Reference) error {
@@ -1755,6 +1740,36 @@ https://www.postgresql.org/docs/9.5/catalog-pg-depend.html`,
 					depTypeNormal,        // deptype
 				); err != nil {
 					return err
+				}
+			}
+
+			// Add dependencies for columns that use sequences. This creates pg_depend
+			// entries with deptype 'a' (auto) for regular sequences and 'i'
+			// (internal) for IDENTITY columns.
+			if table.IsTable() {
+				for _, column := range table.AllColumns() {
+					for i := 0; i < column.NumOwnsSequences(); i++ {
+						seqID := column.GetOwnsSequenceID(i)
+						seqObjID := tableOid(seqID)
+						tableObjID := tableOid(table.GetID())
+						columnSubID := tree.NewDInt(tree.DInt(column.GetPGAttributeNum()))
+						depType := depTypeAuto
+						if column.IsGeneratedAsIdentity() {
+							depType = depTypeInternal
+						}
+
+						if err := addRow(
+							pgClassTableOid, // classid
+							seqObjID,        // objid
+							zeroVal,         // objsubid
+							pgClassTableOid, // refclassid
+							tableObjID,      // refobjid
+							columnSubID,     // refobjsubid
+							depType,         // deptype
+						); err != nil {
+							return err
+						}
+					}
 				}
 			}
 			return nil
@@ -2508,11 +2523,14 @@ https://www.postgresql.org/docs/9.6/view-pg-prepared-statements.html`,
 			paramNames := make([]string, len(placeholderTypes))
 
 			for i, placeholderType := range placeholderTypes {
+				// TODO(yuzefovich): we're including INT8 into array containing
+				// REGTYPE. Figure it out.
 				paramTypes.Array[i] = tree.NewDOidWithTypeAndName(
 					placeholderType.Oid(),
 					placeholderType,
 					placeholderType.SQLStandardName(),
 				)
+				paramTypes.SetHasNonNulls(true /* hasNonNulls */)
 				paramNames[i] = placeholderType.Name()
 			}
 
@@ -2609,7 +2627,7 @@ func addPgProcBuiltinRow(name string, addRow func(...tree.Datum) error) error {
 		}
 
 		getVariadicStringArray := func() tree.Datum {
-			return &tree.DArray{ParamTyp: types.String, Array: tree.Datums{proArgModeVariadic}}
+			return tree.NewDArrayFromDatums(types.String, tree.Datums{proArgModeVariadic})
 		}
 
 		var argmodes tree.Datum

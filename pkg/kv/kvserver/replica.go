@@ -571,6 +571,14 @@ type Replica struct {
 	//
 	// TODO(pav-kv): audit all other fields and include here.
 	shMu struct {
+		// The destroyed status of a replica indicating if it's alive, corrupt,
+		// scheduled for destruction or has been GCed. destroyStatus should only be
+		// set while also holding the raftMu and readOnlyCmdMu.
+		//
+		// When this replica is being removed, the destroyStatus is updated and
+		// RangeTombstone is written in the same raftMu critical section.
+		destroyStatus
+
 		// The state of the Raft state machine.
 		// Invariant: state.TruncatedState == nil. The field is being phased out in
 		// favour of the one contained in logStorage.
@@ -587,14 +595,6 @@ type Replica struct {
 	mu struct {
 		// Protects all fields in the mu struct.
 		ReplicaMutex
-		// The destroyed status of a replica indicating if it's alive, corrupt,
-		// scheduled for destruction or has been GCed.
-		// destroyStatus should only be set while also holding the raftMu and
-		// readOnlyCmdMu.
-		//
-		// When this replica is being removed, the destroyStatus is updated and
-		// RangeTombstone is written in the same raftMu critical section.
-		destroyStatus
 		// Is the range quiescent? Quiescent ranges are not Tick()'d and unquiesce
 		// whenever a Raft operation is performed.
 		//
@@ -1250,7 +1250,7 @@ func (r *Replica) IsDestroyed() (DestroyReason, error) {
 }
 
 func (r *Replica) isDestroyedRLocked() (DestroyReason, error) {
-	return r.mu.destroyStatus.reason, r.mu.destroyStatus.err
+	return r.shMu.destroyStatus.reason, r.shMu.destroyStatus.err
 }
 
 // IsQuiescent returns whether the replica is quiescent or not.
@@ -1531,7 +1531,7 @@ func (r *Replica) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 			// I wish this could be a Fatal, but unfortunately it's possible for the
 			// lease to be incoherent with the descriptor after a leaseholder was
 			// brutally removed through `cockroach debug recover`.
-			log.Errorf(ctx, "leaseholder replica not in descriptor; desc: %s, lease: %s", desc, l)
+			log.Dev.Errorf(ctx, "leaseholder replica not in descriptor; desc: %s, lease: %s", desc, l)
 			// Let's not return an incoherent lease; for example if we end up
 			// returning it to a client through a br.RangeInfos, the client will freak
 			// out.
@@ -1970,17 +1970,17 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 	ctx context.Context, reader storage.Reader,
 ) {
 	if ts := r.shMu.state.TruncatedState; ts != nil {
-		log.Fatalf(ctx, "non-empty RaftTruncatedState in ReplicaState: %+v", ts)
+		log.Dev.Fatalf(ctx, "non-empty RaftTruncatedState in ReplicaState: %+v", ts)
 	} else if loaded, err := r.raftMu.stateLoader.LoadRaftTruncatedState(ctx, reader); err != nil {
-		log.Fatalf(ctx, "%s", err)
+		log.Dev.Fatalf(ctx, "%s", err)
 	} else if ts := r.asLogStorage().shMu.trunc; loaded != ts {
-		log.Fatalf(ctx, "on-disk and in-memory RaftTruncatedState diverged: %s",
+		log.Dev.Fatalf(ctx, "on-disk and in-memory RaftTruncatedState diverged: %s",
 			redact.Safe(pretty.Diff(loaded, ts)))
 	}
 
 	diskState, err := r.raftMu.stateLoader.Load(ctx, reader, r.shMu.state.Desc)
 	if err != nil {
-		log.Fatalf(ctx, "%v", err)
+		log.Dev.Fatalf(ctx, "%v", err)
 	}
 
 	// We don't care about this field; see comment on
@@ -1991,15 +1991,15 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 		// The roundabout way of printing here is to expose this information in sentry.io.
 		//
 		// TODO(dt): expose properly once #15892 is addressed.
-		log.Errorf(ctx, "on-disk and in-memory state diverged:\n%s",
+		log.Dev.Errorf(ctx, "on-disk and in-memory state diverged:\n%s",
 			pretty.Diff(diskState, r.shMu.state))
 		r.shMu.state.Desc, diskState.Desc = nil, nil
-		log.Fatalf(ctx, "on-disk and in-memory state diverged: %s",
+		log.Dev.Fatalf(ctx, "on-disk and in-memory state diverged: %s",
 			redact.Safe(pretty.Diff(diskState, r.shMu.state)))
 	}
 	if r.IsInitialized() {
 		if !r.startKey.Equal(r.shMu.state.Desc.StartKey) {
-			log.Fatalf(ctx, "denormalized start key %s diverged from %s",
+			log.Dev.Fatalf(ctx, "denormalized start key %s diverged from %s",
 				r.startKey, r.shMu.state.Desc.StartKey)
 		}
 	}
@@ -2029,18 +2029,18 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 	if !r.store.TestingKnobs().DisableEagerReplicaRemoval && r.shMu.state.Desc.IsInitialized() {
 		replDesc, ok := r.shMu.state.Desc.GetReplicaDescriptor(r.store.StoreID())
 		if !ok {
-			log.Fatalf(ctx, "%+v does not contain local store s%d", r.shMu.state.Desc, r.store.StoreID())
+			log.Dev.Fatalf(ctx, "%+v does not contain local store s%d", r.shMu.state.Desc, r.store.StoreID())
 		}
 		if replDesc.ReplicaID != r.replicaID {
-			log.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.replicaID, r.shMu.state.Desc)
+			log.Dev.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.replicaID, r.shMu.state.Desc)
 		}
 	}
 	diskReplID, err := r.raftMu.stateLoader.LoadRaftReplicaID(ctx, reader)
 	if err != nil {
-		log.Fatalf(ctx, "%s", err)
+		log.Dev.Fatalf(ctx, "%s", err)
 	}
 	if diskReplID.ReplicaID != r.replicaID {
-		log.Fatalf(ctx, "disk replicaID %d does not match in-mem %d", diskReplID, r.replicaID)
+		log.Dev.Fatalf(ctx, "disk replicaID %d does not match in-mem %d", diskReplID, r.replicaID)
 	}
 }
 
@@ -2362,7 +2362,7 @@ func shouldWaitForPendingMerge(
 	mergeTxnID uuid.UUID,
 ) error {
 	if !mergeInProgress {
-		log.Fatal(ctx, "programming error: shouldWaitForPendingMerge should"+
+		log.Dev.Fatal(ctx, "programming error: shouldWaitForPendingMerge should"+
 			" only be called when a range merge is in progress")
 		return nil
 	}
@@ -2658,7 +2658,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 				// merge committed iff that range descriptor has a different range ID.
 				var meta2Desc roachpb.RangeDescriptor
 				if err := getRes.Value.GetProto(&meta2Desc); err != nil {
-					log.Fatalf(ctx, "error while watching for merge to complete: "+
+					log.Dev.Fatalf(ctx, "error while watching for merge to complete: "+
 						"unmarshaling meta2 range descriptor: %s", err)
 				}
 				if meta2Desc.RangeID != r.RangeID {
@@ -2666,17 +2666,17 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 				}
 			}
 		default:
-			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
+			log.Dev.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
 				intentRes.Intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		}
 		r.raftMu.Lock()
 		r.readOnlyCmdMu.Lock()
 		r.mu.Lock()
-		if mergeCommitted && r.mu.destroyStatus.IsAlive() {
+		if mergeCommitted && r.shMu.destroyStatus.IsAlive() {
 			// The merge committed but the left-hand replica on this store hasn't
 			// subsumed this replica yet. Mark this replica as destroyed so it
 			// doesn't serve requests when we close the mergeCompleteCh below.
-			r.mu.destroyStatus.Set(kvpb.NewRangeNotFoundError(r.RangeID, r.store.StoreID()), destroyReasonMergePending)
+			r.shMu.destroyStatus.Set(kvpb.NewRangeNotFoundError(r.RangeID, r.store.StoreID()), destroyReasonMergePending)
 		}
 		// Unblock pending requests. If the merge committed, the requests will
 		// notice that the replica has been destroyed and return an appropriate
@@ -2930,15 +2930,8 @@ func (r *Replica) maybeEnqueueProblemRange(
 	if !isLeaseholder || !leaseValid {
 		// The replicate queue will not process the replica without a valid lease.
 		// Track when we skip enqueuing for these reasons.
-		boolToInt := func(b bool) int {
-			if b {
-				return 1
-			}
-			return 0
-		}
-		reasons := []string{"is not the leaseholder", "the lease is not valid"}
-		reason := reasons[boolToInt(isLeaseholder)]
-		log.KvDistribution.VInfof(ctx, 1, "not enqueuing replica %s because %s", r.Desc(), reason)
+		log.KvDistribution.Infof(ctx, "not enqueuing replica %s because isLeaseholder=%t, leaseValid=%t",
+			r.Desc(), isLeaseholder, leaseValid)
 		r.store.metrics.DecommissioningNudgerNotLeaseholderOrInvalidLease.Inc(1)
 		return
 	}

@@ -738,6 +738,23 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
+	`use_soft_limit_for_distribute_scan`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`use_soft_limit_for_distribute_scan`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("use_soft_limit_for_distribute_scan", s)
+			if err != nil {
+				return err
+			}
+			m.SetUseSoftLimitForDistributeScan(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().UseSoftLimitForDistributeScan), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
 	`distribute_join_row_count_threshold`: {
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return strconv.FormatUint(evalCtx.SessionData().DistributeJoinRowCountThreshold, 10), nil
@@ -4347,6 +4364,24 @@ var varGen = map[string]sessionVar{
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().AllowUnsafeInternals), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	`optimizer_use_improved_hoist_join_project`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_improved_hoist_join_project`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_improved_hoist_join_project", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseImprovedHoistJoinProject(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(
+				evalCtx.SessionData().OptimizerUseImprovedHoistJoinProject,
+			), nil
 		},
 		GlobalDefault: globalTrue,
 	},

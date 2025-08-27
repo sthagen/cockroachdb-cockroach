@@ -9,8 +9,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"net/url"
-	"path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -271,7 +269,7 @@ func backup(
 		for progress := range progCh {
 			var progDetails backuppb.BackupManifest_Progress
 			if err := types.UnmarshalAny(&progress.ProgressDetails, &progDetails); err != nil {
-				log.Errorf(ctx, "unable to unmarshal backup progress details: %+v", err)
+				log.Dev.Errorf(ctx, "unable to unmarshal backup progress details: %+v", err)
 			}
 			if backupManifest.RevisionStartTime.Less(progDetails.RevStartTime) {
 				backupManifest.RevisionStartTime = progDetails.RevStartTime
@@ -320,7 +318,7 @@ func backup(
 					ctx, details.URI, encryption, &kmsEnv, backupManifest, execCtx.ExecCfg(), execCtx.User(),
 				)
 				if err != nil {
-					log.Errorf(ctx, "unable to checkpoint backup descriptor: %+v", err)
+					log.Dev.Errorf(ctx, "unable to checkpoint backup descriptor: %+v", err)
 				}
 				lastCheckpoint = timeutil.Now()
 				if execCtx.ExecCfg().BackupRestoreTestingKnobs != nil &&
@@ -829,7 +827,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			pts := p.ExecCfg().ProtectedTimestampProvider.WithTxn(txn)
 			return releaseProtectedTimestamp(ctx, pts, details.ProtectedTimestampRecord)
 		}); err != nil {
-			log.Errorf(ctx, "failed to release protected timestamp: %v", err)
+			log.Dev.Errorf(ctx, "failed to release protected timestamp: %v", err)
 		}
 	}
 
@@ -842,16 +840,10 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// potentially expensive listing of a giant backup collection to find the most
 	// recent completed entry.
 	if backupManifest.StartTime.IsEmpty() && details.CollectionURI != "" {
-		backupURI, err := url.Parse(details.URI)
+		suffix, err := backuputils.AbsoluteBackupPathInCollectionURI(details.CollectionURI, details.URI)
 		if err != nil {
 			return err
 		}
-		collectionURI, err := url.Parse(details.CollectionURI)
-		if err != nil {
-			return err
-		}
-
-		suffix := strings.TrimPrefix(path.Clean(backupURI.Path), path.Clean(collectionURI.Path))
 
 		c, err := p.ExecCfg().DistSQLSrv.ExternalStorageFromURI(ctx, details.CollectionURI, p.User())
 		if err != nil {
@@ -1882,10 +1874,10 @@ func (b *backupResumer) readManifestOnResume(
 		}
 		// Best effort remove temp checkpoint.
 		if err := defaultStore.Delete(ctx, tmpCheckpoint); err != nil {
-			log.Errorf(ctx, "error removing temporary checkpoint %s", tmpCheckpoint)
+			log.Dev.Errorf(ctx, "error removing temporary checkpoint %s", tmpCheckpoint)
 		}
 		if err := defaultStore.Delete(ctx, backupinfo.BackupProgressDirectory+"/"+tmpCheckpoint); err != nil {
-			log.Errorf(ctx, "error removing temporary checkpoint %s", backupinfo.BackupProgressDirectory+"/"+tmpCheckpoint)
+			log.Dev.Errorf(ctx, "error removing temporary checkpoint %s", backupinfo.BackupProgressDirectory+"/"+tmpCheckpoint)
 		}
 	}
 
@@ -1988,7 +1980,7 @@ func (b *backupResumer) OnFailOrCancel(
 	// job is being run under fails. This could happen if the schedule is dropped
 	// while the job is executing.
 	if err := b.processScheduledBackupCompletion(ctx, jobs.StateFailed, p, details); err != nil {
-		log.Errorf(ctx, "failed to notify job %d on completion of OnFailOrCancel: %+v",
+		log.Dev.Errorf(ctx, "failed to notify job %d on completion of OnFailOrCancel: %+v",
 			b.job.ID(), err)
 	}
 	return nil //nolint:returnerrcheck

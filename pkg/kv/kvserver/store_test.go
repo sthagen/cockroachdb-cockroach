@@ -98,7 +98,7 @@ func (s *Store) TestSender() kv.Sender {
 		// that.
 		key, err := keys.Addr(ba.Requests[0].GetInner().Header().Key)
 		if err != nil {
-			log.Fatalf(context.Background(), "%v", err)
+			log.Dev.Fatalf(context.Background(), "%v", err)
 		}
 
 		ba.RangeID = roachpb.RangeID(1)
@@ -776,7 +776,7 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 	require.Equal(t, errRemoved, err)
 
 	repl1.mu.RLock()
-	expErr := repl1.mu.destroyStatus.err
+	expErr := repl1.shMu.destroyStatus.err
 	repl1.mu.RUnlock()
 
 	if expErr == nil {

@@ -106,13 +106,12 @@ var EnqueueProblemRangeInReplicateQueueInterval = settings.RegisterDurationSetti
 // PriorityInversionRequeue is a setting that controls whether to requeue
 // replicas when their priority at enqueue time and processing time is inverted
 // too much (e.g. dropping from a repair action to AllocatorConsiderRebalance).
-// TODO(wenyihu6): flip default to true after landing 152596 to bake
 var PriorityInversionRequeue = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.priority_inversion_requeue_replicate_queue.enabled",
 	"whether the requeue replicas should requeue when enqueued for "+
 		"repair action but ended up consider rebalancing during processing",
-	false,
+	true,
 )
 
 // ReplicateQueueMaxSize is a setting that controls the max size of the
@@ -609,14 +608,18 @@ func newReplicateQueue(store *Store, allocator allocatorimpl.Allocator) *replica
 			// so we use the raftSnapshotQueueTimeoutFunc. This function sets a
 			// timeout based on the range size and the sending rate in addition
 			// to consulting the setting which controls the minimum timeout.
-			processTimeoutFunc: makeRateLimitedTimeoutFunc(rebalanceSnapshotRate),
-			successes:          store.metrics.ReplicateQueueSuccesses,
-			failures:           store.metrics.ReplicateQueueFailures,
-			pending:            store.metrics.ReplicateQueuePending,
-			full:               store.metrics.ReplicateQueueFull,
-			processingNanos:    store.metrics.ReplicateQueueProcessingNanos,
-			purgatory:          store.metrics.ReplicateQueuePurgatory,
-			disabledConfig:     kvserverbase.ReplicateQueueEnabled,
+			processTimeoutFunc:        makeRateLimitedTimeoutFunc(rebalanceSnapshotRate),
+			enqueueAdd:                store.metrics.ReplicateQueueEnqueueAdd,
+			enqueueFailedPrecondition: store.metrics.ReplicateQueueEnqueueFailedPrecondition,
+			enqueueNoAction:           store.metrics.ReplicateQueueEnqueueNoAction,
+			enqueueUnexpectedError:    store.metrics.ReplicateQueueEnqueueUnexpectedError,
+			successes:                 store.metrics.ReplicateQueueSuccesses,
+			failures:                  store.metrics.ReplicateQueueFailures,
+			pending:                   store.metrics.ReplicateQueuePending,
+			full:                      store.metrics.ReplicateQueueFull,
+			processingNanos:           store.metrics.ReplicateQueueProcessingNanos,
+			purgatory:                 store.metrics.ReplicateQueuePurgatory,
+			disabledConfig:            kvserverbase.ReplicateQueueEnabled,
 		},
 	)
 	rq.baseQueue.SetMaxSize(ReplicateQueueMaxSize.Get(&store.cfg.Settings.SV))

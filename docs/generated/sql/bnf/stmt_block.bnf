@@ -49,6 +49,7 @@ preparable_stmt ::=
 	| explain_stmt
 	| import_stmt
 	| insert_stmt
+	| inspect_stmt
 	| pause_stmt
 	| reset_stmt
 	| restore_stmt
@@ -245,6 +246,10 @@ import_stmt ::=
 insert_stmt ::=
 	opt_with_clause 'INSERT' 'INTO' insert_target insert_rest returning_clause
 	| opt_with_clause 'INSERT' 'INTO' insert_target insert_rest on_conflict returning_clause
+
+inspect_stmt ::=
+	inspect_table_stmt
+	| inspect_database_stmt
 
 pause_stmt ::=
 	pause_jobs_stmt
@@ -753,6 +758,12 @@ on_conflict ::=
 	| 'ON' 'CONFLICT' 'ON' 'CONSTRAINT' constraint_name 'DO' 'NOTHING'
 	| 'ON' 'CONFLICT' 'ON' 'CONSTRAINT' constraint_name 'DO' 'UPDATE' 'SET' set_clause_list opt_where_clause
 
+inspect_table_stmt ::=
+	'INSPECT' 'TABLE' table_name opt_as_of_clause opt_inspect_options_clause
+
+inspect_database_stmt ::=
+	'INSPECT' 'DATABASE' db_name opt_as_of_clause opt_inspect_options_clause
+
 pause_jobs_stmt ::=
 	'PAUSE' 'JOB' a_expr
 	| 'PAUSE' 'JOB' a_expr 'WITH' 'REASON' '=' string_or_placeholder
@@ -840,7 +851,7 @@ use_stmt ::=
 	'USE' var_value
 
 show_backup_stmt ::=
-	'SHOW' 'BACKUPS' 'IN' string_or_placeholder_opt_list
+	'SHOW' 'BACKUPS' 'IN' string_or_placeholder_opt_list opt_with_show_backups_options
 	| 'SHOW' 'BACKUP' show_backup_details 'FROM' string_or_placeholder 'IN' string_or_placeholder_opt_list opt_with_show_backup_options
 	| 'SHOW' 'BACKUP' string_or_placeholder 'IN' string_or_placeholder_opt_list opt_with_show_backup_options
 
@@ -1260,6 +1271,7 @@ unreserved_keyword ::=
 	| 'INJECT'
 	| 'INPUT'
 	| 'INSERT'
+	| 'INSPECT'
 	| 'INSTEAD'
 	| 'INTO_DB'
 	| 'INVERTED'
@@ -2044,6 +2056,13 @@ insert_column_item ::=
 kv_option_list ::=
 	( kv_option ) ( ( ',' kv_option ) )*
 
+opt_inspect_options_clause ::=
+	'WITH' 'OPTIONS' inspect_option_list
+	| 
+
+db_name ::=
+	db_object_name
+
 session_var ::=
 	'identifier'
 	| 'identifier' session_var_parts
@@ -2113,6 +2132,11 @@ to_or_eq ::=
 var_value ::=
 	a_expr
 	| extra_var_value
+
+opt_with_show_backups_options ::=
+	'WITH' show_backups_options_list
+	| 'WITH' 'OPTIONS' '(' show_backups_options_list ')'
+	| 
 
 show_backup_details ::=
 	'SCHEMAS'
@@ -2940,6 +2964,9 @@ kv_option ::=
 	| 'SCONST' '=' string_or_placeholder
 	| 'SCONST'
 
+inspect_option_list ::=
+	( inspect_option ) ( ( ',' inspect_option ) )*
+
 session_var_parts ::=
 	( '.' 'identifier' ) ( ( '.' 'identifier' ) )*
 
@@ -3002,6 +3029,9 @@ extra_var_value ::=
 	'ON'
 	| 'NONE'
 	| cockroachdb_extra_reserved_keyword
+
+show_backups_options_list ::=
+	( show_backups_options ) ( ( ',' show_backups_options ) )*
 
 show_backup_options_list ::=
 	( show_backup_options ) ( ( ',' show_backup_options ) )*
@@ -3579,6 +3609,10 @@ only_signed_fconst ::=
 db_object_name_list ::=
 	( db_object_name ) ( ( ',' db_object_name ) )*
 
+inspect_option ::=
+	'INDEX' 'ALL'
+	| 'INDEX' '(' table_index_name_list ')'
+
 virtual_cluster_name ::=
 	'VIRTUAL_CLUSTER_NAME'
 
@@ -3632,6 +3666,9 @@ for_locking_item ::=
 
 var_list ::=
 	( var_value ) ( ( ',' var_value ) )*
+
+show_backups_options ::=
+	'INDEX'
 
 show_backup_options ::=
 	'AS_JSON'
@@ -4163,6 +4200,7 @@ bare_label_keywords ::=
 	| 'INPUT'
 	| 'INSENSITIVE'
 	| 'INSERT'
+	| 'INSPECT'
 	| 'INSTEAD'
 	| 'INT'
 	| 'INTEGER'

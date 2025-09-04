@@ -2098,6 +2098,8 @@ type InspectTestingKnobs struct {
 	// OnInspectJobStart is called just before the inspect job begins execution.
 	// If it returns an error, the job fails immediately.
 	OnInspectJobStart func() error
+	// InspectIssueLogger is an override to the default issue logger.
+	InspectIssueLogger interface{}
 }
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
@@ -4376,6 +4378,10 @@ func (m *sessionDataMutator) SetOptimizerUseExistsFilterHoistRule(val bool) {
 
 func (m *sessionDataMutator) SetEnableScrubJob(val bool) {
 	m.data.EnableScrubJob = val
+}
+
+func (m *sessionDataMutator) SetEnableInspectCommand(val bool) {
+	m.data.EnableInspectCommand = val
 }
 
 func (m *sessionDataMutator) SetInitialRetryBackoffForReadCommitted(val time.Duration) {

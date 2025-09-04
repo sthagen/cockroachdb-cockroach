@@ -156,7 +156,7 @@ func (n *scrubNode) Close(ctx context.Context) {
 // the database. Views are skipped without errors.
 func (n *scrubNode) startScrubDatabase(ctx context.Context, p *planner, name *tree.Name) error {
 	if p.extendedEvalCtx.SessionData().EnableScrubJob {
-		return errors.Errorf("SCRUB DATABASE not supported with enable_scrub_job")
+		return errors.New("SCRUB DATABASE not supported with enable_scrub_job")
 	}
 
 	// Check that the database exists.
@@ -473,6 +473,8 @@ func (n *scrubNode) runScrubTableJob(
 
 	// TODO(148300): just grab the first secondary index and use that for the
 	// consistency check.
+	// TODO(148365): When INSPECT is added, we want to skip unsupported indexes
+	// and return a NOTICE.
 	secIndexes := tableDesc.PublicNonPrimaryIndexes()
 	if len(secIndexes) == 0 {
 		return errors.AssertionFailedf("must have at least one secondary index")

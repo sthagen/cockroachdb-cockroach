@@ -31,7 +31,7 @@ query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE data WITH DETAILS] ORDER BY 1
 ----
 start_key           end_key       replicas  lease_holder
-<before:/Table/73>  …/1/1         {1}       1
+<before:/Table/75>  …/1/1         {1}       1
 …/1/1               …/1/2         {2}       2
 …/1/2               …/1/3         {3}       3
 …/1/3               …/1/4         {4}       4
@@ -47,12 +47,12 @@ subtest end
 subtest scrub_job_implicit_txn
 
 statement ok
-EXPERIMENTAL SCRUB TABLE data;
+EXPERIMENTAL SCRUB TABLE data AS OF SYSTEM TIME '-1us';
 
 query TTB
 SELECT description, status, finished IS NOT NULL AS finished FROM [SHOW JOBS] WHERE job_type = 'INSPECT' ORDER BY created DESC LIMIT 1
 ----
-EXPERIMENTAL SCRUB TABLE data  succeeded  true
+EXPERIMENTAL SCRUB TABLE data AS OF SYSTEM TIME '-1us'  succeeded  true
 
 subtest end
 

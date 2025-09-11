@@ -176,10 +176,15 @@ func TestReplicateQueueRebalance(t *testing.T) {
 // rebalances the replicas and leases.
 func TestReplicateQueueRebalanceMultiStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	skip.UnderRace(t)
-	skip.UnderShort(t)
-	skip.UnderDeadlock(t)
+	skip.UnderDuress(t) // eight stores is too much under duress
+	scope := log.Scope(t)
+	defer scope.Close(t)
+
+	// The test exhibited an interesting failure mode that we want
+	// to be able to better investigate should it reoccur.
+	// See: https://github.com/cockroachdb/cockroach/issues/153137
+	// and https://cockroachlabs.slack.com/archives/G01G8LK77DK/p1757330830964639.
+	defer testutils.StartExecTrace(t, scope.GetDirectory()).Finish(t)
 
 	testCases := []struct {
 		name          string
@@ -2151,12 +2156,32 @@ func TestPromoteNonVoterInAddVoter(t *testing.T) {
 	scope := log.Scope(t)
 	defer scope.Close(t)
 
+	// Add some debugging helpful for #134383, where the zone config update that
+	// should lead to down-replication is simply "ignored" and it's unclear who
+	// is to blame.
+	// `store=2` unconditionally logs changed spanconfigs in
+	// `spanconfigstore/store.go` and `reconciler=3` logs incoming updates from
+	// the rangefeed on the zone configs table. You'll need to look at the
+	// complete logs (not just the default log) and search for "test setting ZONE
+	// survival configuration" to find the start of the interesting bit. In
+	// passing runs, this shows the AUTO SPAN RECONCILIATION job acting on a new
+	// SQL update, changing the span configs (which should register on all nodes),
+	// and subsequent replication changes. In failing runs, it will be interesting
+	// which prefix of events remains.
+	{
+		old := log.GetVModule()
+		changed := "store=2,reconciler=3"
+		if old != "" {
+			changed = old + "," + changed
+		}
+		require.NoError(t, log.SetVModule(changed))
+		defer func() { _ = log.SetVModule(old) }()
+	}
+
 	// This test is slow under stress/race and can time out when upreplicating /
 	// rebalancing to ensure all stores have the same range count initially, due
 	// to slow heartbeats.
-	skip.UnderStress(t)
-	skip.UnderDeadlock(t)
-	skip.UnderRace(t)
+	skip.UnderDuress(t)
 
 	defer testutils.StartExecTrace(t, scope.GetDirectory()).Finish(t)
 

@@ -452,10 +452,10 @@ func allocateStoreIDs(
 
 // GetBootstrapSchema returns the schema which will be used to bootstrap a new
 // server.
-func GetBootstrapSchema(
+func GetBootstrapSchemaForTest(
 	defaultZoneConfig *zonepb.ZoneConfig, defaultSystemZoneConfig *zonepb.ZoneConfig,
 ) bootstrap.MetadataSchema {
-	return bootstrap.MakeMetadataSchema(keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig)
+	return bootstrap.MakeMetadataSchema(keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig, bootstrap.NoOffset)
 }
 
 // bootstrapCluster initializes the passed-in engines for a new cluster.
@@ -1621,8 +1621,19 @@ func (n *Node) batchInternal(
 		defer log.Event(ctx, "node sending response")
 	}
 
+	var rangeTenantIDForAC roachpb.TenantID
+	// The computation of rangeTenantIDForAC fails open in case of error.
+	if len(args.Requests) > 0 {
+		k, err := keys.Addr(args.Requests[0].GetInner().Header().Key)
+		if err == nil {
+			_, tid, err := keys.DecodeTenantPrefix(roachpb.Key(k))
+			if err == nil {
+				rangeTenantIDForAC = tid
+			}
+		}
+	}
 	tStart := timeutil.Now()
-	handle, err := n.storeCfg.KVAdmissionController.AdmitKVWork(ctx, tenID, args)
+	handle, err := n.storeCfg.KVAdmissionController.AdmitKVWork(ctx, tenID, rangeTenantIDForAC, args)
 	if err != nil {
 		return nil, err
 	}

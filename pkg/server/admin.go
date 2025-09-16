@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
@@ -2134,7 +2135,7 @@ func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
 		return err
 	}
 
-	if s.drpc.enabled {
+	if rpcbase.ExperimentalDRPCEnabled.Get(&s.st.SV) {
 		if err := s.drpc.health(ctx); err != nil {
 			return err
 		}
@@ -2180,7 +2181,7 @@ func (s *systemAdminServer) checkReadinessForHealthCheck(ctx context.Context) er
 		return err
 	}
 
-	if s.drpc.enabled {
+	if rpcbase.ExperimentalDRPCEnabled.Get(&s.st.SV) {
 		if err := s.drpc.health(ctx); err != nil {
 			return err
 		}
@@ -3509,11 +3510,11 @@ func (rs resultScanner) ScanIndex(row tree.Datums, index int, dst interface{}) e
 		*d = &val
 
 	case *int64:
-		s, ok := tree.AsDInt(src)
+		s, ok := src.(*tree.DInt)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
 		}
-		*d = int64(s)
+		*d = int64(*s)
 
 	case **int64:
 		s, ok := src.(*tree.DInt)
@@ -3528,29 +3529,29 @@ func (rs resultScanner) ScanIndex(row tree.Datums, index int, dst interface{}) e
 		*d = &val
 
 	case *[]int64:
-		s, ok := tree.AsDArray(src)
+		s, ok := src.(*tree.DArray)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
 		}
 		for i := 0; i < s.Len(); i++ {
-			id, ok := tree.AsDInt(s.Array[i])
+			id, ok := s.Array[i].(*tree.DInt)
 			if !ok {
 				return errors.Errorf("source type assertion failed on index %d", i)
 			}
-			*d = append(*d, int64(id))
+			*d = append(*d, int64(*id))
 		}
 
 	case *[]descpb.ID:
-		s, ok := tree.AsDArray(src)
+		s, ok := src.(*tree.DArray)
 		if !ok {
 			return errors.Errorf("source type assertion failed")
 		}
 		for i := 0; i < s.Len(); i++ {
-			id, ok := tree.AsDInt(s.Array[i])
+			id, ok := s.Array[i].(*tree.DInt)
 			if !ok {
 				return errors.Errorf("source type assertion failed on index %d", i)
 			}
-			*d = append(*d, descpb.ID(id))
+			*d = append(*d, descpb.ID(*id))
 		}
 
 	case *time.Time:

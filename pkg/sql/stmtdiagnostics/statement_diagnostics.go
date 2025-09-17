@@ -28,9 +28,10 @@ import (
 
 var pollingInterval = settings.RegisterDurationSetting(
 	settings.SystemVisible,
-	"sql.stmt_diagnostics.poll_interval",
-	"rate at which the stmtdiagnostics.Registry polls for requests, set to zero to disable",
+	"sql.diagnostics.poll_interval",
+	"rate at which the stmtdiagnostics registries polls for requests, set to zero to disable",
 	10*time.Second,
+	settings.WithRetiredName("sql.stmt_diagnostics.poll_interval"),
 )
 
 var bundleChunkSize = settings.RegisterByteSizeSetting(
@@ -146,68 +147,6 @@ func NewRegistry(db isql.DB, st *cluster.Settings) *Registry {
 	}
 	r.mu.rand = rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	return r
-}
-
-// Start will start the polling loop for the Registry.
-func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) {
-	// The registry has the same lifetime as the server, so the cancellation
-	// function can be ignored and it'll be called by the stopper.
-	ctx, _ = stopper.WithCancelOnQuiesce(ctx) // nolint:quiesce
-
-	// Since background statement diagnostics collection is not under user
-	// control, exclude it from cost accounting and control.
-	ctx = multitenant.WithTenantCostControlExemption(ctx)
-
-	// NB: The only error that should occur here would be if the server were
-	// shutting down so let's swallow it.
-	_ = stopper.RunAsyncTask(ctx, "stmt-diag-poll", r.poll)
-}
-
-func (r *Registry) poll(ctx context.Context) {
-	var (
-		timer               timeutil.Timer
-		lastPoll            time.Time
-		deadline            time.Time
-		pollIntervalChanged = make(chan struct{}, 1)
-		maybeResetTimer     = func() {
-			if interval := pollingInterval.Get(&r.st.SV); interval == 0 {
-				// Setting the interval to zero stops the polling.
-				timer.Stop()
-			} else {
-				newDeadline := lastPoll.Add(interval)
-				if deadline.IsZero() || !deadline.Equal(newDeadline) {
-					deadline = newDeadline
-					timer.Reset(timeutil.Until(deadline))
-				}
-			}
-		}
-		poll = func() {
-			if err := r.pollRequests(ctx); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Dev.Warningf(ctx, "error polling for statement diagnostics requests: %s", err)
-			}
-			lastPoll = timeutil.Now()
-		}
-	)
-	pollingInterval.SetOnChange(&r.st.SV, func(ctx context.Context) {
-		select {
-		case pollIntervalChanged <- struct{}{}:
-		default:
-		}
-	})
-	for {
-		maybeResetTimer()
-		select {
-		case <-pollIntervalChanged:
-			continue // go back around and maybe reset the timer
-		case <-timer.C:
-		case <-ctx.Done():
-			return
-		}
-		poll()
-	}
 }
 
 type StmtDiagnostic struct {
@@ -580,7 +519,7 @@ func (r *Registry) InsertStatementDiagnostics(
 	var diagID CollectedInstanceID
 	err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		txn.KV().SetDebugName("stmt-diag-insert-bundle")
-		id, err := r.innerInsertStatementDiagnostics(ctx, NewStmtDiagnostic(requestID, req, stmtFingerprint, stmt, bundle, collectionErr), txn)
+		id, err := r.innerInsertStatementDiagnostics(ctx, NewStmtDiagnostic(requestID, req, stmtFingerprint, stmt, bundle, collectionErr), txn, CollectedInstanceID(0))
 		if err != nil {
 			return err
 		}
@@ -627,7 +566,7 @@ func (r *Registry) insertBundleChunks(
 }
 
 func (r *Registry) innerInsertStatementDiagnostics(
-	ctx context.Context, diagnostic StmtDiagnostic, txn isql.Txn,
+	ctx context.Context, diagnostic StmtDiagnostic, txn isql.Txn, txnDiagnosticId CollectedInstanceID,
 ) (CollectedInstanceID, error) {
 	var diagID CollectedInstanceID
 	if diagnostic.requestID != 0 {
@@ -663,14 +602,22 @@ func (r *Registry) innerInsertStatementDiagnostics(
 
 	collectionTime := timeutil.Now()
 
+	insertCols := "statement_fingerprint, statement, collected_at, bundle_chunks, error"
+	insertVals := "$1, $2, $3, $4, $5"
+	vals := []interface{}{diagnostic.stmtFingerprint, diagnostic.stmt, collectionTime, bundleChunksVal, errorVal}
+	if txnDiagnosticId != 0 {
+		insertCols += ", transaction_diagnostics_id"
+		insertVals += ", $6"
+		vals = append(vals, txnDiagnosticId)
+	}
 	// Insert the collection metadata into system.statement_diagnostics.
 	row, err := txn.QueryRowEx(
 		ctx, "stmt-diag-insert", txn.KV(),
 		sessiondata.NodeUserSessionDataOverride,
 		"INSERT INTO system.statement_diagnostics "+
-			"(statement_fingerprint, statement, collected_at, bundle_chunks, error) "+
-			"VALUES ($1, $2, $3, $4, $5) RETURNING id",
-		diagnostic.stmtFingerprint, diagnostic.stmt, collectionTime, bundleChunksVal, errorVal,
+			"("+insertCols+") "+
+			"VALUES ("+insertVals+") RETURNING id",
+		vals...,
 	)
 	if err != nil {
 		return diagID, err
@@ -725,9 +672,9 @@ func (r *Registry) innerInsertStatementDiagnostics(
 	return diagID, nil
 }
 
-// pollRequests reads the pending rows from system.statement_diagnostics_requests and
+// pollStmtRequests reads the pending rows from system.statement_diagnostics_requests and
 // updates r.mu.requests accordingly.
-func (r *Registry) pollRequests(ctx context.Context) error {
+func (r *Registry) pollStmtRequests(ctx context.Context) error {
 	var rows []tree.Datums
 
 	// Loop until we run the query without straddling an epoch increment.
@@ -814,4 +761,72 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// StartPolling starts a background task that polls for new statement and
+// transaction requests and updates the corresponding registries.
+func StartPolling(ctx context.Context, tr *TxnRegistry, sr *Registry, stopper *stop.Stopper) {
+	// The registry has the same lifetime as the server, so the cancellation
+	// function can be ignored and it'll be called by the stopper.
+	ctx, _ = stopper.WithCancelOnQuiesce(ctx) // nolint:quiesce
+
+	// Since background diagnostics collection is not under user
+	// control, exclude it from cost accounting and control.
+	ctx = multitenant.WithTenantCostControlExemption(ctx)
+
+	// NB: The only error that should occur here would be if the server were
+	// shutting down so let's swallow it.
+	_ = stopper.RunAsyncTask(ctx, "stmt-txn-diag-poll", func(ctx context.Context) {
+		var (
+			timer               timeutil.Timer
+			lastPoll            time.Time
+			deadline            time.Time
+			pollIntervalChanged = make(chan struct{}, 1)
+			maybeResetTimer     = func() {
+				if interval := pollingInterval.Get(&sr.st.SV); interval == 0 {
+					// Setting the interval to zero stops the polling.
+					timer.Stop()
+				} else {
+					newDeadline := lastPoll.Add(interval)
+					if deadline.IsZero() || !deadline.Equal(newDeadline) {
+						deadline = newDeadline
+						timer.Reset(timeutil.Until(deadline))
+					}
+				}
+			}
+			poll = func() {
+				if err := tr.pollTxnRequests(ctx); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Ops.Warningf(ctx, "error polling for transaction diagnostics requests: %s", err)
+				}
+				if err := sr.pollStmtRequests(ctx); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Ops.Warningf(ctx, "error polling for statement diagnostics requests: %s", err)
+				}
+				lastPoll = timeutil.Now()
+			}
+		)
+
+		pollingInterval.SetOnChange(&sr.st.SV, func(ctx context.Context) {
+			select {
+			case pollIntervalChanged <- struct{}{}:
+			default:
+			}
+		})
+		for {
+			maybeResetTimer()
+			select {
+			case <-pollIntervalChanged:
+				continue // go back around and maybe reset the timer
+			case <-timer.C:
+			case <-ctx.Done():
+				return
+			}
+			poll()
+		}
+	})
 }

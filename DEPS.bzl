@@ -1128,6 +1128,16 @@ def go_deps():
         ],
     )
     go_repository(
+        name = "com_github_binxio_gcloudconfig",
+        build_file_proto_mode = "disable_global",
+        importpath = "github.com/binxio/gcloudconfig",
+        sha256 = "82797ef5d9fa4cba09d64ca885a3b6b8867d046c8f144ed15dc102085b0c6ceb",
+        strip_prefix = "github.com/binxio/gcloudconfig@v0.1.5",
+        urls = [
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/binxio/gcloudconfig/com_github_binxio_gcloudconfig-v0.1.5.zip",
+        ],
+    )
+    go_repository(
         name = "com_github_biogo_store",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/biogo/store",
@@ -1820,10 +1830,10 @@ def go_deps():
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "349899ce403cf2875a953fec3a21666bc8f94b1d8ca6804afde2468158fbdfaa",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250908223345-342d2e8b9a0b",
+        sha256 = "10060b8a61eef9e99114b4e92a058f142507920eb1a32217c9026d684c44ae63",
+        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20250915183128-9eec1725930d",
         urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250908223345-342d2e8b9a0b.zip",
+            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20250915183128-9eec1725930d.zip",
         ],
     )
     go_repository(

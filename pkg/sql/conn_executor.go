@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schematelemetry/schematelemetrycontroller"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention/txnidcache"
@@ -3643,23 +3644,6 @@ var allowBufferedWritesForWeakIsolation = settings.RegisterBoolSetting(
 
 var logIsolationLevelLimiter = log.Every(10 * time.Second)
 
-// Bitmask for enabling various query fingerprint formatting styles.
-// We don't publish this setting because most users should not need
-// to tweak the fingerprint generation.
-var queryFormattingForFingerprintsMask = settings.RegisterIntSetting(
-	settings.ApplicationLevel,
-	"sql.stats.statement_fingerprint.format_mask",
-	"enables setting additional fmt flags for statement fingerprint formatting. "+
-		"Flags set here will be applied in addition to FmtHideConstants",
-	int64(tree.FmtCollapseLists|tree.FmtConstantsAsUnderscores),
-	settings.WithValidateInt(func(i int64) error {
-		if i == 0 || int64(tree.FmtCollapseLists|tree.FmtConstantsAsUnderscores)&i == i {
-			return nil
-		}
-		return errors.Newf("invalid value %d", i)
-	}),
-)
-
 func (ex *connExecutor) txnIsolationLevelToKV(
 	ctx context.Context, level tree.IsolationLevel,
 ) isolation.Level {
@@ -3863,7 +3847,7 @@ func (ex *connExecutor) initPCRReaderCatalog(ctx context.Context) {
 	err := timeutil.RunWithTimeout(ctx, "detect-pcr-reader-catalog", initPCRReaderCatalogTimeout,
 		func(ctx context.Context) error {
 			if lm := ex.server.cfg.LeaseManager; ex.executorType == executorTypeExec && lm != nil {
-				desc, err := lm.Acquire(ctx, ex.server.cfg.Clock.Now(), keys.SystemDatabaseID)
+				desc, err := lm.Acquire(ctx, lease.TimestampToReadTimestamp(ex.server.cfg.Clock.Now()), keys.SystemDatabaseID)
 				if err != nil {
 					return err
 				}
@@ -3889,8 +3873,6 @@ func (ex *connExecutor) GetPCRReaderTimestamp() hlc.Timestamp {
 	}
 	return hlc.Timestamp{}
 }
-
-var minTSErr = kvpb.NewMinTimestampBoundUnsatisfiableError(hlc.Timestamp{}, hlc.Timestamp{})
 
 // resetEvalCtx initializes the fields of evalCtx that can change
 // during a session (i.e. the fields not set by initEvalCtx).
@@ -3930,7 +3912,8 @@ func (ex *connExecutor) resetEvalCtx(evalCtx *extendedEvalContext, txn *kv.Txn, 
 
 	// See resetPlanner for more context on setting the maximum timestamp for
 	// AOST read retries.
-	if err := ex.state.mu.autoRetryReason; err != nil && errors.Is(err, minTSErr) {
+	var minTSErr *kvpb.MinTimestampBoundUnsatisfiableError
+	if err := ex.state.mu.autoRetryReason; err != nil && errors.HasType(err, minTSErr) {
 		evalCtx.AsOfSystemTime.MaxTimestampBound = ex.extraTxnState.descCollection.GetMaxTimestampBound()
 	} else if newTxn {
 		evalCtx.AsOfSystemTime = nil

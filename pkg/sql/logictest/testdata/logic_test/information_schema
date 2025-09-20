@@ -1584,6 +1584,10 @@ system              public             29_75_2_not_null                         
 system              public             29_75_3_not_null                                                                                                statement_fingerprint_ids IS NOT NULL
 system              public             29_75_4_not_null                                                                                                transaction_fingerprint IS NOT NULL
 system              public             29_75_5_not_null                                                                                                collected_at IS NOT NULL
+system              public             29_76_1_not_null                                                                                                row_id IS NOT NULL
+system              public             29_76_3_not_null                                                                                                fingerprint IS NOT NULL
+system              public             29_76_4_not_null                                                                                                hint IS NOT NULL
+system              public             29_76_5_not_null                                                                                                created_at IS NOT NULL
 system              public             29_7_1_not_null                                                                                                 value IS NOT NULL
 system              public             29_8_1_not_null                                                                                                 id IS NOT NULL
 system              public             29_9_1_not_null                                                                                                 crdb_region IS NOT NULL
@@ -1924,6 +1928,10 @@ system              public             29_75_2_not_null                         
 system              public             29_75_3_not_null                                                                                                statement_fingerprint_ids IS NOT NULL
 system              public             29_75_4_not_null                                                                                                transaction_fingerprint IS NOT NULL
 system              public             29_75_5_not_null                                                                                                collected_at IS NOT NULL
+system              public             29_76_1_not_null                                                                                                row_id IS NOT NULL
+system              public             29_76_3_not_null                                                                                                fingerprint IS NOT NULL
+system              public             29_76_4_not_null                                                                                                hint IS NOT NULL
+system              public             29_76_5_not_null                                                                                                created_at IS NOT NULL
 system              public             29_7_1_not_null                                                                                                 value IS NOT NULL
 system              public             29_8_1_not_null                                                                                                 id IS NOT NULL
 system              public             29_9_1_not_null                                                                                                 crdb_region IS NOT NULL
@@ -3285,7 +3293,6 @@ admin    test           CREATE             NULL
 admin    test           DELETE             NULL
 admin    test           DROP               NULL
 admin    test           INSERT             NULL
-admin    test           INSPECT            NULL
 admin    test           REPLICATIONDEST    NULL
 admin    test           REPLICATIONSOURCE  NULL
 admin    test           SELECT             NULL
@@ -3299,7 +3306,6 @@ root     test           CREATE             NULL
 root     test           DELETE             NULL
 root     test           DROP               NULL
 root     test           INSERT             NULL
-root     test           INSPECT            NULL
 root     test           REPLICATIONDEST    NULL
 root     test           REPLICATIONSOURCE  NULL
 root     test           SELECT             NULL
@@ -3529,6 +3535,97 @@ SELECT * FROM information_schema.parameters WHERE specific_name LIKE 'get_byte%'
 specific_catalog  specific_schema  specific_name  ordinal_position  parameter_mode  is_result  as_locator  parameter_name  data_type  character_maximum_length  character_octet_length  character_set_catalog  character_set_schema  character_set_name  collation_catalog  collation_schema  collation_name  numeric_precision  numeric_precision_radix  numeric_scale  datetime_precision  interval_type  interval_precision  udt_catalog  udt_schema  udt_name  scope_catalog  scope_schema  scope_name  maximum_cardinality  dtd_identifier  parameter_default
 test              pg_catalog       get_byte_854   1                 IN              NO         NO          NULL            bytea      NULL                      NULL                    NULL                   NULL                  NULL                NULL               NULL              NULL            NULL               NULL                     NULL           NULL                NULL           NULL                test         pg_catalog  bytea     NULL           NULL          NULL        NULL                 1               NULL
 test              pg_catalog       get_byte_854   2                 IN              NO         NO          NULL            bigint     NULL                      NULL                    NULL                   NULL                  NULL                NULL               NULL              NULL            NULL               NULL                     NULL           NULL                NULL           NULL                test         pg_catalog  int8      NULL           NULL          NULL        NULL                 2               NULL
+
+# Test that default values are populated correctly.
+statement ok
+CREATE OR REPLACE FUNCTION f_default(
+  p_no_default INT,
+  p_int INT DEFAULT 0,
+  p_string STRING DEFAULT '0'
+)
+RETURNS varchar
+LANGUAGE plpgsql
+AS
+$$
+BEGIN
+  RETURN p_no_default::varchar || ':' || p_int::varchar || ':' || p_string;
+END;
+$$
+
+query TT
+SELECT p.parameter_name, p.parameter_default
+FROM information_schema.routines AS r
+JOIN information_schema.parameters AS p ON r.specific_name = p.specific_name
+WHERE r.routine_name = 'f_default'
+ORDER BY p.ordinal_position;
+----
+p_no_default  NULL
+p_int         0:::INT8
+p_string      '0':::STRING
+
+# Test INOUT parameters with defaults.
+statement ok
+CREATE FUNCTION f_inout_default(
+  INOUT p_inout_no_default INT,
+  INOUT p_inout_with_default INT DEFAULT 42
+) RETURNS RECORD AS $$ SELECT p_inout_no_default + 1, p_inout_with_default + 1; $$ LANGUAGE SQL;
+
+query TT
+SELECT p.parameter_name, p.parameter_default
+FROM information_schema.routines AS r
+JOIN information_schema.parameters AS p ON r.specific_name = p.specific_name
+WHERE r.routine_name = 'f_inout_default'
+ORDER BY p.ordinal_position;
+----
+p_inout_no_default      NULL
+p_inout_with_default    42:::INT8
+
+# Test mixed parameter modes with defaults. Note that parameters with
+# defaults must appear after all parameters without defaults.
+statement ok
+CREATE FUNCTION f_mixed_defaults(
+  p_in_no_default INT,
+  OUT p_out_param INT,
+  INOUT p_inout_no_default INT,
+  p_in_default INT DEFAULT 10,
+  INOUT p_inout_default INT DEFAULT 20
+) RETURNS RECORD AS $$
+  SELECT p_in_no_default + p_in_default, p_inout_no_default + 1, p_inout_default + 1;
+$$ LANGUAGE SQL;
+
+query TT
+SELECT p.parameter_name, p.parameter_default
+FROM information_schema.routines AS r
+JOIN information_schema.parameters AS p ON r.specific_name = p.specific_name
+WHERE r.routine_name = 'f_mixed_defaults'
+ORDER BY p.ordinal_position;
+----
+p_in_no_default     NULL
+p_out_param         NULL
+p_inout_no_default  NULL
+p_in_default        10:::INT8
+p_inout_default     20:::INT8
+
+# Test complex default expressions with different parameter modes.
+statement ok
+CREATE FUNCTION f_complex_defaults(
+  OUT p_out_result INT,
+  INOUT p_complex_default INT DEFAULT length('test'),
+  p_function_default INT DEFAULT length('hello')
+) RETURNS RECORD AS $$
+  SELECT p_complex_default + p_function_default, p_complex_default;
+$$ LANGUAGE SQL;
+
+query TT
+SELECT p.parameter_name, p.parameter_default
+FROM information_schema.routines AS r
+JOIN information_schema.parameters AS p ON r.specific_name = p.specific_name
+WHERE r.routine_name = 'f_complex_defaults'
+ORDER BY p.ordinal_position;
+----
+p_out_result        NULL
+p_complex_default   length('test':::STRING)
+p_function_default  length('hello':::STRING)
 
 skipif config local-mixed-25.2
 query TTTTTTTT colnames,rowsort

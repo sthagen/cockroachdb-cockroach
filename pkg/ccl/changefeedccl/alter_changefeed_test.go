@@ -1273,7 +1273,8 @@ func TestAlterChangefeedAlterTableName(t *testing.T) {
 
 		expectResolvedTimestamp(t, testFeed)
 
-		waitForSchemaChange(t, sqlDB, `ALTER TABLE movr.users RENAME TO movr.riders`)
+		sqlDB.Exec(t, `ALTER TABLE movr.users RENAME TO movr.riders`)
+		sqlDB.CheckQueryResultsRetry(t, "SELECT count(*) FROM [SHOW TABLES FROM movr] WHERE table_name = 'riders'", [][]string{{"1"}})
 
 		var tsLogical string
 		sqlDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&tsLogical)
@@ -1524,13 +1525,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 			defer rndMu.Unlock()
 
 			if r.Span.Equal(fooTableSpan) {
-				// Do not emit resolved events for the entire table span.
-				// We "simulate" large table by splitting single table span into many parts, so
-				// we want to resolve those sub-spans instead of the entire table span.
-				// However, we have to emit something -- otherwise the entire changefeed
-				// machine would not work.
-				r.Span.EndKey = fooTableSpan.Key.Next()
-				return false, nil
+				return true, nil
 			}
 			if haveGaps {
 				return rndMu.rnd.Intn(10) > 7, nil

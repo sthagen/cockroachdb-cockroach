@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 )
 
 const (
@@ -31,6 +32,11 @@ const (
 	defaultLBRebalanceQPSThreshold = 0.1
 	defaultLBRebalancingObjective  = 0 // QPS
 )
+
+const DefaultNodeCPURateCapacityNanos = 8 * 1e9        // 8 vcpus
+const DefaultStoreDiskCapacityBytes = 1024 << 30       // 1024 GiB
+const DoubleDefaultNodeCPURateCapacityNanos = 16 * 1e9 // 16 vcpus
+const DoubleDefaultStoreDiskCapacityBytes = 2048 << 30 // 2048 GiB
 
 var (
 	// DefaultStartTime is used as the default beginning time for simulation
@@ -111,6 +117,9 @@ type SimulationSettings struct {
 	// TODO(wenyihu6): Remove any non-simulation settings from this struct and
 	// instead override the settings below.
 	ST *cluster.Settings
+	// OnRecording is called with trace spans obtained by recording the allocator.
+	// NB: we can't use state.StoreID here since that causes an import cycle.
+	OnRecording func(storeID int64, rec tracingpb.Recording)
 }
 
 // DefaultSimulationSettings returns a set of default settings for simulation.

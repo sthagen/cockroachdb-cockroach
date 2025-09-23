@@ -666,7 +666,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		}
 
 		// Collect telemetry, once per backup after resolving its destination.
-		collectTelemetry(ctx, backupManifest, initialDetails, details, true, b.job.ID())
+		collectTelemetry(ctx, backupManifest, initialDetails, details, b.job.ID())
 	}
 
 	// For all backups, partitioned or not, the main BACKUP manifest is stored at
@@ -984,7 +984,6 @@ func collectTelemetry(
 	ctx context.Context,
 	backupManifest *backuppb.BackupManifest,
 	initialDetails, backupDetails jobspb.BackupDetails,
-	licensed bool,
 	jobID jobspb.JobID,
 ) {
 	// sourceSuffix specifies if this schedule was created by a schedule.
@@ -1000,14 +999,6 @@ func collectTelemetry(
 	}
 
 	countSource("backup.total.started")
-	if backupManifest.IsIncremental() || backupDetails.EncryptionOptions != nil {
-		countSource("backup.using-enterprise-features")
-	}
-	if licensed {
-		countSource("backup.licensed")
-	} else {
-		countSource("backup.free")
-	}
 	if backupDetails.StartTime.IsEmpty() {
 		countSource("backup.span.full")
 	} else {
@@ -1030,33 +1021,6 @@ func collectTelemetry(
 		case jobspb.EncryptionMode_KMS:
 			countSource("backup.encryption.kms")
 		}
-	}
-	if backupDetails.CollectionURI != "" {
-		countSource("backup.nested")
-		timeBaseSubdir := true
-		if _, err := time.Parse(backupbase.DateBasedIntoFolderName,
-			initialDetails.Destination.Subdir); err != nil {
-			timeBaseSubdir = false
-		}
-		if backupDetails.StartTime.IsEmpty() {
-			if !timeBaseSubdir {
-				countSource("backup.deprecated-full-nontime-subdir")
-			} else if initialDetails.Destination.Exists {
-				countSource("backup.deprecated-full-time-subdir")
-			} else {
-				countSource("backup.full-no-subdir")
-			}
-		} else {
-			if initialDetails.Destination.Subdir == backupbase.LatestFileName {
-				countSource("backup.incremental-latest-subdir")
-			} else if !timeBaseSubdir {
-				countSource("backup.deprecated-incremental-nontime-subdir")
-			} else {
-				countSource("backup.incremental-explicit-subdir")
-			}
-		}
-	} else {
-		countSource("backup.deprecated-non-collection")
 	}
 	if backupManifest.DescriptorCoverage == tree.AllDescriptors {
 		countSource("backup.targets.full_cluster")
@@ -1845,33 +1809,9 @@ func (b *backupResumer) readManifestOnResume(
 	// they could be using either the new or the old foreign key
 	// representations. We should just preserve whatever representation the
 	// table descriptors were using and leave them alone.
-	desc, memSize, err := backupinfo.ReadBackupCheckpointManifest(ctx, mem, defaultStore,
-		backupinfo.BackupManifestCheckpointName, details.EncryptionOptions, kmsEnv)
-	if err != nil {
-		if !errors.Is(err, cloud.ErrFileDoesNotExist) {
-			return nil, 0, errors.Wrapf(err, "reading backup checkpoint")
-		}
-		// Try reading temp checkpoint.
-		tmpCheckpoint := backupinfo.TempCheckpointFileNameForJob(b.job.ID())
-		desc, memSize, err = backupinfo.ReadBackupCheckpointManifest(ctx, mem, defaultStore,
-			tmpCheckpoint, details.EncryptionOptions, kmsEnv)
-		if err != nil {
-			return nil, 0, err
-		}
-		// "Rename" temp checkpoint.
-		if err := backupinfo.WriteBackupManifestCheckpoint(
-			ctx, details.URI, details.EncryptionOptions, kmsEnv, &desc, cfg, user,
-		); err != nil {
-			mem.Shrink(ctx, memSize)
-			return nil, 0, errors.Wrapf(err, "renaming temp checkpoint file")
-		}
-		// Best effort remove temp checkpoint.
-		if err := defaultStore.Delete(ctx, tmpCheckpoint); err != nil {
-			log.Dev.Errorf(ctx, "error removing temporary checkpoint %s", tmpCheckpoint)
-		}
-		if err := defaultStore.Delete(ctx, backupinfo.BackupProgressDirectory+"/"+tmpCheckpoint); err != nil {
-			log.Dev.Errorf(ctx, "error removing temporary checkpoint %s", backupinfo.BackupProgressDirectory+"/"+tmpCheckpoint)
-		}
+	desc, memSize, err := backupinfo.ReadBackupCheckpointManifest(ctx, mem, defaultStore, details.EncryptionOptions, kmsEnv)
+	if err != nil && !errors.Is(err, cloud.ErrFileDoesNotExist) {
+		return nil, 0, errors.Wrapf(err, "reading backup checkpoint")
 	}
 
 	if !desc.ClusterID.Equal(cfg.NodeInfo.LogicalClusterID()) {
@@ -2009,16 +1949,6 @@ func (b *backupResumer) deleteCheckpoint(
 			return err
 		}
 		defer exportStore.Close()
-		// We first attempt to delete from base directory to account for older
-		// backups, and then from the progress directory.
-		err = exportStore.Delete(ctx, backupinfo.BackupManifestCheckpointName)
-		if err != nil {
-			log.Dev.Warningf(ctx, "unable to delete checkpointed backup descriptor file in base directory: %+v", err)
-		}
-		err = exportStore.Delete(ctx, backupinfo.BackupManifestCheckpointName+backupinfo.BackupManifestChecksumSuffix)
-		if err != nil {
-			log.Dev.Warningf(ctx, "unable to delete checkpoint checksum file in base directory: %+v", err)
-		}
 		// Delete will not delete a nonempty directory, so we have to go through
 		// all files and delete each file one by one.
 		return exportStore.List(ctx, backupinfo.BackupProgressDirectory, "", func(p string) error {

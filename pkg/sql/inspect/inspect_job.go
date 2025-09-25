@@ -10,9 +10,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
@@ -40,8 +43,21 @@ func (c *inspectResumer) Resume(ctx context.Context, execCtx interface{}) error 
 		return err
 	}
 
+	details := c.job.Details().(jobspb.InspectDetails)
+	if len(details.Checks) == 0 {
+		return nil
+	}
+
 	pkSpans, err := c.getPrimaryIndexSpans(ctx, execCfg)
 	if err != nil {
+		return err
+	}
+
+	if err := c.maybeProtectTimestamp(ctx, execCfg, details); err != nil {
+		return err
+	}
+
+	if err := c.maybeRunAfterProtectedTimestampHook(execCfg); err != nil {
 		return err
 	}
 
@@ -55,6 +71,8 @@ func (c *inspectResumer) Resume(ctx context.Context, execCtx interface{}) error 
 		return err
 	}
 
+	c.maybeCleanupProtectedTimestamp(ctx, execCfg)
+
 	return c.markJobComplete(ctx)
 }
 
@@ -62,6 +80,9 @@ func (c *inspectResumer) Resume(ctx context.Context, execCtx interface{}) error 
 func (c *inspectResumer) OnFailOrCancel(
 	ctx context.Context, execCtx interface{}, jobErr error,
 ) error {
+	jobExecCtx := execCtx.(sql.JobExecContext)
+	execCfg := jobExecCtx.ExecCfg()
+	c.maybeCleanupProtectedTimestamp(ctx, execCfg)
 	return nil
 }
 
@@ -77,6 +98,13 @@ func (c *inspectResumer) maybeRunOnJobStartHook(execCfg *sql.ExecutorConfig) err
 	return execCfg.InspectTestingKnobs.OnInspectJobStart()
 }
 
+func (c *inspectResumer) maybeRunAfterProtectedTimestampHook(execCfg *sql.ExecutorConfig) error {
+	if execCfg.InspectTestingKnobs == nil || execCfg.InspectTestingKnobs.OnInspectAfterProtectedTimestamp == nil {
+		return nil
+	}
+	return execCfg.InspectTestingKnobs.OnInspectAfterProtectedTimestamp()
+}
+
 // getPrimaryIndexSpans returns the primary index spans for all tables involved in
 // the INSPECT job's checks.
 func (c *inspectResumer) getPrimaryIndexSpans(
@@ -84,10 +112,17 @@ func (c *inspectResumer) getPrimaryIndexSpans(
 ) ([]roachpb.Span, error) {
 	details := c.job.Details().(jobspb.InspectDetails)
 
-	spans := make([]roachpb.Span, 0, len(details.Checks))
+	// Deduplicate by table ID to avoid processing the same span multiple times
+	// when there are multiple checks on the same table.
+	uniqueTableIDs := make(map[descpb.ID]struct{})
+	for i := range details.Checks {
+		uniqueTableIDs[details.Checks[i].TableID] = struct{}{}
+	}
+
+	spans := make([]roachpb.Span, 0, len(uniqueTableIDs))
 	err := execCfg.InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
-		for i := range details.Checks {
-			desc, err := txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, details.Checks[i].TableID)
+		for tableID := range uniqueTableIDs {
+			desc, err := txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID)
 			if err != nil {
 				return err
 			}
@@ -104,9 +139,6 @@ func (c *inspectResumer) getPrimaryIndexSpans(
 func (c *inspectResumer) planInspectProcessors(
 	ctx context.Context, jobExecCtx sql.JobExecContext, entirePKSpans []roachpb.Span,
 ) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
-	if len(entirePKSpans) > 1 {
-		return nil, nil, errors.AssertionFailedf("we only support one check: %d", len(entirePKSpans))
-	}
 	distSQLPlanner := jobExecCtx.DistSQLPlanner()
 	planCtx, _, err := distSQLPlanner.SetupAllNodesPlanning(ctx, jobExecCtx.ExtendedEvalContext(), jobExecCtx.ExecCfg())
 	if err != nil {
@@ -196,6 +228,50 @@ func (c *inspectResumer) markJobComplete(ctx context.Context) error {
 			return nil
 		},
 	)
+}
+
+// maybeProtectTimestamp creates a protected timestamp record for the AsOf
+// timestamp to prevent garbage collection during the inspect operation.
+// If no AsOf timestamp is specified, this function does nothing.
+// The protection target includes all tables involved in the inspect checks.
+// Uses the jobsprotectedts.Manager to store the PTS ID in job details.
+func (c *inspectResumer) maybeProtectTimestamp(
+	ctx context.Context, execCfg *sql.ExecutorConfig, details jobspb.InspectDetails,
+) error {
+	// If we are not running a historical query, nothing to do here.
+	if details.AsOf.IsEmpty() {
+		return nil
+	}
+
+	// Create a target for the specific tables involved in the inspect checks
+	var tableIDSet catalog.DescriptorIDSet
+	for _, check := range details.Checks {
+		tableIDSet.Add(check.TableID)
+	}
+	target := ptpb.MakeSchemaObjectsTarget(tableIDSet.Ordered())
+
+	// Protect will store the PTS ID in job details.
+	_, err := execCfg.ProtectedTimestampManager.Protect(ctx, c.job, target, details.AsOf)
+	if err != nil {
+		return errors.Wrapf(err, "failed to protect timestamp %s for INSPECT job %d", details.AsOf, c.job.ID())
+	}
+
+	log.Dev.Infof(ctx, "protected timestamp created for INSPECT job %d at %s", c.job.ID(), details.AsOf)
+	return nil
+}
+
+// maybeCleanupProtectedTimestamp cleans up any protected timestamp record
+// associated with this job. If no protected timestamp was created, this
+// function does nothing.
+func (c *inspectResumer) maybeCleanupProtectedTimestamp(
+	ctx context.Context, execCfg *sql.ExecutorConfig,
+) {
+	details := c.job.Details().(jobspb.InspectDetails)
+	if details.ProtectedTimestampRecord != nil {
+		if err := execCfg.ProtectedTimestampManager.Unprotect(ctx, c.job); err != nil {
+			log.Dev.Warningf(ctx, "failed to clean up protected timestamp: %v", err)
+		}
+	}
 }
 
 func init() {

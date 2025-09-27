@@ -8,6 +8,7 @@ package inspect
 import (
 	"context"
 	"runtime"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -20,9 +21,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	pbtypes "github.com/gogo/protobuf/types"
 )
 
 var (
@@ -34,9 +37,17 @@ var (
 		0,
 		settings.NonNegativeInt,
 	)
+
+	fractionUpdateInterval = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
+		"sql.inspect.fraction_update_interval",
+		"the amount of time between INSPECT job percent complete progress updates",
+		10*time.Second,
+		settings.DurationWithMinimum(1*time.Millisecond),
+	)
 )
 
-type inspectCheckFactory func() inspectCheck
+type inspectCheckFactory func(asOf hlc.Timestamp) inspectCheck
 
 type inspectProcessor struct {
 	processorID    int32
@@ -47,6 +58,7 @@ type inspectProcessor struct {
 	spanSrc        spanSource
 	logger         inspectLogger
 	concurrency    int
+	clock          *hlc.Clock
 }
 
 var _ execinfra.Processor = (*inspectProcessor)(nil)
@@ -114,7 +126,7 @@ func (p *inspectProcessor) runInspect(ctx context.Context, output execinfra.RowR
 						// Channel is closed, no more spans to process.
 						return nil
 					}
-					if err := p.processSpan(ctx, span, workerIndex); err != nil {
+					if err := p.processSpan(ctx, span, workerIndex, output); err != nil {
 						// On error, return it. ctxgroup will cancel all other goroutines.
 						return err
 					}
@@ -148,6 +160,12 @@ func (p *inspectProcessor) runInspect(ctx context.Context, output execinfra.RowR
 	if err := group.Wait(); err != nil {
 		return err
 	}
+
+	// Send final completion message to indicate this processor is finished
+	if err := p.sendInspectProgress(ctx, output, 0, true /* finished */); err != nil {
+		return err
+	}
+
 	log.Dev.Infof(ctx, "INSPECT processor completed processorID=%d issuesFound=%t", p.processorID, p.logger.hasIssues())
 	if p.logger.hasIssues() {
 		return pgerror.Newf(pgcode.DataException, "INSPECT found inconsistencies")
@@ -186,14 +204,31 @@ func getInspectLogger(flowCtx *execinfra.FlowCtx, jobID jobspb.JobID) inspectLog
 
 // processSpan executes all configured inspect checks against a single span.
 // It instantiates a fresh set of checks from the configured factories and uses
-// an inspectRunner to drive their execution.
+// an inspectRunner to drive their execution. After processing the span, it
+// sends progress metadata to the coordinator.
 func (p *inspectProcessor) processSpan(
-	ctx context.Context, span roachpb.Span, workerIndex int,
+	ctx context.Context, span roachpb.Span, workerIndex int, output execinfra.RowReceiver,
 ) (err error) {
-	checks := make([]inspectCheck, len(p.checkFactories))
-	for i, factory := range p.checkFactories {
-		checks[i] = factory()
+	asOfToUse := p.getTimestampForSpan()
+
+	// Only create checks that apply to this span
+	var checks []inspectCheck
+	for _, factory := range p.checkFactories {
+		check := factory(asOfToUse)
+		applies, err := check.AppliesTo(p.cfg.Codec, span)
+		if err != nil {
+			return err
+		}
+		if applies {
+			checks = append(checks, check)
+		}
 	}
+
+	// If no checks apply to this span, there's nothing to do
+	if len(checks) == 0 {
+		return nil
+	}
+
 	runner := inspectRunner{
 		checks: checks,
 		logger: p.logger,
@@ -204,6 +239,10 @@ func (p *inspectProcessor) processSpan(
 		}
 	}()
 
+	// Keep track of completed checks for progress updates.
+	initialCheckCount := len(checks)
+	lastSeenCheckCount := initialCheckCount
+
 	// Process all checks on the given span.
 	for {
 		ok, stepErr := runner.Step(ctx, p.cfg, span, workerIndex)
@@ -213,8 +252,57 @@ func (p *inspectProcessor) processSpan(
 		if !ok {
 			break
 		}
+
+		// Check if any inspections have completed (when the count decreases).
+		currentCheckCount := runner.CheckCount()
+		if currentCheckCount < lastSeenCheckCount {
+			checksCompleted := lastSeenCheckCount - currentCheckCount
+			lastSeenCheckCount = currentCheckCount
+			if err := p.sendInspectProgress(ctx, output, int64(checksCompleted), false /* finished */); err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
+}
+
+// sendInspectProgress marshals and sends inspect processor progress via BulkProcessorProgress.
+func (p *inspectProcessor) sendInspectProgress(
+	ctx context.Context, output execinfra.RowReceiver, checksCompleted int64, finished bool,
+) error {
+	progressMsg := &jobspb.InspectProcessorProgress{
+		ChecksCompleted: checksCompleted,
+		Finished:        finished,
+	}
+
+	progressAny, err := pbtypes.MarshalAny(progressMsg)
+	if err != nil {
+		return errors.Wrapf(err, "unable to marshal inspect processor progress")
+	}
+
+	meta := &execinfrapb.ProducerMetadata{
+		BulkProcessorProgress: &execinfrapb.RemoteProducerMetadata_BulkProcessorProgress{
+			ProgressDetails: *progressAny,
+			NodeID:          p.flowCtx.NodeID.SQLInstanceID(),
+			FlowID:          p.flowCtx.ID,
+			ProcessorID:     p.processorID,
+			Drained:         finished,
+		},
+	}
+
+	output.Push(nil, meta)
+	return nil
+}
+
+// getTimestampForSpan returns the timestamp to use for processing a span.
+// If AsOf is empty, it returns the current timestamp from the processor's clock.
+// Otherwise, it returns the specified AsOf timestamp.
+func (p *inspectProcessor) getTimestampForSpan() hlc.Timestamp {
+	if p.spec.InspectDetails.AsOf.IsEmpty() {
+		return p.clock.Now()
+	}
+	return p.spec.InspectDetails.AsOf
 }
 
 // newInspectProcessor constructs a new inspectProcessor from the given InspectSpec.
@@ -226,9 +314,6 @@ func (p *inspectProcessor) processSpan(
 func newInspectProcessor(
 	ctx context.Context, flowCtx *execinfra.FlowCtx, processorID int32, spec execinfrapb.InspectSpec,
 ) (execinfra.Processor, error) {
-	if spec.InspectDetails.AsOf.IsEmpty() {
-		return nil, errors.AssertionFailedf("ASOF time must be set for INSPECT")
-	}
 	checkFactories, err := buildInspectCheckFactories(flowCtx, spec)
 	if err != nil {
 		return nil, err
@@ -243,6 +328,7 @@ func newInspectProcessor(
 		spanSrc:        newSliceSpanSource(spec.Spans),
 		logger:         getInspectLogger(flowCtx, spec.JobID),
 		concurrency:    getProcessorConcurrency(flowCtx),
+		clock:          flowCtx.Cfg.DB.KV().Clock(),
 	}, nil
 }
 
@@ -261,12 +347,14 @@ func buildInspectCheckFactories(
 		indexID := specCheck.IndexID
 		switch specCheck.Type {
 		case jobspb.InspectCheckIndexConsistency:
-			checkFactories = append(checkFactories, func() inspectCheck {
+			checkFactories = append(checkFactories, func(asOf hlc.Timestamp) inspectCheck {
 				return &indexConsistencyCheck{
+					indexConsistencyCheckApplicability: indexConsistencyCheckApplicability{
+						tableID: tableID,
+					},
 					flowCtx: flowCtx,
-					tableID: tableID,
 					indexID: indexID,
-					asOf:    spec.InspectDetails.AsOf,
+					asOf:    asOf,
 				}
 			})
 

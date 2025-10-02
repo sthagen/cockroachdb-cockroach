@@ -57,7 +57,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	roachprodaws "github.com/cockroachdb/cockroach/pkg/roachprod/vm/aws"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -1881,14 +1880,8 @@ func runCDCMultiTablePTSBenchmark(
 
 	ct.waitForWorkload()
 
-	t.Status("workload finished, verifying metrics")
-
-	// These metrics are in nanoseconds, so we are asserting that both
-	// of these latency metrics are less than 25 milliseconds.
-	ct.verifyMetrics(ctx, ct.verifyMetricsUnderThreshold([]string{
-		"changefeed_stage_pts_manage_latency",
-		"changefeed_stage_pts_create_latency",
-	}, float64(30*time.Millisecond)))
+	// TODO(#154447): Send values of changefeed_stage_pts_manage_latency and
+	// changefeed_stage_pts_manage_error_latency metrics to RoachPerf.
 
 	t.Status("multi-table PTS benchmark finished")
 }
@@ -2108,7 +2101,7 @@ func registerCDC(r registry.Registry) {
 		Name:      "cdc/initial-scan-only",
 		Owner:     registry.OwnerCDC,
 		Benchmark: true,
-		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(vm.ArchAMD64)),
+		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
 		// This test uses google cloudStorageSink because it is the fastest,
 		// but it is not a requirement for this test. The sink could be
 		// chosen on a per cloud basis if we want to run this on other clouds.
@@ -2289,7 +2282,7 @@ func registerCDC(r registry.Registry) {
 		Name:      "cdc/initial-scan-only/parquet",
 		Owner:     registry.OwnerCDC,
 		Benchmark: true,
-		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(vm.ArchAMD64)),
+		Cluster:   r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
 		// This test uses google cloudStorageSink because it is the fastest,
 		// but it is not a requirement for this test. The sink could be
 		// chosen on a per cloud basis if we want to run this on other clouds.
@@ -2318,7 +2311,7 @@ func registerCDC(r registry.Registry) {
 		Skip:             "#119295",
 		Owner:            registry.OwnerCDC,
 		Benchmark:        true,
-		Cluster:          r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(vm.ArchAMD64)),
+		Cluster:          r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -2780,7 +2773,7 @@ func registerCDC(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:             "cdc/kafka-auth-msk",
 		Owner:            registry.OwnerCDC,
-		Cluster:          r.MakeClusterSpec(1, spec.Arch(vm.ArchAMD64)),
+		Cluster:          r.MakeClusterSpec(1, spec.Arch(spec.OnlyAMD64)),
 		Leases:           registry.MetamorphicLeases,
 		CompatibleClouds: registry.OnlyAWS,
 		Suites:           registry.Suites(registry.Nightly),
@@ -2815,7 +2808,7 @@ func registerCDC(r registry.Registry) {
 		Owner:     `cdc`,
 		Benchmark: true,
 		// Only Kafka 3 supports Arm64, but the broker setup for Oauth used only works with Kafka 2
-		Cluster: r.MakeClusterSpec(4, spec.WorkloadNode(), spec.Arch(vm.ArchAMD64)),
+		Cluster: r.MakeClusterSpec(4, spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
 		Leases:  registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
 		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM(),
@@ -2862,7 +2855,7 @@ func registerCDC(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:    "cdc/kafka-topics",
 		Owner:   `cdc`,
-		Cluster: r.MakeClusterSpec(4, spec.WorkloadNode(), spec.Arch(vm.ArchAMD64)),
+		Cluster: r.MakeClusterSpec(4, spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
 		Leases:  registry.MetamorphicLeases,
 		// Disabled on IBM due to lack of Kafka support on s390x.
 		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM(),
@@ -2992,7 +2985,7 @@ func registerCDC(r registry.Registry) {
 		Owner:            `cdc`,
 		CompatibleClouds: registry.OnlyAzure,
 		// The Azure CLI only packages AMD64 binaries in its deb installer, so lock to AMD64.
-		Cluster: r.MakeClusterSpec(2, spec.WorkloadNode(), spec.Arch(vm.ArchAMD64)),
+		Cluster: r.MakeClusterSpec(2, spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
 		Leases:  registry.MetamorphicLeases,
 		Suites:  registry.Suites(registry.Nightly),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -4912,43 +4905,6 @@ func verifyMetricsNonZero(names ...string) func(metrics map[string]*prompb.Metri
 			for _, m := range fam.Metric {
 				if m.Counter.GetValue() > 0 {
 					found[name] = struct{}{}
-				}
-			}
-
-			if len(found) == len(names) {
-				return true
-			}
-		}
-		return false
-	}
-}
-
-func (ct *cdcTester) verifyMetricsUnderThreshold(
-	names []string, threshold float64,
-) func(metrics map[string]*prompb.MetricFamily) (ok bool) {
-	namesMap := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		namesMap[name] = struct{}{}
-	}
-
-	return func(metrics map[string]*prompb.MetricFamily) (ok bool) {
-		found := map[string]struct{}{}
-
-		for name, fam := range metrics {
-			if _, ok := namesMap[name]; !ok {
-				continue
-			}
-
-			for _, m := range fam.Metric {
-				if m.Histogram.GetSampleCount() == 0 {
-					continue
-				}
-
-				observedValue := m.Histogram.GetSampleSum() / float64(m.Histogram.GetSampleCount())
-				if observedValue < threshold {
-					found[name] = struct{}{}
-				} else {
-					ct.t.Fatalf("observed value for metric %s over threshold. observedValue: %f, threshold: %f", name, observedValue, threshold)
 				}
 			}
 

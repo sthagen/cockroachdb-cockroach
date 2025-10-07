@@ -597,6 +597,7 @@ func (ca *changeAggregator) makeKVFeedCfg(
 		WithDiff:             filters.WithDiff,
 		WithFiltering:        filters.WithFiltering,
 		WithFrontierQuantize: changefeedbase.Quantize.Get(&cfg.Settings.SV),
+		WithBulkDelivery:     changefeedbase.BulkDelivery.Get(&cfg.Settings.SV),
 		NeedsInitialScan:     needsInitialScan,
 		SchemaChangeEvents:   schemaChange.EventClass,
 		SchemaChangePolicy:   schemaChange.Policy,
@@ -1975,7 +1976,7 @@ func (cf *changeFrontier) manageProtectedTimestamps(
 		return cf.frontier.Frontier()
 	}()
 
-	if cf.spec.ProgressConfig.PerTableProtectedTimestamps {
+	if cf.spec.ProgressConfig != nil && cf.spec.ProgressConfig.PerTableProtectedTimestamps {
 		return cf.managePerTableProtectedTimestamps(ctx, txn, &ptsEntries, highwater)
 	}
 

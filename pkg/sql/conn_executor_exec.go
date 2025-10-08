@@ -2418,6 +2418,10 @@ func (ex *connExecutor) commitSQLTransactionInternal(ctx context.Context) (retEr
 		}
 	}
 
+	if err := ex.extraTxnState.descCollection.EmitDescriptorUpdatesKey(ctx, ex.state.mu.txn); err != nil {
+		return err
+	}
+
 	if err := ex.state.mu.txn.Commit(ctx); err != nil {
 		return err
 	}
@@ -3097,6 +3101,7 @@ func (ex *connExecutor) handleTxnRowsGuardrails(
 	if shouldLog {
 		commonSQLEventDetails := ex.planner.getCommonSQLEventDetails()
 		var event logpb.EventPayload
+		var migrator log.StructuredEventMigrator
 		if ex.executorType == executorTypeInternal {
 			if isRead {
 				event = &eventpb.TxnRowsReadLimitInternal{
@@ -3109,6 +3114,9 @@ func (ex *connExecutor) handleTxnRowsGuardrails(
 					CommonTxnRowsLimitDetails: commonTxnRowsLimitDetails,
 				}
 			}
+			migrator = log.NewStructuredEventMigrator(func() bool {
+				return log.ShouldMigrateEvent(ex.planner.ExecCfg().SV())
+			}, logpb.Channel_SQL_INTERNAL_PERF)
 		} else {
 			if isRead {
 				event = &eventpb.TxnRowsReadLimit{
@@ -3121,12 +3129,12 @@ func (ex *connExecutor) handleTxnRowsGuardrails(
 					CommonTxnRowsLimitDetails: commonTxnRowsLimitDetails,
 				}
 			}
-			migrator := log.NewStructuredEventMigrator(func() bool {
+			migrator = log.NewStructuredEventMigrator(func() bool {
 				return log.ShouldMigrateEvent(ex.planner.ExecCfg().SV())
-			}, logpb.Channel_SQL_EXEC)
-			migrator.StructuredEvent(ctx, severity.INFO, event)
-			logCounter.Inc(1)
+			}, logpb.Channel_SQL_PERF)
 		}
+		migrator.StructuredEvent(ctx, severity.INFO, event)
+		logCounter.Inc(1)
 	}
 	if shouldErr {
 		if isRead {

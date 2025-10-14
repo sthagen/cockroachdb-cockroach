@@ -19,10 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
@@ -57,7 +59,24 @@ var (
 		30*time.Second,
 		settings.DurationWithMinimum(1*time.Millisecond),
 	)
+
+	admissionControlEnabled = settings.RegisterBoolSetting(
+		settings.ApplicationLevel,
+		"sql.inspect.admission_control.enabled",
+		"when enabled, INSPECT operations are throttled to minimize impact on foreground query performance; "+
+			"when disabled, INSPECT runs faster but may slow down foreground queries",
+		true,
+	)
 )
+
+// getInspectQoS returns the QoS level to use for INSPECT operations based on
+// the cluster setting sql.inspect.admission_control.enabled.
+func getInspectQoS(sv *settings.Values) sessiondatapb.QoSLevel {
+	if admissionControlEnabled.Get(sv) {
+		return sessiondatapb.BulkLowQoS
+	}
+	return sessiondatapb.Normal
+}
 
 type inspectCheckFactory func(asOf hlc.Timestamp) inspectCheck
 
@@ -71,6 +90,12 @@ type inspectProcessor struct {
 	logger         inspectLogger
 	concurrency    int
 	clock          *hlc.Clock
+	mu             struct {
+		// Guards calls to output.Push because DistSQLReceiver.Push is not
+		// concurrency safe and progress metadata can be emitted from multiple
+		// worker goroutines.
+		syncutil.Mutex
+	}
 }
 
 var _ execinfra.Processor = (*inspectProcessor)(nil)
@@ -206,6 +231,7 @@ func getInspectLogger(flowCtx *execinfra.FlowCtx, jobID jobspb.JobID) inspectLog
 		&tableSink{
 			db:    flowCtx.Cfg.DB,
 			jobID: jobID,
+			sv:    &flowCtx.Cfg.Settings.SV,
 		},
 		&metricsLogger{
 			issuesFoundCtr: metrics.IssuesFound,
@@ -310,7 +336,7 @@ func (p *inspectProcessor) sendInspectProgress(
 		},
 	}
 
-	output.Push(nil, meta)
+	p.pushProgressMeta(output, meta)
 	return nil
 }
 
@@ -350,8 +376,19 @@ func (p *inspectProcessor) sendSpanCompletionProgress(
 		},
 	}
 
-	output.Push(nil, meta)
+	p.pushProgressMeta(output, meta)
 	return nil
+}
+
+// pushProgressMeta serializes metadata pushes so only one goroutine interacts
+// with the DistSQL receiver at a time (DistSQLReceiver.Push is not concurrency
+// safe).
+func (p *inspectProcessor) pushProgressMeta(
+	output execinfra.RowReceiver, meta *execinfrapb.ProducerMetadata,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	output.Push(nil, meta)
 }
 
 // newInspectProcessor constructs a new inspectProcessor from the given InspectSpec.

@@ -507,7 +507,7 @@ func (ca *changeAggregator) startKVFeed(
 	}
 	buf := kvevent.NewThrottlingBuffer(
 		kvevent.NewMemBuffer(kvFeedMemMon.MakeBoundAccount(), &cfg.Settings.SV,
-			&ca.metrics.KVFeedMetrics.AggregatorBufferMetricsWithCompat, options...),
+			&ca.metrics.KVFeedMetrics.AggregatorBufferMetrics, options...),
 		cdcutils.NodeLevelThrottler(&cfg.Settings.SV, &ca.metrics.ThrottleMetrics))
 
 	// KVFeed takes ownership of the kvevent.Writer portion of the buffer, while
@@ -1783,7 +1783,7 @@ func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
 		// The feed's checkpoint is tracked in a map which is used to inform the
 		// checkpoint_progress metric which will return the lowest timestamp across
 		// all feeds in the scope.
-		cf.sliMetrics.setCheckpoint(cf.sliMetricsID, cf.frontier.Frontier())
+		cf.sliMetrics.setCheckpoint(cf.sliMetricsID, newResolved)
 
 		return cf.maybeEmitResolved(cf.Ctx(), newResolved)
 	}
@@ -2226,16 +2226,29 @@ func (cf *changeFrontier) maybeEmitResolved(ctx context.Context, newResolved hlc
 
 // updateProgressSkewMetrics updates the progress skew metrics.
 func (cf *changeFrontier) updateProgressSkewMetrics() {
-	maxSpanTS := cf.frontier.LatestTS()
-	maxTableTS := cf.frontier.Frontier()
-	for _, f := range cf.frontier.Frontiers() {
-		tableTS := f.Frontier()
-		if tableTS.After(maxTableTS) {
-			maxTableTS = tableTS
+	fastestSpanTS := cf.frontier.LatestTS()
+	fastestTableTS := func() hlc.Timestamp {
+		var maxTS hlc.Timestamp
+		for _, f := range cf.frontier.Frontiers() {
+			if f.Frontier().After(maxTS) {
+				maxTS = f.Frontier()
+			}
+		}
+		return maxTS
+	}()
+
+	slowestTS := cf.frontier.Frontier()
+	var spanSkew, tableSkew int64
+	if slowestTS.IsSet() {
+		if fastestSpanTS.IsSet() {
+			spanSkew = fastestSpanTS.WallTime - slowestTS.WallTime
+		}
+		if fastestTableTS.IsSet() {
+			tableSkew = fastestTableTS.WallTime - slowestTS.WallTime
 		}
 	}
 
-	cf.sliMetrics.setFastestTS(cf.sliMetricsID, maxSpanTS, maxTableTS)
+	cf.sliMetrics.setProgressSkew(cf.sliMetricsID, spanSkew, tableSkew)
 }
 
 func frontierIsBehind(frontier hlc.Timestamp, sv *settings.Values) bool {
@@ -2252,7 +2265,7 @@ func frontierIsBehind(frontier hlc.Timestamp, sv *settings.Values) bool {
 // frontier is behind
 func maybeLogBehindSpan(
 	ctx context.Context,
-	description string,
+	description redact.SafeString,
 	frontier span.Frontier,
 	frontierChanged bool,
 	sv *settings.Values,
@@ -2272,12 +2285,12 @@ func maybeLogBehindSpan(
 
 	if frontierChanged && slowLogEveryN.ShouldProcess(now) {
 		log.Changefeed.Infof(ctx, "%s new resolved timestamp %s is behind by %s",
-			redact.Safe(description), frontierTS, resolvedBehind)
+			description, frontierTS, resolvedBehind)
 	}
 
 	if slowLogEveryN.ShouldProcess(now) {
 		s := frontier.PeekFrontierSpan()
-		log.Changefeed.Infof(ctx, "%s span %s is behind by %s", redact.Safe(description), s, resolvedBehind)
+		log.Changefeed.Infof(ctx, "%s span %s is behind by %s", description, s, resolvedBehind)
 	}
 }
 

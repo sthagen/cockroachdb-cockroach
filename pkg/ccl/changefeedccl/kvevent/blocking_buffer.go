@@ -19,14 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 )
 
 // blockingBuffer is an implementation of Buffer which allocates memory
 // from a mon.BoundAccount and blocks if no resources are available.
 type blockingBuffer struct {
 	sv       *settings.Values
-	metrics  *PerBufferMetricsWithCompat
+	metrics  *PerBufferMetrics
 	qp       allocPool     // Pool for memory allocations.
 	signalCh chan struct{} // Signal when new events are available.
 
@@ -55,7 +54,7 @@ type blockingBuffer struct {
 func NewMemBuffer(
 	acc mon.BoundAccount,
 	sv *settings.Values,
-	metrics *PerBufferMetricsWithCompat,
+	metrics *PerBufferMetrics,
 	options ...BlockingBufferOption,
 ) Buffer {
 	return newMemBuffer(acc, sv, metrics, nil, options...)
@@ -66,7 +65,7 @@ func NewMemBuffer(
 func TestingNewMemBuffer(
 	acc mon.BoundAccount,
 	sv *settings.Values,
-	metrics *PerBufferMetricsWithCompat,
+	metrics *PerBufferMetrics,
 	onWaitStart quotapool.OnWaitStartFunc,
 ) Buffer {
 	return newMemBuffer(acc, sv, metrics, onWaitStart)
@@ -75,7 +74,7 @@ func TestingNewMemBuffer(
 func newMemBuffer(
 	acc mon.BoundAccount,
 	sv *settings.Values,
-	metrics *PerBufferMetricsWithCompat,
+	metrics *PerBufferMetrics,
 	onWaitStart quotapool.OnWaitStartFunc,
 	options ...BlockingBufferOption,
 ) Buffer {
@@ -489,7 +488,7 @@ func (r *memRequest) ShouldWait() bool {
 
 type allocPool struct {
 	*quotapool.AbstractPool
-	metrics *PerBufferMetricsWithCompat
+	metrics *PerBufferMetrics
 	sv      *settings.Values
 }
 
@@ -524,15 +523,13 @@ func logSlowAcquisition(
 		shouldLog := logSlowAcquire.ShouldLog()
 		if shouldLog {
 			log.Changefeed.Warningf(ctx, "have been waiting %s attempting to acquire changefeed quota (buffer=%s)",
-				timeutil.Since(start),
-				redact.SafeString(bufType))
+				timeutil.Since(start), bufType)
 		}
 
 		return func() {
 			if shouldLog {
 				log.Changefeed.Infof(ctx, "acquired changefeed quota after %s (buffer=%s)",
-					timeutil.Since(start),
-					redact.SafeString(bufType))
+					timeutil.Since(start), bufType)
 			}
 		}
 	}

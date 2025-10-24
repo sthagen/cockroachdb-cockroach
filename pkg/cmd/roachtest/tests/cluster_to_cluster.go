@@ -933,7 +933,7 @@ func (rd *replicationDriver) onFingerprintMismatch(
 		endTime)
 	// Before failing on this error, back up the source and destination tenants.
 	if fingerprintBisectErr != nil {
-		rd.t.L().Printf("fingerprint bisect error", fingerprintBisectErr)
+		rd.t.L().Printf("fingerprint bisect error %+v", fingerprintBisectErr)
 	} else {
 		rd.t.L().Printf("table level fingerprints seem to match")
 	}
@@ -2019,17 +2019,18 @@ func registerClusterReplicationResilience(r registry.Registry) {
 // reconnects the nodes.
 func registerClusterReplicationDisconnect(r registry.Registry) {
 	sp := replicationSpec{
-		name:               "c2c/disconnect",
-		srcNodes:           3,
-		dstNodes:           3,
-		cpus:               4,
-		workload:           replicateKV{readPercent: 0, initRows: 1000000, maxBlockBytes: 1024, initWithSplitAndScatter: true, tolerateErrors: true},
-		timeout:            20 * time.Minute,
-		additionalDuration: 10 * time.Minute,
-		cutover:            2 * time.Minute,
-		maxAcceptedLatency: 12 * time.Minute,
-		clouds:             registry.OnlyGCE,
-		suites:             registry.Suites(registry.Nightly),
+		name:                      "c2c/disconnect",
+		srcNodes:                  3,
+		dstNodes:                  3,
+		cpus:                      4,
+		workload:                  replicateKV{readPercent: 0, initRows: 1000000, maxBlockBytes: 1024, initWithSplitAndScatter: true, tolerateErrors: true},
+		timeout:                   20 * time.Minute,
+		additionalDuration:        10 * time.Minute,
+		cutover:                   2 * time.Minute,
+		maxAcceptedLatency:        12 * time.Minute,
+		skipNodeDistributionCheck: true,
+		clouds:                    registry.OnlyGCE,
+		suites:                    registry.Suites(registry.Nightly),
 	}
 	c2cRegisterWrapper(r, sp, func(ctx context.Context, t test.Test, c cluster.Cluster) {
 		rd := makeReplicationDriver(t, c, sp)

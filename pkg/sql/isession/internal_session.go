@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionmutator"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/crlib/crtime"
@@ -51,6 +52,25 @@ var (
 	rollback = statements.Statement[tree.Statement]{
 		AST: &tree.RollbackTransaction{},
 		SQL: "ROLLBACK",
+	}
+
+	savepointBegin = statements.Statement[tree.Statement]{
+		AST: &tree.Savepoint{
+			Name: tree.Name("internal_session"),
+		},
+		SQL: "SAVEPOINT internal_session",
+	}
+	savepointRelease = statements.Statement[tree.Statement]{
+		AST: &tree.ReleaseSavepoint{
+			Savepoint: tree.Name("internal_session"),
+		},
+		SQL: "RELEASE SAVEPOINT internal_session",
+	}
+	savepointRollback = statements.Statement[tree.Statement]{
+		AST: &tree.RollbackToSavepoint{
+			Savepoint: tree.Name("internal_session"),
+		},
+		SQL: "ROLLBACK TO SAVEPOINT internal_session",
 	}
 )
 
@@ -113,6 +133,40 @@ func (i *InternalSession) Txn(ctx context.Context, do func(ctx context.Context) 
 	}
 
 	return err
+}
+
+func (i *InternalSession) Savepoint(ctx context.Context, do func(ctx context.Context) error) error {
+	if i.poison != nil {
+		return i.poison
+	}
+
+	if err := i.executeStatement(ctx, savepointBegin); err != nil {
+		return errors.Wrap(err, "failed to create savepoint")
+	}
+
+	innerErr := do(ctx)
+	if innerErr != nil {
+		// Return the rollback error as primary since it indicates a more
+		// serious problem than the original error.
+		savePointErr := i.executeStatement(ctx, savepointRollback)
+		if savePointErr != nil {
+			return errors.CombineErrors(savePointErr, innerErr)
+		}
+		// NOTE: Rollback does not release the savepoint. We need to release the
+		// savepoint to avoid leaking it and causing weird behavior if the user is
+		// nesting savepoint calls.
+		releaseErr := i.executeStatement(ctx, savepointRelease)
+		if releaseErr != nil {
+			return errors.CombineErrors(releaseErr, innerErr)
+		}
+		return innerErr
+	}
+
+	if err := i.executeStatement(ctx, savepointRelease); err != nil {
+		return errors.Wrap(err, "failed to release the savepoint")
+	}
+
+	return nil
 }
 
 func (i *InternalSession) Prepare(
@@ -233,7 +287,7 @@ func (i *InternalSession) executeStatement(
 		return errors.Wrap(err, "unable to push sync statement")
 	}
 	_, _, err = i.readResults(ctx)
-	return errors.Wrap(err, "unable to execute raw statement")
+	return errors.Wrapf(err, "unable to execute raw statement %s", stmt.SQL)
 }
 
 func (i *InternalSession) readResults(ctx context.Context) ([]tree.Datums, int, error) {
@@ -270,6 +324,20 @@ func (i *InternalSession) readResults(ctx context.Context) ([]tree.Datums, int, 
 	}
 
 	return rows, rowCount, resultErr
+}
+
+func (i *InternalSession) ModifySession(
+	ctx context.Context, mutate func(mutator sessionmutator.SessionDataMutator),
+) error {
+	if i.poison != nil {
+		return i.poison
+	}
+
+	sdMutIterator := i.csm.SessionDataMutatorIterator()
+	return sdMutIterator.ApplyOnTopMutator(func(m sessionmutator.SessionDataMutator) error {
+		mutate(m)
+		return nil
+	})
 }
 
 func (i *InternalSession) Close(ctx context.Context) {

@@ -451,7 +451,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	stmtTS := ex.server.cfg.Clock.PhysicalTime()
 	ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
-	p.sessionDataMutatorIterator.paramStatusUpdater = res
+	p.sessionDataMutatorIterator.ParamStatusUpdater = res
 	p.noticeSender = res
 	ih := &p.instrumentation
 
@@ -1337,7 +1337,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	stmtTS := ex.server.cfg.Clock.PhysicalTime()
 	ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
-	p.sessionDataMutatorIterator.paramStatusUpdater = res
+	p.sessionDataMutatorIterator.ParamStatusUpdater = res
 	p.noticeSender = res
 	ih := &p.instrumentation
 
@@ -2331,7 +2331,7 @@ func (ex *connExecutor) reportSessionDataChanges(fn func() error) error {
 		return err
 	}
 	after := ex.sessionDataStack.Top()
-	if ex.dataMutatorIterator.paramStatusUpdater != nil {
+	if ex.dataMutatorIterator.ParamStatusUpdater != nil {
 		for _, param := range bufferableParamStatusUpdates {
 			if param.sv.Equal == nil {
 				return errors.AssertionFailedf("Equal for %s must be set", param.name)
@@ -2340,18 +2340,18 @@ func (ex *connExecutor) reportSessionDataChanges(fn func() error) error {
 				return errors.AssertionFailedf("GetFromSessionData for %s must be set", param.name)
 			}
 			if !param.sv.Equal(before, after) {
-				ex.dataMutatorIterator.paramStatusUpdater.BufferParamStatusUpdate(
+				ex.dataMutatorIterator.ParamStatusUpdater.BufferParamStatusUpdate(
 					param.name,
 					param.sv.GetFromSessionData(after),
 				)
 			}
 		}
 	}
-	if before.DefaultIntSize != after.DefaultIntSize && ex.dataMutatorIterator.onDefaultIntSizeChange != nil {
-		ex.dataMutatorIterator.onDefaultIntSizeChange(after.DefaultIntSize)
+	if before.DefaultIntSize != after.DefaultIntSize && ex.dataMutatorIterator.OnDefaultIntSizeChange != nil {
+		ex.dataMutatorIterator.OnDefaultIntSizeChange(after.DefaultIntSize)
 	}
-	if before.ApplicationName != after.ApplicationName && ex.dataMutatorIterator.onApplicationNameChange != nil {
-		ex.dataMutatorIterator.onApplicationNameChange(after.ApplicationName)
+	if before.ApplicationName != after.ApplicationName && ex.dataMutatorIterator.OnApplicationNameChange != nil {
+		ex.dataMutatorIterator.OnApplicationNameChange(after.ApplicationName)
 	}
 	return nil
 }
@@ -3275,12 +3275,23 @@ func (ex *connExecutor) makeExecPlan(
 
 // topLevelQueryStats returns some basic statistics about the run of the query.
 type topLevelQueryStats struct {
-	// bytesRead is the number of bytes read from disk.
-	bytesRead int64
-	// rowsRead is the number of rows read from disk.
+	// rowsRead is the number of rows read from primary and secondary indexes.
 	rowsRead int64
-	// rowsWritten is the number of rows written.
+	// bytesRead is the number of bytes read from primary and secondary indexes.
+	bytesRead int64
+	// rowsWritten is the number of rows written to the primary index. It does not
+	// include rows written to secondary indexes.
+	// NB: There is an asymmetry between rowsRead and rowsWritten - rowsRead
+	// includes rows read from secondary indexes, while rowsWritten does not
+	// include rows written to secondary indexes. This matches the behavior of
+	// EXPLAIN ANALYZE and SQL "rows affected".
 	rowsWritten int64
+	// indexRowsWritten is the number of rows written to primary and secondary
+	// indexes. It is always >= rowsWritten.
+	indexRowsWritten int64
+	// indexBytesWritten is the number of bytes written to primary and secondary
+	// indexes.
+	indexBytesWritten int64
 	// networkEgressEstimate is an estimate for the number of bytes sent to the
 	// client. It is used for estimating the number of RUs consumed by a query.
 	networkEgressEstimate int64
@@ -3296,6 +3307,8 @@ func (s *topLevelQueryStats) add(other *topLevelQueryStats) {
 	s.bytesRead += other.bytesRead
 	s.rowsRead += other.rowsRead
 	s.rowsWritten += other.rowsWritten
+	s.indexBytesWritten += other.indexBytesWritten
+	s.indexRowsWritten += other.indexRowsWritten
 	s.networkEgressEstimate += other.networkEgressEstimate
 	s.clientTime += other.clientTime
 }

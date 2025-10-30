@@ -309,16 +309,22 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 	}
 
 	if res.Split != nil {
-		// Splits require a new HardState to be written to the new RHS
-		// range (and this needs to be atomic with the main batch). This
-		// cannot be constructed at evaluation time because it differs
-		// on each replica (votes may have already been cast on the
-		// uninitialized replica). Write this new hardstate to the batch too.
+		// Splits require a new HardState to be written for the new RHS replica,
+		// atomically with the main batch. This cannot be constructed at evaluation
+		// time because it differs on each replica (votes may have already been cast
+		// on the uninitialized replica). Write this new HardState to the batch too.
 		// See https://github.com/cockroachdb/cockroach/issues/20629.
 		//
-		// Alternatively if we discover that the RHS has already been removed
-		// from this store, clean up its data.
-		splitPreApply(ctx, b.r, b.batch, res.Split.SplitTrigger, cmd.Cmd.ClosedTimestamp)
+		// Alternatively if we discover that the RHS has already been removed from
+		// this store, clean up its data.
+		//
+		// NB: another reason why we shouldn't write HardState at evaluation time is
+		// that it belongs to the log engine, whereas the evaluated batch must
+		// contain only state machine updates.
+		splitPreApply(
+			ctx, b.r, kvstorage.StateRW(b.batch), kvstorage.TODORaft(b.batch),
+			res.Split.SplitTrigger, cmd.Cmd.ClosedTimestamp,
+		)
 
 		// The rangefeed processor will no longer be provided logical ops for
 		// its entire range, so it needs to be shut down and all registrations
@@ -330,9 +336,7 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		if res.Split.SplitTrigger.ManualSplit {
 			reason = kvpb.RangeFeedRetryError_REASON_MANUAL_RANGE_SPLIT
 		}
-		b.r.disconnectRangefeedWithReason(
-			reason,
-		)
+		b.r.disconnectRangefeedWithReason(reason)
 	}
 
 	if merge := res.Merge; merge != nil {
@@ -700,16 +704,13 @@ func (b *replicaAppBatch) ApplyToStateMachine(ctx context.Context) error {
 }
 
 // addAppliedStateKeyToBatch adds the applied state key to the application
-// batch's RocksDB batch. This records the highest raft and lease index that
-// have been applied as of this batch. It also records the Range's mvcc stats.
+// batch's Pebble batch. This records the highest raft and lease index that have
+// been applied as of this batch. It also records the Range's MVCC stats.
 func (b *replicaAppBatch) addAppliedStateKeyToBatch(ctx context.Context) error {
-	// Set the range applied state, which includes the last applied raft and
-	// lease index along with the mvcc stats, all in one key.
-	loader := &b.r.raftMu.stateLoader
-	return loader.SetRangeAppliedState(
-		ctx, b.batch, b.state.RaftAppliedIndex, b.state.LeaseAppliedIndex, b.state.RaftAppliedIndexTerm,
-		b.state.Stats, b.state.RaftClosedTimestamp, &b.asAlloc,
-	)
+	// Set the range applied state, which includes the last applied raft and lease
+	// index along with the MVCC stats, all in one key.
+	b.asAlloc = b.state.ToRangeAppliedState()
+	return b.r.raftMu.stateLoader.SetRangeAppliedState(ctx, b.batch, &b.asAlloc)
 }
 
 func (b *replicaAppBatch) recordStatsOnCommit() {

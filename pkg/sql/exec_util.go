@@ -293,7 +293,7 @@ var TraceTxnSampleRate = settings.RegisterFloatSetting(
 		"will have tracing enabled, and only those which exceed the configured "+
 		"threshold will be logged.",
 	1.0,
-	settings.NonNegativeFloatWithMaximum(1.0),
+	settings.Fraction,
 	settings.WithPublic)
 
 // TraceTxnOutputJaegerJSON sets the output format of transaction trace logs.
@@ -1515,25 +1515,25 @@ var (
 	MetaStatementRowsRead = metric.Metadata{
 		Name:        "sql.statements.rows_read.count",
 		Help:        "Number of rows read by SQL statements",
-		Measurement: "SQL Statements",
+		Measurement: "Rows",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaStatementBytesRead = metric.Metadata{
 		Name:        "sql.statements.bytes_read.count",
 		Help:        "Number of bytes read by SQL statements",
-		Measurement: "SQL Statements",
+		Measurement: "Bytes",
 		Unit:        metric.Unit_BYTES,
 	}
 	MetaStatementIndexRowsWritten = metric.Metadata{
 		Name:        "sql.statements.index_rows_written.count",
 		Help:        "Number of primary and secondary index rows modified by SQL statements",
-		Measurement: "SQL Statements",
+		Measurement: "Rows",
 		Unit:        metric.Unit_COUNT,
 	}
 	MetaStatementIndexBytesWritten = metric.Metadata{
 		Name:        "sql.statements.index_bytes_written.count",
 		Help:        "Number of primary and secondary index bytes modified by SQL statements",
-		Measurement: "SQL Statements",
+		Measurement: "Bytes",
 		Unit:        metric.Unit_BYTES,
 	}
 )
@@ -3479,35 +3479,6 @@ func HashForReporting(secret, appName string) string {
 			`"It never returns an error." -- https://golang.org/pkg/hash`))
 	}
 	return hex.EncodeToString(hash.Sum(nil)[:4])
-}
-
-// formatStatementHideConstants formats the statement using
-// tree.FmtHideConstants. It does *not* anonymize the statement, since
-// the result will still contain names and identifiers.
-func formatStatementHideConstants(ast tree.Statement, optFlags ...tree.FmtFlags) string {
-	if ast == nil {
-		return ""
-	}
-	fmtFlags := tree.FmtHideConstants
-	for _, f := range optFlags {
-		fmtFlags |= f
-	}
-	return tree.AsStringWithFlags(ast, fmtFlags)
-}
-
-// formatStatementSummary formats the statement using tree.FmtSummary
-// and tree.FmtHideConstants. This returns a summarized version of the
-// query. It does *not* anonymize the statement, since the result will
-// still contain names and identifiers.
-func formatStatementSummary(ast tree.Statement, optFlags ...tree.FmtFlags) string {
-	if ast == nil {
-		return ""
-	}
-	fmtFlags := tree.FmtSummary | tree.FmtHideConstants
-	for _, f := range optFlags {
-		fmtFlags |= f
-	}
-	return tree.AsStringWithFlags(ast, fmtFlags)
 }
 
 // DescsTxn is a convenient method for running a transaction on descriptors

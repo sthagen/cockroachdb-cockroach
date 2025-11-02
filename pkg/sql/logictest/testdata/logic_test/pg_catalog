@@ -3137,8 +3137,8 @@ on_update_rehome_row_enabled                                     on             
 opt_split_scan_limit                                             2048                NULL      NULL        NULL        string
 optimizer_always_use_histograms                                  on                  NULL      NULL        NULL        string
 optimizer_check_input_min_row_count                              1                   NULL      NULL        NULL        string
-optimizer_clamp_inequality_selectivity                           off                 NULL      NULL        NULL        string
-optimizer_clamp_low_histogram_selectivity                        off                 NULL      NULL        NULL        string
+optimizer_clamp_inequality_selectivity                           on                  NULL      NULL        NULL        string
+optimizer_clamp_low_histogram_selectivity                        on                  NULL      NULL        NULL        string
 optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables  on                  NULL      NULL        NULL        string
 optimizer_enable_lock_elision                                    on                  NULL      NULL        NULL        string
 optimizer_hoist_uncorrelated_equality_subqueries                 on                  NULL      NULL        NULL        string
@@ -3166,6 +3166,7 @@ optimizer_use_improved_zigzag_join_costing                       on             
 optimizer_use_limit_ordering_for_streaming_group_by              on                  NULL      NULL        NULL        string
 optimizer_use_lock_elision_multiple_families                     off                 NULL      NULL        NULL        string
 optimizer_use_lock_op_for_serializable                           off                 NULL      NULL        NULL        string
+optimizer_use_max_frequency_selectivity                          on                  NULL      NULL        NULL        string
 optimizer_use_merged_partial_statistics                          on                  NULL      NULL        NULL        string
 optimizer_use_multicol_stats                                     on                  NULL      NULL        NULL        string
 optimizer_use_not_visible_indexes                                off                 NULL      NULL        NULL        string
@@ -3383,8 +3384,8 @@ on_update_rehome_row_enabled                                     on             
 opt_split_scan_limit                                             2048                NULL  user     NULL      2048                2048
 optimizer_always_use_histograms                                  on                  NULL  user     NULL      on                  on
 optimizer_check_input_min_row_count                              1                   NULL  user     NULL      1                   1
-optimizer_clamp_inequality_selectivity                           off                 NULL  user     NULL      off                 off
-optimizer_clamp_low_histogram_selectivity                        off                 NULL  user     NULL      off                 off
+optimizer_clamp_inequality_selectivity                           on                  NULL  user     NULL      on                  on
+optimizer_clamp_low_histogram_selectivity                        on                  NULL  user     NULL      on                  on
 optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables  on                  NULL  user     NULL      on                  on
 optimizer_enable_lock_elision                                    on                  NULL  user     NULL      on                  on
 optimizer_hoist_uncorrelated_equality_subqueries                 on                  NULL  user     NULL      on                  on
@@ -3412,6 +3413,7 @@ optimizer_use_improved_zigzag_join_costing                       on             
 optimizer_use_limit_ordering_for_streaming_group_by              on                  NULL  user     NULL      on                  on
 optimizer_use_lock_elision_multiple_families                     off                 NULL  user     NULL      off                 off
 optimizer_use_lock_op_for_serializable                           off                 NULL  user     NULL      off                 off
+optimizer_use_max_frequency_selectivity                          on                  NULL  user     NULL      on                  on
 optimizer_use_merged_partial_statistics                          on                  NULL  user     NULL      on                  on
 optimizer_use_multicol_stats                                     on                  NULL  user     NULL      on                  on
 optimizer_use_not_visible_indexes                                off                 NULL  user     NULL      off                 off
@@ -3649,6 +3651,7 @@ optimizer_use_improved_zigzag_join_costing                       NULL    NULL   
 optimizer_use_limit_ordering_for_streaming_group_by              NULL    NULL     NULL     NULL        NULL
 optimizer_use_lock_elision_multiple_families                     NULL    NULL     NULL     NULL        NULL
 optimizer_use_lock_op_for_serializable                           NULL    NULL     NULL     NULL        NULL
+optimizer_use_max_frequency_selectivity                          NULL    NULL     NULL     NULL        NULL
 optimizer_use_merged_partial_statistics                          NULL    NULL     NULL     NULL        NULL
 optimizer_use_multicol_stats                                     NULL    NULL     NULL     NULL        NULL
 optimizer_use_not_visible_indexes                                NULL    NULL     NULL     NULL        NULL

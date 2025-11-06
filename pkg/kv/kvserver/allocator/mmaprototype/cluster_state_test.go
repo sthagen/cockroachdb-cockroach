@@ -63,6 +63,53 @@ func parseSecondaryLoadVector(t *testing.T, in string) SecondaryLoadVector {
 	return vec
 }
 
+func parseStatusFromArgs(t *testing.T, d *datadriven.TestData) Status {
+	var status Status
+	if d.HasArg("health") {
+		healthStr := dd.ScanArg[string](t, d, "health")
+		found := false
+		for i := Health(0); i < healthCount; i++ {
+			if i.String() == healthStr {
+				status.Health = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("unknown health: %s", healthStr)
+		}
+	}
+	if d.HasArg("leases") {
+		leaseStr := dd.ScanArg[string](t, d, "leases")
+		found := false
+		for i := LeaseDisposition(0); i < leaseDispositionCount; i++ {
+			if i.String() == leaseStr {
+				status.Disposition.Lease = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("unknown lease disposition: %s", leaseStr)
+		}
+	}
+	if d.HasArg("replicas") {
+		replicaStr := dd.ScanArg[string](t, d, "replicas")
+		found := false
+		for i := ReplicaDisposition(0); i < replicaDispositionCount; i++ {
+			if i.String() == replicaStr {
+				status.Disposition.Replica = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("unknown replica disposition: %s", replicaStr)
+		}
+	}
+	return status
+}
+
 func parseStoreLoadMsg(t *testing.T, in string) StoreLoadMsg {
 	var msg StoreLoadMsg
 	for _, v := range strings.Fields(in) {
@@ -207,8 +254,8 @@ func printPendingChangesTest(changes []*pendingReplicaChange) string {
 	return buf.String()
 }
 
-func testingGetStoreList(t *testing.T, cs *clusterState) (member, removed storeIDPostingList) {
-	var clusterStoreList, nodeStoreList storeIDPostingList
+func testingGetStoreList(t *testing.T, cs *clusterState) storeSet {
+	var clusterStoreList, nodeStoreList storeSet
 	// Ensure that the storeIDs in the cluster store map and the stores listed
 	// under each node are the same.
 	for storeID := range cs.stores {
@@ -222,15 +269,7 @@ func testingGetStoreList(t *testing.T, cs *clusterState) (member, removed storeI
 	require.True(t, clusterStoreList.isEqual(nodeStoreList),
 		"expected store lists to be equal %v != %v", clusterStoreList, nodeStoreList)
 
-	for storeID, ss := range cs.stores {
-		switch ss.storeMembership {
-		case storeMembershipMember, storeMembershipRemoving:
-			member.insert(storeID)
-		case storeMembershipRemoved:
-			removed.insert(storeID)
-		}
-	}
-	return member, removed
+	return clusterStoreList
 }
 
 func testingGetPendingChanges(t *testing.T, cs *clusterState) []*pendingReplicaChange {
@@ -301,12 +340,12 @@ func TestClusterState(t *testing.T) {
 				var buf strings.Builder
 				for _, nodeID := range nodeList {
 					ns := cs.nodes[roachpb.NodeID(nodeID)]
-					fmt.Fprintf(&buf, "node-id=%s failure-summary=%s locality-tiers=%s\n",
-						ns.NodeID, ns.fdSummary, cs.stores[ns.stores[0]].StoreAttributesAndLocality.locality())
+					fmt.Fprintf(&buf, "node-id=%s locality-tiers=%s\n",
+						ns.NodeID, cs.stores[ns.stores[0]].StoreAttributesAndLocality.locality())
 					for _, storeID := range ns.stores {
 						ss := cs.stores[storeID]
-						fmt.Fprintf(&buf, "  store-id=%v membership=%v attrs=%s locality-code=%s\n",
-							ss.StoreID, ss.storeMembership, ss.StoreAttrs, ss.localityTiers.str)
+						fmt.Fprintf(&buf, "  store-id=%v attrs=%s locality-code=%s\n",
+							ss.StoreID, ss.StoreAttrs, ss.localityTiers.str)
 					}
 				}
 				return buf.String()
@@ -336,13 +375,15 @@ func TestClusterState(t *testing.T) {
 
 				case "get-load-info":
 					var buf strings.Builder
-					memberStores, _ := testingGetStoreList(t, cs)
+					memberStores := testingGetStoreList(t, cs)
 					for _, storeID := range memberStores {
 						ss := cs.stores[storeID]
 						ns := cs.nodes[ss.NodeID]
 						fmt.Fprintf(&buf,
-							"store-id=%v node-id=%v reported=%v adjusted=%v node-reported-cpu=%v node-adjusted-cpu=%v seq=%d\n",
-							ss.StoreID, ss.NodeID, ss.reportedLoad, ss.adjusted.load, ns.ReportedCPU, ns.adjustedCPU, ss.loadSeqNum,
+							"store-id=%v node-id=%v status=%s reported=%v adjusted=%v node-reported-cpu=%v node-adjusted-cpu=%v seq"+
+								"=%d\n",
+							ss.StoreID, ss.NodeID, ss.status, ss.reportedLoad, ss.adjusted.load, ns.ReportedCPU, ns.adjustedCPU,
+							ss.loadSeqNum,
 						)
 						for ls, topk := range ss.adjusted.topKRanges {
 							n := topk.len()
@@ -362,42 +403,21 @@ func TestClusterState(t *testing.T) {
 					for _, next := range strings.Split(d.Input, "\n") {
 						sal := parseStoreAttributedAndLocality(t, next)
 						cs.setStore(sal)
+						// For convenience, in these tests, stores start out
+						// healthy.
+						cs.stores[sal.StoreID].status = Status{Health: HealthOK}
 					}
 					return printNodeListMeta()
 
-				case "set-store-membership":
+				case "set-store-status":
 					storeID := dd.ScanArg[roachpb.StoreID](t, d, "store-id")
-					var storeMembershipVal storeMembership
-					switch str := dd.ScanArg[string](t, d, "membership"); str {
-					case "member":
-						storeMembershipVal = storeMembershipMember
-					case "removing":
-						storeMembershipVal = storeMembershipRemoving
-					case "removed":
-						storeMembershipVal = storeMembershipRemoved
+					ss, ok := cs.stores[storeID]
+					if !ok {
+						t.Fatalf("store %d not found", storeID)
 					}
-					cs.setStoreMembership(storeID, storeMembershipVal)
-
-					var buf strings.Builder
-					nonRemovedStores, removedStores := testingGetStoreList(t, cs)
-					buf.WriteString("member store-ids: ")
-					printPostingList(&buf, nonRemovedStores)
-					buf.WriteString("\nremoved store-ids: ")
-					printPostingList(&buf, removedStores)
-					return buf.String()
-
-				case "update-failure-detection":
-					nodeID := dd.ScanArg[roachpb.NodeID](t, d, "node-id")
-					failureDetectionString := dd.ScanArg[string](t, d, "summary")
-					var fd failureDetectionSummary
-					for i := fdOK; i < fdDead+1; i++ {
-						if i.String() == failureDetectionString {
-							fd = i
-							break
-						}
-					}
-					cs.updateFailureDetectionSummary(nodeID, fd)
-					return printNodeListMeta()
+					status := parseStatusFromArgs(t, d)
+					ss.status = MakeStatus(status.Health, status.Disposition.Lease, status.Disposition.Replica)
+					return ss.status.String()
 
 				case "store-load-msg":
 					msg := parseStoreLoadMsg(t, d.Input)

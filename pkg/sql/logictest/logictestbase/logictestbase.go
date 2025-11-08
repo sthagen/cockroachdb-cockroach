@@ -556,11 +556,19 @@ var LogicTestConfigs = []TestClusterConfig{
 		// local is the configuration where we run all tests which have bad
 		// interactions with the default test tenant.
 		//
-		// TODO(#76378): We should review this choice. Why can't we use "Random"
+		// TODO(#156124): We should review this choice. Why can't we use "Random"
 		// here? If there are specific tests that are incompatible, we can
 		// flag them to run only in a separate config.
 		UseSecondaryTenant:            Never,
 		EnableLeasedDescriptorSupport: true,
+	},
+	{
+		// This config runs a cluster with 3 nodes, with a separate process per
+		// node. The nodes initially start on v25.4.
+		Name:                     "cockroach-go-testserver-25.4",
+		UseCockroachGoTestserver: true,
+		BootstrapVersion:         clusterversion.V25_4,
+		NumNodes:                 3,
 	},
 }
 
@@ -685,6 +693,7 @@ var DefaultConfigSets = map[string]ConfigSet{
 	"cockroach-go-testserver-configs": makeConfigSet(
 		"cockroach-go-testserver-25.2",
 		"cockroach-go-testserver-25.3",
+		"cockroach-go-testserver-25.4",
 	),
 
 	// Special alias for configs where schema locked is disabled.

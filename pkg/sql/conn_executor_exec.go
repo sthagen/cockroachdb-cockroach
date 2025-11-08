@@ -901,10 +901,6 @@ func (ex *connExecutor) execStmtInOpenState(
 				typeHints[i] = resolved
 			}
 		}
-		var statementHintsCache *hints.StatementHintsCache
-		if ex.executorType != executorTypeInternal {
-			statementHintsCache = ex.server.cfg.StatementHintsCache
-		}
 		prepStmt := makeStatement(
 			ctx,
 			statements.Statement[tree.Statement]{
@@ -1882,10 +1878,6 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 				}
 				typeHints[i] = resolved
 			}
-		}
-		var statementHintsCache *hints.StatementHintsCache
-		if ex.executorType != executorTypeInternal {
-			statementHintsCache = ex.server.cfg.StatementHintsCache
 		}
 		prepStmt := makeStatement(
 			ctx,
@@ -3278,7 +3270,6 @@ func (ex *connExecutor) makeExecPlan(
 	// Include gist in error reports.
 	ih := &planner.instrumentation
 	ex.curStmtPlanGist = redact.SafeString(ih.planGist.String())
-	ctx = withPlanGist(ctx, ih.planGist.String())
 	if buildutil.CrdbTestBuild && ih.planGist.String() != "" {
 		// Ensure that the gist can be decoded in test builds.
 		//

@@ -76,7 +76,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxlog"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -3228,6 +3227,12 @@ func (ex *connExecutor) execCopyIn(
 	// Disable the buffered writes for COPY since there is no benefit in this
 	// ability here.
 	ex.state.mu.txn.SetBufferedWritesEnabled(false /* enabled */)
+	// Step the txn in case it had just been rolled back to a savepoint (if it
+	// wasn't, this is harmless). This also matches what we do unconditionally
+	// on the main query path.
+	if err := ex.state.mu.txn.Step(ctx, false /* allowReadTimestampStep */); err != nil {
+		return ex.makeErrEvent(err, cmd.ParsedStmt.AST)
+	}
 	txnOpt := copyTxnOpt{
 		txn:           ex.state.mu.txn,
 		txnTimestamp:  ex.state.sqlTimestamp,
@@ -4937,29 +4942,4 @@ func (ex *connExecutor) WithAnonymizedStatementAndGist(err error) error {
 		err = errors.WithSafeDetails(err, "plan gist: %s", ex.curStmtPlanGist)
 	}
 	return err
-}
-
-var contextPlanGistKey = ctxutil.RegisterFastValueKey()
-
-func withPlanGist(ctx context.Context, gist string) context.Context {
-	if gist == "" {
-		return ctx
-	}
-	return ctxutil.WithFastValue(ctx, contextPlanGistKey, gist)
-}
-
-func planGistFromCtx(ctx context.Context) string {
-	val := ctxutil.FastValue(ctx, contextPlanGistKey)
-	if val != nil {
-		return val.(string)
-	}
-	return ""
-}
-
-func init() {
-	// Register a function to include the plan gist in crash reports.
-	logcrash.RegisterTagFn("gist", func(ctx context.Context) string {
-		return planGistFromCtx(ctx)
-	})
-	tree.PlanGistFromCtx = planGistFromCtx
 }

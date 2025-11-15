@@ -378,7 +378,8 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 	if ca.knobs.OverrideExecCfg != nil {
 		execCfg = ca.knobs.OverrideExecCfg(execCfg)
 	}
-	ca.targets, err = AllTargets(ctx, ca.spec.Feed, execCfg)
+	targetTS := ca.spec.GetSchemaTS()
+	ca.targets, err = AllTargets(ctx, ca.spec.Feed, execCfg, targetTS)
 	if err != nil {
 		log.Changefeed.Warningf(ca.Ctx(), "moving to draining due to error getting targets: %v", err)
 		ca.MoveToDraining(err)
@@ -1115,7 +1116,7 @@ const (
 )
 
 // slowLogEveryN rate-limits the logging of slow spans
-var slowLogEveryN = log.Every(slowSpanMaxFrequency)
+var slowLogEveryN = util.Every(slowSpanMaxFrequency)
 
 // jobState encapsulates changefeed job state.
 type jobState struct {
@@ -1352,7 +1353,8 @@ func newChangeFrontierProcessor(
 	if cf.knobs.OverrideExecCfg != nil {
 		execCfg = cf.knobs.OverrideExecCfg(execCfg)
 	}
-	targets, err := AllTargets(ctx, spec.Feed, execCfg)
+	targetTS := cf.spec.GetSchemaTS()
+	targets, err := AllTargets(ctx, cf.spec.Feed, execCfg, targetTS)
 	if err != nil {
 		return nil, err
 	}
@@ -2432,7 +2434,7 @@ type saveRateConfig struct {
 // duration it takes to save progress.
 type saveRateLimiter struct {
 	config     saveRateConfig
-	warnEveryN util.EveryN
+	warnEveryN util.EveryN[time.Time]
 
 	clock timeutil.TimeSource
 

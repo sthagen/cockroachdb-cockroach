@@ -128,6 +128,15 @@ func (lv *SecondaryLoadVector) subtract(other SecondaryLoadVector) {
 	}
 }
 
+func (lv SecondaryLoadVector) String() string {
+	return redact.StringWithoutMarkers(lv)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (lv SecondaryLoadVector) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("[lease:%d, replica:%d]", lv[LeaseCount], lv[ReplicaCount])
+}
+
 type RangeLoad struct {
 	Load LoadVector
 	// Nanos per second. RaftCPU <= Load[cpu]. Handling this as a special case,
@@ -361,6 +370,8 @@ func computeMeansForStoreSet(
 	clear(scratchStores)
 	n := 0
 	for _, storeID := range stores {
+		// NB: using reported load and not adjusted load, so cannot be
+		// negative.
 		nodeID, sload := loadProvider.getStoreReportedLoad(storeID)
 		if _, ok := scratchStores[storeID]; ok {
 			continue
@@ -380,6 +391,8 @@ func computeMeansForStoreSet(
 		}
 		nLoad := scratchNodes[nodeID]
 		if nLoad == nil {
+			// NB: using reported load and not adjusted load, so cannot be
+			// negative.
 			scratchNodes[nodeID] = loadProvider.getNodeReportedLoad(nodeID)
 		}
 	}
@@ -458,6 +471,8 @@ func (ls loadSummary) SafeFormat(w redact.SafePrinter, _ rune) {
 }
 
 // Computes the loadSummary for a particular load dimension.
+//
+// NB: load can be negative since it may be adjusted load.
 func loadSummaryForDimension(
 	ctx context.Context,
 	storeID roachpb.StoreID,

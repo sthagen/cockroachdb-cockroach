@@ -2253,7 +2253,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 
 	// Create the Store Liveness SupportManager.
 	sm := storeliveness.NewSupportManager(
-		slpb.StoreIdent{NodeID: s.nodeDesc.NodeID, StoreID: s.StoreID()}, s.StateEngine(),
+		slpb.StoreIdent{NodeID: s.nodeDesc.NodeID, StoreID: s.StoreID()}, s.LogEngine(),
 		s.cfg.StoreLiveness.Options, s.cfg.Settings, s.stopper, s.cfg.Clock,
 		s.cfg.StoreLiveness.HeartbeatTicker, s.cfg.StoreLiveness.Transport,
 		s.cfg.StoreLiveness.SupportManagerKnobs(),
@@ -3965,6 +3965,13 @@ func (s *Store) AllocatorCheckRange(
 	collectTraces bool,
 	overrideStorePool storepool.AllocatorStorePool,
 ) (allocatorimpl.AllocatorAction, roachpb.ReplicationTarget, tracingpb.Recording, error) {
+	// Testing knob to inject errors.
+	if interceptor := s.cfg.TestingKnobs.AllocatorCheckRangeInterceptor; interceptor != nil {
+		if err := interceptor(); err != nil {
+			return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, tracingpb.Recording{}, err
+		}
+	}
+
 	var spanOptions []tracing.SpanOption
 	if collectTraces {
 		spanOptions = append(spanOptions, tracing.WithRecording(tracingpb.RecordingVerbose))

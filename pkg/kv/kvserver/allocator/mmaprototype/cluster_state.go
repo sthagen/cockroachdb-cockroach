@@ -75,13 +75,12 @@ func (rit ReplicaIDAndType) String() string {
 	return redact.StringWithoutMarkers(rit)
 }
 
-// subsumesChange returns true if rit subsumes prev and next. prev is the state
-// before the proposed change and next is the state after the proposed change.
-// rit is the current observed state.
+// subsumesChange returns true if rit subsumes next, where next is the state
+// after the proposed change, and rit is the current observed state.
 //
 // NB: this method uses a value receiver since it mutates the value as part of
 // its computation.
-func (rit ReplicaIDAndType) subsumesChange(prev, next ReplicaIDAndType) bool {
+func (rit ReplicaIDAndType) subsumesChange(next ReplicaIDAndType) bool {
 	if rit.ReplicaID == noReplicaID && next.ReplicaID == noReplicaID {
 		// Removal has happened.
 		return true
@@ -98,26 +97,18 @@ func (rit ReplicaIDAndType) subsumesChange(prev, next ReplicaIDAndType) bool {
 	// been subsumed.
 	switch rit.ReplicaType.ReplicaType {
 	case roachpb.VOTER_INCOMING:
-		// Already seeing the load, so consider the change done.
+		// Already a voter, so consider the change done.
 		rit.ReplicaType.ReplicaType = roachpb.VOTER_FULL
 	}
-	// rit.replicaType.ReplicaType equal to LEARNER, VOTER_DEMOTING* are left
-	// as-is. If next is trying to remove a replica, this change has not
+	// NB: rit.replicaType.ReplicaType equal to LEARNER, VOTER_DEMOTING* are
+	// left as-is. If next is trying to remove a replica, this change has not
 	// finished yet, and the store is still seeing the load corresponding to the
-	// state it is exiting.
+	// state it is exiting. If next is trying to demote to a NON_VOTER, but
+	// rit.ReplicaType.ReplicaType is equal to VOTER_DEMOTING_NON_VOTER, then it
+	// is still a voter, so the change is not yet done.
 
-	// TODO: the prev.IsLeaseholder == next.IsLeaseholder check originates in
-	// the notion that if we were changing some aspect of ReplicaType, but not
-	// whether it was the leaseholder, we could leave IsLeaseholder false in
-	// both prev and next (signifying no change in this replica's leaseholder
-	// bit). I think this is not actually true, and if it is, we should make it
-	// not true. That is, we should populate all fields in prev and next,
-	// regardless of whether they are changing or not. Additionally, it is hard
-	// to fathom a change in the ReplicaType when it was a leaseholder and is
-	// staying a leaseholder.
 	if rit.ReplicaType.ReplicaType == next.ReplicaType.ReplicaType &&
-		(prev.IsLeaseholder == next.IsLeaseholder ||
-			rit.IsLeaseholder == next.IsLeaseholder) {
+		rit.IsLeaseholder == next.IsLeaseholder {
 		return true
 	}
 	return false
@@ -178,7 +169,10 @@ type ReplicaChange struct {
 
 	// target is the target {store,node} for the change.
 	target roachpb.ReplicationTarget
-	// TODO(sumeer): remove rangeID.
+	// rangeID is the same as that in the PendingRangeChange.RangeID this change
+	// is part of. It is duplicated here since the individual
+	// pendingReplicaChanges are kept in various maps keyed by the changeID, and
+	// having the RangeID field on each change is convenient.
 	rangeID roachpb.RangeID
 
 	// NB: 0 is not a valid ReplicaID, but this component does not care about
@@ -476,8 +470,8 @@ func mapReplicaTypeToVoterOrNonVoter(rType roachpb.ReplicaType) roachpb.ReplicaT
 //
 // Some the state inside each *pendingReplicaChange is mutable at arbitrary
 // points in time by the code inside this package (with the relevant locking,
-// of course). Currently, this state is revisedGCTime, enactedAtTime. Neither
-// of it is read by the public methods on PendingRangeChange.
+// of course). Currently, this state is gcTime, enactedAtTime. Neither of it
+// is read by the public methods on PendingRangeChange.
 //
 // TODO(sumeer): when we expand the set of mutable fields, make a deep copy.
 type PendingRangeChange struct {
@@ -720,29 +714,23 @@ func (prc PendingRangeChange) LeaseTransferFrom() roachpb.StoreID {
 // change. It may not be enacted if it will cause some invariant (like the
 // number of replicas, or having a leaseholder) to be violated. If not
 // enacted, the allocator will either be told about the lack of enactment, or
-// will eventually expire from the allocator's state after
-// pendingChangeGCDuration or revisedGCTime. Such expiration without enactment
-// should be rare. pendingReplicaChanges can be paired, when a range is being
-// moved from one store to another -- that pairing is not captured here, and
-// captured in the changes suggested by the allocator to the external entity.
+// will eventually expire from the allocator's state at gcTime. Such
+// expiration without enactment should be rare. pendingReplicaChanges can be
+// paired, when a range is being moved from one store to another -- that
+// pairing is not captured here, and captured in the changes suggested by the
+// allocator to the external entity.
 type pendingReplicaChange struct {
 	changeID
 	ReplicaChange
 
 	// The wall time at which this pending change was initiated. Used for
-	// expiry.
+	// expiry. All replica changes in a PendingRangeChange have the same
+	// startTime.
 	startTime time.Time
-	// revisedGCTime is optionally populated (the zero value represents no
-	// revision). When populated, it represents a time, which, if earlier than
-	// the GC time decided by startTime + pendingChangeGCDuration, will cause an
-	// earlier GC. It is used to hasten GC (for the remaining changes) when some
-	// subset of changes corresponding to the same complex change have been
-	// observed to be enacted.
-	//
-	// The GC of these changes happens on a different path than the usual GC,
-	// which can undo the changes -- this GC happens only when processing a
-	// RangeMsg from the leaseholder.
-	revisedGCTime time.Time
+	// gcTime represents a time when the unenacted change should be GC'd, either
+	// using the normal GC undo path, or if rangeState.pendingChangeNoRollback
+	// is true, when processing a RangeMsg from the leaseholder.
+	gcTime time.Time
 
 	// TODO(kvoli,sumeerbhola): Consider adopting an explicit expiration time,
 	// after which the change is considered to have been rejected. This would
@@ -1106,7 +1094,7 @@ type rangeState struct {
 	// - The pending change failed to apply via
 	// AdjustPendingChangesDisposition(failed)).
 	// - The pending change is garbage collected after this pending change has
-	// been created for pendingChangeGCDuration.
+	// been created for pending{Replica,Lease}ChangeGCDuration.
 	//
 	// 3. Dropped due to incompatibility: mma creates these pending changes while
 	// working with an earlier authoritative leaseholder message. These changes
@@ -1209,8 +1197,6 @@ type rangeState struct {
 	// Life-cycle matches clusterState.pendingChanges. The consolidated
 	// rangeState.pendingChanges across all ranges in clusterState.ranges will
 	// be identical to clusterState.pendingChanges.
-	//
-	// TODO(sumeer): replace by PendingRangeChange.
 	pendingChanges []*pendingReplicaChange
 	// When set, the pendingChanges can not be rolled back anymore. They have
 	// to be enacted, or discarded wholesale in favor of the latest RangeMsg
@@ -1544,7 +1530,7 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 			if !ok {
 				adjustedReplica.ReplicaID = noReplicaID
 			}
-			if adjustedReplica.subsumesChange(change.prev.ReplicaIDAndType, change.next) {
+			if adjustedReplica.subsumesChange(change.next) {
 				// The change has been enacted according to the leaseholder.
 				enactedChanges = append(enactedChanges, change)
 			} else {
@@ -1558,20 +1544,25 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 			// Note that normal GC will not GC these, since normal GC needs to undo,
 			// and we are not allowed to undo these.
 			if len(remainingChanges) > 0 {
-				startTime := remainingChanges[0].startTime
-				revisedGCTime := remainingChanges[0].revisedGCTime
-				if startTime.Add(pendingChangeGCDuration).Before(now) || revisedGCTime.Before(now) {
+				gcTime := remainingChanges[0].gcTime
+				if gcTime.Before(now) {
 					gcRemainingChanges = true
 				}
 			}
-		} else if len(enactedChanges) > 0 {
-			// First time this set of changes is seeing something enacted.
+		} else if len(enactedChanges) > 0 && len(remainingChanges) > 0 {
+			// First time this set of changes is seeing something enacted, and there
+			// are remaining changes.
 			//
 			// No longer permitted to rollback.
 			rs.pendingChangeNoRollback = true
-			for _, change := range remainingChanges {
-				// Potentially shorten when the GC happens.
-				change.revisedGCTime = now.Add(partiallyEnactedGCDuration)
+			// All remaining changes have the same gcTime.
+			curGCTime := remainingChanges[0].gcTime
+			revisedGCTime := now.Add(partiallyEnactedGCDuration)
+			if revisedGCTime.Before(curGCTime) {
+				// Shorten when the GC happens.
+				for _, change := range remainingChanges {
+					change.gcTime = revisedGCTime
+				}
 			}
 		}
 		// rs.pendingChanges is the union of remainingChanges and enactedChanges.
@@ -1616,7 +1607,10 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 				// remainingChanges, but they are not the same slice.
 				rc := rs.pendingChanges
 				rs.pendingChanges = nil
-				err := cs.preCheckOnApplyReplicaChanges(remainingChanges)
+				err := cs.preCheckOnApplyReplicaChanges(PendingRangeChange{
+					RangeID:               rangeMsg.RangeID,
+					pendingReplicaChanges: remainingChanges,
+				})
 				valid = err == nil
 				if err != nil {
 					reason = redact.Sprint(err)
@@ -1870,17 +1864,21 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 
 }
 
-// If the pending change does not happen within this GC duration, we
+// If the pending replica change does not happen within this GC duration, we
 // forget it in the data-structure.
-const pendingChangeGCDuration = 5 * time.Minute
+const pendingReplicaChangeGCDuration = 5 * time.Minute
+
+// If the pending lease transfer does not happen within this GC duration, we
+// forget it in the data-structure.
+const pendingLeaseTransferGCDuration = 1 * time.Minute
 
 // partiallyEnactedGCDuration is the duration after which a pending change is
 // GC'd if some other change that was part of the same decision has been
 // enacted, and this duration has elapsed since that enactment. This is
-// shorter than the normal pendingChangeGCDuration, since we want to clean up
-// such partially enacted changes faster. Long-running decisions are those
-// that involve a new range snapshot being sent, and that is the first change
-// that is seen as enacted. Subsequent ones should be fast.
+// shorter than the normal pendingReplicaChangeGCDuration, since we want to
+// clean up such partially enacted changes faster. Long-running decisions are
+// those that involve a new range snapshot being sent, and that is the first
+// change that is seen as enacted. Subsequent ones should be fast.
 const partiallyEnactedGCDuration = 30 * time.Second
 
 // Called periodically by allocator.
@@ -1909,14 +1907,14 @@ func (cs *clusterState) gcPendingChanges(now time.Time) {
 		if len(rs.pendingChanges) == 0 {
 			panic(errors.AssertionFailedf("no pending changes in range %v", rangeID))
 		}
-		startTime := rs.pendingChanges[0].startTime
-		// NB: we don't bother looking at revisedGCTime, since in that case
-		// rangeState.pendingChangeNoRollback is set to true, so we can't do GC
-		// here (since it requires undo).
-		if !startTime.Add(pendingChangeGCDuration).Before(now) {
+		gcTime := rs.pendingChanges[0].gcTime
+		if !gcTime.Before(now) {
 			continue
 		}
-		if err := cs.preCheckOnUndoReplicaChanges(rs.pendingChanges); err != nil {
+		if err := cs.preCheckOnUndoReplicaChanges(PendingRangeChange{
+			RangeID:               rangeID,
+			pendingReplicaChanges: rs.pendingChanges,
+		}); err != nil {
 			panic(err)
 		}
 		// Gather the changeIDs, since calls to undoPendingChange modify the
@@ -1989,24 +1987,6 @@ func printMapPendingChanges(changes map[changeID]*pendingReplicaChange) string {
 	return buf.String()
 }
 
-//lint:ignore U1000 used in tests
-func printPendingChanges(changes []*pendingReplicaChange) string {
-	var buf strings.Builder
-	fmt.Fprintf(&buf, "pending(%d)", len(changes))
-	for _, change := range changes {
-		fmt.Fprintf(&buf, "\nchange-id=%d store-id=%v node-id=%v range-id=%v load-delta=%v start=%v",
-			change.changeID, change.target.StoreID, change.target.NodeID, change.rangeID,
-			change.loadDelta, change.startTime,
-		)
-		if !(change.enactedAtTime == time.Time{}) {
-			fmt.Fprintf(&buf, " enacted=%v",
-				change.enactedAtTime)
-		}
-		fmt.Fprintf(&buf, "\n  prev=(%v)\n  next=(%v)", change.prev, change.next)
-	}
-	return buf.String()
-}
-
 // addPendingRangeChange takes a range change containing a set of replica
 // changes, and applies the changes as pending. The application updates the
 // adjusted load, tracked pending changes and changeIDs to reflect the pending
@@ -2033,6 +2013,11 @@ func (cs *clusterState) addPendingRangeChange(change PendingRangeChange) {
 	// NB: rs != nil is also required, but we also check that in a method called
 	// below.
 
+	gcDuration := pendingReplicaChangeGCDuration
+	if change.IsTransferLease() {
+		// Only the lease is being transferred.
+		gcDuration = pendingLeaseTransferGCDuration
+	}
 	pendingChanges := change.pendingReplicaChanges
 	now := cs.ts.Now()
 	for _, pendingChange := range pendingChanges {
@@ -2041,6 +2026,7 @@ func (cs *clusterState) addPendingRangeChange(change PendingRangeChange) {
 		cid := cs.changeSeqGen
 		pendingChange.changeID = cid
 		pendingChange.startTime = now
+		pendingChange.gcTime = now.Add(gcDuration)
 		pendingChange.enactedAtTime = time.Time{}
 		storeState := cs.stores[pendingChange.target.StoreID]
 		rangeState := cs.ranges[rangeID]
@@ -2071,16 +2057,11 @@ func (cs *clusterState) addPendingRangeChange(change PendingRangeChange) {
 // been added at a store, but it has not yet received the lease. Finally, it
 // checks that after the changes are applied there is exactly one leaseholder.
 // It returns a non-nil error if any of these checks fail.
-//
-// REQUIRES: all the changes are to the same range, and there is at most one
-// change per store.
-//
-// TODO(sumeer): change to take PendingRangeChange as parameter
-func (cs *clusterState) preCheckOnApplyReplicaChanges(changes []*pendingReplicaChange) error {
-	if len(changes) == 0 {
+func (cs *clusterState) preCheckOnApplyReplicaChanges(rangeChange PendingRangeChange) error {
+	if len(rangeChange.pendingReplicaChanges) == 0 {
 		return nil
 	}
-	rangeID := changes[0].rangeID
+	rangeID := rangeChange.RangeID
 	curr, ok := cs.ranges[rangeID]
 	// Return early if range already has some pending changes or the range does not exist.
 	if !ok {
@@ -2095,7 +2076,7 @@ func (cs *clusterState) preCheckOnApplyReplicaChanges(changes []*pendingReplicaC
 	copiedCurr := rangeState{
 		replicas: append([]StoreIDAndReplicaState{}, curr.replicas...),
 	}
-	for _, change := range changes {
+	for _, change := range rangeChange.pendingReplicaChanges {
 		// Check that all changes correspond to the same range. Panic otherwise.
 		if change.rangeID != rangeID {
 			panic(errors.AssertionFailedf("unexpected change rangeID %d != %d", change.rangeID, rangeID))
@@ -2124,20 +2105,17 @@ func (cs *clusterState) preCheckOnApplyReplicaChanges(changes []*pendingReplicaC
 // preCheckOnUndoReplicaChanges does some validation of the changes being
 // proposed for undo.
 //
-// REQUIRES: changes is non-empty; all changes are to the same range; the
-// rangeState.pendingChangeNoRollback is false.
+// REQUIRES: the rangeState.pendingChangeNoRollback is false.
 //
 // This method is defensive since if we always check against the current state
 // before allowing a change to be added (including re-addition after a
 // StoreLeaseholderMsg), we should never have invalidity during an undo, if
 // all the changes are being undone.
-//
-// TODO(sumeer): change to take PendingRangeChange as parameter
-func (cs *clusterState) preCheckOnUndoReplicaChanges(changes []*pendingReplicaChange) error {
-	if len(changes) == 0 {
-		panic(errors.AssertionFailedf("no changes to undo"))
+func (cs *clusterState) preCheckOnUndoReplicaChanges(rangeChange PendingRangeChange) error {
+	if len(rangeChange.pendingReplicaChanges) == 0 {
+		return nil
 	}
-	rangeID := changes[0].rangeID
+	rangeID := rangeChange.RangeID
 	curr, ok := cs.ranges[rangeID]
 	if !ok {
 		return errors.Errorf("range %v does not exist in cluster state", rangeID)
@@ -2146,7 +2124,7 @@ func (cs *clusterState) preCheckOnUndoReplicaChanges(changes []*pendingReplicaCh
 	copiedCurr := &rangeState{
 		replicas: append([]StoreIDAndReplicaState{}, curr.replicas...),
 	}
-	for _, change := range changes {
+	for _, change := range rangeChange.pendingReplicaChanges {
 		if change.rangeID != rangeID {
 			panic(errors.AssertionFailedf("unexpected change rangeID %d != %d", change.rangeID, rangeID))
 		}
@@ -2173,6 +2151,7 @@ func (cs *clusterState) preCheckOnUndoReplicaChanges(changes []*pendingReplicaCh
 	return nil
 }
 
+// REQUIRES: the range and store are known to the allocator.
 func (cs *clusterState) applyReplicaChange(change ReplicaChange, applyLoadChange bool) {
 	storeState, ok := cs.stores[change.target.StoreID]
 	if !ok {
@@ -2180,12 +2159,6 @@ func (cs *clusterState) applyReplicaChange(change ReplicaChange, applyLoadChange
 	}
 	rangeState, ok := cs.ranges[change.rangeID]
 	if !ok {
-		// This is the first time encountering this range, we add it to the cluster
-		// state.
-		//
-		// TODO(kvoli): Pass in the range descriptor to construct the range state
-		// here. Currently, when the replica change is a removal this won't work
-		// because the range state will not contain the replica being removed.
 		panic(fmt.Sprintf("range %v not found in cluster state", change.rangeID))
 	}
 

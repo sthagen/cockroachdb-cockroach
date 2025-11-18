@@ -285,10 +285,7 @@ func (re *rebalanceEnv) rebalanceReplicas(
 			log.KvDistribution.VInfof(ctx, 2, "skipping r%d: too soon after failed change", rangeID)
 			continue
 		}
-		if !re.ensureAnalyzedConstraints(rstate) {
-			log.KvDistribution.VInfof(ctx, 2, "skipping r%d: constraints analysis failed", rangeID)
-			continue
-		}
+		re.ensureAnalyzedConstraints(rstate)
 		isVoter, isNonVoter := rstate.constraints.replicaRole(store.StoreID)
 		if !isVoter && !isNonVoter {
 			// Due to REQUIREMENT(change-computation), the top-k is up to date, so
@@ -413,7 +410,7 @@ func (re *rebalanceEnv) rebalanceReplicas(
 		replicaChanges := makeRebalanceReplicaChanges(
 			rangeID, rstate.replicas, rstate.load, addTarget, removeTarget)
 		rangeChange := MakePendingRangeChange(rangeID, replicaChanges[:])
-		if err = re.preCheckOnApplyReplicaChanges(rangeChange.pendingReplicaChanges); err != nil {
+		if err = re.preCheckOnApplyReplicaChanges(rangeChange); err != nil {
 			panic(errors.Wrapf(err, "pre-check failed for replica changes: %v for %v",
 				replicaChanges, rangeID))
 		}
@@ -486,10 +483,7 @@ func (re *rebalanceEnv) rebalanceLeases(
 			log.KvDistribution.VInfof(ctx, 2, "skipping r%d: too soon after failed change", rangeID)
 			continue
 		}
-		if !re.ensureAnalyzedConstraints(rstate) {
-			log.KvDistribution.VInfof(ctx, 2, "skipping r%d: constraints analysis failed", rangeID)
-			continue
-		}
+		re.ensureAnalyzedConstraints(rstate)
 		if rstate.constraints.leaseholderID != store.StoreID {
 			// We should not panic here since the leaseQueue may have shed the
 			// lease and informed MMA, since the last time MMA computed the
@@ -591,7 +585,7 @@ func (re *rebalanceEnv) rebalanceLeases(
 		replicaChanges := MakeLeaseTransferChanges(
 			rangeID, rstate.replicas, rstate.load, addTarget, removeTarget)
 		leaseChange := MakePendingRangeChange(rangeID, replicaChanges[:])
-		if err := re.preCheckOnApplyReplicaChanges(leaseChange.pendingReplicaChanges); err != nil {
+		if err := re.preCheckOnApplyReplicaChanges(leaseChange); err != nil {
 			panic(errors.Wrapf(err, "pre-check failed for lease transfer %v", leaseChange))
 		}
 		re.addPendingRangeChange(leaseChange)

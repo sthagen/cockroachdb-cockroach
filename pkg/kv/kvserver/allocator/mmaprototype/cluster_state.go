@@ -880,7 +880,7 @@ type storeState struct {
 	localityTiers
 
 	// Time when this store started to be observed as overloaded. Set by
-	// clusterState.rebalanceStores.
+	// rebalanceStores.
 	overloadStartTime time.Time
 	// When overloaded this is equal to time.Time{}.
 	overloadEndTime time.Time
@@ -1385,6 +1385,8 @@ type clusterState struct {
 	*constraintMatcher
 	*localityTierInterner
 	meansMemo *meansMemo
+
+	mmaid int // a counter for rebalanceStores calls, for logging
 }
 
 func newClusterState(ts timeutil.TimeSource, interner *stringInterner) *clusterState {
@@ -1441,7 +1443,7 @@ func (cs *clusterState) processStoreLoadMsg(ctx context.Context, storeMsg *Store
 	// corresponding delta adjustment as the reported load already contains the
 	// effect.
 	for _, change := range ss.computePendingChangesReflectedInLatestLoad(storeMsg.LoadTime) {
-		log.KvDistribution.VInfof(ctx, 2, "s%d not-pending %v", storeMsg.StoreID, change)
+		log.KvDistribution.VEventf(ctx, 2, "s%d not-pending %v", storeMsg.StoreID, change)
 		delete(ss.adjusted.loadPendingChanges, change.changeID)
 	}
 
@@ -1451,7 +1453,7 @@ func (cs *clusterState) processStoreLoadMsg(ctx context.Context, storeMsg *Store
 		// replicas.
 		cs.applyChangeLoadDelta(change.ReplicaChange)
 	}
-	log.KvDistribution.VInfof(ctx, 2, "processStoreLoadMsg for store s%v: %v",
+	log.KvDistribution.VEventf(ctx, 2, "processStoreLoadMsg for store s%v: %v",
 		storeMsg.StoreID, ss.adjusted.load)
 }
 
@@ -1663,8 +1665,18 @@ func (cs *clusterState) processStoreLeaseholderMsgInternal(
 		if rangeMsg.MaybeSpanConfIsPopulated {
 			normSpanConfig, err := makeNormalizedSpanConfig(&rangeMsg.MaybeSpanConf, cs.constraintMatcher.interner)
 			if err != nil {
-				// TODO(kvoli): Should we log as a warning here, or return further back out?
-				panic(err)
+				if normSpanConfig == nil {
+					// TODO: the roachpb.SpanConfig violated the basic requirements
+					// documented in the proto. We need to ensure that the checks that
+					// happened here are also done when the user set the ZoneConfig, so
+					// that we can reject such violations up front. At this point in the
+					// code we have no way of continuing, so we panic, but we must ensure
+					// we never get here in production for user specified input.
+					panic(err)
+				} else {
+					log.KvDistribution.Warningf(
+						ctx, "range r%v span config had errors in normalization: %v", rangeMsg.RangeID, err)
+				}
 			}
 			rs.conf = normSpanConfig
 		}
@@ -2045,7 +2057,7 @@ func (cs *clusterState) addPendingRangeChange(change PendingRangeChange) {
 		storeState.adjusted.loadPendingChanges[cid] = pendingChange
 		rangeState.pendingChanges = append(rangeState.pendingChanges, pendingChange)
 		rangeState.pendingChangeNoRollback = false
-		log.KvDistribution.VInfof(context.Background(), 3,
+		log.KvDistribution.VEventf(context.Background(), 3,
 			"addPendingRangeChange: change_id=%v, range_id=%v, change=%v",
 			cid, rangeID, pendingChange.ReplicaChange)
 		pendingChanges = append(pendingChanges, pendingChange)
@@ -2173,7 +2185,7 @@ func (cs *clusterState) applyReplicaChange(change ReplicaChange, applyLoadChange
 		panic(fmt.Sprintf("range %v not found in cluster state", change.rangeID))
 	}
 
-	log.KvDistribution.VInfof(context.Background(), 2, "applying replica change %v to range %d on store %d",
+	log.KvDistribution.VEventf(context.Background(), 2, "applying replica change %v to range %d on store %d",
 		change, change.rangeID, change.target.StoreID)
 	if change.isRemoval() {
 		delete(storeState.adjusted.replicas, change.rangeID)
@@ -2357,11 +2369,11 @@ func (cs *clusterState) canShedAndAddLoad(
 	var reason strings.Builder
 	defer func() {
 		if canAddLoad {
-			log.KvDistribution.VInfof(ctx, 3, "can add load to n%vs%v: %v targetSLS[%v] srcSLS[%v]",
+			log.KvDistribution.VEventf(ctx, 3, "can add load to n%vs%v: %v targetSLS[%v] srcSLS[%v]",
 				targetNS.NodeID, targetSS.StoreID, canAddLoad, targetSLS, srcSLS)
 		} else {
-			log.KvDistribution.VInfof(ctx, 2, "cannot add load to n%vs%v: due to %s", targetNS.NodeID, targetSS.StoreID, reason.String())
-			log.KvDistribution.VInfof(ctx, 2, "[target_sls:%v,src_sls:%v]", targetSLS, srcSLS)
+			log.KvDistribution.VEventf(ctx, 2, "cannot add load to n%vs%v: due to %s", targetNS.NodeID, targetSS.StoreID, reason.String())
+			log.KvDistribution.VEventf(ctx, 2, "[target_sls:%v,src_sls:%v]", targetSLS, srcSLS)
 		}
 	}()
 	if targetSLS.highDiskSpaceUtilization {
@@ -2461,6 +2473,9 @@ func (cs *clusterState) canShedAndAddLoad(
 		// that case.
 	}
 	canAddLoad = overloadedDimPermitsChange && !otherDimensionsBecameWorseInTarget &&
+		// NB: the target here is quite loaded, so we are stricter than in other
+		// places and require that there are *no* pending changes (rather than
+		// a threshold fraction).
 		targetSLS.maxFractionPendingIncrease < epsilon &&
 		targetSLS.maxFractionPendingDecrease < epsilon &&
 		// NB: targetSLS.nls <= targetSLS.sls is not a typo, in that we are

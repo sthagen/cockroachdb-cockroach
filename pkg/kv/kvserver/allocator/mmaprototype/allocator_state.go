@@ -212,11 +212,6 @@ type allocatorState struct {
 
 var _ Allocator = &allocatorState{}
 
-// TODO(sumeer): temporary constants.
-const (
-	maxFractionPendingThreshold = 0.1
-)
-
 func NewAllocatorState(ts timeutil.TimeSource, rand *rand.Rand) *allocatorState {
 	interner := newStringInterner()
 	cs := newClusterState(ts, interner)
@@ -333,7 +328,8 @@ func (a *allocatorState) ComputeChanges(
 		panic(fmt.Sprintf("ComputeChanges: expected StoreID %d, got %d", opts.LocalStoreID, msg.StoreID))
 	}
 	a.cs.processStoreLeaseholderMsg(ctx, msg, a.mmaMetrics)
-	return a.cs.rebalanceStores(ctx, opts.LocalStoreID, a.rand, a.diversityScoringMemo)
+	re := newRebalanceEnv(a.cs, a.rand, a.diversityScoringMemo, a.cs.ts.Now())
+	return re.rebalanceStores(ctx, opts.LocalStoreID)
 }
 
 // AdminRelocateOne implements the Allocator interface.
@@ -497,6 +493,7 @@ func sortTargetCandidateSetAndPick(
 	ignoreLevel ignoreLevel,
 	overloadedDim LoadDimension,
 	rng *rand.Rand,
+	maxFractionPendingThreshold float64,
 ) roachpb.StoreID {
 	var b strings.Builder
 	for i := range cands.candidates {
@@ -538,7 +535,7 @@ func sortTargetCandidateSetAndPick(
 		}
 	}
 	if j == 0 {
-		log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to disk space util")
+		log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to disk space util")
 		return 0
 	}
 	// Every candidate in [0:j] has same diversity and is sorted by increasing
@@ -588,21 +585,22 @@ func sortTargetCandidateSetAndPick(
 			(cand.nls == loadThreshold && ignoreLevel < ignoreHigherThanLoadThreshold)
 		candDiscardedByOverloadDim := overloadedDim != NumLoadDimensions &&
 			cand.dimSummary[overloadedDim] >= loadNoChange
-		if candDiscardedByNLS || candDiscardedByOverloadDim ||
-			cand.maxFractionPendingIncrease >= maxFractionPendingThreshold {
+		candDiscardedByPendingThreshold := cand.maxFractionPendingIncrease >= maxFractionPendingThreshold
+		if candDiscardedByNLS || candDiscardedByOverloadDim || candDiscardedByPendingThreshold {
 			// Discard this candidate.
 			if cand.maxFractionPendingIncrease > epsilon && discardedCandsHadNoPendingChanges {
 				discardedCandsHadNoPendingChanges = false
 			}
-			log.KvDistribution.VInfof(ctx, 2,
-				"candiate store %v was discarded: sls=%v", cand.StoreID, cand.storeLoadSummary)
+			log.KvDistribution.VEventf(ctx, 2,
+				"candiate store %v was discarded due to (nls=%t overloadDim=%t pending_thresh=%t): sls=%v", cand.StoreID,
+				candDiscardedByNLS, candDiscardedByOverloadDim, candDiscardedByPendingThreshold, cand.storeLoadSummary)
 			continue
 		}
 		cands.candidates[j] = cand
 		j++
 	}
 	if j == 0 {
-		log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to load")
+		log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to load")
 		return 0
 	}
 	lowestLoadSet = cands.candidates[0].sls
@@ -633,7 +631,7 @@ func sortTargetCandidateSetAndPick(
 	}
 	// INVARIANT: lowestLoad <= loadThreshold.
 	if lowestLoadSet == loadThreshold && ignoreLevel < ignoreHigherThanLoadThreshold {
-		log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to equal to loadThreshold")
+		log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to equal to loadThreshold")
 		return 0
 	}
 	// INVARIANT: lowestLoad < loadThreshold ||
@@ -643,7 +641,7 @@ func sortTargetCandidateSetAndPick(
 	// [loadNoChange, loadThreshold), or loadThreshold && ignoreHigherThanLoadThreshold.
 	if lowestLoadSet >= loadNoChange &&
 		(!discardedCandsHadNoPendingChanges || ignoreLevel == ignoreLoadNoChangeAndHigher) {
-		log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to loadNoChange")
+		log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to loadNoChange")
 		return 0
 	}
 	if lowestLoadSet != highestLoadSet {
@@ -663,7 +661,7 @@ func sortTargetCandidateSetAndPick(
 		j++
 	}
 	if j == 0 {
-		log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to lease preference")
+		log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to lease preference")
 		return 0
 	}
 	cands.candidates = cands.candidates[:j]
@@ -676,7 +674,7 @@ func sortTargetCandidateSetAndPick(
 		})
 		lowestOverloadedLoad := cands.candidates[0].dimSummary[overloadedDim]
 		if lowestOverloadedLoad >= loadNoChange {
-			log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to overloadedDim")
+			log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: no candidates due to overloadedDim")
 			return 0
 		}
 		j = 1
@@ -693,7 +691,7 @@ func sortTargetCandidateSetAndPick(
 		fmt.Fprintf(&b, " s%v(%v)", cands.candidates[i].StoreID, cands.candidates[i].sls)
 	}
 	j = rng.Intn(j)
-	log.KvDistribution.VInfof(ctx, 2, "sortTargetCandidateSetAndPick: candidates:%s, picked s%v", b.String(), cands.candidates[j].StoreID)
+	log.KvDistribution.VEventf(ctx, 2, "sortTargetCandidateSetAndPick: candidates:%s, picked s%v", b.String(), cands.candidates[j].StoreID)
 	if ignoreLevel == ignoreLoadNoChangeAndHigher && cands.candidates[j].sls >= loadNoChange ||
 		ignoreLevel == ignoreLoadThresholdAndHigher && cands.candidates[j].sls >= loadThreshold ||
 		ignoreLevel == ignoreHigherThanLoadThreshold && cands.candidates[j].sls > loadThreshold {

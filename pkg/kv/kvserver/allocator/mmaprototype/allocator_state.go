@@ -257,16 +257,12 @@ func (a *allocatorState) ProcessStoreLoadMsg(ctx context.Context, msg *StoreLoad
 func (a *allocatorState) AdjustPendingChangeDisposition(change ExternalRangeChange, success bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	rs, ok := a.cs.ranges[change.RangeID]
+	_, ok := a.cs.ranges[change.RangeID]
 	if !ok {
 		// Range no longer exists. This can happen if the StoreLeaseholderMsg
 		// which included the effect of the change that transferred the lease away
 		// was already processed, causing the range to no longer be tracked by the
 		// allocator.
-		return
-	}
-	if !success && rs.pendingChangeNoRollback {
-		// Not allowed to undo.
 		return
 	}
 	// NB: It is possible that some of the changes have already been enacted via
@@ -703,6 +699,11 @@ func sortTargetCandidateSetAndPick(
 	return cands.candidates[j].StoreID
 }
 
+// ensureAnalyzedConstraints ensures that the constraints field of rangeState is
+// populated. It uses rangeState.{replicas,conf} as inputs to the computation.
+//
+// NB: Caller is responsible for calling clearAnalyzedConstraints when rstate or
+// the rstate.constraints is no longer needed.
 func (cs *clusterState) ensureAnalyzedConstraints(rstate *rangeState) {
 	if rstate.constraints != nil {
 		return

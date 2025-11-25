@@ -1790,7 +1790,7 @@ func (r *Replica) ContainsKeyRange(start, end roachpb.Key) bool {
 func (r *Replica) GetLastReplicaGCTimestamp(ctx context.Context) (hlc.Timestamp, error) {
 	key := keys.RangeLastReplicaGCTimestampKey(r.RangeID)
 	var timestamp hlc.Timestamp
-	_, err := storage.MVCCGetProto(ctx, r.store.TODOEngine(), key, hlc.Timestamp{}, &timestamp,
+	_, err := storage.MVCCGetProto(ctx, r.store.LogEngine(), key, hlc.Timestamp{}, &timestamp,
 		storage.MVCCGetOptions{})
 	if err != nil {
 		return hlc.Timestamp{}, err
@@ -1801,7 +1801,7 @@ func (r *Replica) GetLastReplicaGCTimestamp(ctx context.Context) (hlc.Timestamp,
 func (r *Replica) setLastReplicaGCTimestamp(ctx context.Context, timestamp hlc.Timestamp) error {
 	key := keys.RangeLastReplicaGCTimestampKey(r.RangeID)
 	return storage.MVCCPutProto(
-		ctx, r.store.TODOEngine(), key, hlc.Timestamp{}, &timestamp, storage.MVCCWriteOptions{})
+		ctx, r.store.LogEngine(), key, hlc.Timestamp{}, &timestamp, storage.MVCCWriteOptions{})
 }
 
 // getQueueLastProcessed returns the last processed timestamp for the
@@ -1810,7 +1810,7 @@ func (r *Replica) getQueueLastProcessed(ctx context.Context, queue string) (hlc.
 	key := keys.QueueLastProcessedKey(r.Desc().StartKey, queue)
 	var timestamp hlc.Timestamp
 	if r.store != nil {
-		_, err := storage.MVCCGetProto(ctx, r.store.TODOEngine(), key, hlc.Timestamp{}, &timestamp,
+		_, err := storage.MVCCGetProto(ctx, r.store.StateEngine(), key, hlc.Timestamp{}, &timestamp,
 			storage.MVCCGetOptions{})
 		if err != nil {
 			log.VErrEventf(ctx, 2, "last processed timestamp unavailable: %s", err)
@@ -1973,18 +1973,18 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 // to check that the in-memory and on-disk states of the Replica are congruent.
 // Requires that r.raftMu is locked and r.mu is read locked.
 func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
-	ctx context.Context, reader storage.Reader,
+	ctx context.Context, stateRO kvstorage.StateRO, raftRO kvstorage.RaftRO,
 ) {
 	if ts := r.shMu.state.TruncatedState; ts != nil {
 		log.KvExec.Fatalf(ctx, "non-empty RaftTruncatedState in ReplicaState: %+v", ts)
-	} else if loaded, err := r.raftMu.stateLoader.LoadRaftTruncatedState(ctx, reader); err != nil {
+	} else if loaded, err := r.raftMu.stateLoader.LoadRaftTruncatedState(ctx, raftRO); err != nil {
 		log.KvExec.Fatalf(ctx, "%s", err)
 	} else if ts := r.asLogStorage().shMu.trunc; loaded != ts {
 		log.KvExec.Fatalf(ctx, "on-disk and in-memory RaftTruncatedState diverged: %s",
 			redact.Safe(pretty.Diff(loaded, ts)))
 	}
 
-	diskState, err := r.raftMu.stateLoader.Load(ctx, reader, r.shMu.state.Desc)
+	diskState, err := r.raftMu.stateLoader.Load(ctx, stateRO, r.shMu.state.Desc)
 	if err != nil {
 		log.KvExec.Fatalf(ctx, "%v", err)
 	}
@@ -2041,7 +2041,7 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 			log.KvExec.Fatalf(ctx, "replica's replicaID %d diverges from descriptor %+v", r.replicaID, r.shMu.state.Desc)
 		}
 	}
-	diskReplID, err := r.raftMu.stateLoader.LoadRaftReplicaID(ctx, reader)
+	diskReplID, err := r.raftMu.stateLoader.LoadRaftReplicaID(ctx, stateRO)
 	if err != nil {
 		log.KvExec.Fatalf(ctx, "%s", err)
 	}
@@ -2516,7 +2516,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 	// if one exists, regardless of what timestamp it is written at.
 	desc := r.descRLocked()
 	descKey := keys.RangeDescriptorKey(desc.StartKey)
-	intentRes, err := storage.MVCCGet(ctx, r.store.TODOEngine(), descKey, hlc.MaxTimestamp,
+	intentRes, err := storage.MVCCGet(ctx, r.store.StateEngine(), descKey, hlc.MaxTimestamp,
 		storage.MVCCGetOptions{Inconsistent: true})
 	if err != nil {
 		return false, err
@@ -2524,7 +2524,7 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	valRes, err := storage.MVCCGetAsTxn(
-		ctx, r.store.TODOEngine(), descKey, intentRes.Intent.Txn.WriteTimestamp, intentRes.Intent.Txn)
+		ctx, r.store.StateEngine(), descKey, intentRes.Intent.Txn.WriteTimestamp, intentRes.Intent.Txn)
 	if err != nil {
 		return false, err
 	} else if valRes.Value != nil {

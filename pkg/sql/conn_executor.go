@@ -1311,8 +1311,6 @@ func (s *Server) newConnExecutor(
 
 	ex.applicationName.Store(ex.sessionData().ApplicationName)
 	ex.applicationStats = applicationStats
-	// We ignore statements and transactions run by the internal executor by
-	// passing a nil writer.
 	ex.statsCollector = sslocal.NewStatsCollector(
 		s.cfg.Settings,
 		applicationStats,
@@ -4020,7 +4018,7 @@ func (ex *connExecutor) initPlanner(ctx context.Context, p *planner) {
 	p.cancelChecker.Reset(ctx)
 
 	ex.initEvalCtx(ctx, &p.extendedEvalCtx, p)
-
+	p.statsCollector = ex.statsCollector
 	p.sessionDataMutatorIterator = ex.dataMutatorIterator
 	p.noticeSender = nil
 	p.preparedStatements = ex.getPrepStmtsAccessor()
@@ -4645,7 +4643,7 @@ func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
 			// Initiate a run of CREATE STATISTICS. We use a large number
 			// for rowsAffected because we want to make sure that stats always get
 			// created/refreshed here.
-			ex.planner.execCfg.StatsRefresher.NotifyMutation(desc, math.MaxInt32 /* rowsAffected */)
+			ex.planner.execCfg.StatsRefresher.NotifyMutation(ctx, desc, math.MaxInt32 /* rowsAffected */)
 		}
 	}
 	if cnt := ex.extraTxnState.descCollection.CountUncommittedNewOrDroppedDescriptors(); cnt > 0 {
@@ -4656,7 +4654,7 @@ func (ex *connExecutor) notifyStatsRefresherOfNewTables(ctx context.Context) {
 			log.Dev.Warningf(ctx, "failed to fetch descriptor table to refresh stats: %v", err)
 			return
 		}
-		ex.planner.execCfg.StatsRefresher.NotifyMutation(desc, cnt)
+		ex.planner.execCfg.StatsRefresher.NotifyMutation(ctx, desc, cnt)
 		// Release the lease after.
 		ex.extraTxnState.descCollection.ReleaseSpecifiedLeases(ctx, []lease.IDVersion{{Version: desc.GetVersion(), ID: desc.GetID()}})
 	}

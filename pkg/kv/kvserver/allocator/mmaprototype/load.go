@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/redact"
+	"github.com/dustin/go-humanize"
 )
 
 // Misc helper classes for working with range, store and node load.
@@ -37,11 +40,11 @@ const (
 func (dim LoadDimension) SafeFormat(w redact.SafePrinter, _ rune) {
 	switch dim {
 	case CPURate:
-		w.Printf("CPURate")
+		w.SafeString("CPURate")
 	case WriteBandwidth:
-		w.Print("WriteBandwidth")
+		w.SafeString("WriteBandwidth")
 	case ByteSize:
-		w.Printf("ByteSize")
+		w.SafeString("ByteSize")
 	default:
 		panic("unknown LoadDimension")
 	}
@@ -54,6 +57,8 @@ func (dim LoadDimension) String() string {
 // LoadValue is the load on a resource.
 type LoadValue int64
 
+func (LoadValue) SafeValue() {}
+
 // LoadVector represents a vector of loads, with one element for each resource
 // dimension.
 type LoadVector [NumLoadDimensions]LoadValue
@@ -64,7 +69,40 @@ func (lv LoadVector) String() string {
 
 // SafeFormat implements the redact.SafeFormatter interface.
 func (lv LoadVector) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("[cpu:%d, write-bandwidth:%d, byte-size:%d]", lv[CPURate], lv[WriteBandwidth], lv[ByteSize])
+	formatVal := func(dim LoadDimension) redact.SafeString {
+		val := lv[dim]
+		if val == UnknownCapacity {
+			return "unknown"
+		}
+		switch dim {
+		case CPURate:
+			cpuDuration := time.Duration(val)
+			if cpuDuration < time.Microsecond {
+				// humanizeutil.Duration doesn't handle sub-microsecond durations
+				return redact.SafeString(cpuDuration.String())
+			}
+			return humanizeutil.Duration(cpuDuration)
+		case WriteBandwidth, ByteSize:
+			isNegative := false
+			if val < 0 {
+				val = -val
+				isNegative = true
+			}
+			bytesStr := humanize.Bytes(uint64(val))
+			if isNegative {
+				return redact.SafeString("-" + bytesStr)
+			}
+			return redact.SafeString(bytesStr)
+		default:
+			panic(fmt.Sprintf("unknown LoadDimension: %d", dim))
+		}
+	}
+	w.Printf(
+		"[cpu:%s/s, write-bandwidth:%s/s, byte-size:%s]",
+		formatVal(CPURate),
+		formatVal(WriteBandwidth),
+		formatVal(ByteSize),
+	)
 }
 
 func (lv *LoadVector) add(other LoadVector) {
@@ -187,7 +225,23 @@ type NodeLoad struct {
 type meanStoreLoad struct {
 	load     LoadVector
 	capacity LoadVector
-	// Util is 0 for CPURate, WriteBandwidth. Non-zero for ByteSize.
+	// util is the capacity-weighted mean utilization, computed as
+	// sum(load)/sum(capacity), NOT the average of individual store utilizations.
+	//
+	// We use capacity-weighted mean because it answers: "Is this store carrying
+	// its fair share of load?" rather than "Is this store more utilized than
+	// typical stores?". This is the desired behavior for heterogeneous clusters
+	// where ideally all stores run at the same utilization regardless of size.
+	//
+	// Example: 3 stores with (load, capacity) = (10, 10), (10, 10), (10, 100)
+	//   - Average of individual utils: (100% + 100% + 10%) / 3 = 70%
+	//   - Capacity-weighted (sum/sum): 30 / 120 = 25%
+	// The capacity-weighted 25% is the true picture of resource availability,
+	// and comparing a store's utilization against this tells us if it's
+	// carrying more than its proportional share.
+	//
+	// Util is 0 for WriteBandwidth (since its Capacity is UnknownCapacity).
+	// Non-zero for CPURate, ByteSize.
 	util [NumLoadDimensions]float64
 
 	secondaryLoad SecondaryLoadVector
@@ -456,15 +510,15 @@ func (ls loadSummary) String() string {
 func (ls loadSummary) SafeFormat(w redact.SafePrinter, _ rune) {
 	switch ls {
 	case loadLow:
-		w.Print("loadLow")
+		w.SafeString("loadLow")
 	case loadNormal:
-		w.Print("loadNormal")
+		w.SafeString("loadNormal")
 	case loadNoChange:
-		w.Print("loadNoChange")
+		w.SafeString("loadNoChange")
 	case overloadSlow:
-		w.Print("overloadSlow")
+		w.SafeString("overloadSlow")
 	case overloadUrgent:
-		w.Print("overloadUrgent")
+		w.SafeString("overloadUrgent")
 	default:
 		panic("unknown loadSummary")
 	}
@@ -484,6 +538,7 @@ func loadSummaryForDimension(
 	meanUtil float64,
 ) (summary loadSummary) {
 	summ := loadLow
+	reason := ""
 	if dim == WriteBandwidth && capacity == UnknownCapacity {
 		// Ignore smaller than 1MiB differences in write bandwidth. This 1MiB
 		// value is somewhat arbitrary, but is based on EBS gp3 having a default
@@ -538,13 +593,43 @@ func loadSummaryForDimension(
 	)
 	if fractionAbove > meanFractionSlow {
 		summ = overloadSlow
+		reason = "load is >10% above mean"
 	} else if fractionAbove < meanFractionLow {
 		summ = loadLow
+		reason = "load is >10% below mean"
 	} else if fractionAbove >= meanFractionNoChange {
 		summ = loadNoChange
+		reason = "load is within 5-10% of mean"
 	} else {
 		summ = loadNormal
+		reason = "load is within 5% of mean"
 	}
+
+	defer func() {
+		if !log.ExpensiveLogEnabled(ctx, 3) {
+			return
+		}
+
+		metrics := fmt.Sprintf("load=%d meanLoad=%d", load, meanLoad)
+		if capacity != UnknownCapacity {
+			metrics += fmt.Sprintf(" fractionUsed=%.2f%% meanUtil=%.2f%% capacity=%d", fractionUsed*100, meanUtil*100, capacity)
+		}
+
+		nodeIdStr := ""
+		if nodeID > nodeIDForLogging {
+			nodeIdStr = fmt.Sprintf("n%v", nodeID)
+		}
+
+		storeIdStr := ""
+		if storeID > storeIDForLogging {
+			storeIdStr = fmt.Sprintf("s%v", storeID)
+		}
+
+		log.KvDistribution.VEventf(ctx, 3,
+			"load summary for dim=%s (%s%s): %s, reason: %s [%s]",
+			dim, nodeIdStr, storeIdStr, summary, reason, metrics)
+	}()
+
 	if capacity != UnknownCapacity && meanUtil*1.1 < fractionUsed {
 		// Further tune the summary based on utilization.
 		//
@@ -553,19 +638,24 @@ func loadSummaryForDimension(
 		// overload due to heterogeneity, while we primarily still want to focus
 		// on balancing towards the mean usage.
 		if fractionUsed > 0.9 {
+			reason = "fractionUsed > 90%"
 			return min(summaryUpperBound, overloadUrgent)
 		}
 		// INVARIANT: fractionUsed <= 0.9
 		if fractionUsed > 0.75 {
 			if meanUtil*1.5 < fractionUsed {
+				reason = "fractionUsed > 75% and >1.5x meanUtil"
 				return min(summaryUpperBound, overloadUrgent)
 			}
+			reason = "fractionUsed > 75%"
 			return min(summaryUpperBound, overloadSlow)
 		}
 		// INVARIANT: fractionUsed <= 0.75
 		if meanUtil*1.75 < fractionUsed {
+			reason = "fractionUsed < 75% and >1.75x meanUtil"
 			return min(summaryUpperBound, overloadSlow)
 		}
+		reason = "fractionUsed < 75%"
 		return min(summaryUpperBound, max(summ, loadNoChange))
 	}
 	return min(summaryUpperBound, summ)

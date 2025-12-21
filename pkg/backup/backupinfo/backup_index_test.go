@@ -6,12 +6,8 @@
 package backupinfo
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"maps"
 	"math/rand"
 	"os"
 	"path"
@@ -23,10 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/backup/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/backup/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/backup/backuptestutils"
+	"github.com/cockroachdb/cockroach/pkg/backup/backuputils"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
@@ -35,11 +31,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,29 +89,6 @@ func TestGetBackupIndexFileName(t *testing.T) {
 	)
 }
 
-func TestGetBackupIndexFilePath(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	start, end := hlc.Timestamp{WallTime: 10}, hlc.Timestamp{WallTime: 20}
-	t.Run("fails if subdir is 'LATEST' and unresolved", func(t *testing.T) {
-		_, err := getBackupIndexFilePath("LATEST", start, end)
-		require.Error(t, err)
-	})
-	t.Run("returns correct path for resolved subdir", func(t *testing.T) {
-		subdir := "/2025/07/17-152115.00"
-		flattenedSubdir := "2025-07-17-152115.00"
-		indexPath, err := getBackupIndexFilePath(subdir, start, end)
-		require.NoError(t, err)
-		require.True(
-			t, strings.HasPrefix(
-				indexPath,
-				path.Join(backupbase.BackupIndexDirectoryPath, flattenedSubdir),
-			),
-		)
-	})
-}
-
 func TestWriteBackupIndexMetadata(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -128,17 +99,30 @@ func TestWriteBackupIndexMetadata(t *testing.T) {
 		clusterversion.Latest.Version(),
 		true,
 	)
-	execCfg := &sql.ExecutorConfig{Settings: st}
-	externalStorage := newFakeExternalStorage()
+	const collectionURI = "nodelocal://1/backup"
+	dir, dirCleanupFn := testutils.TempDir(t)
+	defer dirCleanupFn()
+	externalStorage, err := cloud.ExternalStorageFromURI(
+		ctx,
+		collectionURI,
+		base.ExternalIODirConfig{},
+		st,
+		blobs.TestBlobServiceClient(dir),
+		username.RootUserName(),
+		nil, /* db */
+		nil, /* limiters */
+		cloud.NilMetrics,
+	)
+	require.NoError(t, err)
 	makeExternalStorage := func(
 		_ context.Context, _ string, _ username.SQLUsername, _ ...cloud.ExternalStorageOption,
 	) (cloud.ExternalStorage, error) {
 		return externalStorage, nil
 	}
 
+	execCfg := &sql.ExecutorConfig{Settings: st}
 	start := hlc.Timestamp{WallTime: 0}
 	end := hlc.Timestamp{WallTime: time.Date(2025, 7, 30, 0, 0, 0, 0, time.UTC).UnixNano()}
-	collectionURI := "nodelocal://1/backup"
 	subdir := "/2025/07/18-143826.00"
 
 	details := jobspb.BackupDetails{
@@ -224,7 +208,7 @@ func TestWriteBackupIndexMetadataWithLocalityAwareBackups(t *testing.T) {
 	))
 }
 
-func TestWriteBackupindexMetadataWithSpecifiedIncrementalLocation(t *testing.T) {
+func TestWriteBackupIndexMetadataWithSpecifiedIncrementalLocation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -260,6 +244,7 @@ func TestDontWriteBackupIndexMetadata(t *testing.T) {
 
 	ctx := context.Background()
 	var externalStorage cloud.ExternalStorage
+	var err error
 	makeExternalStorage := func(
 		_ context.Context, _ string, _ username.SQLUsername, _ ...cloud.ExternalStorageOption,
 	) (cloud.ExternalStorage, error) {
@@ -276,13 +261,26 @@ func TestDontWriteBackupIndexMetadata(t *testing.T) {
 	}
 
 	t.Run("pre v25.4 version", func(t *testing.T) {
-		externalStorage = newFakeExternalStorage()
 		st := cluster.MakeTestingClusterSettingsWithVersions(
 			clusterversion.V25_3.Version(),
 			clusterversion.V25_3.Version(),
 			true,
 		)
-
+		const collectionURI = "nodelocal://1/backup"
+		dir, dirCleanupFn := testutils.TempDir(t)
+		defer dirCleanupFn()
+		externalStorage, err = cloud.ExternalStorageFromURI(
+			ctx,
+			collectionURI,
+			base.ExternalIODirConfig{},
+			st,
+			blobs.TestBlobServiceClient(dir),
+			username.RootUserName(),
+			nil, /* db */
+			nil, /* limiters */
+			cloud.NilMetrics,
+		)
+		require.NoError(t, err)
 		execCfg := &sql.ExecutorConfig{Settings: st}
 
 		start := hlc.Timestamp{}
@@ -302,12 +300,26 @@ func TestDontWriteBackupIndexMetadata(t *testing.T) {
 	})
 
 	t.Run("missing full backup index", func(t *testing.T) {
-		externalStorage = newFakeExternalStorage()
 		st := cluster.MakeTestingClusterSettingsWithVersions(
 			clusterversion.Latest.Version(),
 			clusterversion.Latest.Version(),
 			true,
 		)
+		const collectionURI = "nodelocal://1/backup"
+		dir, dirCleanupFn := testutils.TempDir(t)
+		defer dirCleanupFn()
+		externalStorage, err = cloud.ExternalStorageFromURI(
+			ctx,
+			collectionURI,
+			base.ExternalIODirConfig{},
+			st,
+			blobs.TestBlobServiceClient(dir),
+			username.RootUserName(),
+			nil, /* db */
+			nil, /* limiters */
+			cloud.NilMetrics,
+		)
+		require.NoError(t, err)
 		execCfg := &sql.ExecutorConfig{Settings: st}
 
 		start := hlc.Timestamp{WallTime: 10}
@@ -451,7 +463,20 @@ func TestIndexExists(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			externalStorage := newFakeExternalStorage()
+			dir, dirCleanupFn := testutils.TempDir(t)
+			defer dirCleanupFn()
+			externalStorage, err := cloud.ExternalStorageFromURI(
+				ctx,
+				collectionURI,
+				base.ExternalIODirConfig{},
+				st,
+				blobs.TestBlobServiceClient(dir),
+				username.RootUserName(),
+				nil, /* db */
+				nil, /* limiters */
+				cloud.NilMetrics,
+			)
+			require.NoError(t, err)
 			makeExternalStorage := func(
 				_ context.Context, _ string, _ username.SQLUsername, _ ...cloud.ExternalStorageOption,
 			) (cloud.ExternalStorage, error) {
@@ -648,109 +673,64 @@ func TestGetBackupTreeIndexMetadata(t *testing.T) {
 	}
 }
 
-type fakeExternalStorage struct {
-	cloud.ExternalStorage
-	files map[string]*closableBytesWriter
-}
+func TestConvertIndexSubdirToSubdir(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-var _ cloud.ExternalStorage = &fakeExternalStorage{}
+	endTime := time.Date(2025, 12, 5, 0, 0, 0, 0, time.UTC)
+	endTimeAsSubdir := endTime.Format(backupbase.DateBasedIntoFolderName)
+	endTimeDescEnc := backuputils.EncodeDescendingTS(endTime)
+	endTimeIndexSuffix := endTime.Format(backupbase.BackupIndexFilenameTimestampFormat)
 
-func newFakeExternalStorage() *fakeExternalStorage {
-	return &fakeExternalStorage{
-		files: make(map[string]*closableBytesWriter),
+	testcases := []struct {
+		name           string
+		indexSubdir    string
+		expectedSubdir string
+		error          string
+	}{
+		{
+			name:           "valid index subdir",
+			indexSubdir:    endTimeDescEnc + "_" + endTimeIndexSuffix,
+			expectedSubdir: endTimeAsSubdir,
+		},
+		{
+			name:        "index subdir missing two parts",
+			indexSubdir: endTimeDescEnc,
+			error:       "invalid index subdir format",
+		},
+		{
+			name:        "index subdir with extra parts",
+			indexSubdir: endTimeDescEnc + "_" + endTimeIndexSuffix + "_extra",
+			error:       "invalid index subdir format",
+		},
+		{
+			name:        "index subdir with invalid descending timestamp",
+			indexSubdir: "invalid" + "_" + endTimeIndexSuffix,
+			error:       "could not be decoded",
+		},
+		{
+			name:        "index subdir with invalid timestamp suffix",
+			indexSubdir: endTimeDescEnc + "_invalid",
+			error:       "could not be decoded",
+		},
+		{
+			name:        "index subdir with mismatched timestamps",
+			indexSubdir: endTimeDescEnc + "_" + endTime.Add(time.Second).Format(backupbase.BackupIndexFilenameTimestampFormat),
+			error:       "mismatched timestamps",
+		},
 	}
-}
 
-func (f *fakeExternalStorage) Close() error {
-	return nil
-}
-
-func (f *fakeExternalStorage) Conf() cloudpb.ExternalStorage {
-	return cloudpb.ExternalStorage{
-		Provider: cloudpb.ExternalStorageProvider_Unknown,
-	}
-}
-
-type closableBytesWriter struct {
-	bytes.Buffer
-}
-
-func (b *closableBytesWriter) Close() error {
-	// No-op for bytes.Buffer, but satisfies io.WriteCloser interface.
-	return nil
-}
-
-func (f *fakeExternalStorage) Writer(ctx context.Context, filename string) (io.WriteCloser, error) {
-	if _, exists := f.files[filename]; exists {
-		return nil, errors.Errorf("file %s already exists", filename)
-	}
-	buf := closableBytesWriter{}
-	f.files[filename] = &buf
-	return &buf, nil
-}
-
-type bytesReaderCtx struct {
-	*bufio.Reader
-}
-
-func (br *bytesReaderCtx) Read(_ context.Context, p []byte) (n int, err error) {
-	// Use the context to satisfy the ReaderCtx interface, but ignore it.
-	return br.Reader.Read(p)
-}
-
-func (b *bytesReaderCtx) Close(_ context.Context) error {
-	// No-op for bufio.Reader, but satisfies io.ReadCloser interface.
-	return nil
-}
-
-func (f *fakeExternalStorage) ReadFile(
-	ctx context.Context, filename string, _ cloud.ReadOptions,
-) (ioctx.ReadCloserCtx, int64, error) {
-	bytes, exists := f.files[filename]
-	if !exists {
-		return nil, 0, errors.Errorf("file %s does not exist", filename)
-	}
-	reader := bytesReaderCtx{
-		Reader: bufio.NewReader(bytes),
-	}
-	return &reader, int64(bytes.Len()), nil
-}
-
-// List lists files in the fake external storage, optionally filtering by prefix.
-func (f *fakeExternalStorage) List(
-	ctx context.Context, prefix string, delimiter string, cb cloud.ListingFn,
-) error {
-	var matchedFiles []string
-	if prefix == "" {
-		matchedFiles = slices.Collect(maps.Keys(f.files))
-	} else {
-		for file := range f.files {
-			if strings.HasPrefix(file, prefix) {
-				matchedFiles = append(matchedFiles, file)
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			subdir, err := convertIndexSubdirToSubdir(tc.indexSubdir)
+			if tc.error != "" {
+				require.ErrorContains(t, err, tc.error)
+				return
 			}
-		}
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedSubdir, subdir)
+		})
 	}
-
-	delimited := make(map[string]struct{})
-	if delimiter != "" {
-		for _, file := range matchedFiles {
-			cutIdx := strings.Index(file[len(prefix):], delimiter) + len(prefix)
-			cut := file[:cutIdx]
-			if _, ok := delimited[cut]; !ok {
-				delimited[cut] = struct{}{}
-			}
-		}
-		matchedFiles = slices.Collect(maps.Keys(delimited))
-	}
-
-	slices.Sort(matchedFiles)
-
-	for _, file := range matchedFiles {
-		if err := cb(file); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // intToTimeWithNano converts the integer time an easy to read hlc.Timestamp

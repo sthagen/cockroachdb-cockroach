@@ -465,6 +465,8 @@ type layerFilters struct {
 	// This is always acquired for descriptors from storage, and may need an extra
 	// round trip.
 	withMetadata bool
+	// withAdding specifies that adding descriptors can be safely included.
+	withAdding bool
 }
 
 type descFilters struct {
@@ -480,6 +482,10 @@ type descFilters struct {
 	// maybeParentID specifies, when set, that the looked-up descriptor
 	// should have the same parent ID, when set.
 	maybeParentID descpb.ID
+	// withoutLockedTimestamp, specifies that leased descriptors should
+	// be resolved at the current timestamp. This is to ensure caches
+	// are up to date.
+	withoutLockedTimestamp bool
 }
 
 func defaultUnleasedFlags() (f getterFlags) {
@@ -568,6 +574,13 @@ func (b ByIDGetterBuilder) WithoutOtherParent(parentID catid.DescID) ByIDGetterB
 	return b
 }
 
+// WithoutLockedTimestamp configures the ByIDGetterBuilder to ensure
+// that leased descriptors are looked up at the read timestamp.
+func (b ByIDGetterBuilder) WithoutLockedTimestamp() ByIDGetterBuilder {
+	b.flags.descFilters.withoutLockedTimestamp = true
+	return b
+}
+
 // Get builds a ByIDGetter.
 func (b ByIDGetterBuilder) Get() ByIDGetter {
 	if b.flags.isMutable {
@@ -629,6 +642,13 @@ type ByNameGetterBuilder getterBase
 // of offline descriptors.
 func (b ByNameGetterBuilder) WithOffline() ByNameGetterBuilder {
 	b.flags.descFilters.withoutOffline = false
+	return b
+}
+
+// WithoutLockedTimestamp configures the ByNameGetterBuilder to ensure
+// that leased descriptors are looked up at the read timestamp.
+func (b ByNameGetterBuilder) WithoutLockedTimestamp() ByNameGetterBuilder {
+	b.flags.descFilters.withoutLockedTimestamp = true
 	return b
 }
 

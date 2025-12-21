@@ -1092,7 +1092,10 @@ func TestChangefeedQuotedTableNameTopicName(t *testing.T) {
 		sqlDB.Exec(t, `UPSERT INTO "MyTable" VALUES (0, 'updated')`)
 
 		foo := feed(t, f,
-			`CREATE CHANGEFEED FOR d.public."MyTable" WITH diff, full_table_name`)
+			`CREATE CHANGEFEED FOR d.public."MyTable" WITH diff, full_table_name`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "fully-qualified table names are simplified when converted to db-level feed filters",
+			})
 		defer closeFeed(t, foo)
 
 		// The topic name should be d.public.MyTable and not d.public._u0022_MyTable_u0022_
@@ -1835,6 +1838,7 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 					"expected LineString",
 					"geometry type is unsupported",
 					"invalid escape string",
+					"invalid input syntax for type",
 					"invalid regular expression",
 					"no locations to init GEOS",
 					"parameter has to be of type Point",
@@ -4276,7 +4280,8 @@ func TestChangefeedJobControl(t *testing.T) {
 		ChangefeedJobPermissionsTestSetup(t, s)
 
 		createFeed := func(stmt string) (cdctest.EnterpriseTestFeed, func()) {
-			successfulFeed := feed(t, f, stmt)
+			successfulFeed := feed(t, f, stmt, optOutOfMetamorphicDBLevelChangefeed{
+				reason: "tests table level changefeed permissions"})
 			closeCf := func() {
 				closeFeed(t, successfulFeed)
 			}
@@ -5707,28 +5712,40 @@ func TestChangefeedLowFrequencyNotices(t *testing.T) {
 	t.Run("no options specified", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makeKafkaFeedFactory(t, s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
 	})
 	t.Run("normal resolved and min_checkpoint_frequency", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makeKafkaFeedFactory(t, s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='10s', min_checkpoint_frequency='10s'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='10s', min_checkpoint_frequency='10s'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
 	})
 	t.Run("low resolved timestamp", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makeKafkaFeedFactory(t, s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='200ms'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='200ms'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		require.Equal(t, `the 'resolved' timestamp interval (200ms) is very low; consider increasing it to at least 500ms`, actual)
 	})
 	t.Run("low min_checkpoint_frequency timestamp", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makeKafkaFeedFactory(t, s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH min_checkpoint_frequency='200ms'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH min_checkpoint_frequency='200ms'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		require.Equal(t, `the 'min_checkpoint_frequency' timestamp interval (200ms) is very low; consider increasing it to at least 500ms`, actual)
 	})
@@ -5764,7 +5781,10 @@ func TestChangefeedOutputTopics(t *testing.T) {
 	t.Run("kafka", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makeKafkaFeedFactory(t, s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
 	})
@@ -5772,7 +5792,10 @@ func TestChangefeedOutputTopics(t *testing.T) {
 	t.Run("pubsub v2", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makePubsubFeedFactory(s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'gcpubsub://does.not.matter/'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'gcpubsub://does.not.matter/'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		// Pubsub doesn't sanitize the topic name.
 		require.Equal(t, `changefeed will emit to topic ☃`, actual)
@@ -5781,7 +5804,10 @@ func TestChangefeedOutputTopics(t *testing.T) {
 	t.Run("webhooks does not emit anything", func(t *testing.T) {
 		actual = "(no notice)"
 		f := makePubsubFeedFactory(s, dbWithHandler)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'webhook-https://does.not.matter/'`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'webhook-https://does.not.matter/'`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "test requires split_column_families NOT to be set",
+			})
 		defer closeFeed(t, testFeed)
 		require.Equal(t, `(no notice)`, actual)
 	})
@@ -5834,7 +5860,10 @@ func TestChangefeedFailOnTableOffline(t *testing.T) {
 		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT) WITH (schema_locked=false)`)
 		defer sqlDB.Exec(t, `DROP TABLE for_import`)
 		sqlDB.Exec(t, `INSERT INTO for_import VALUES (0, NULL)`)
-		forImport := feed(t, f, `CREATE CHANGEFEED FOR for_import `)
+		forImport := feed(t, f, `CREATE CHANGEFEED FOR for_import `,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "DB level changefeeds do not fail with 'CHANGEFEED cannot target offline table' terminal error",
+			})
 		defer closeFeed(t, forImport)
 		assertPayloads(t, forImport, []string{
 			`for_import: [0]->{"after": {"a": 0, "b": null}}`,
@@ -5878,7 +5907,10 @@ func TestChangefeedFailOnTableOffline(t *testing.T) {
 		sqlDB.CheckQueryResultsRetry(t, "SELECT count(*) FROM for_import", [][]string{{"1"}})
 
 		// Changefeed should fail regardless
-		forImport := feed(t, f, `CREATE CHANGEFEED FOR for_import WITH cursor=$1`, start)
+		forImport := feed(t, f, `CREATE CHANGEFEED FOR for_import WITH cursor=$1`, start,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "DB level changefeeds do not fail with 'CHANGEFEED cannot target offline table' terminal error",
+			})
 		defer closeFeed(t, forImport)
 		requireTerminalErrorSoon(context.Background(), t, forImport,
 			regexp.MustCompile(`CHANGEFEED cannot target offline table: for_import \(offline reason: "importing"\)`))
@@ -7034,53 +7066,80 @@ func TestChangefeedCursorAgeWarning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	var cursorAges = []time.Duration{
-		time.Hour,
-		6 * time.Hour,
-	}
+	for name, tc := range map[string]struct {
+		cursorAge     time.Duration
+		expectWarning bool
+	}{
+		// The warning threshold is 5 hours, so we expect no warning for 1 hour.
+		"1 hour (no warning)": {cursorAge: time.Hour, expectWarning: false},
+		"6 hours (warning)":   {cursorAge: 6 * time.Hour, expectWarning: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spy := &changefeedLogSpy{}
+			cleanup := log.InterceptWith(context.Background(), spy)
+			defer cleanup()
 
-	testutils.RunValues(t, "cursor age", cursorAges, func(t *testing.T, cursorAge time.Duration) {
-		s, stopServer := makeServer(t, withAllowChangefeedErr("expects batch ts gc error"))
-		defer stopServer()
-		knobs := s.TestingKnobs.
-			DistSQL.(*execinfra.TestingKnobs).
-			Changefeed.(*TestingKnobs)
-		knobs.OverrideCursorAge = func() int64 {
-			return int64(cursorAge)
-		}
+			s, stopServer := makeServer(t, withAllowChangefeedErr("expects batch ts gc error"))
+			defer stopServer()
+			knobs := s.TestingKnobs.
+				DistSQL.(*execinfra.TestingKnobs).
+				Changefeed.(*TestingKnobs)
+			knobs.OverrideCursorAge = func() int64 {
+				return int64(tc.cursorAge)
+			}
 
-		warning := fmt.Sprintf(
-			"the provided cursor is %d hours old; older cursors can result in increased changefeed latency",
-			int64(cursorAge/time.Hour))
-		noWarning := "(no notice)"
+			warning := fmt.Sprintf(
+				"the provided cursor is %d hours old; older cursors can result in increased changefeed latency",
+				int64(tc.cursorAge)/int64(time.Hour))
+			noWarning := "(no notice)"
 
-		expectedWarning := func(initial_scan string) string {
-			if cursorAge == time.Hour || initial_scan == "only" {
+			expectedWarning := func(initial_scan string) string {
+				if tc.expectWarning && initial_scan != "only" {
+					return warning
+				}
 				return noWarning
 			}
-			return warning
-		}
 
-		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sqlDB.Exec(t, `CREATE TABLE f (a INT PRIMARY KEY)`)
-		sqlDB.Exec(t, `INSERT INTO f VALUES (1)`)
-		timeNow := strings.Split(s.Server.Clock().Now().AsOfSystemTime(), ".")[0]
+			sqlDB := sqlutils.MakeSQLRunner(s.DB)
+			sqlDB.Exec(t, `CREATE TABLE f (a INT PRIMARY KEY)`)
+			sqlDB.Exec(t, `INSERT INTO f VALUES (1)`)
+			timeNow := strings.Split(s.Server.Clock().Now().AsOfSystemTime(), ".")[0]
 
-		expectNotice(t, s.Server,
-			fmt.Sprintf(
-				`CREATE CHANGEFEED FOR TABLE d.f INTO 'null://' with cursor = '%s', initial_scan='only'`,
-				timeNow), expectedWarning("only"))
+			expectNotice(t, s.Server,
+				fmt.Sprintf(
+					`CREATE CHANGEFEED FOR TABLE d.f INTO 'null://' with cursor = '%s', initial_scan='only'`,
+					timeNow), expectedWarning("only"))
 
-		expectNotice(t, s.Server,
-			fmt.Sprintf(
-				`CREATE CHANGEFEED FOR TABLE d.f INTO 'null://' with cursor = '%s', initial_scan='yes'`,
-				timeNow), expectedWarning("yes"))
+			expectNotice(t, s.Server,
+				fmt.Sprintf(
+					`CREATE CHANGEFEED FOR TABLE d.f INTO 'null://' with cursor = '%s', initial_scan='yes'`,
+					timeNow), expectedWarning("yes"))
 
-		expectNotice(t, s.Server,
-			fmt.Sprintf(
-				`CREATE CHANGEFEED FOR TABLE d.f INTO 'null://' with cursor = '%s', initial_scan='no'`,
-				timeNow), expectedWarning("no"))
-	})
+			expectNotice(t, s.Server,
+				fmt.Sprintf(
+					`CREATE CHANGEFEED FOR TABLE d.f INTO 'null://' with cursor = '%s', initial_scan='no'`,
+					timeNow), expectedWarning("no"))
+
+			// We also verify that warnings are logged and not just sent as notices.
+			spy.Lock()
+			defer spy.Unlock()
+			warningsLogged := 0
+			for _, logMsg := range spy.logs {
+				if strings.Contains(logMsg, warning) {
+					warningsLogged++
+				}
+			}
+			if tc.expectWarning {
+				// We expect two warnings to be logged, one for initial_scan='no'
+				// and one for initial_scan='yes' but not one for initial_scan='only'.
+				require.Equal(t, warningsLogged, 2,
+					"expected 2 cursor age warning logs, got %d", warningsLogged)
+			} else {
+				require.Equal(t, warningsLogged, 0,
+					"expected no cursor age warning logs, got %d", warningsLogged)
+			}
+		})
+	}
 }
 
 // TestChangefeedSchemaTTL ensures that changefeeds fail with an error in the case
@@ -8205,10 +8264,15 @@ func TestChangefeedTelemetry(t *testing.T) {
 		// Reset the counts.
 		_ = telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
 
-		// Start some feeds (and read from them to make sure they've started.
-		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		// Start some feeds (and read from them to make sure they've started).
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`, optOutOfMetamorphicDBLevelChangefeed{
+			reason: "db-level changefeeds do not have a static number of tables for telemetry",
+		})
 		defer closeFeed(t, foo)
-		fooBar := feed(t, f, `CREATE CHANGEFEED FOR foo, bar WITH format=json`)
+		fooBar := feed(t, f, `CREATE CHANGEFEED FOR foo, bar WITH format=json`,
+			optOutOfMetamorphicDBLevelChangefeed{
+				reason: "db-level changefeeds do not have a static number of tables for telemetry",
+			})
 		defer closeFeed(t, fooBar)
 		assertPayloads(t, foo, []string{
 			`foo: [1]->{"after": {"a": 1}}`,
@@ -8489,7 +8553,9 @@ func TestChangefeedHandlesDrainingNodes(t *testing.T) {
 	defer closeSink()
 
 	atomic.StoreInt32(&shouldDrain, 1)
-	feed := feed(t, f, "CREATE CHANGEFEED FOR foo")
+	feed := feed(t, f, "CREATE CHANGEFEED FOR foo", optOutOfMetamorphicDBLevelChangefeed{
+		reason: "changefeed watches tables not in the default database",
+	})
 	defer closeFeed(t, feed)
 
 	jobID := feed.(cdctest.EnterpriseTestFeed).JobID()
@@ -8654,7 +8720,10 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 	defer closeSink()
 
 	proceed <- struct{}{} // Allow changefeed to start.
-	feed := feed(t, f, "CREATE CHANGEFEED FOR foo WITH initial_scan='no', min_checkpoint_frequency='100ms'")
+	feed := feed(t, f, "CREATE CHANGEFEED FOR foo WITH initial_scan='no', min_checkpoint_frequency='100ms'",
+		optOutOfMetamorphicDBLevelChangefeed{
+			reason: "changefeed watches tables not in the default database",
+		})
 	defer closeFeed(t, feed)
 
 	jf := feed.(cdctest.EnterpriseTestFeed)
@@ -8829,7 +8898,8 @@ func TestChangefeedTimelyResolvedTimestampUpdatePostRollingRestart(t *testing.T)
 	defer DiscardMessages(testFeed)()
 
 	// Ensure the changefeed is able to complete in a reasonable amount of time.
-	require.NoError(t, testFeed.(cdctest.EnterpriseTestFeed).WaitDurationForState(5*time.Minute, func(s jobs.State) bool {
+	require.NoError(t, testFeed.(cdctest.EnterpriseTestFeed).WaitDurationForState(time.Minute, func(s jobs.State) bool {
+		require.NoError(t, testFeed.(cdctest.EnterpriseTestFeed).FetchTerminalJobErr())
 		return s == jobs.StateSucceeded
 	}))
 }
@@ -10860,7 +10930,9 @@ func TestAlterChangefeedTelemetryLogs(t *testing.T) {
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 		sqlDB.Exec(t, `CREATE TABLE bar (a INT PRIMARY KEY, b STRING)`)
 
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo, bar`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo, bar`, optOutOfMetamorphicDBLevelChangefeed{
+			reason: "db level changefeeds don't support ADD/DROP TARGETS in ALTER CHANGEFEEDs",
+		})
 		defer closeFeed(t, testFeed)
 		feed := testFeed.(cdctest.EnterpriseTestFeed)
 
@@ -12251,7 +12323,10 @@ WITH resolved='10ms', min_checkpoint_frequency='10ms', no_initial_scan`
 			require.NoError(t, err)
 			return ts
 		}
-		perTablePTSEnabled := changefeedbase.PerTableProtectedTimestamps.Get(&s.Server.ClusterSettings().SV)
+
+		// TODO(#158779): Re-add per table protected timestamps setting and
+		// fetch this value from that cluster setting.
+		perTablePTSEnabled := false
 		perTableProgressEnabled := changefeedbase.TrackPerTableProgress.Get(&s.Server.ClusterSettings().SV)
 		getPTS := func() hlc.Timestamp {
 			if perTablePTSEnabled && perTableProgressEnabled {
@@ -13083,4 +13158,329 @@ func TestDatabaseLevelChangefeedWithInitialScanOptions(t *testing.T) {
 			cdcTest(t, testFn, feedTestEnterpriseSinks)
 		})
 	}
+}
+
+func TestDatabaseLevelChangefeedSkipOfflineTables(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	dataSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			if _, err := w.Write([]byte("42,42\n")); err != nil {
+				t.Logf("failed to write: %s", err.Error())
+			}
+		}
+	}))
+	defer dataSrv.Close()
+
+	testSkipsOnOfflineTable := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT)`)
+		feed := feed(t, f, `CREATE CHANGEFEED FOR DATABASE d`)
+		defer closeFeed(t, feed)
+		sqlDB.Exec(t, `INSERT INTO for_import VALUES (0, NULL)`)
+		assertPayloads(t, feed, []string{
+			`for_import: [0]->{"after": {"a": 0, "b": null}}`,
+		})
+		sqlDB.Exec(t, `IMPORT INTO for_import CSV DATA ($1)`, dataSrv.URL)
+		sqlDB.Exec(t, `INSERT INTO for_import VALUES (1, NULL)`)
+		assertPayloads(t, feed, []string{
+			`for_import: [1]->{"after": {"a": 1, "b": null}}`,
+		})
+	}
+	t.Run("skips on offline table", func(t *testing.T) {
+		cdcTest(t, testSkipsOnOfflineTable, feedTestEnterpriseSinks)
+	})
+
+	testSkipsOnOfflineTableWithDiff := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT)`)
+		feed := feed(t, f, `CREATE CHANGEFEED FOR DATABASE d WITH diff`)
+		defer closeFeed(t, feed)
+		sqlDB.Exec(t, `IMPORT INTO for_import CSV DATA ($1)`, dataSrv.URL)
+		sqlDB.Exec(t, `UPDATE for_import set b = 2 WHERE a = 42`)
+		// The imported value is skipped, but shows up in the next diff.
+		assertPayloads(t, feed, []string{
+			`for_import: [42]->{"after": {"a": 42, "b": 2}, "before": {"a": 42, "b": 42}}`,
+		})
+		sqlDB.Exec(t, `UPDATE for_import set b = 3 WHERE a = 42`)
+		assertPayloads(t, feed, []string{
+			`for_import: [42]->{"after": {"a": 42, "b": 3}, "before": {"a": 42, "b": 2}}`,
+		})
+	}
+	t.Run("skips on offline table with diff", func(t *testing.T) {
+		cdcTest(t, testSkipsOnOfflineTableWithDiff, feedTestEnterpriseSinks)
+	})
+
+	testSkipsOnOfflineTableWithDiffBackfill := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT)`)
+		feed := feed(t, f, `CREATE CHANGEFEED FOR DATABASE d WITH diff, schema_change_policy='backfill'`)
+		defer closeFeed(t, feed)
+		sqlDB.Exec(t, `IMPORT INTO for_import CSV DATA ($1)`, dataSrv.URL)
+		sqlDB.Exec(t, `ALTER TABLE for_import ADD COLUMN c INT DEFAULT 0`)
+		assertPayloads(t, feed, []string{
+			`for_import: [42]->{"after": {"a": 42, "b": 42, "c": 0}, "before": {"a": 42, "b": 42}}`,
+		})
+	}
+	t.Run("skips on offline table with diff backfill", func(t *testing.T) {
+		cdcTest(t, testSkipsOnOfflineTableWithDiffBackfill, feedTestEnterpriseSinks)
+	})
+
+	testAdvancesHWMOnOfflineTable := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `SET CLUSTER SETTING jobs.debug.pausepoints = 'import.after_ingest'`)
+
+		sqlDB.Exec(t, `CREATE TABLE for_import (a INT PRIMARY KEY, b INT)`)
+		feed := feed(t, f, `CREATE CHANGEFEED FOR DATABASE d WITH resolved='100ms'`)
+		defer closeFeed(t, feed)
+		eFeed, ok := feed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok, "expected enterprise feed")
+		var tsStr string
+		sqlDB.QueryRow(t, `INSERT INTO for_import VALUES (0, NULL) RETURNING cluster_logical_timestamp()`).Scan(&tsStr)
+		ts := parseTimeToHLC(t, tsStr)
+		assertPayloads(t, feed, []string{
+			`for_import: [0]->{"after": {"a": 0, "b": null}}`,
+		})
+		require.NoError(t, eFeed.WaitForHighWaterMark(ts))
+
+		hwm, err := eFeed.HighWaterMark()
+		require.NoError(t, err)
+		require.True(t, ts.Less(hwm), "expected high-water > insert ts; got hwm=%s ts=%s", hwm, ts)
+
+		hwmBeforeImport := hwm
+
+		go func() {
+			sqlDB.ExpectErrWithRetry(t, `pause point`, `IMPORT INTO for_import CSV DATA ($1)`, `result is ambiguous`, dataSrv.URL)
+		}()
+		sqlDB.CheckQueryResultsRetry(t,
+			`SELECT count(*) FROM [SHOW JOBS] WHERE job_type='IMPORT' AND status='paused'`,
+			[][]string{{"1"}},
+		)
+
+		time.Sleep(2 * time.Second)
+		require.NoError(t, eFeed.WaitForHighWaterMark(hwmBeforeImport))
+		hwmDuringImport, err := eFeed.HighWaterMark()
+		require.NoError(t, err)
+		require.True(t, hwmBeforeImport.Less(hwmDuringImport), "expected high-water to advance during import; got hwm=%s hwmBeforeImport=%s", hwmDuringImport, hwmBeforeImport)
+
+		var state string
+		sqlDB.QueryRow(t, `
+			SELECT state
+			FROM crdb_internal.tables
+			WHERE database_name = 'd' AND schema_name = 'public' AND name = 'for_import'
+		`).Scan(&state)
+		require.Equal(t, "OFFLINE", state)
+	}
+	t.Run("advances HWM while table is offline", func(t *testing.T) {
+		cdcTest(t, testAdvancesHWMOnOfflineTable, feedTestForceSink("webhook"))
+	})
+
+	// TODO(158678): Add RESTORE subtest once db-level changefeeds support it.
+	// DB-level changefeeds do not yet add newly created tables to the
+	// changefeed when they are restored, and dropping an included table to
+	// restore it will fail the feed.
+}
+
+// TestDatabaseLevelChangefeedEmptyTableset tests that a database-level changefeed
+// hibernates while there are no tables in the database.
+func TestDatabaseLevelChangefeedEmptyTableset(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFnNoWait := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE DATABASE db`)
+		sqlDB.Exec(t, `GRANT CHANGEFEED ON DATABASE db TO enterprisefeeduser`)
+		dbcf := feed(t, f, `CREATE CHANGEFEED FOR DATABASE db`)
+		defer closeFeed(t, dbcf)
+
+		// create a table
+		sqlDB.Exec(t, `CREATE TABLE db.foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO db.foo VALUES (0, 'initial')`)
+
+		assertPayloads(t, dbcf, []string{
+			`foo: [0]->{"after": {"a": 0, "b": "initial"}}`,
+		})
+	}
+	cdcTest(t, testFnNoWait, feedTestEnterpriseSinks)
+
+	testFnWait := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE DATABASE db`)
+		sqlDB.Exec(t, `GRANT CHANGEFEED ON DATABASE db TO enterprisefeeduser`)
+		dbcf := feed(t, f, `CREATE CHANGEFEED FOR DATABASE db`)
+		defer closeFeed(t, dbcf)
+
+		time.Sleep(5 * time.Second)
+
+		// create a table
+		sqlDB.Exec(t, `CREATE TABLE db.foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO db.foo VALUES (0, 'initial')`)
+
+		assertPayloads(t, dbcf, []string{
+			`foo: [0]->{"after": {"a": 0, "b": "initial"}}`,
+		})
+	}
+	cdcTest(t, testFnWait, feedTestEnterpriseSinks)
+}
+
+// TestDatabaseLevelChangefeedHibernationPollingFrequency tests that
+// the hibernation polling frequency option is correctly validated for
+// database-level changefeeds and fails for table-level changefeeds.
+// The hibernation polling frequency is only supported for database-level
+// changefeeds.
+func TestDatabaseLevelChangefeedHibernationPollingFrequency(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCreateFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE DATABASE db`)
+		sqlDB.Exec(t, `GRANT CHANGEFEED ON DATABASE db TO enterprisefeeduser`)
+
+		dbcf := feed(t, f, `CREATE CHANGEFEED FOR DATABASE db WITH hibernation_polling_frequency='1s'`)
+		defer closeFeed(t, dbcf)
+
+		sqlDB.Exec(t, `CREATE TABLE db.foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO db.foo VALUES (0, 'initial')`)
+
+		assertPayloads(t, dbcf, []string{
+			`foo: [0]->{"after": {"a": 0, "b": "initial"}}`,
+		})
+
+		expectErrCreatingFeed(t, f, `CREATE CHANGEFEED FOR db.foo WITH hibernation_polling_frequency='1s'`, "hibernation_polling_frequency is only supported for database-level changefeeds")
+	}
+	cdcTest(t, testCreateFn, feedTestEnterpriseSinks)
+
+	opts := changefeedbase.MakeStatementOptions(map[string]string{
+		changefeedbase.OptHibernationPollingFrequency: "2s",
+	})
+
+	tableDetails := jobspb.ChangefeedDetails{
+		TargetSpecifications: []jobspb.ChangefeedTargetSpecification{{
+			Type: jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
+		}},
+	}
+	if err := validateDetailsAndOptions(tableDetails, opts); err == nil {
+		t.Fatalf("expected error when %q is set for table-level changefeed",
+			changefeedbase.OptHibernationPollingFrequency)
+	}
+
+	dbDetails := jobspb.ChangefeedDetails{
+		TargetSpecifications: []jobspb.ChangefeedTargetSpecification{{
+			Type: jobspb.ChangefeedTargetSpecification_DATABASE,
+		}},
+	}
+	if err := validateDetailsAndOptions(dbDetails, opts); err != nil {
+		t.Fatalf("unexpected error for db-level changefeed: %v", err)
+	}
+}
+
+// TestDatabaseLevelChangefeedFiltersHibernation tests that a database-level changefeed
+// with include/exclude filters correctly handles hibernation:
+//   - With EXCLUDE filter: creating an excluded table should not wake the changefeed,
+//     but creating a non-excluded table should wake it.
+//   - With INCLUDE filter: creating a non-included table should not wake the changefeed,
+//     but creating an included table should wake it.
+func TestDatabaseLevelChangefeedFiltersHibernation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	full_filter := map[string]string{
+		"include": "EXCLUDE TABLES excluded_table",
+		"exclude": "INCLUDE TABLES included_table",
+	}
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory, filterType string) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE DATABASE db`)
+		sqlDB.Exec(t, `GRANT CHANGEFEED ON DATABASE db TO enterprisefeeduser`)
+
+		// Create changefeed with exclude filter - should hibernate since no tables exist
+		createStmt := fmt.Sprintf(`CREATE CHANGEFEED FOR DATABASE db %s`, full_filter[filterType])
+		dbcf := feed(t, f, createStmt)
+		defer closeFeed(t, dbcf)
+
+		var jobID jobspb.JobID
+		if ef, ok := dbcf.(cdctest.EnterpriseTestFeed); ok {
+			jobID = ef.JobID()
+		} else {
+			t.Fatal("expected EnterpriseTestFeed")
+		}
+
+		// Get initial diagram count (should be 0 when hibernating, as no diagram is written yet)
+		getDiagramCount := func() int {
+			var count int
+			sqlDB.QueryRow(t,
+				`SELECT count(*) FROM system.job_info WHERE job_id = $1 AND info_key LIKE '~dsp-diag-url-%'`,
+				jobID,
+			).Scan(&count)
+			return count
+		}
+
+		testutils.SucceedsSoon(t, func() error {
+			var count int
+			sqlDB.QueryRow(t,
+				`SELECT count(*) FROM [SHOW CHANGEFEED JOB $1] WHERE running_status = 'running'`,
+				jobID,
+			).Scan(&count)
+			return nil
+		})
+		require.Equal(t, 0, getDiagramCount(), "changefeed should be hibernating (no diagram written)")
+		time.Sleep(20 * time.Second)
+		require.Equal(t, 0, getDiagramCount(), "changefeed should stay hibernating (no diagram written)")
+
+		// Create a table that is excluded - changefeed should stay hibernating
+		sqlDB.Exec(t, `CREATE TABLE db.excluded_table (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO db.excluded_table VALUES (0, 'excluded')`)
+
+		// // Verify changefeed stays hibernating (no new diagram written)
+		time.Sleep(20 * time.Second)
+		require.Equal(t, 0, getDiagramCount(), "changefeed should stay hibernating (no new diagram written)")
+
+		// Create a table that is NOT excluded - changefeed should wake up
+		sqlDB.Exec(t, `CREATE TABLE db.included_table (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `INSERT INTO db.included_table VALUES (0, 'included')`)
+
+		// Wait for a new diagram to be written (indicating changefeed woke up)
+		time.Sleep(20 * time.Second)
+		require.Equal(t, 1, getDiagramCount(), "changefeed should wake up (new diagram written)")
+
+		// Should only receive events from the included table
+		assertPayloads(t, dbcf, []string{
+			`included_table: [0]->{"after": {"a": 0, "b": "included"}}`,
+		})
+	}
+	testutils.RunValues(t, "filterType", []string{"include", "exclude"}, func(t *testing.T, filterType string) {
+		runTestFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+			testFn(t, s, f, filterType)
+		}
+		cdcTest(t, runTestFn, feedTestEnterpriseSinks)
+	})
+}
+
+// TestChangefeedWatcherCleanupOnStop verifies that the watcher context is properly
+// cleaned up when a changefeed is stopped before receiving any table diffs.
+func TestChangefeedWatcherCleanupOnStop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE DATABASE db`)
+		sqlDB.Exec(t, `GRANT CHANGEFEED ON DATABASE db TO enterprisefeeduser`)
+
+		feed, err := f.Feed(`CREATE CHANGEFEED FOR DATABASE db`)
+		require.NoError(t, err)
+		enterpriseFeed := feed.(cdctest.EnterpriseTestFeed)
+		waitForJobState(sqlDB, t, enterpriseFeed.JobID(), jobs.StateRunning)
+
+		sqlDB.Exec(t, `CANCEL JOB $1`, enterpriseFeed.JobID())
+		waitForJobState(sqlDB, t, enterpriseFeed.JobID(), jobs.StateCanceled)
+
+		require.NoError(t, feed.Close())
+	}
+
+	cdcTest(t, testFn, feedTestEnterpriseSinks)
 }

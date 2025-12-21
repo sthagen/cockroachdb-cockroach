@@ -52,6 +52,7 @@ import (
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/cockroachkvs"
 	"github.com/cockroachdb/pebble/metrics"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/rangekey"
@@ -554,7 +555,8 @@ var (
 		"the minimum size of a value that will be separated into a blob file given the value is "+
 			"likely not the latest version of a key",
 		int64(metamorphic.ConstantWithTestRange("storage.value_separation.mvcc_history_minimum_size",
-			32 /* 32 bytes (default) */, 25 /* 25 bytes (minimum) */, 512 /* 512 bytes (maximum) */)),
+			1<<10, /* 1 KiB (default) */
+			25 /* 25 bytes (minimum) */, 1<<20 /* 1 MiB (maximum) */)),
 		settings.IntWithMinimum(1),
 	)
 )
@@ -633,7 +635,9 @@ const DefaultMemtableSize = 64 << 20 // 64 MB
 
 const mvccWallTimeIntervalCollector = "MVCCTimeInterval"
 
-func defaultPebbleOptions(sv *settings.Values) *pebble.Options {
+// initPebbleOptions populates Pebble options common for all uses.
+// EnsureDefaults is not called.
+func initPebbleOptions() *pebble.Options {
 	opts := &pebble.Options{
 		Comparer:   &EngineComparer,
 		FS:         vfs.Default,
@@ -660,7 +664,6 @@ func defaultPebbleOptions(sv *settings.Values) *pebble.Options {
 	opts.FlushDelayRangeKey = 10 * time.Second
 	opts.Experimental.ShortAttributeExtractor = shortAttributeExtractorForValues
 
-	opts.Experimental.SpanPolicyFunc = spanPolicyFuncFactory(sv)
 	opts.Experimental.UserKeyCategories = userKeyCategories
 
 	// Every 5 minutes, log iterators that have been open for more than 1 minute.
@@ -668,18 +671,16 @@ func defaultPebbleOptions(sv *settings.Values) *pebble.Options {
 	opts.Experimental.IteratorTracking.MaxAge = time.Minute
 
 	opts.Levels[0] = pebble.LevelOptions{
-		BlockSize:      32 << 10,  // 32 KB
-		IndexBlockSize: 256 << 10, // 256 KB
-		FilterPolicy:   bloom.FilterPolicy(10),
-		FilterType:     pebble.TableFilter,
+		BlockSize:         32 << 10,  // 32 KB
+		IndexBlockSize:    256 << 10, // 256 KB
+		TableFilterPolicy: bloom.FilterPolicy(10),
 	}
 	opts.Levels[0].EnsureL0Defaults()
 	for i := 1; i < len(opts.Levels); i++ {
 		l := &opts.Levels[i]
 		l.BlockSize = 32 << 10       // 32 KB
 		l.IndexBlockSize = 256 << 10 // 256 KB
-		l.FilterPolicy = bloom.FilterPolicy(10)
-		l.FilterType = pebble.TableFilter
+		l.TableFilterPolicy = bloom.FilterPolicy(10)
 		l.EnsureL1PlusDefaults(&opts.Levels[i-1])
 	}
 
@@ -701,18 +702,13 @@ func defaultPebbleOptions(sv *settings.Values) *pebble.Options {
 	return opts
 }
 
-// DefaultPebbleOptions returns the default pebble options for general use
-// (e.g., SST writers, external iterators, tests). This does not use cluster
-// settings and should not be used when opening a production Pebble engine.
+// DefaultPebbleOptions returns default Pebble options for general use (e.g.,
+// SST writers, external iterators, tests). This does not use cluster settings
+// and cannot be used when opening a production Pebble engine.
 func DefaultPebbleOptions() *pebble.Options {
-	return defaultPebbleOptions(nil /* sv */)
-}
-
-// DefaultPebbleOptionsForOpen returns the default pebble options for opening
-// a production Pebble engine. It uses cluster settings to configure value
-// storage policies.
-func DefaultPebbleOptionsForOpen(sv *settings.Values) *pebble.Options {
-	return defaultPebbleOptions(sv)
+	opts := initPebbleOptions()
+	opts.EnsureDefaults()
+	return opts
 }
 
 var (
@@ -1013,11 +1009,12 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 			cfg.opts.FormatMajorVersion, MinimumSupportedFormatVersion,
 		)
 	}
+	sv := &cfg.settings.SV
 	cfg.opts.FS = cfg.env
 	cfg.opts.Lock = cfg.env.DirectoryLock
 	cfg.opts.ErrorIfNotExists = cfg.mustExist
 	cfg.opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
-		return CompressionAlgorithmStorage.Get(&cfg.settings.SV).DBCompressionSettings()
+		return CompressionAlgorithmStorage.Get(sv).DBCompressionSettings()
 	})
 	// Note: the CompactionConcurrencyRange function will be wrapped below to
 	// allow overriding the lower and upper values at runtime through
@@ -1028,27 +1025,28 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 			upper = determineMaxConcurrentCompactions(
 				defaultMaxConcurrentCompactions,
 				envMaxConcurrentCompactions,
-				int(compactionConcurrencyUpper.Get(&cfg.settings.SV)),
+				int(compactionConcurrencyUpper.Get(sv)),
 			)
 			return lower, max(lower, upper)
 		}
 	}
 	if cfg.opts.MaxConcurrentDownloads == nil {
 		cfg.opts.MaxConcurrentDownloads = func() int {
-			return int(concurrentDownloadCompactions.Get(&cfg.settings.SV))
+			return int(concurrentDownloadCompactions.Get(sv))
 		}
 	}
 	cfg.opts.DeletionPacing.BaselineRate = func() uint64 {
-		return uint64(baselineDeletionRate.Get(&cfg.settings.SV))
+		return uint64(baselineDeletionRate.Get(sv))
 	}
 	cfg.opts.Experimental.TombstoneDenseCompactionThreshold = func() float64 {
-		return 0.01 * float64(tombstoneDenseCompactionThreshold.Get(&cfg.settings.SV))
+		return 0.01 * float64(tombstoneDenseCompactionThreshold.Get(sv))
 	}
 	if cfg.opts.Experimental.UseDeprecatedCompensatedScore == nil {
 		cfg.opts.Experimental.UseDeprecatedCompensatedScore = func() bool {
-			return useDeprecatedCompensatedScore.Get(&cfg.settings.SV)
+			return useDeprecatedCompensatedScore.Get(sv)
 		}
 	}
+	cfg.opts.Experimental.SpanPolicyFunc = spanPolicyFuncFactory(sv)
 
 	cfg.opts.EnsureDefaults()
 
@@ -2506,15 +2504,15 @@ func (p *Pebble) CreateCheckpoint(dir string, spans []roachpb.Span) error {
 // named version, it can be assumed all *nodes* have ratcheted to the pebble
 // version associated with it, since they did so during the fence version.
 var pebbleFormatVersionMap = map[clusterversion.Key]pebble.FormatMajorVersion{
-	clusterversion.V25_4_PebbleFormatV2BlobFiles: pebble.FormatV2BlobFiles,
-	clusterversion.V25_3:                         pebble.FormatValueSeparation,
+	clusterversion.V26_1: pebble.FormatMarkForCompactionInVersionEdit,
+	clusterversion.V25_4: pebble.FormatV2BlobFiles,
 }
 
 // MinimumSupportedFormatVersion is the version that provides features that the
 // Cockroach code relies on unconditionally (like range keys). New stores are by
 // default created with this version. It should correspond to the minimum
 // supported binary version.
-const MinimumSupportedFormatVersion = pebble.FormatValueSeparation
+const MinimumSupportedFormatVersion = pebble.FormatV2BlobFiles
 
 // pebbleFormatVersionKeys contains the keys in the map above, in descending order.
 var pebbleFormatVersionKeys = slices.SortedFunc(maps.Keys(pebbleFormatVersionMap), func(a, b clusterversion.Key) int {
@@ -2635,11 +2633,11 @@ func (p *Pebble) BufferedSize() int {
 	return 0
 }
 
-// ConvertFilesToBatchAndCommit implements the Engine interface.
-func (p *Pebble) ConvertFilesToBatchAndCommit(
-	_ context.Context, paths []string, clearedSpans []roachpb.Span,
+// IngestLocalFilesToWriter implements the Engine interface.
+func (p *Pebble) IngestLocalFilesToWriter(
+	_ context.Context, paths []string, clearedSpans []roachpb.Span, writer Writer,
 ) error {
-	files := make([]sstable.ReadableFile, len(paths))
+	files := make([]objstorage.ReadableFile, len(paths))
 	closeFiles := func() {
 		for i := range files {
 			if files[i] != nil {
@@ -2656,7 +2654,7 @@ func (p *Pebble) ConvertFilesToBatchAndCommit(
 		files[i] = f
 	}
 	iter, err := NewSSTEngineIterator(
-		[][]sstable.ReadableFile{files},
+		[][]objstorage.ReadableFile{files},
 		IterOptions{
 			KeyTypes:   IterKeyTypePointsAndRanges,
 			LowerBound: roachpb.KeyMin,
@@ -2675,11 +2673,8 @@ func (p *Pebble) ConvertFilesToBatchAndCommit(
 	}
 	defer iter.Close()
 
-	batch := p.NewWriteBatch()
-	for i := range clearedSpans {
-		err :=
-			batch.ClearRawRange(clearedSpans[i].Key, clearedSpans[i].EndKey, true, true)
-		if err != nil {
+	for _, span := range clearedSpans {
+		if err := writer.ClearRawRange(span.Key, span.EndKey, true, true); err != nil {
 			return err
 		}
 	}
@@ -2695,7 +2690,7 @@ func (p *Pebble) ConvertFilesToBatchAndCommit(
 			if v, err = iter.UnsafeValue(); err != nil {
 				break
 			}
-			if err = batch.PutEngineKey(k, v); err != nil {
+			if err = writer.PutEngineKey(k, v); err != nil {
 				break
 			}
 		}
@@ -2706,7 +2701,7 @@ func (p *Pebble) ConvertFilesToBatchAndCommit(
 			}
 			rangeKeys := iter.EngineRangeKeys()
 			for i := range rangeKeys {
-				if err = batch.PutEngineRangeKey(rangeBounds.Key, rangeBounds.EndKey, rangeKeys[i].Version,
+				if err = writer.PutEngineRangeKey(rangeBounds.Key, rangeBounds.EndKey, rangeKeys[i].Version,
 					rangeKeys[i].Value); err != nil {
 					break
 				}
@@ -2717,11 +2712,7 @@ func (p *Pebble) ConvertFilesToBatchAndCommit(
 		}
 		valid, err = iter.NextEngineKey()
 	}
-	if err != nil {
-		batch.Close()
-		return err
-	}
-	return batch.Commit(true)
+	return err
 }
 
 func (p *Pebble) GetDiskUnhealthy() bool {

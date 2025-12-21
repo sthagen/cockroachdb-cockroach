@@ -1106,6 +1106,25 @@ type SetSequenceOption struct {
 	Value      string
 }
 
+type UnsetSequenceOption struct {
+	immediateMutationOp
+	SequenceID descpb.ID
+	Key        string
+}
+
+type MaybeUpdateSequenceValue struct {
+	immediateMutationOp
+	SequenceID       descpb.ID
+	PrevIncrement    int64
+	UpdatedIncrement int64
+	PrevMinValue     int64
+	UpdatedMinValue  int64
+	PrevMaxValue     int64
+	UpdatedMaxValue  int64
+	PrevStart        int64
+	UpdatedStart     int64
+}
+
 type InitSequence struct {
 	immediateMutationOp
 	SequenceID     descpb.ID
@@ -1239,4 +1258,24 @@ type SetTableSchemaLocked struct {
 	immediateMutationOp
 	TableID descpb.ID
 	Locked  bool
+}
+
+// SetTableStorageParam sets a storage parameter on a table.
+type SetTableStorageParam struct {
+	immediateMutationOp
+	Param scpb.TableStorageParam
+}
+
+// ResetTableStorageParam resets a storage parameter on a table to its default.
+type ResetTableStorageParam struct {
+	immediateMutationOp
+	Param scpb.TableStorageParam
+}
+
+// UpsertRowLevelTTL sets the RowLevelTTL on a table descriptor.
+type UpsertRowLevelTTL struct {
+	immediateMutationOp
+	TableID     descpb.ID
+	RowLevelTTL catpb.RowLevelTTL
+	TTLExpr     *scpb.Expression
 }

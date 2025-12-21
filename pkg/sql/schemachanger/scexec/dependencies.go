@@ -120,6 +120,12 @@ type Catalog interface {
 	// InitializeSequence initializes the initial value for a sequence.
 	InitializeSequence(ctx context.Context, id descpb.ID, startVal int64) error
 
+	// SetSequence sets a sequence to the given value.
+	SetSequence(ctx context.Context, seq *SequenceToSet) error
+
+	// MaybeUpdateSequenceValue updates a sequence value if certain conditions are met.
+	MaybeUpdateSequenceValue(ctx context.Context, seq *SequenceToMaybeUpdate) error
+
 	// CheckMaxSchemaObjects checks if the number of schema objects in the
 	// cluster plus the new objects being created would exceed the configured
 	// limit. Returns an error if the limit would be exceeded.
@@ -380,6 +386,12 @@ type DescriptorMetadataUpdater interface {
 	// UpdateTTLScheduleLabel updates the schedule_name for the TTL Scheduled Job
 	// of the given table.
 	UpdateTTLScheduleLabel(ctx context.Context, tbl catalog.TableDescriptor) error
+
+	// UpdateTTLScheduleCron updates the cron schedule for a TTL job.
+	UpdateTTLScheduleCron(ctx context.Context, scheduleID jobspb.ScheduleID, cronExpr string) error
+
+	// CreateRowLevelTTLSchedule creates a new row-level TTL schedule for a table.
+	CreateRowLevelTTLSchedule(ctx context.Context, tbl catalog.TableDescriptor) error
 }
 
 type TemporarySchemaCreator interface {

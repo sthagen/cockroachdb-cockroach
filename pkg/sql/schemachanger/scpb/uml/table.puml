@@ -93,7 +93,6 @@ ColumnType :  TableID
 ColumnType :  FamilyID
 ColumnType :  ColumnID
 ColumnType :  TypeT
-ColumnType :  ComputeExpr
 ColumnType :  IsVirtual
 ColumnType :  ElementCreationMetadata
 ColumnType :  ColumnFamilyOrderFollowsColumnID
@@ -366,6 +365,7 @@ object RowLevelTTL
 RowLevelTTL :  TableID
 RowLevelTTL :  RowLevelTTL
 RowLevelTTL :  TTLExpr
+RowLevelTTL :  SeqNum
 
 object Schema
 
@@ -416,6 +416,18 @@ SequenceOwner :  SequenceID
 SequenceOwner :  TableID
 SequenceOwner :  ColumnID
 
+object SequenceValue
+
+SequenceValue :  SequenceID
+SequenceValue :  PrevIncrement
+SequenceValue :  UpdatedIncrement
+SequenceValue :  PrevMinValue
+SequenceValue :  UpdatedMinValue
+SequenceValue :  PrevMaxValue
+SequenceValue :  UpdatedMaxValue
+SequenceValue :  PrevStart
+SequenceValue :  UpdatedStart
+
 object Table
 
 Table :  TableID
@@ -462,6 +474,12 @@ TablePartitioning :  TableID
 object TableSchemaLocked
 
 TableSchemaLocked :  TableID
+
+object TableStorageParam
+
+TableStorageParam :  TableID
+TableStorageParam :  Name
+TableStorageParam :  Value
 
 object TableZoneConfig
 
@@ -662,6 +680,7 @@ Table <|-- SecondaryIndex
 View <|-- SecondaryIndex
 Sequence <|-- SequenceOption
 Column <|-- SequenceOwner
+Sequence <|-- SequenceValue
 Table <|-- TableComment
 View <|-- TableComment
 Sequence <|-- TableComment
@@ -675,6 +694,7 @@ Table <|-- TableLocalityRegionalByRowUsingConstraint
 Table <|-- TableLocalitySecondaryRegion
 Table <|-- TablePartitioning
 Table <|-- TableSchemaLocked
+Table <|-- TableStorageParam
 Table <|-- TableZoneConfig
 View <|-- TableZoneConfig
 Table <|-- TemporaryIndex

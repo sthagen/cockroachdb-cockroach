@@ -120,13 +120,17 @@ const (
 	// PolicyID is an attribute for row-level security policies to uniquely
 	// identify a policy within a table.
 	PolicyID
-
 	// GeneratedAsIdentityType is the type for a generated as identity column.
 	// It's value must be in catpb.GeneratedAsIdentityType.
 	GeneratedAsIdentityType
 
+	// IntValue A int64 used only for element uniqueness, and this can map out
+	// to any int64 attribute. It is currently used for:
+	// 1) SchemaID in the namespace element.
+	IntValue
+
 	// AttrMax is the largest possible Attr value.
-	// Note: add any new enum values before TargetStatus, leave these at the end.
+	// Note: add any new enum values before IntValue, leave these at the end.
 	AttrMax = iota - 1
 )
 
@@ -259,6 +263,7 @@ var elementSchemaOptions = []rel.SchemaOption{
 	),
 	rel.EntityMapping(t((*scpb.RowLevelTTL)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(SeqNum, "SeqNum"),
 	),
 	rel.EntityMapping(t((*scpb.Trigger)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -298,6 +303,10 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.SequenceOption)(nil)),
 		rel.EntityAttr(DescID, "SequenceID"),
 		rel.EntityAttr(Name, "Key"),
+		rel.EntityAttr(Value, "Value"),
+	),
+	rel.EntityMapping(t((*scpb.SequenceValue)(nil)),
+		rel.EntityAttr(DescID, "SequenceID"),
 	),
 	rel.EntityMapping(t((*scpb.SequenceOwner)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -430,7 +439,8 @@ var elementSchemaOptions = []rel.SchemaOption{
 	// Common elements.
 	rel.EntityMapping(t((*scpb.Namespace)(nil)),
 		rel.EntityAttr(DescID, "DescriptorID"),
-		rel.EntityAttr(ReferencedDescID, "SchemaID"),
+		rel.EntityAttr(ReferencedDescID, "DatabaseID"),
+		rel.EntityAttr(IntValue, "SchemaID"),
 		rel.EntityAttr(Name, "Name"),
 	),
 	rel.EntityMapping(t((*scpb.Owner)(nil)),
@@ -534,6 +544,11 @@ var elementSchemaOptions = []rel.SchemaOption{
 	),
 	rel.EntityMapping(t((*scpb.TableSchemaLocked)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
+	),
+	rel.EntityMapping(t((*scpb.TableStorageParam)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(Name, "Name"),
+		rel.EntityAttr(Value, "Value"),
 	),
 	rel.EntityMapping(t((*scpb.RowLevelSecurityEnabled)(nil)),
 		rel.EntityAttr(DescID, "TableID"),

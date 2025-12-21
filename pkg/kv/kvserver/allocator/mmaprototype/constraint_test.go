@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/dd"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
@@ -124,30 +126,56 @@ func printSpanConfig(b *strings.Builder, conf roachpb.SpanConfig) {
 	}
 }
 
+// TestNormalizedSpanConfig exercises the full constraint normalization pipeline
+// including both normalizeVoterConstraints and normalizeEmptyConstraints.
+// It tests relationship types: conjEqualSet, conjStrictSubset, conjStrictSuperset,
+// conjNonIntersecting, and conjPossiblyIntersecting, as well as empty constraint
+// handling across both normalization phases.
 func TestNormalizedSpanConfig(t *testing.T) {
 	interner := newStringInterner()
-	datadriven.RunTest(t, "testdata/normalize_config",
-		func(t *testing.T, d *datadriven.TestData) string {
-			switch d.Cmd {
-			case "normalize":
-				conf := parseSpanConfig(t, d)
-				var b strings.Builder
-				fmt.Fprintf(&b, "input:\n")
-				printSpanConfig(&b, conf)
-				nConf, err := makeNormalizedSpanConfig(&conf, interner)
-				if err != nil {
-					fmt.Fprintf(&b, "err=%s\n", err.Error())
-				}
-				if nConf != nil {
-					fmt.Fprintf(&b, "output:\n")
-					printSpanConfig(&b, nConf.uninternedConfig())
-				}
-				return b.String()
 
-			default:
-				return fmt.Sprintf("unknown command: %s", d.Cmd)
+	// Handler uses observer to show intermediate states after each normalization
+	// phase, printing "(unchanged)" when a phase doesn't modify the config.
+	handler := func(t *testing.T, d *datadriven.TestData) string {
+		switch d.Cmd {
+		case "normalize":
+			conf := parseSpanConfig(t, d)
+			var b strings.Builder
+
+			// Track previous state to detect changes.
+			var prev strings.Builder
+
+			// Observer compares current state with previous to avoid redundant output.
+			observer := func(phaseName string, nConf *normalizedSpanConfig) {
+				fmt.Fprintf(&b, "%s:\n", phaseName)
+				var cur strings.Builder
+				printSpanConfig(&cur, nConf.uninternedConfig())
+				if cur.String() == prev.String() {
+					fmt.Fprintf(&b, " (unchanged)\n")
+				} else {
+					b.WriteString(cur.String())
+				}
+				prev = cur
 			}
-		})
+
+			// Run normalization with observer.
+			_, err := makeNormalizedSpanConfigWithObserver(&conf, interner, observer)
+			if err != nil {
+				fmt.Fprintf(&b, "err=%s\n", err.Error())
+			}
+			return b.String()
+		default:
+			return fmt.Sprintf("unknown command: %s", d.Cmd)
+		}
+	}
+
+	t.Run("Basic", func(t *testing.T) {
+		datadriven.RunTest(t, filepath.Join(datapathutils.TestDataPath(t), t.Name()), handler)
+	})
+
+	t.Run("EdgeCases", func(t *testing.T) {
+		datadriven.RunTest(t, filepath.Join(datapathutils.TestDataPath(t), t.Name()), handler)
+	})
 }
 
 func printPostingList(b *strings.Builder, pl storeSet) {
@@ -409,7 +437,8 @@ func TestRangeAnalyzedConstraints(t *testing.T) {
 					buf.tryAddingStore(roachpb.StoreID(storeID), typ,
 						ltInterner.intern(stores[roachpb.StoreID(storeID)].NodeLocality))
 				}
-				rac.finishInit(nConf, cm, leaseholder)
+				err := rac.finishInit(nConf, cm, leaseholder)
+				require.NoError(t, err)
 				var b strings.Builder
 				printRangeAnalyzedConstraints(&b, rac, ltInterner)
 				// If there is a previous rangeAnalyzedConstraints, release it before
@@ -878,4 +907,86 @@ func TestDiversityScore(t *testing.T) {
 				tt.name, tt.expectedReplicaScore, replicaScore)
 		})
 	}
+}
+
+// TestNormalizedVoterAllRelationships verifies both normalization and the
+// building of relationships between voter and all replica constraints.
+func TestNormalizedVoterAllRelationships(t *testing.T) {
+	interner := newStringInterner()
+	datadriven.RunTest(t, filepath.Join(datapathutils.TestDataPath(t), t.Name()),
+		func(t *testing.T, d *datadriven.TestData) string {
+			switch d.Cmd {
+			case "normalized-voter-all-rels":
+				conf := parseSpanConfig(t, d)
+				var b strings.Builder
+				fmt.Fprintf(&b, "input:\n")
+				printSpanConfig(&b, conf)
+
+				nConf, err := makeBasicNormalizedSpanConfig(&conf, interner)
+				if err != nil {
+					fmt.Fprintf(&b, "normalization error: %s\n", err.Error())
+					return b.String()
+				}
+				fmt.Fprintf(&b, "normalized:\n")
+				printSpanConfig(&b, nConf.uninternedConfig())
+
+				rels, emptyConstraintIndex, emptyVoterConstraintIndex, err := nConf.buildVoterAndAllRelationships()
+				fmt.Fprintf(&b, "table:\n")
+				fmt.Fprintf(&b, "\temptyConstraintIndex: %d\n", emptyConstraintIndex)
+				fmt.Fprintf(&b, "\temptyVoterConstraintIndex: %d\n", emptyVoterConstraintIndex)
+				fmt.Fprintf(&b, "\trelationships:\n")
+				if err != nil {
+					fmt.Fprintf(&b, "\terr: %s\n", err.Error())
+					return b.String()
+				}
+				for i, rel := range rels {
+					fmt.Fprintf(&b, "\t[idx=%d][voter=%s] [all=%s] rel=%s\n",
+						i, nConf.voterConstraints[rel.voterIndex].unintern(interner), nConf.constraints[rel.allIndex].unintern(interner), rel.voterAndAllRel)
+				}
+				return b.String()
+			default:
+				return fmt.Sprintf("unknown command: %s", d.Cmd)
+			}
+		})
+}
+
+// TestDedupAndFilterConstraints tests the dedupAndFilterConstraints function
+// which deduplicates constraints by summing their numReplicas.
+func TestDedupAndFilterConstraints(t *testing.T) {
+	interner := newStringInterner()
+
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, t.Name()),
+		func(t *testing.T, d *datadriven.TestData) string {
+			switch d.Cmd {
+			case "dedup":
+				// Parse input lines directly as internedConstraintsConjunction.
+				// Each line format: num-replicas=N [+key=val|-key=val]...
+				var constraints []internedConstraintsConjunction
+				for _, line := range strings.Split(d.Input, "\n") {
+					parts := strings.Fields(line)
+					if len(parts) == 0 {
+						continue
+					}
+					cc := parseConstraintsConj(t, parts)
+					constraints = append(constraints, internedConstraintsConjunction{
+						numReplicas: cc.NumReplicas,
+						constraints: interner.internConstraintsConj(cc.Constraints),
+					})
+				}
+				constraints = dedupAndFilterConstraints(constraints)
+
+				// Format output.
+				var b strings.Builder
+				for _, icc := range constraints {
+					cc := icc.unintern(interner)
+					fmt.Fprintf(&b, "%s\n", cc.String())
+				}
+				if len(constraints) == 0 {
+					b.WriteString("(empty)\n")
+				}
+				return b.String()
+			default:
+				return fmt.Sprintf("unknown command: %s", d.Cmd)
+			}
+		})
 }

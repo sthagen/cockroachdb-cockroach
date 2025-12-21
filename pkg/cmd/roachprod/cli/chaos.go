@@ -38,6 +38,8 @@ const (
 	StageRecover FailureStage = "recover"
 	// StageCleanup runs only the cleanup phase
 	StageCleanup FailureStage = "cleanup"
+	// StageInjectRecover runs inject, waits, then recovers (without setup/cleanup)
+	StageInjectRecover FailureStage = "inject-recover"
 )
 
 // ValidStages returns all valid lifecycle stage values for a failure
@@ -48,6 +50,7 @@ func ValidStages() []string {
 		string(StageInject),
 		string(StageRecover),
 		string(StageCleanup),
+		string(StageInjectRecover),
 	}
 }
 
@@ -113,6 +116,7 @@ Global flags control the duration and cleanup behavior of all chaos commands.
   - inject: runs only the inject phase (activates the failure)
   - recover: runs only the recover phase (removes the failure)
   - cleanup: runs only the cleanup phase (removes failure dependencies)
+  - inject-recover: runs inject, waits for --wait-before-cleanup or --run-forever, then recovers
 Default: all`)
 	chaosCmd.PersistentFlags().BoolVar(&verbose,
 		"verbose", false,
@@ -121,6 +125,8 @@ Default: all`)
 	// Add subcommands
 	chaosCmd.AddCommand(cr.buildChaosNetworkPartitionCmd())
 	chaosCmd.AddCommand(cr.buildChaosNetworkLatencyCmd())
+	chaosCmd.AddCommand(cr.buildChaosDiskStallCmd())
+	chaosCmd.AddCommand(cr.buildChaosProcessKillCmd())
 
 	return chaosCmd
 }
@@ -229,6 +235,8 @@ func runFailureLifecycle(
 		return runRecoverStage(ctx, failer, args)
 	case StageCleanup:
 		return runCleanupStage(ctx, failer, args)
+	case StageInjectRecover:
+		return runInjectRecoverStage(ctx, failer, args, opts)
 	case StageAll:
 		return runFullLifecycle(ctx, failer, args, opts)
 	default:
@@ -299,6 +307,29 @@ func runCleanupStage(
 	return nil
 }
 
+// runInjectRecoverStage runs inject, waits for the configured duration or interrupt,
+// then recovers. This is useful when setup has already been run separately and cleanup
+// will be run separately afterward.
+func runInjectRecoverStage(
+	ctx context.Context, failer *failures.Failer, args failures.FailureArgs, opts GlobalChaosOpts,
+) error {
+	// Inject phase
+	if err := runInjectStage(ctx, failer, args); err != nil {
+		return err
+	}
+
+	// Wait phase
+	waitForDurationOrInterrupt(opts)
+
+	// Recover phase
+	if err := runRecoverStage(ctx, failer, args); err != nil {
+		return err
+	}
+
+	config.Logger.Printf("Inject-recover stage completed successfully")
+	return nil
+}
+
 // runFullLifecycle executes the complete failure lifecycle:
 // Setup → Inject → Wait → Recover → Cleanup
 func runFullLifecycle(
@@ -326,19 +357,7 @@ func runFullLifecycle(
 	}
 
 	// Wait phase
-	if opts.RunForever {
-		config.Logger.Printf("Failure injected. Waiting for interrupt (Ctrl+C)...")
-		<-waitForInterrupt()
-		config.Logger.Printf("Interrupt received. Beginning recovery...")
-	} else {
-		config.Logger.Printf("Failure injected. Waiting %s before recovery...", opts.WaitBeforeCleanup)
-		select {
-		case <-time.After(opts.WaitBeforeCleanup):
-			config.Logger.Printf("Wait period complete. Beginning recovery...")
-		case <-waitForInterrupt():
-			config.Logger.Printf("Interrupt received. Beginning recovery...")
-		}
-	}
+	waitForDurationOrInterrupt(opts)
 
 	// Recover phase
 	if err := runRecoverStage(ctx, failer, args); err != nil {
@@ -355,6 +374,24 @@ func runFullLifecycle(
 	return nil
 }
 
+// waitForDurationOrInterrupt waits for the configured duration or until an interrupt signal
+// is received, whichever comes first. If RunForever is set, it waits indefinitely until interrupted.
+func waitForDurationOrInterrupt(opts GlobalChaosOpts) {
+	if opts.RunForever {
+		config.Logger.Printf("Failure injected. Waiting for interrupt (Ctrl+C)...")
+		<-waitForInterrupt()
+		config.Logger.Printf("Interrupt received. Beginning recovery...")
+	} else {
+		config.Logger.Printf("Failure injected. Waiting %s before recovery...", opts.WaitBeforeCleanup)
+		select {
+		case <-time.After(opts.WaitBeforeCleanup):
+			config.Logger.Printf("Wait period complete. Beginning recovery...")
+		case <-waitForInterrupt():
+			config.Logger.Printf("Interrupt received. Beginning recovery...")
+		}
+	}
+}
+
 // waitForInterrupt returns a channel that receives a signal when SIGINT or SIGTERM is received
 func waitForInterrupt() <-chan os.Signal {
 	sigCh := make(chan os.Signal, 1)
@@ -362,11 +399,14 @@ func waitForInterrupt() <-chan os.Signal {
 	return sigCh
 }
 
-// validateClusterAndNodes validates that:
-// 1. The cluster exists
-// 2. The source and destination nodes are valid for the cluster
-func validateClusterAndNodes(clusterName string, srcNodes, destNodes install.Nodes) error {
-	// Get cluster to validate it exists and get node count
+// validateNodesInCluster validates that the cluster exists and all provided nodes
+// are within the cluster's valid range. The name parameter is used in error messages
+// to describe which node list failed validation (e.g., "source", "destination", "target").
+func validateNodesInCluster(clusterName string, nodes install.Nodes, name string) error {
+	if len(nodes) == 0 {
+		return errors.Newf("%s nodes cannot be empty", name)
+	}
+
 	c, err := roachprod.GetClusterFromCache(
 		config.Logger,
 		clusterName,
@@ -376,31 +416,11 @@ func validateClusterAndNodes(clusterName string, srcNodes, destNodes install.Nod
 		return errors.Wrapf(err, "cluster %q not found", clusterName)
 	}
 
-	// Validate source nodes
-	if err := validateNodesInCluster(c, srcNodes, "source"); err != nil {
-		return err
-	}
-
-	// Validate destination nodes
-	if err := validateNodesInCluster(c, destNodes, "destination"); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// validateNodesInCluster validates that all nodes are within the cluster's range
-func validateNodesInCluster(c *install.SyncedCluster, nodes install.Nodes, name string) error {
-	if len(nodes) == 0 {
-		return errors.Newf("%s nodes cannot be empty", name)
-	}
-
-	clusterNodes := c.Nodes
-	if len(clusterNodes) == 0 {
+	if len(c.Nodes) == 0 {
 		return errors.Newf("cluster has no nodes")
 	}
 
-	maxNode := clusterNodes[len(clusterNodes)-1]
+	maxNode := c.Nodes[len(c.Nodes)-1]
 	for _, n := range nodes {
 		if n < 1 || n > maxNode {
 			return errors.Newf("%s node %d is out of range (cluster has nodes 1-%d)",

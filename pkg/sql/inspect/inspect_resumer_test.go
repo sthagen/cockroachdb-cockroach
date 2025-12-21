@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -68,7 +69,6 @@ func TestInspectJobImplicitTxnSemantics(t *testing.T) {
 
 	runner.Exec(t, `
 		CREATE DATABASE db;
-		SET enable_inspect_command = true;
 		CREATE TABLE db.t (
 			id INT PRIMARY KEY,
 			val INT
@@ -192,6 +192,7 @@ func TestInspectJobProtectedTimestamp(t *testing.T) {
 							return nil
 						},
 					},
+					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				},
 			})
 			defer s.Stopper().Stop(ctx)
@@ -199,7 +200,6 @@ func TestInspectJobProtectedTimestamp(t *testing.T) {
 			runner := sqlutils.MakeSQLRunner(db)
 			runner.Exec(t, `
 				CREATE DATABASE db;
-				SET enable_inspect_command = true;
 				CREATE TABLE db.t (
 					id INT PRIMARY KEY,
 					val INT
@@ -367,7 +367,6 @@ func TestInspectProgressWithMultiRangeTable(t *testing.T) {
 	// Start the INSPECT job.
 	t.Logf("Starting INSPECT job on table with %d ranges distributed across %d nodes", rangeCount, nodeCount)
 	_, err := db.Exec(`
-		SET enable_inspect_command = true;
 		COMMIT;
 		INSPECT TABLE multi_range_table`)
 	require.NoError(t, err)

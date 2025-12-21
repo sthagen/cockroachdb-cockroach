@@ -393,6 +393,7 @@ func (g *routineGenerator) startInternal(ctx context.Context, txn *kv.Txn) (err 
 					}
 					stmtStats := statsBuilder.
 						SessionID(g.p.ExtendedEvalContext().SessionID).
+						QueryID(g.p.execCfg.GenerateID()).
 						LatencyRecorder(latencyRecorder).
 						PlanMetadata(
 							flags.IsSet(planFlagGeneric),
@@ -415,7 +416,7 @@ func (g *routineGenerator) startInternal(ctx context.Context, txn *kv.Txn) (err 
 				statsBuilder.StatementError(err)
 				return err
 			}
-			statsBuilder.QueryLevelStats(queryStats.bytesRead, queryStats.rowsRead, queryStats.rowsWritten)
+			statsBuilder.QueryLevelStats(queryStats.bytesRead, queryStats.rowsRead, queryStats.rowsWritten, queryStats.kvCPUTimeNanos.Nanoseconds())
 			forwardInnerQueryStats(g.p.routineMetadataForwarder, queryStats)
 			if openCursor {
 				return cursorHelper.createCursor(g.p)

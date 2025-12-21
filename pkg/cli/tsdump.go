@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -60,7 +61,9 @@ var debugTimeSeriesDumpOpts = struct {
 	noOfUploadWorkers      int
 	retryFailedRequests    bool
 	disableDeltaProcessing bool
-	ddMetricInterval       int64 // interval for datadoginit format only
+	ddMetricInterval       int64  // interval for datadoginit format only
+	metricsListFile        string // file containing explicit list of metrics to dump
+	nonVerbose             bool   // dump only essential and support metrics
 }{
 	format:                 tsDumpText,
 	from:                   timestampValue{},
@@ -69,6 +72,7 @@ var debugTimeSeriesDumpOpts = struct {
 	yaml:                   "/tmp/tsdump.yaml",
 	retryFailedRequests:    false,
 	disableDeltaProcessing: false, // delta processing enabled by default
+	nonVerbose:             false, // dump all metrics by default
 
 	// default to 10 seconds interval for datadoginit.
 	// This is based on the scrape interval that is currently set accross all managed clusters
@@ -191,6 +195,11 @@ will then convert it to the --format requested in the current invocation.
 		if convertFile == "" {
 			// To enable conversion without a running cluster, we want to skip
 			// connecting to the server when converting an existing tsdump.
+			if cliCtx.clientOpts.User != username.RootUser {
+				// Error is ignored because PurposeValidation does not return errors.
+				serverCfg.User, _ = username.MakeSQLUsernameFromUserInput(cliCtx.clientOpts.User, username.PurposeValidation)
+			}
+
 			conn, finish, err := newClientConn(ctx, serverCfg)
 			if err != nil {
 				return err
@@ -199,9 +208,39 @@ will then convert it to the --format requested in the current invocation.
 
 			target, _ := addr.AddrWithDefaultLocalhost(serverCfg.AdvertiseAddr)
 			adminClient := conn.NewAdminClient()
-			names, err := serverpb.GetInternalTimeseriesNamesFromServer(ctx, adminClient)
+
+			// Validate that --non-verbose and --metrics-list-file are not both specified
+			if debugTimeSeriesDumpOpts.nonVerbose && debugTimeSeriesDumpOpts.metricsListFile != "" {
+				return errors.New("--non-verbose and --metrics-list-file cannot be used together")
+			}
+
+			var names []string
+			var filter []serverpb.MetricsFilterEntry
+			if debugTimeSeriesDumpOpts.metricsListFile != "" {
+				// Use explicit metrics list from file
+				filter, err = readMetricsListFile(debugTimeSeriesDumpOpts.metricsListFile)
+				if err != nil {
+					return err
+				}
+			}
+			var stats serverpb.FilterStats
+			names, stats, err = serverpb.GetInternalTimeseriesNamesFromServer(ctx, adminClient, filter, debugTimeSeriesDumpOpts.nonVerbose)
 			if err != nil {
 				return err
+			}
+			if debugTimeSeriesDumpOpts.metricsListFile != "" {
+				// Print warnings for unmatched literal metric names
+				for _, literal := range stats.UnmatchedLiterals {
+					fmt.Fprintf(os.Stderr, "Warning: metric '%s' not found (check for typos or outdated metric names)\n", literal)
+				}
+				// Print regex match counts for user feedback
+				for pattern, count := range stats.RegexMatchCounts {
+					if count > 0 {
+						fmt.Fprintf(os.Stderr, "Pattern '%s' matched %d metrics\n", pattern, count)
+					} else {
+						fmt.Fprintf(os.Stderr, "Warning: pattern '%s' matched no metrics\n", pattern)
+					}
+				}
 			}
 			req := &tspb.DumpRequest{
 				StartNanos: time.Time(debugTimeSeriesDumpOpts.from).UnixNano(),
@@ -214,11 +253,6 @@ will then convert it to the --format requested in the current invocation.
 
 			tsClient := conn.NewTimeSeriesClient()
 			if debugTimeSeriesDumpOpts.format == tsDumpRaw {
-				stream, err := tsClient.DumpRaw(context.Background(), req)
-				if err != nil {
-					return errors.Wrapf(err, "connecting to %s", target)
-				}
-
 				// get the node details so that we can get the SQL port
 				statusClient := conn.NewStatusClient()
 				resp, err := statusClient.Details(ctx, &serverpb.DetailsRequest{NodeId: "local"})
@@ -244,6 +278,11 @@ will then convert it to the --format requested in the current invocation.
 					Version:        build.BinaryVersion(),
 					StoreToNodeMap: storeToNodeMap,
 					CreatedAt:      timeutil.Now(),
+				}
+
+				stream, err := tsClient.DumpRaw(context.Background(), req)
+				if err != nil {
+					return errors.Wrapf(err, "connecting to %s", target)
 				}
 
 				// Buffer the writes to os.Stdout since we're going to
@@ -689,6 +728,81 @@ func (w defaultTSWriter) Emit(data *tspb.TimeSeriesData) error {
 		fmt.Fprintf(w.w, "%v %v\n", d.TimestampNanos, d.Value)
 	}
 	return nil
+}
+
+// regexMetaChars contains characters that indicate a line is a regex pattern
+// rather than a literal metric name. Metric names only contain alphanumeric
+// characters, dots, underscores, and hyphens.
+var regexMetaChars = regexp.MustCompile(`[*+?^$|()\[\]{}\\]`)
+
+// isRegexPattern returns true if the line contains regex metacharacters,
+// indicating it should be treated as a regex pattern rather than a literal name.
+func isRegexPattern(line string) bool {
+	return regexMetaChars.MatchString(line)
+}
+
+// readMetricsListFile reads a file containing metric names or regex patterns (one per line).
+// Lines starting with # are treated as comments and skipped. Inline comments
+// (text after #) are also stripped. Empty lines are skipped. If metric names
+// include cr.node., cr.store., or cockroachdb. prefixes, they are stripped.
+// Lines containing regex metacharacters (*+?^$|()[]{}\) are automatically
+// detected and treated as regex patterns.
+// Duplicate entries are removed. Returns entries without any prefix.
+func readMetricsListFile(filePath string) ([]serverpb.MetricsFilterEntry, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to open metrics list file %s", filePath)
+	}
+	defer file.Close()
+
+	seen := make(map[string]struct{})
+	var entries []serverpb.MetricsFilterEntry
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+
+		// Strip inline comments (anything after #)
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+
+		// Auto-detect if this is a regex pattern based on metacharacters
+		isRegex := isRegexPattern(line)
+		if isRegex {
+			// Validate the regex - if invalid, warn and skip this line
+			if _, err := regexp.Compile(line); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: invalid regex pattern on line %d, skipping: %s (%v)\n", lineNum, line, err)
+				continue
+			}
+		} else {
+			// Strip common prefixes if present (cr.node., cr.store., cockroachdb.)
+			line = strings.TrimPrefix(line, "cr.node.")
+			line = strings.TrimPrefix(line, "cr.store.")
+			line = strings.TrimPrefix(line, "cockroachdb.")
+		}
+
+		// Skip duplicates
+		if _, exists := seen[line]; exists {
+			continue
+		}
+		seen[line] = struct{}{}
+		entries = append(entries, serverpb.MetricsFilterEntry{Value: line, IsRegex: isRegex})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, errors.Wrapf(err, "error reading metrics list file %s", filePath)
+	}
+	if len(entries) == 0 {
+		return nil, errors.Newf("metrics list file %s contains no valid metric names or patterns", filePath)
+	}
+	return entries, nil
 }
 
 type tsDumpFormat int

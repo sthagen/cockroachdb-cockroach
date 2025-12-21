@@ -159,6 +159,8 @@ type ImmediateMutationVisitor interface {
 	CreateSchemaDescriptor(context.Context, CreateSchemaDescriptor) error
 	CreateSequenceDescriptor(context.Context, CreateSequenceDescriptor) error
 	SetSequenceOption(context.Context, SetSequenceOption) error
+	UnsetSequenceOption(context.Context, UnsetSequenceOption) error
+	MaybeUpdateSequenceValue(context.Context, MaybeUpdateSequenceValue) error
 	InitSequence(context.Context, InitSequence) error
 	CreateDatabaseDescriptor(context.Context, CreateDatabaseDescriptor) error
 	AddNamedRangeZoneConfig(context.Context, AddNamedRangeZoneConfig) error
@@ -176,6 +178,9 @@ type ImmediateMutationVisitor interface {
 	MarkRecreatedIndexesAsVisible(context.Context, MarkRecreatedIndexesAsVisible) error
 	MarkRecreatedIndexAsVisible(context.Context, MarkRecreatedIndexAsVisible) error
 	SetTableSchemaLocked(context.Context, SetTableSchemaLocked) error
+	SetTableStorageParam(context.Context, SetTableStorageParam) error
+	ResetTableStorageParam(context.Context, ResetTableStorageParam) error
+	UpsertRowLevelTTL(context.Context, UpsertRowLevelTTL) error
 }
 
 // Visit is part of the ImmediateMutationOp interface.
@@ -889,6 +894,16 @@ func (op SetSequenceOption) Visit(ctx context.Context, v ImmediateMutationVisito
 }
 
 // Visit is part of the ImmediateMutationOp interface.
+func (op UnsetSequenceOption) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.UnsetSequenceOption(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op MaybeUpdateSequenceValue) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.MaybeUpdateSequenceValue(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
 func (op InitSequence) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
 	return v.InitSequence(ctx, op)
 }
@@ -971,4 +986,19 @@ func (op MarkRecreatedIndexAsVisible) Visit(ctx context.Context, v ImmediateMuta
 // Visit is part of the ImmediateMutationOp interface.
 func (op SetTableSchemaLocked) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
 	return v.SetTableSchemaLocked(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op SetTableStorageParam) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.SetTableStorageParam(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op ResetTableStorageParam) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.ResetTableStorageParam(ctx, op)
+}
+
+// Visit is part of the ImmediateMutationOp interface.
+func (op UpsertRowLevelTTL) Visit(ctx context.Context, v ImmediateMutationVisitor) error {
+	return v.UpsertRowLevelTTL(ctx, op)
 }

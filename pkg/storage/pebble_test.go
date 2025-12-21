@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/mvccencoding"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -1429,7 +1430,7 @@ func TestApproximateDiskBytes(t *testing.T) {
 	}
 }
 
-func TestConvertFilesToBatchAndCommit(t *testing.T) {
+func TestIngestAndExciseFilesToWriter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
@@ -1498,11 +1499,16 @@ func TestConvertFilesToBatchAndCommit(t *testing.T) {
 	require.NoError(t, w2.Finish())
 	w2.Close()
 
-	require.NoError(t, engs[batchEngine].ConvertFilesToBatchAndCommit(
+	b := engs[batchEngine].NewWriteBatch()
+	defer b.Close()
+	require.NoError(t, engs[batchEngine].IngestLocalFilesToWriter(
 		ctx, []string{fileName1, fileName2}, []roachpb.Span{
 			{Key: lkStart, EndKey: lkEnd}, {Key: startKey, EndKey: endKey},
-		}))
+		}, b))
+	require.NoError(t, b.Commit(true /* sync */))
+
 	require.NoError(t, engs[ingestEngine].IngestLocalFiles(ctx, []string{fileName1, fileName2}))
+
 	outputState := func(eng Engine) []string {
 		it, err := eng.NewEngineIterator(context.Background(), IterOptions{
 			UpperBound: roachpb.KeyMax,
@@ -1635,6 +1641,10 @@ func TestMinimumSupportedFormatVersion(t *testing.T) {
 
 func TestPebbleFormatVersion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
+	if len(pebbleFormatVersionMap) == 1 {
+		skip.IgnoreLint(t, "test requires multiple entries in pebbleFormatVersionMap")
+	}
 
 	latestKey := pebbleFormatVersionKeys[0]
 	latestVersion := latestKey.Version()

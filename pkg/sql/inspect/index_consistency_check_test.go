@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -133,10 +134,17 @@ func TestDetectIndexConsistencyErrors(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				Inspect: &sql.InspectTestingKnobs{
 					InspectIssueLogger: issueLogger,
+					OnCheckComplete: func(check interface{}) error {
+						if rowCountCheck, ok := check.(inspectCheckRowCount); ok {
+							issueLogger.recordRowCount(rowCountCheck.RowCount())
+						}
+						return nil
+					},
 				},
 				GCJob: &sql.GCJobTestingKnobs{
 					SkipWaitingForMVCCGC: true,
 				},
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
 		},
 	})
@@ -183,6 +191,9 @@ func TestDetectIndexConsistencyErrors(t *testing.T) {
 		expectedInternalErrorPatterns []map[string]string
 		// useTimestampBeforeCorruption uses a timestamp from before corruption is introduced
 		useTimestampBeforeCorruption bool
+		// expectedRowCount is the expected number of rows counted by the check.
+		// If 0, defaults to 2000 (1000 initial + 1000 after index creation).
+		expectedRowCount uint64
 	}{
 		{
 			desc: "happy path sanity",
@@ -268,7 +279,8 @@ func TestDetectIndexConsistencyErrors(t *testing.T) {
 			indexDDL: []string{
 				"CREATE INDEX idx_t_a ON test.t (a)",
 			},
-			postIndexSQL: "DELETE FROM test.t", /* delete all rows to test hasRows=false code path */
+			postIndexSQL:     "DELETE FROM test.t", /* delete all rows to test hasRows=false code path */
+			expectedRowCount: 1000,                 // Only 1000 rows remain after deletion
 		},
 		{
 			desc:          "timestamp before corruption - no issues found",
@@ -278,6 +290,7 @@ func TestDetectIndexConsistencyErrors(t *testing.T) {
 			},
 			danglingIndexEntryInsertQuery: "SELECT 15, 30, 300, 'corrupt', 'e_3', 300.5", // Add dangling entry after timestamp
 			useTimestampBeforeCorruption:  true,                                          // Use timestamp from before corruption
+			expectedRowCount:              1000,                                          // Only 1000 rows exist at the timestamp
 		},
 		{
 			desc:          "2 indexes, corrupt second index, missing entry",
@@ -339,7 +352,6 @@ func TestDetectIndexConsistencyErrors(t *testing.T) {
 		{name: "hash-disabled", enabled: false},
 	}
 	for _, hashCfg := range hashConfigs {
-		hashCfg := hashCfg
 		t.Run(hashCfg.name, func(t *testing.T) {
 			r.Exec(t, "SET CLUSTER SETTING sql.inspect.index_consistency_hash.enabled = $1", hashCfg.enabled)
 			t.Cleanup(func() {
@@ -483,6 +495,21 @@ func TestDetectIndexConsistencyErrors(t *testing.T) {
 					if tc.expectedErrRegex == "" {
 						require.NoError(t, err)
 						require.Equal(t, 0, issueLogger.numIssuesFound())
+
+						// Verify that row count was captured for successful checks when hash is enabled.
+						// Row counts are only populated during the hash precheck, so we only verify them
+						// in the hash-enabled test configuration.
+						if hashCfg.enabled {
+							rowCount, ok := issueLogger.getRowCount()
+							require.True(t, ok, "expected row count to be captured")
+							// The test inserts 2000 rows total (1000 before index creation + 1000 after),
+							// unless otherwise specified by expectedRowCount.
+							expectedRowCount := tc.expectedRowCount
+							if expectedRowCount == 0 {
+								expectedRowCount = 2000
+							}
+							require.Equal(t, expectedRowCount, rowCount, "expected row count to match")
+						}
 						return
 					}
 
@@ -587,7 +614,11 @@ func TestDanglingIndexEntryInEmptyTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	})
 	defer s.Stopper().Stop(ctx)
 	codec := s.ApplicationLayer().Codec()
 
@@ -646,7 +677,11 @@ func TestIndexConsistencyWithReservedWordColumns(t *testing.T) {
 
 	issueLogger := &testIssueCollector{}
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	})
 	defer s.Stopper().Stop(ctx)
 	r := sqlutils.MakeSQLRunner(db)
 
@@ -705,7 +740,11 @@ func TestMissingIndexEntryWithHistoricalQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	})
 	defer s.Stopper().Stop(ctx)
 	r := sqlutils.MakeSQLRunner(db)
 	codec := s.ApplicationLayer().Codec()
@@ -777,6 +816,7 @@ func TestInspectWithoutASOFSchemaChange(t *testing.T) {
 					}
 				},
 			},
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
 	})
 	defer s.Stopper().Stop(ctx)
@@ -834,7 +874,11 @@ func TestInspectASOFAfterPrimaryKeySwap(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	})
 	defer s.Stopper().Stop(ctx)
 	r := sqlutils.MakeSQLRunner(db)
 

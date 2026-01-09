@@ -23,7 +23,6 @@ import (
 
 	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/ts/tsdumpmeta"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -298,6 +297,10 @@ sql.query.count
 		metricsListFile, err := os.CreateTemp("", "metrics_list_mutual_exclusion_*.txt")
 		require.NoError(t, err)
 		defer func() {
+			// Reset flags to prevent pollution of subsequent tests
+			debugTimeSeriesDumpOpts.nonVerbose = false
+			debugTimeSeriesDumpOpts.metricsListFile = ""
+			debugTimeSeriesDumpOpts.format = tsDumpRaw
 			require.NoError(t, os.Remove(metricsListFile.Name()))
 		}()
 
@@ -314,6 +317,40 @@ sql.query.count
 		// Verify that the error message about mutual exclusivity is returned
 		require.Contains(t, out, "--non-verbose and --metrics-list-file cannot be used together")
 	})
+
+	t.Run("debug tsdump --output writes to file", func(t *testing.T) {
+		destPath := "tsdump_test_output.txt"
+		defer func() {
+			_ = os.Remove(destPath)
+			// Reset flags to prevent pollution of subsequent tests
+			debugTimeSeriesDumpOpts.output = ""
+			debugTimeSeriesDumpOpts.format = tsDumpRaw
+		}()
+
+		_, err := c.RunWithCapture(fmt.Sprintf(
+			"debug tsdump --format=text --output=%s --cluster-name=test-cluster-1 --disable-cluster-name-verification",
+			destPath,
+		))
+		require.NoError(t, err)
+
+		// Verify file was created
+		_, err = os.Stat(destPath)
+		require.NoError(t, err, "expected output file to be created")
+	})
+
+	t.Run("debug tsdump --output with non-existent directory returns error", func(t *testing.T) {
+		defer func() {
+			// Reset flags to prevent pollution of subsequent tests
+			debugTimeSeriesDumpOpts.output = ""
+			debugTimeSeriesDumpOpts.format = tsDumpRaw
+		}()
+
+		out, _ := c.RunWithCapture(
+			"debug tsdump --format=text --output=./non-existent/directory/dump.txt --cluster-name=test-cluster-1 --disable-cluster-name-verification",
+		)
+		require.Contains(t, out, "no such file or directory")
+	})
+
 }
 
 func TestMakeOpenMetricsWriter(t *testing.T) {
@@ -405,7 +442,6 @@ func TestTSDumpConversionWithEmbeddedMetadata(t *testing.T) {
 func TestTSDumpRawGenerationWithEmbeddedMetadata(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	skip.UnderRace(t, "test too slow under race")
 
 	c := NewCLITest(TestCLIParams{})
 	defer c.Cleanup()

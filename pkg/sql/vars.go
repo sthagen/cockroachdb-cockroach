@@ -4380,9 +4380,6 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().AllowUnsafeInternals), nil
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			if defaultAllowUnsafeInternals.Get(sv) {
-				return "on"
-			}
 			return "off"
 		},
 	},
@@ -4525,6 +4522,23 @@ var varGen = map[string]sessionVar{
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().UseImprovedRoutineDepsTriggersAndComputedCols), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`distsql_prevent_partitioning_soft_limited_scans`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`distsql_prevent_partitioning_soft_limited_scans`),
+		Set: func(_ context.Context, m sessionmutator.SessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("distsql_prevent_partitioning_soft_limited_scans", s)
+			if err != nil {
+				return err
+			}
+			m.SetDistSQLPreventPartitioningSoftLimitedScans(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DistSQLPreventPartitioningSoftLimitedScans), nil
 		},
 		GlobalDefault: globalTrue,
 	},

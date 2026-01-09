@@ -193,6 +193,10 @@ type Controller interface {
 	// GetSnapshotQueue returns the SnapshotQueue which is used for ingesting raft
 	// snapshots.
 	GetSnapshotQueue(roachpb.StoreID) *admission.SnapshotQueue
+	// GetProvisionedBandwidth returns the provisioned disk bandwidth for the
+	// given store in bytes/second, or 0 if the store is not found or bandwidth
+	// is not configured.
+	GetProvisionedBandwidth(roachpb.StoreID) int64
 }
 
 // TenantWeightProvider can be periodically asked to provide the tenant
@@ -396,7 +400,11 @@ func (n *controllerImpl) AdmitKVWork(
 			// reads, so in some sense, the integration is incomplete. This is
 			// probably harmless.
 			elasticWorkHandle, err := n.elasticCPUGrantCoordinator.ElasticCPUWorkQueue.Admit(
-				ctx, admitDuration, admissionInfo,
+				// NB: yieldInHandle is always false at this point, since requests may
+				// subsequently acquire latches, and requests holding latches should
+				// never yield. Later code, that knows about the state of latching,
+				// can revise this decision.
+				ctx, admitDuration, admissionInfo, false,
 			)
 			if err != nil {
 				return Handle{}, err
@@ -600,6 +608,10 @@ func (n *controllerImpl) GetSnapshotQueue(storeID roachpb.StoreID) *admission.Sn
 		return nil
 	}
 	return sq.(*admission.SnapshotQueue)
+}
+
+func (n *controllerImpl) GetProvisionedBandwidth(storeID roachpb.StoreID) int64 {
+	return n.storeGrantCoords.TryGetProvisionedBandwidthForStore(storeID)
 }
 
 // FollowerStoreWriteBytes captures stats about writes done to a store by a

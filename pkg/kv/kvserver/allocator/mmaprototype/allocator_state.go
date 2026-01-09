@@ -204,6 +204,15 @@ func (a *allocatorState) ProcessStoreLoadMsg(ctx context.Context, msg *StoreLoad
 	a.cs.processStoreLoadMsg(ctx, msg)
 }
 
+// UpdateStoresStatus implements the Allocator interface.
+func (a *allocatorState) UpdateStoresStatuses(
+	ctx context.Context, storeStatuses map[roachpb.StoreID]Status,
+) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cs.updateStoreStatuses(ctx, storeStatuses)
+}
+
 // AdjustPendingChangeDisposition implements the Allocator interface.
 func (a *allocatorState) AdjustPendingChangeDisposition(
 	ctx context.Context, change ExternalRangeChange, success bool,
@@ -278,7 +287,7 @@ func (a *allocatorState) AdjustPendingChangeDisposition(
 		if success {
 			a.cs.pendingChangeEnacted(c.changeID, a.cs.ts.Now())
 		} else {
-			a.cs.undoPendingChange(c.changeID)
+			a.cs.undoPendingChange(ctx, c.changeID)
 		}
 	}
 }
@@ -292,13 +301,12 @@ func (a *allocatorState) RegisterExternalChange(
 	rangeOperationMetrics := a.getCounterMetricsForLocalStoreLocked(ctx, localStoreID)
 	if err := a.cs.preCheckOnApplyReplicaChanges(change); err != nil {
 		rangeOperationMetrics.ExternalRegisterFailure.Inc(1)
-		log.KvDistribution.Infof(context.Background(),
-			"did not register external changes: due to %v", err)
+		log.KvDistribution.Infof(ctx, "did not register external changes: due to %v", err)
 		return ExternalRangeChange{}, false
 	} else {
 		rangeOperationMetrics.ExternalRegisterSuccess.Inc(1)
 	}
-	a.cs.addPendingRangeChange(change)
+	a.cs.addPendingRangeChange(ctx, change)
 	return MakeExternalRangeChange(OriginExternal, localStoreID, change), true
 }
 
@@ -796,14 +804,14 @@ func sortTargetCandidateSetAndPick(
 //
 // NB: Caller is responsible for calling clearAnalyzedConstraints when rstate or
 // the rstate.constraints is no longer needed.
-func (cs *clusterState) ensureAnalyzedConstraints(rstate *rangeState) {
+func (cs *clusterState) ensureAnalyzedConstraints(ctx context.Context, rstate *rangeState) {
 	if rstate.constraints != nil {
 		return
 	}
 	// Skip the range if the configuration is invalid for constraint analysis.
 	if rstate.conf == nil {
-		log.KvDistribution.Warning(context.Background(),
-			"no span config due to normalization error, skipping constraint analysis")
+		log.KvDistribution.Warning(
+			ctx, "no span config due to normalization error, skipping constraint analysis")
 		return
 	}
 	// Populate the constraints.
@@ -826,13 +834,13 @@ func (cs *clusterState) ensureAnalyzedConstraints(rstate *rangeState) {
 		// that there is a new leaseholder (and thus should drop this range).
 		// However, even in this case, replica.IsLeaseholder should still be there
 		// based on to the stale state, so this should still be impossible to hit.
-		log.KvDistribution.Warningf(context.Background(),
+		log.KvDistribution.Warningf(ctx,
 			"mma: no leaseholders found in %v, skipping constraint analysis", rstate.replicas)
 		return
 	}
 	if err := rac.finishInit(rstate.conf, cs.constraintMatcher, leaseholder); err != nil {
 		releaseRangeAnalyzedConstraints(rac)
-		log.KvDistribution.Warningf(context.Background(),
+		log.KvDistribution.Warningf(ctx,
 			"mma: error finishing constraint analysis: %v, skipping range", err)
 		return
 	}
@@ -947,8 +955,10 @@ func (cs *clusterState) computeCandidatesForReplicaTransfer(
 	}
 
 	sheddingSLS = cs.computeLoadSummary(ctx, loadSheddingStore, &effectiveMeans.storeLoad, &effectiveMeans.nodeLoad)
-	if sheddingSLS.sls <= loadNoChange && sheddingSLS.nls <= loadNoChange {
-		// In this set of stores, this store no longer looks overloaded.
+	if sheddingSLS.sls <= loadNoChange {
+		// In this set of stores, this store no longer looks overloaded. Note that
+		// we don't consider nls here: if nls is high but sls is low, it means other
+		// stores on the node are causing node-level overload, not this store.
 		passObs.replicaShed(notOverloaded)
 		return candidateSet{}, sheddingSLS
 	}

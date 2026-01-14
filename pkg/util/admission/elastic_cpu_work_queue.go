@@ -37,7 +37,7 @@ var (
 type ElasticCPUWorkQueue struct {
 	settings  *cluster.Settings
 	workQueue elasticCPUInternalWorkQueue
-	granter   granter
+	granter   granterAndYieldDelayRecorder
 	metrics   *elasticCPUGranterMetrics
 
 	testingEnabled bool
@@ -46,7 +46,7 @@ type ElasticCPUWorkQueue struct {
 // elasticCPUInternalWorkQueue abstracts *WorkQueue for testing.
 type elasticCPUInternalWorkQueue interface {
 	requester
-	Admit(ctx context.Context, info WorkInfo) (enabled bool, err error)
+	Admit(ctx context.Context, info WorkInfo) (AdmitResponse, error)
 	SetTenantWeights(tenantWeights map[uint64]uint32)
 	adjustTenantUsed(tenantID roachpb.TenantID, additionalUsed int64)
 }
@@ -54,7 +54,7 @@ type elasticCPUInternalWorkQueue interface {
 func makeElasticCPUWorkQueue(
 	settings *cluster.Settings,
 	workQueue elasticCPUInternalWorkQueue,
-	granter granter,
+	granter granterAndYieldDelayRecorder,
 	metrics *elasticCPUGranterMetrics,
 ) *ElasticCPUWorkQueue {
 	return &ElasticCPUWorkQueue{
@@ -83,18 +83,18 @@ func (e *ElasticCPUWorkQueue) Admit(
 		duration = MaxElasticCPUDuration
 	}
 	info.RequestedCount = duration.Nanoseconds()
-	enabled, err := e.workQueue.Admit(ctx, info)
+	resp, err := e.workQueue.Admit(ctx, info)
 	if err != nil {
 		return nil, err
 	}
-	if !enabled {
+	if !resp.Enabled {
 		return nil, nil
 	}
 	e.metrics.AcquiredNanos.Inc(duration.Nanoseconds())
 	if info.BypassAdmission {
 		e.metrics.bypassedAdmissionCumNanos.Add(duration.Nanoseconds())
 	}
-	return newElasticCPUWorkHandle(info.TenantID, duration, yieldInHandle, info.BypassAdmission), nil
+	return newElasticCPUWorkHandle(info.TenantID, duration, yieldInHandle, info.BypassAdmission, e.granter), nil
 }
 
 // AdmittedWorkDone indicates to the queue that the admitted work has

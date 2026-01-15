@@ -328,8 +328,7 @@ func registerImport(r registry.Registry) {
 			suites = registry.ManualOnly
 		}
 
-		// TODO(#159956): unskip distMerge=true.
-		for _, distMerge := range []bool{false} {
+		for _, distMerge := range []bool{false, true} {
 			for _, numNodes := range testSpec.nodes {
 				ts := testSpec
 				numNodes := numNodes
@@ -345,6 +344,9 @@ func registerImport(r registry.Registry) {
 					Suites:            suites,
 					EncryptionSupport: registry.EncryptionMetamorphic,
 					Leases:            registry.MetamorphicLeases,
+					// Never run with runtime assertions as this makes this test
+					// take too long to complete.
+					CockroachBinary: registry.StandardCockroach,
 					Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 						runImportTest(ctx, t, c, ts, numNodes, timeout, distMerge)
 					},

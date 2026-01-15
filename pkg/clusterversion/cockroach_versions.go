@@ -191,46 +191,8 @@ const (
 	// V25_2 is CockroachDB v25.2. It's used for all v25.2.x patch releases.
 	V25_2
 
-	TODO_Delete_V25_3_Start
-
-	TODO_Delete_V25_3_AddEventLogColumnAndIndex
-
-	TODO_Delete_V25_3_AddEstimatedLastLoginTime
-
-	TODO_Delete_V25_3_AddHotRangeLoggerJob
-
 	// V25_3 is CockroachDB v25.3. It's used for all v25.3.x patch releases.
 	V25_3
-
-	TODO_Delete_V25_4_Start
-
-	// TODO_Delete_V25_4_WriteInitialTruncStateBeforeSplitApplication is the version above
-	// which we write the initial truncated state before applying a split. By
-	// extension, we no longer need to replicate the truncated state when
-	// constructing the split write batch.
-	TODO_Delete_V25_4_WriteInitialTruncStateBeforeSplitApplication
-
-	// TODO_Delete_V25_4_PebbleFormatV2BlobFiles bumps the pebble format to FormatV2BlobFiles.
-	TODO_Delete_V25_4_PebbleFormatV2BlobFiles
-
-	// TODO_Delete_V25_4_InspectErrorsTable adds the system.inspect_errors table. The table
-	// will be used to log the results of INSPECT jobs.
-	TODO_Delete_V25_4_InspectErrorsTable
-
-	// TODO_Delete_V25_4_TransactionDiagnosticsSupport adds the system.transaction_diagnostics_requests and
-	// system.transaction_diagnostics tables, and adds a transaction_diagnostics_id column to
-	// system.statement_diagnostics to support transaction-level diagnostic bundle collection.
-	TODO_Delete_V25_4_TransactionDiagnosticsSupport
-
-	// TODO_Delete_V25_4_SystemStatsTablesAutostatsFraction sets the autostats fraction for
-	// system.statement_statistics and system.transaction_statistics to 0.9
-	// to reduce frequent automatic statistics collection.
-	TODO_Delete_V25_4_SystemStatsTablesAutostatsFraction
-
-	// TODO_Delete_V25_4_AddSystemStatementHintsTable adds the system.statement_hints table.
-	// The table is used to contain "external" hints, i.e. hints that are
-	// associated with a query without modifying the query or application itself.
-	TODO_Delete_V25_4_AddSystemStatementHintsTable
 
 	// V25_4 is CockroachDB v25.4. It's used for all v25.4.x patch releases.
 	V25_4
@@ -245,6 +207,11 @@ const (
 	// table. The table is used to limit the number of concurrent automatic
 	// table statistics collections.
 	V26_1_AddTableStatisticsLocksTable
+
+	// V26_1 is CockroachDB v26.1. It's used for all v26.1.x patch releases.
+	V26_1
+
+	V26_2_Start
 
 	// *************************************************
 	// Step (1) Add new versions above this comment.
@@ -283,32 +250,7 @@ var versionTable = [numKeys]roachpb.Version{
 	V24_3: {Major: 24, Minor: 3, Internal: 0},
 	V25_1: {Major: 25, Minor: 1, Internal: 0},
 	V25_2: {Major: 25, Minor: 2, Internal: 0},
-
-	// v25.3 versions. Internal versions must be even.
-	TODO_Delete_V25_3_Start: {Major: 25, Minor: 2, Internal: 2},
-
-	TODO_Delete_V25_3_AddEventLogColumnAndIndex: {Major: 25, Minor: 2, Internal: 4},
-
-	TODO_Delete_V25_3_AddEstimatedLastLoginTime: {Major: 25, Minor: 2, Internal: 6},
-
-	TODO_Delete_V25_3_AddHotRangeLoggerJob: {Major: 25, Minor: 2, Internal: 8},
-
 	V25_3: {Major: 25, Minor: 3, Internal: 0},
-
-	// v25.4 versions. Internal versions must be even.
-	TODO_Delete_V25_4_Start: {Major: 25, Minor: 3, Internal: 2},
-
-	TODO_Delete_V25_4_WriteInitialTruncStateBeforeSplitApplication: {Major: 25, Minor: 3, Internal: 4},
-	TODO_Delete_V25_4_PebbleFormatV2BlobFiles:                      {Major: 25, Minor: 3, Internal: 6},
-
-	TODO_Delete_V25_4_InspectErrorsTable: {Major: 25, Minor: 3, Internal: 8},
-
-	TODO_Delete_V25_4_TransactionDiagnosticsSupport: {Major: 25, Minor: 3, Internal: 10},
-
-	TODO_Delete_V25_4_SystemStatsTablesAutostatsFraction: {Major: 25, Minor: 3, Internal: 12},
-
-	TODO_Delete_V25_4_AddSystemStatementHintsTable: {Major: 25, Minor: 3, Internal: 14},
-
 	V25_4: {Major: 25, Minor: 4, Internal: 0},
 
 	// v26.1 versions. Internal versions must be even.
@@ -317,6 +259,11 @@ var versionTable = [numKeys]roachpb.Version{
 	V26_1_InstallMeta2StaticSplitPoint: {Major: 25, Minor: 4, Internal: 4},
 
 	V26_1_AddTableStatisticsLocksTable: {Major: 25, Minor: 4, Internal: 6},
+
+	V26_1: {Major: 26, Minor: 1, Internal: 0},
+
+	// v26.2 versions. Internal versions must be even.
+	V26_2_Start: {Major: 26, Minor: 1, Internal: 2},
 
 	// *************************************************
 	// Step (2): Add new versions above this comment.
@@ -335,13 +282,13 @@ const MinSupported Key = V25_4
 // have at least an RC build published).
 const PreviousRelease Key = V25_4
 
-// V26_1 is a placeholder that will eventually be replaced by the actual 26.1
+// V26_2 is a placeholder that will eventually be replaced by the actual 26.2
 // version Key, but in the meantime it points to the latest Key. The placeholder
 // is defined so that it can be referenced in code that simply wants to check if
-// a cluster is running 26.1 and has completed all associated migrations; most
+// a cluster is running 26.2 and has completed all associated migrations; most
 // version gates can use this instead of defining their own version key if they
-// only need to check that the cluster has upgraded to 26.1.
-const V26_1 = Latest
+// only need to check that the cluster has upgraded to 26.2.
+const V26_2 = Latest
 
 // DevelopmentBranch must be true on the main development branch but should be
 // set to false on a release branch once the set of versions becomes append-only

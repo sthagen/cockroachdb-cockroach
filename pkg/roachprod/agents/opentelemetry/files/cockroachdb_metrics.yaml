@@ -110,6 +110,7 @@ admission_errored_sql_sql_response_locking_normal_pri: admission.errored.sql_sql
 admission_errored_sql_sql_response_normal_pri: admission.errored.sql_sql_response.normal_pri
 admission_granter_cpu_load_long_period_duration_kv: admission.granter.cpu_load_long_period_duration.kv
 admission_granter_cpu_load_short_period_duration_kv: admission.granter.cpu_load_short_period_duration.kv
+admission_granter_disk_write_byte_tokens_exhausted_duration_kv: admission.granter.disk_write_byte_tokens_exhausted_duration.kv
 admission_granter_elastic_io_tokens_available_kv: admission.granter.elastic_io_tokens_available.kv
 admission_granter_elastic_io_tokens_exhausted_duration_kv: admission.granter.elastic_io_tokens_exhausted_duration.kv
 admission_granter_io_tokens_available_kv: admission.granter.io_tokens_available.kv
@@ -1930,6 +1931,7 @@ sql_distsql_exec_latency_internal_sum: sql.distsql.exec.latency.internal.sum
 sql_distsql_exec_latency_sum: sql.distsql.exec.latency.sum
 sql_distsql_flows_active: sql.distsql.flows.active
 sql_distsql_flows_total: sql.distsql.flows.total
+sql_distsql_parallel_runner_count: sql.distsql.parallel_runner.count
 sql_distsql_queries_active: sql.distsql.queries.active
 sql_distsql_queries_spilled: sql.distsql.queries.spilled
 sql_distsql_queries_total: sql.distsql.queries.total
@@ -1937,6 +1939,7 @@ sql_distsql_select_count: sql.distsql.select.count
 sql_distsql_select_count_internal: sql.distsql.select.internal
 sql_distsql_select_distributed_exec_count: sql.distsql.select.distributed_exec.count
 sql_distsql_select_distributed_exec_count_internal: sql.distsql.select.distributed_exec.count.internal
+sql_distsql_sequential_runner_count: sql.distsql.sequential_runner.count
 sql_distsql_service_latency: sql.distsql.service.latency
 sql_distsql_service_latency_bucket: sql.distsql.service.latency.bucket
 sql_distsql_service_latency_count: sql.distsql.service.latency.count
@@ -2123,6 +2126,8 @@ sql_query_started_count: sql.query.started.count
 sql_query_started_count_internal: sql.query.started.internal
 sql_query_unique_count: sql.query.unique.count
 sql_query_unique_count_internal: sql.query.unique.count.internal
+sql_query_with_statement_hints_count: sql.query.with_statement_hints.count
+sql_query_with_statement_hints_count_internal: sql.query.with_statement_hints.count.internal
 sql_restart_savepoint_count: sql.restart_savepoint.count
 sql_restart_savepoint_count_internal: sql.restart_savepoint.internal
 sql_restart_savepoint_release_count: sql.restart_savepoint.release.count

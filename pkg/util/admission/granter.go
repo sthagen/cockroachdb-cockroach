@@ -83,8 +83,8 @@ func (sg *slotGranter) returnGrantLocked(count int64, _ int8) {
 	}
 	if sg.usedSlots == sg.totalSlots {
 		now := timeutil.Now()
-		exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
-		sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
+		exhaustedDuration := now.Sub(sg.exhaustedStart)
+		sg.slotsExhaustedDurationMetric.Inc(exhaustedDuration.Nanoseconds())
 	}
 	sg.usedSlots--
 	if sg.usedSlots < 0 {
@@ -150,8 +150,8 @@ func (sg *slotGranter) setTotalSlotsLockedInternal(totalSlots int) {
 	if totalSlots > sg.totalSlots {
 		if sg.totalSlots <= sg.usedSlots && totalSlots > sg.usedSlots {
 			now := timeutil.Now()
-			exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
-			sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
+			exhaustedDuration := now.Sub(sg.exhaustedStart)
+			sg.slotsExhaustedDurationMetric.Inc(exhaustedDuration.Nanoseconds())
 		}
 	} else if totalSlots < sg.totalSlots {
 		if sg.totalSlots > sg.usedSlots && totalSlots <= sg.usedSlots {
@@ -284,9 +284,11 @@ type kvStoreTokenGranter struct {
 		availableIOTokens            [admissionpb.NumWorkClasses]int64
 		elasticIOTokensUsedByElastic int64
 		// TODO(aaditya): add support for read/IOPS tokens.
-		// Disk bandwidth tokens.
+		// Disk tokens available.
 		diskTokensAvailable diskTokens
-		diskTokensError     struct {
+		// The capacity of the token bucket for disk write bytes.
+		diskWriteByteTokensCapacity int64
+		diskTokensError             struct {
 			// prevObserved{Writes,Reads} is the observed disk metrics in the last
 			// call to adjustDiskTokenErrorLocked. These are used to compute the
 			// delta.
@@ -299,19 +301,24 @@ type kvStoreTokenGranter struct {
 		// exhaustedStart is the time when the corresponding availableIOTokens
 		// became <= 0. Ignored when the corresponding availableIOTokens is > 0.
 		exhaustedStart [admissionpb.NumWorkClasses]time.Time
-		// startingIOTokens is the number of tokens set by setAvailableTokens for
+		// startingIOTokens is the number of tokens set by addAvailableTokens for
 		// regular work. It is used to compute the tokens used, by computing
 		// startingIOTokens-availableIOTokens[RegularWorkClass].
 		startingIOTokens int64
+		// diskWriteByteTokensExhaustedStart is the time when
+		// diskTokensAvailable.writeByteTokens became <= 0. Ignored when
+		// diskTokensAvailable.writeByteTokens is > 0.
+		diskWriteByteTokensExhaustedStart time.Time
 
 		// Estimation models.
 		l0WriteLM, l0IngestLM, ingestLM, writeAmpLM tokensLinearModel
 	}
 
-	ioTokensExhaustedDurationMetric [admissionpb.NumWorkClasses]*metric.Counter
-	availableTokensMetric           [admissionpb.NumWorkClasses]*metric.Gauge
-	tokensReturnedMetric            *metric.Counter
-	tokensTakenMetric               *metric.Counter
+	ioTokensExhaustedDurationMetric            [admissionpb.NumWorkClasses]*metric.Counter
+	availableTokensMetric                      [admissionpb.NumWorkClasses]*metric.Gauge
+	tokensReturnedMetric                       *metric.Counter
+	tokensTakenMetric                          *metric.Counter
+	diskWriteByteTokensExhaustedDurationMetric *metric.Counter
 }
 
 var _ granterWithIOTokens = &kvStoreTokenGranter{}
@@ -411,8 +418,7 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWor
 	case admissionpb.RegularStoreWorkType:
 		if sg.mu.availableIOTokens[admissionpb.RegularWorkClass] > 0 {
 			sg.subtractIOTokensLocked(count, count, false)
-			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
-			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
+			sg.subtractDiskWriteTokensLocked(diskWriteTokens, false)
 			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
 			return true
 		}
@@ -422,8 +428,7 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWor
 			sg.mu.availableIOTokens[admissionpb.ElasticWorkClass] > 0 {
 			sg.subtractIOTokensLocked(count, count, false)
 			sg.mu.elasticIOTokensUsedByElastic += count
-			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
-			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
+			sg.subtractDiskWriteTokensLocked(diskWriteTokens, false)
 			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
 			return true
 		}
@@ -431,8 +436,7 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWor
 		// Snapshot ingests do not go into L0, so we only subject them to
 		// writeByteTokens.
 		if sg.mu.diskTokensAvailable.writeByteTokens > 0 {
-			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
-			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
+			sg.subtractDiskWriteTokensLocked(diskWriteTokens, false)
 			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
 			return true
 		}
@@ -472,14 +476,12 @@ func (sg *kvStoreTokenGranter) subtractTokensForStoreWorkTypeLocked(
 	switch wt {
 	case admissionpb.RegularStoreWorkType, admissionpb.ElasticStoreWorkType:
 		diskTokenCount := sg.mu.writeAmpLM.applyLinearModel(count)
-		sg.mu.diskTokensAvailable.writeByteTokens -= diskTokenCount
-		sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskTokenCount
+		sg.subtractDiskWriteTokensLocked(diskTokenCount, false)
 		sg.mu.diskTokensUsed[wt].writeByteTokens += diskTokenCount
 	case admissionpb.SnapshotIngestStoreWorkType:
 		// Do not apply the writeAmpLM since these writes do not incur additional
 		// write-amp.
-		sg.mu.diskTokensAvailable.writeByteTokens -= count
-		sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += count
+		sg.subtractDiskWriteTokensLocked(count, false)
 		sg.mu.diskTokensUsed[wt].writeByteTokens += count
 	}
 }
@@ -517,13 +519,17 @@ func (sg *kvStoreTokenGranter) adjustDiskTokenErrorLocked(readBytes uint64, writ
 	// Compensate for error due to writes.
 	writeError := intWrites - sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted
 	if writeError > 0 {
-		sg.mu.diskTokensAvailable.writeByteTokens -= writeError
+		// NB: the following also updates diskWriteTokensAlreadyDeducted, which is
+		// harmless, since we reset it to 0 later in this function.
+		sg.subtractDiskWriteTokensLocked(writeError, false)
 	}
 
 	// Compensate for error due to reads.
 	readError := intReads - sg.mu.diskTokensError.diskReadTokensAlreadyDeducted
 	if readError > 0 {
-		sg.mu.diskTokensAvailable.writeByteTokens -= readError
+		// NB: the following also updates diskWriteTokensAlreadyDeducted, which is
+		// harmless, since we reset it to 0 later in this function.
+		sg.subtractDiskWriteTokensLocked(readError, false)
 	}
 
 	// We have compensated for error, if any, in this interval, so we reset the
@@ -583,10 +589,38 @@ func (sg *kvStoreTokenGranter) subtractTokensLockedForWorkClass(
 		// don't show a sudden change in the metric after minutes of exhaustion
 		// (we had observed such behavior prior to this change).
 		now := timeutil.Now()
-		exhaustedMicros := now.Sub(sg.mu.exhaustedStart[wc]).Microseconds()
-		sg.ioTokensExhaustedDurationMetric[wc].Inc(exhaustedMicros)
+		exhaustedDuration := now.Sub(sg.mu.exhaustedStart[wc])
+		sg.ioTokensExhaustedDurationMetric[wc].Inc(exhaustedDuration.Nanoseconds())
 		if sg.mu.availableIOTokens[wc] <= 0 {
 			sg.mu.exhaustedStart[wc] = now
+		}
+	}
+}
+
+func (sg *kvStoreTokenGranter) subtractDiskWriteTokensLocked(
+	count int64, settingAvailableTokens bool,
+) {
+	avail := sg.mu.diskTokensAvailable.writeByteTokens
+	sg.mu.diskTokensAvailable.writeByteTokens -= count
+	if settingAvailableTokens && sg.mu.diskTokensAvailable.writeByteTokens > sg.mu.diskWriteByteTokensCapacity {
+		sg.mu.diskTokensAvailable.writeByteTokens = sg.mu.diskWriteByteTokensCapacity
+	}
+	if !settingAvailableTokens {
+		sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += count
+	}
+	if count > 0 && avail > 0 && sg.mu.diskTokensAvailable.writeByteTokens <= 0 {
+		// Transition from > 0 to <= 0.
+		sg.mu.diskWriteByteTokensExhaustedStart = timeutil.Now()
+	} else if count < 0 && avail <= 0 &&
+		(sg.mu.diskTokensAvailable.writeByteTokens > 0 || settingAvailableTokens) {
+		// Transition from <= 0 to > 0, or if we're setting available tokens. The
+		// latter ensures that if the available tokens stay <= 0, we don't show a
+		// sudden change in the metric after minutes of exhaustion.
+		now := timeutil.Now()
+		exhaustedDur := now.Sub(sg.mu.diskWriteByteTokensExhaustedStart)
+		sg.diskWriteByteTokensExhaustedDurationMetric.Inc(exhaustedDur.Nanoseconds())
+		if sg.mu.diskTokensAvailable.writeByteTokens <= 0 {
+			sg.mu.diskWriteByteTokensExhaustedStart = now
 		}
 	}
 }
@@ -649,8 +683,8 @@ func (sg *kvStoreTokenGranter) tryGrantLockedOne() bool {
 	return false
 }
 
-// setAvailableTokens implements granterWithIOTokens.
-func (sg *kvStoreTokenGranter) setAvailableTokens(
+// addAvailableTokens implements granterWithIOTokens.
+func (sg *kvStoreTokenGranter) addAvailableTokens(
 	ioTokens int64,
 	elasticIOTokens int64,
 	diskWriteTokens int64,
@@ -700,14 +734,19 @@ func (sg *kvStoreTokenGranter) setAvailableTokens(
 	sg.mu.startingIOTokens = sg.mu.availableIOTokens[admissionpb.RegularWorkClass]
 
 	// Allocate disk write and read tokens.
-	sg.mu.diskTokensAvailable.writeByteTokens += diskWriteTokens
-	if sg.mu.diskTokensAvailable.writeByteTokens > diskWriteTokensCapacity {
-		sg.mu.diskTokensAvailable.writeByteTokens = diskWriteTokensCapacity
-	}
-	// NB: We don't cap the disk read tokens as they are only deducted during the
-	// error accounting loop. So essentially, we give reads the "burst" capacity
-	// of the error accounting interval. See `adjustDiskTokenErrorLocked` for the
-	// error accounting logic, and where we reset this bucket to 0.
+	sg.mu.diskWriteByteTokensCapacity = diskWriteTokensCapacity
+	sg.subtractDiskWriteTokensLocked(-diskWriteTokens, true)
+	// The read tokens are not added to a token bucket, and instead are
+	// considered "already deducted" since they were pre-deducted when computing
+	// the write tokens in the diskBandwidthLimiter. The actual observed reads
+	// in the error accounting loop will be compared against these pre-deducted
+	// tokens to compute read error.
+	//
+	// NB: We don't cap the disk read tokens as they are only compared during
+	// the error accounting loop. So essentially, we give reads the "burst"
+	// capacity of the error accounting interval. See
+	// `adjustDiskTokenErrorLocked` for the error accounting logic, and where we
+	// reset this bucket to 0.
 	sg.mu.diskTokensError.diskReadTokensAlreadyDeducted += diskReadTokens
 
 	return ioTokensUsed, ioTokensUsedByElasticWork
@@ -779,9 +818,14 @@ func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked(
 	ingestIntoLSM := sg.mu.ingestLM.applyLinearModel(admittedInfo.IngestedBytes)
 	totalBytesIntoLSM := actualL0WriteTokens + ingestIntoLSM
 	actualDiskWriteTokens := sg.mu.writeAmpLM.applyLinearModel(totalBytesIntoLSM)
+	// NB: there is a small inconsistency here in that the linear model applied
+	// to the originalTokens may have been different, since the linear model
+	// changes every 15s. So we may have previously deducted something different
+	// from originalDiskTokens. We accept that inconsistency in token accounting
+	// for simplicity.
 	originalDiskTokens := sg.mu.writeAmpLM.applyLinearModel(originalTokens)
 	additionalDiskWriteTokens := actualDiskWriteTokens - originalDiskTokens
-	sg.mu.diskTokensAvailable.writeByteTokens -= additionalDiskWriteTokens
+	sg.subtractDiskWriteTokensLocked(additionalDiskWriteTokens, false)
 	sg.mu.diskTokensUsed[wt].writeByteTokens += additionalDiskWriteTokens
 
 	if canGrantAnother && (additionalL0TokensNeeded < 0) {
@@ -795,6 +839,10 @@ func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked(
 	// decisions, but we don't necessarily need something more sophisticated
 	// like "Dominant Resource Fairness".
 	return additionalL0TokensNeeded
+}
+
+func (sg *kvStoreTokenGranter) hasExhaustedDiskTokens() bool {
+	return sg.diskWriteByteTokensExhaustedDurationMetric.Count() > 0
 }
 
 // StoreMetrics are the metrics and some config information for a store.
@@ -846,26 +894,29 @@ var (
 	// or not.
 	kvSlotsExhaustedDuration = metric.Metadata{
 		Name: "admission.granter.slots_exhausted_duration.kv",
-		Help: "Total duration (in micros) when KV slots were exhausted, as observed by the slot " +
-			"granter (not waiters)",
-		Measurement: "Microseconds",
-		Unit:        metric.Unit_COUNT,
+		Help: "Total duration when KV slots were exhausted, as observed by the slot " +
+			"granter (not waiters). This is reported in nanoseconds from 26.1 onwards, " +
+			"and was microseconds before that.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	// We have a metric for both short and long period. These metrics use the
 	// period provided in CPULoad and not wall time. So if the sum of the rate
 	// of these two is < 1sec/sec, the CPULoad ticks are not happening at the
 	// expected frequency (this could happen due to CPU overload).
 	kvCPULoadShortPeriodDuration = metric.Metadata{
-		Name:        "admission.granter.cpu_load_short_period_duration.kv",
-		Help:        "Total duration when CPULoad was being called with a short period, in micros",
-		Measurement: "Microseconds",
-		Unit:        metric.Unit_COUNT,
+		Name: "admission.granter.cpu_load_short_period_duration.kv",
+		Help: "Total duration when CPULoad was being called with a short period. This is " +
+			"reported in nanoseconds from 26.1 onwards, and was microseconds before that.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	kvCPULoadLongPeriodDuration = metric.Metadata{
-		Name:        "admission.granter.cpu_load_long_period_duration.kv",
-		Help:        "Total duration when CPULoad was being called with a long period, in micros",
-		Measurement: "Microseconds",
-		Unit:        metric.Unit_COUNT,
+		Name: "admission.granter.cpu_load_long_period_duration.kv",
+		Help: "Total duration when CPULoad was being called with a long period. This is " +
+			"reported in nanoseconds from 26.1 onwards, and was microseconds before that.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	kvSlotAdjusterIncrements = metric.Metadata{
 		Name:        "admission.granter.slot_adjuster_increments.kv",
@@ -881,17 +932,19 @@ var (
 	}
 	kvIOTokensExhaustedDuration = metric.Metadata{
 		Name: "admission.granter.io_tokens_exhausted_duration.kv",
-		Help: "Total duration (in micros) when IO tokens were exhausted, as observed by " +
-			"the token granter (not waiters)",
-		Measurement: "Microseconds",
-		Unit:        metric.Unit_COUNT,
+		Help: "Total duration when IO tokens were exhausted, as observed by the token granter " +
+			"(not waiters). This is reported in nanoseconds from 26.1 onwards, and was " +
+			"microseconds before that.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	kvElasticIOTokensExhaustedDuration = metric.Metadata{
 		Name: "admission.granter.elastic_io_tokens_exhausted_duration.kv",
-		Help: "Total duration (in micros) when Elastic IO tokens were exhausted, as observed by " +
-			"the token granter (not waiters)",
-		Measurement: "Microseconds",
-		Unit:        metric.Unit_COUNT,
+		Help: "Total duration when Elastic IO tokens were exhausted, as observed by the token " +
+			"granter (not waiters). This is reported in nanoseconds from 26.1 onwards, and was " +
+			"microseconds before that.",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	kvIOTokensTaken = metric.Metadata{
 		Name:        "admission.granter.io_tokens_taken.kv",
@@ -922,6 +975,13 @@ var (
 		Help:        "Number of tokens available",
 		Measurement: "Tokens",
 		Unit:        metric.Unit_COUNT,
+	}
+	kvDiskWriteByteTokensExhaustedDuration = metric.Metadata{
+		Name: "admission.granter.disk_write_byte_tokens_exhausted_duration.kv",
+		Help: "Total duration (in nanos) when disk write byte tokens were exhausted, as observed by " +
+			"the token granter (not waiters)",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	l0CompactedBytes = metric.Metadata{
 		Name:        "admission.l0_compacted_bytes.kv",

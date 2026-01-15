@@ -779,6 +779,11 @@ message ImportProgress {
   repeated SequenceDetails sequence_details = 6;
 
   roachpb.BulkOpSummary summary = 7 [(gogoproto.nullable) = false];
+
+  // SSTStoragePrefixes identifies the external storage prefixes used to write
+  // distributed-merge SSTs for this import. These prefixes are used to clean
+  // up job-scoped files on completion or cancellation.
+  repeated string sst_storage_prefixes = 8 [(gogoproto.customname) = "SSTStoragePrefixes"];
 }
 
 // TypeSchemaChangeDetails is the job detail information for a type schema change job.
@@ -1525,6 +1530,9 @@ message InspectDetails {
       // INDEX_CONSISTENCY performs validation between primary and secondary indexes
       // to detect missing or dangling index entries.
       INSPECT_CHECK_INDEX_CONSISTENCY = 1 [(gogoproto.enumvalue_customname) = "InspectCheckIndexConsistency"];
+
+      // INSPECT_CHECK_ROW_COUNT validates a table has the expected number of rows.
+      INSPECT_CHECK_ROW_COUNT = 2 [(gogoproto.enumvalue_customname) = "InspectCheckRowCount"];
     }
 
     // Type is the kind of validation to perform.
@@ -1551,6 +1559,10 @@ message InspectDetails {
       (gogoproto.customname) = "TableVersion",
       (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.DescriptorVersion"
     ];
+
+    // RowCount indicates the expected number of rows in the table, if applicable. Should be set
+    // for row count checks.
+    uint64 row_count = 5;
   }
 
   // Checks is the list of individual checks this job will perform.
@@ -1626,9 +1638,14 @@ message HotRangesLoggerProgress {
 message InspectProgress {
   int64 job_total_check_count = 1;
   int64 job_completed_check_count = 2;
+  uint64 row_count = 3; // Accumulator of row counts of each index.
 }
 
+// InspectProcessorProgress is the per-processor progress for an INSPECT job.
+// 
+// Deprecated: Moved to cockroach.sql.inspect.inspectpb.
 message InspectProcessorProgress {
+  option deprecated=true;
   int64 checks_completed = 1;  // Number of checks completed since last update.
   bool finished = 2;           // Processor finished all checks.
 

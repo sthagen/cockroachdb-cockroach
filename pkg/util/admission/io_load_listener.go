@@ -80,7 +80,9 @@ var L0SubLevelCountOverloadThreshold = settings.RegisterIntSetting(
 	"when the L0 sub-level count exceeds this threshold, the store is considered overloaded",
 	l0SubLevelCountOverloadThreshold, settings.PositiveInt)
 
-// ElasticBandwidthMaxUtil sets the max utilization for disk bandwidth for elastic traffic.
+// ElasticBandwidthMaxUtil sets the max utilization for disk bandwidth, which
+// is used to shape elastic traffic. It can be exceeded if regular
+// (non-elastic) traffic by itself causes this utilization to be exceeded.
 var ElasticBandwidthMaxUtil = settings.RegisterFloatSetting(
 	settings.SystemOnly, "kvadmission.store.elastic_disk_bandwidth_max_util",
 	"sets the max utilization for disk bandwidth for elastic traffic",
@@ -532,7 +534,10 @@ func replaceFlushThroughputBytesBySSTableWriteThroughput(m *pebble.Metrics) {
 
 // pebbleMetricsTicks is called every adjustmentInterval seconds, and decides
 // the token allocations until the next call. Returns true iff the system is
-// loaded.
+// loaded or has been loaded sometime in the past (the callee is free to
+// choose whichever, since the caller incorporates this bool into a running
+// bool representing historical overload, to do a one way switch to ticking
+// more frequently).
 func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, metrics StoreMetrics) bool {
 	ctx = logtags.AddTag(ctx, "s", io.storeID)
 	m := metrics.Metrics
@@ -581,11 +586,11 @@ func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, metrics StoreMe
 	}
 	io.adjustTokens(ctx, metrics)
 	io.cumFlushWriteThroughput = metrics.Flush.WriteThroughput
-	// We assume that the system is loaded if there is less than unlimited tokens
-	// available.
-	//
-	// TODO(sumeer): this condition should also incorporate disk byte tokens.
-	return io.totalNumByteTokens < unlimitedTokens || io.totalNumElasticByteTokens < unlimitedTokens
+	// We assume that the system is loaded if there is less than unlimited
+	// tokens available, or has suffered from disk bandwidth overload in the
+	// past.
+	return io.totalNumByteTokens < unlimitedTokens || io.totalNumElasticByteTokens < unlimitedTokens ||
+		io.kvGranter.hasExhaustedDiskTokens()
 }
 
 // For both byte and disk bandwidth tokens, allocateTokensTick gives out
@@ -677,7 +682,7 @@ func (io *ioLoadListener) allocateTokensTick(remainingTicks int64) {
 		io.diskWriteTokens, 0, unloadedDuration.ticksInAdjustmentInterval(),
 	)
 
-	tokensUsed, tokensUsedByElasticWork := io.kvGranter.setAvailableTokens(
+	tokensUsed, tokensUsedByElasticWork := io.kvGranter.addAvailableTokens(
 		toAllocateByteTokens,
 		toAllocateElasticByteTokens,
 		toAllocateDiskWriteTokens,
@@ -777,7 +782,7 @@ func (io *ioLoadListener) adjustTokens(ctx context.Context, metrics StoreMetrics
 	// NB: we also log if prevDoLogFlush is true, since we often see a single
 	// interval of no overload sandwiched between intervals of overload and we
 	// want to know what happened in that interval.
-	if prevDoLogFlush || io.aux.doLogFlush || io.diskBandwidthLimiter.state.diskBWUtil > 0.8 ||
+	if prevDoLogFlush || io.aux.doLogFlush || io.diskBandwidthLimiter.state.prevWriteTokenUtil > 0.8 ||
 		log.V(1) {
 		log.Dev.Infof(ctx, "IO overload: %s; %s", io.adjustTokensResult, io.diskBandwidthLimiter)
 	}

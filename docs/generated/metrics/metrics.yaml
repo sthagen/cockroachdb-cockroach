@@ -1401,6 +1401,22 @@ layers:
       derivative: NON_NEGATIVE_DERIVATIVE
       how_to_use: The rate of this metric shows how frequently new connections are being established. This can be useful in determining if a high rate of incoming new connections is causing additional load on the server due to a misconfigured application.
       visibility: ESSENTIAL
+    - name: sql.query.with_statement_hints.count
+      exported_name: sql_query_with_statement_hints_count
+      description: Number of SQL queries executed with external statement hints
+      y_axis_label: SQL Statements
+      type: COUNTER
+      unit: COUNT
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
+    - name: sql.query.with_statement_hints.count.internal
+      exported_name: sql_query_with_statement_hints_count_internal
+      description: Number of SQL queries executed with external statement hints (internal queries)
+      y_axis_label: SQL Internal Statements
+      type: COUNTER
+      unit: COUNT
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
     - name: sql.routine.delete.count
       exported_name: sql_routine_delete_count
       labeled_name: 'sql.count{query_type: routine_delete}'
@@ -7615,6 +7631,14 @@ layers:
       unit: COUNT
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
+    - name: sql.distsql.parallel_runner.count
+      exported_name: sql_distsql_parallel_runner_count
+      description: Number of SetupFlowRequest RPCs executed concurrently via DistSQL runners
+      y_axis_label: Requests
+      type: COUNTER
+      unit: COUNT
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
     - name: sql.distsql.queries.active
       exported_name: sql_distsql_queries_active
       description: Number of invocations of the execution engine currently active (multiple of which may occur for a single SQL statement)
@@ -7667,6 +7691,14 @@ layers:
       exported_name: sql_distsql_select_distributed_exec_count_internal
       description: Number of SELECT statements that were distributed (internal queries)
       y_axis_label: SQL Internal Statements
+      type: COUNTER
+      unit: COUNT
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
+    - name: sql.distsql.sequential_runner.count
+      exported_name: sql_distsql_sequential_runner_count
+      description: Number of SetupFlowRequest RPCs executed sequentially via the main gateway goroutine
+      y_axis_label: Requests
       type: COUNTER
       unit: COUNT
       aggregation: AVG
@@ -10819,10 +10851,10 @@ layers:
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.elastic_cpu.nanos_exhausted_duration
       exported_name: admission_elastic_cpu_nanos_exhausted_duration
-      description: Total duration (in micros) when elastic CPU tokens (tokens measured in nanoseconds) were exhausted, as observed by the token granter (not waiters)
-      y_axis_label: Microseconds
+      description: Total duration when elastic CPU tokens (tokens measured in nanoseconds) were exhausted, as observed by the token granter (not waiters). This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
+      y_axis_label: Nanoseconds
       type: COUNTER
-      unit: COUNT
+      unit: NANOSECONDS
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.elastic_cpu.over_limit_durations
@@ -11051,18 +11083,26 @@ layers:
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.cpu_load_long_period_duration.kv
       exported_name: admission_granter_cpu_load_long_period_duration_kv
-      description: Total duration when CPULoad was being called with a long period, in micros
-      y_axis_label: Microseconds
+      description: Total duration when CPULoad was being called with a long period. This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
+      y_axis_label: Nanoseconds
       type: COUNTER
-      unit: COUNT
+      unit: NANOSECONDS
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.cpu_load_short_period_duration.kv
       exported_name: admission_granter_cpu_load_short_period_duration_kv
-      description: Total duration when CPULoad was being called with a short period, in micros
-      y_axis_label: Microseconds
+      description: Total duration when CPULoad was being called with a short period. This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
+      y_axis_label: Nanoseconds
       type: COUNTER
-      unit: COUNT
+      unit: NANOSECONDS
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
+    - name: admission.granter.disk_write_byte_tokens_exhausted_duration.kv
+      exported_name: admission_granter_disk_write_byte_tokens_exhausted_duration_kv
+      description: Total duration (in nanos) when disk write byte tokens were exhausted, as observed by the token granter (not waiters)
+      y_axis_label: Nanoseconds
+      type: COUNTER
+      unit: NANOSECONDS
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.elastic_io_tokens_available.kv
@@ -11075,10 +11115,10 @@ layers:
       derivative: NONE
     - name: admission.granter.elastic_io_tokens_exhausted_duration.kv
       exported_name: admission_granter_elastic_io_tokens_exhausted_duration_kv
-      description: Total duration (in micros) when Elastic IO tokens were exhausted, as observed by the token granter (not waiters)
-      y_axis_label: Microseconds
+      description: Total duration when Elastic IO tokens were exhausted, as observed by the token granter (not waiters). This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
+      y_axis_label: Nanoseconds
       type: COUNTER
-      unit: COUNT
+      unit: NANOSECONDS
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.io_tokens_available.kv
@@ -11099,10 +11139,10 @@ layers:
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.io_tokens_exhausted_duration.kv
       exported_name: admission_granter_io_tokens_exhausted_duration_kv
-      description: Total duration (in micros) when IO tokens were exhausted, as observed by the token granter (not waiters)
-      y_axis_label: Microseconds
+      description: Total duration when IO tokens were exhausted, as observed by the token granter (not waiters). This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
+      y_axis_label: Nanoseconds
       type: COUNTER
-      unit: COUNT
+      unit: NANOSECONDS
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.io_tokens_returned.kv
@@ -11139,10 +11179,10 @@ layers:
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.slots_exhausted_duration.kv
       exported_name: admission_granter_slots_exhausted_duration_kv
-      description: Total duration (in micros) when KV slots were exhausted, as observed by the slot granter (not waiters)
-      y_axis_label: Microseconds
+      description: Total duration when KV slots were exhausted, as observed by the slot granter (not waiters). This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
+      y_axis_label: Nanoseconds
       type: COUNTER
-      unit: COUNT
+      unit: NANOSECONDS
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
     - name: admission.granter.total_slots.kv

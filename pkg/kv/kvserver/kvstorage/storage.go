@@ -10,7 +10,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
@@ -120,8 +119,8 @@ type Engines struct {
 	//   particular write, or there is a candidate, but it needs to be verified.
 	todoEngine storage.Engine
 	// logEngine is the engine holding mainly the raft state, such as HardState
-	// and logs, and the Store-local keys. This engine provides timely durability,
-	// by frequent and on-demand syncing.
+	// and logs, and the Store-local keys. This engine provides timely
+	// durability, by frequent and on-demand syncing.
 	logEngine storage.Engine
 	// separated is true iff the engines are logically or physically separated.
 	// Can be true only in tests.
@@ -131,7 +130,7 @@ type Engines struct {
 // MakeEngines creates an Engines handle in which both state machine and log
 // engine reside in the same physical engine.
 func MakeEngines(eng storage.Engine) Engines {
-	if util.RaceEnabled {
+	if spanset.EnableAssertions {
 		// Wrap the engines with span set engines to catch incorrect engine
 		// accesses.
 		return Engines{
@@ -154,7 +153,7 @@ func MakeSeparatedEnginesForTesting(state, log storage.Engine) Engines {
 	if !buildutil.CrdbTestBuild {
 		panic("separated engines are not supported")
 	}
-	if util.RaceEnabled {
+	if spanset.EnableAssertions {
 		// Wrap the engines with span set engines to catch incorrect engine
 		// accesses.
 		return Engines{

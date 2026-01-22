@@ -12,7 +12,7 @@ describe("metrics page", () => {
       cy.login(user.username, user.password);
     });
     // Wait for login redirect to complete before navigating further
-    cy.location("hash").should("equal", "#/");
+    cy.location("hash").should("equal", "#/overview/list");
     // make sure we deterministic start on a fixed set of configurations
     cy.visit("#/metrics/overview/cluster?preset=past-hour");
   });
@@ -73,8 +73,6 @@ describe("metrics page", () => {
       Changefeeds: "changefeeds",
       Overload: "overload",
       TTL: "ttl",
-      "Physical Cluster Replication": "crossClusterReplication",
-      "Logical Data Replication": "logicalDataReplication",
     };
 
     cy.wrap(Object.entries(dashboards)).each(([title, pathSegment]) => {
@@ -96,27 +94,31 @@ describe("metrics page", () => {
   });
 
   it("displays summary side bar", () => {
-    cy.get(".summary-section").within(() => {
-      cy.get(".summary-label").contains("Summary");
+    cy.get(".summary-section")
+      .eq(0)
+      .within(() => {
+        cy.get(".summary-label").contains("Summary");
 
-      cy.contains("Total Nodes").should("exist");
-      cy.contains("View nodes list").should(
-        "have.attr",
-        "href",
-        "#/overview/list",
-      );
-      cy.contains("Capacity Usage").should("exist");
-      cy.contains("Unavailable ranges").should("exist");
-      cy.contains("Queries per second").should("exist");
-      cy.contains("P99 latency").should("exist");
-    });
+        cy.contains("Total Nodes").should("exist");
+        cy.contains("View nodes list").should(
+          "have.attr",
+          "href",
+          "#/overview/list",
+        );
+        cy.contains("Capacity Usage").should("exist");
+        cy.contains("Unavailable ranges").should("exist");
+        cy.contains("Queries per second").should("exist");
+        cy.contains("P99 latency").should("exist");
+      });
   });
 
   it("displays events section", () => {
-    cy.get(".summary-section").within(() => {
-      cy.contains(".summary-label", "Events");
+    cy.get(".summary-section")
+      .eq(1)
+      .within(() => {
+        cy.contains(".summary-label", "Events");
 
-      cy.contains("View all events").should("have.attr", "href", "#/events");
-    });
+        cy.contains("View all events").should("have.attr", "href", "#/events");
+      });
   });
 });

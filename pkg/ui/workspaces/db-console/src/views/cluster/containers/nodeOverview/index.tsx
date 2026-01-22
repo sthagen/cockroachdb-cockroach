@@ -31,7 +31,7 @@ import {
   SummaryValue,
 } from "src/views/shared/components/summaryBar";
 
-import "./nodeOverview.styl";
+import "./nodeOverview.scss";
 
 import {
   LiveBytesTooltip,
@@ -149,7 +149,7 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
         </div>
         <section className="section l-columns">
           <div className="l-columns__left">
-            <table className="table">
+            <table className="table" data-testid="node-overview-table">
               <thead>
                 <tr className="table__row table__row--header">
                   <th className="table__cell" />

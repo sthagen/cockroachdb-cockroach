@@ -508,7 +508,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 
 	firstEngine := s.inspectedDiskState.uninitializedEngines[0]
 	clusterVersion := clusterversion.ClusterVersion{Version: *resp.ActiveVersion}
-	if err := kvstorage.WriteClusterVersion(ctx, firstEngine.TODOEngine(), clusterVersion); err != nil {
+	if err := firstEngine.SetMinVersion(clusterVersion); err != nil {
 		return nil, err
 	}
 
@@ -516,7 +516,7 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 	if err != nil {
 		return nil, err
 	}
-	if err := kvstorage.InitEngine(ctx, firstEngine.TODOEngine(), sIdent); err != nil {
+	if err := kvstorage.InitEngine(ctx, firstEngine, sIdent); err != nil {
 		return nil, err
 	}
 
@@ -726,13 +726,8 @@ func inspectEngines(
 		}
 		nodeID = storeIdent.NodeID
 
-		if err := eng.StateEngine().SetStoreID(ctx, int32(storeIdent.StoreID)); err != nil {
+		if err := eng.SetStoreID(ctx, storeIdent.StoreID); err != nil {
 			return nil, err
-		}
-		if eng.Separated() {
-			if err := eng.LogEngine().SetStoreID(ctx, int32(storeIdent.StoreID)); err != nil {
-				return nil, err
-			}
 		}
 
 		initializedEngines = append(initializedEngines, eng)

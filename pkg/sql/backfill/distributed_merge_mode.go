@@ -7,12 +7,12 @@ package backfill
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -65,16 +65,6 @@ var DistributedMergeIndexBackfillMode = settings.RegisterEnumSetting(
 	settings.WithRetiredName("bulkio.index_backfill.distributed_merge.enabled"),
 )
 
-// DistributedMergeIterations controls the number of merge iterations to perform
-// during index backfills using the distributed merge pipeline.
-var DistributedMergeIterations = settings.RegisterIntSetting(
-	settings.ApplicationLevel,
-	"bulkio.index_backfill.distributed_merge.iterations",
-	"number of merge iterations to perform during index backfills",
-	1,
-	settings.IntWithMinimum(1),
-)
-
 // shouldEnableDistributedMergeIndexBackfill determines whether the specified
 // backfill consumer should opt into the distributed merge pipeline based on the
 // current cluster setting and version state.
@@ -106,7 +96,7 @@ func shouldEnableDistributedMergeIndexBackfill(
 // processor constructs the full nodelocal URI using its own node ID at runtime.
 func EnableDistributedMergeIndexBackfillSink(jobID jobspb.JobID, spec *execinfrapb.BackfillerSpec) {
 	spec.UseDistributedMergeSink = true
-	spec.DistributedMergeFilePrefix = fmt.Sprintf("job/%d/map", jobID)
+	spec.DistributedMergeFilePrefix = bulkutil.NewDistMergePaths(jobID).MapPath()
 }
 
 // DetermineDistributedMergeMode evaluates the cluster setting to decide

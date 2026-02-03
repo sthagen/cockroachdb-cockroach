@@ -36,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -231,7 +232,7 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 }
 
 func (tc *testContext) Sender() kv.Sender {
-	return kv.Wrap(tc.repl, func(ba *kvpb.BatchRequest) *kvpb.BatchRequest {
+	return kv.Wrap(ToSenderForTesting(tc.repl), func(ba *kvpb.BatchRequest) *kvpb.BatchRequest {
 		if ba.RangeID == 0 {
 			ba.RangeID = 1
 		}
@@ -528,7 +529,7 @@ func sendLeaseRequest(r *Replica, l *roachpb.Lease) error {
 	}
 	ba.Add(leaseReq)
 	_, tok := r.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-	ch, _, _, _, pErr := r.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+	ch, _, _, _, pErr := r.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 	if pErr == nil {
 		// Next if the command was committed, wait for the range to apply it.
 		// TODO(bdarnell): refactor this to a more conventional error-handling pattern.
@@ -889,7 +890,7 @@ func TestReplicaRangeMismatchRedirect(t *testing.T) {
 	}
 	ba.Add(&gArgs)
 
-	br, pErr := tc.store.Send(context.Background(), ba)
+	br, pErr := ToSenderForTesting(tc.store).Send(context.Background(), ba)
 
 	require.Nil(t, pErr)
 	rangeInfos := br.RangeInfos
@@ -1295,7 +1296,7 @@ func TestReplicaLeaseRejectUnknownRaftNodeID(t *testing.T) {
 	ba.Timestamp = tc.repl.store.Clock().Now()
 	ba.Add(&kvpb.RequestLeaseRequest{Lease: *lease, PrevLease: st.Lease})
 	_, tok := tc.repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-	ch, _, _, _, pErr := tc.repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+	ch, _, _, _, pErr := tc.repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 	if pErr == nil {
 		// Next if the command was committed, wait for the range to apply it.
 		// TODO(bdarnell): refactor to a more conventional error-handling pattern.
@@ -4862,7 +4863,7 @@ func setupResolutionTest(
 		pArgs := putArgs(splitKey.AsRawKey(), []byte("value"))
 		ba.Add(&pArgs)
 		assignSeqNumsForReqs(txn, &pArgs)
-		if _, pErr := newRepl.Send(context.Background(), ba); pErr != nil {
+		if _, pErr := ToSenderForTesting(newRepl).Send(context.Background(), ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 	}
@@ -4912,7 +4913,7 @@ func TestEndTxnResolveOnlyLocalIntents(t *testing.T) {
 		if err := ba.SetActiveTimestamp(tc.Clock()); err != nil {
 			t.Fatal(err)
 		}
-		_, pErr := newRepl.Send(ctx, ba)
+		_, pErr := ToSenderForTesting(newRepl).Send(ctx, ba)
 		if _, ok := pErr.GetDetail().(*kvpb.LockConflictError); !ok {
 			t.Errorf("expected lock conflict error, but got %s", pErr)
 		}
@@ -5225,7 +5226,7 @@ func TestAbortSpanPoisonOnResolve(t *testing.T) {
 				RequestHeader: kvpb.RequestHeader{Key: k}, Increment: 123,
 			}
 			assignSeqNumsForReqs(actor, incArgs)
-			reply, pErr := kv.SendWrappedWith(ctx, tc.store, kvpb.Header{
+			reply, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(tc.store), kvpb.Header{
 				Txn:     actor,
 				RangeID: 1,
 			}, incArgs)
@@ -5238,7 +5239,7 @@ func TestAbortSpanPoisonOnResolve(t *testing.T) {
 		get := func(actor *roachpb.Transaction, k roachpb.Key) *kvpb.Error {
 			gArgs := getArgs(k)
 			assignSeqNumsForReqs(actor, &gArgs)
-			_, pErr := kv.SendWrappedWith(ctx, tc.store, kvpb.Header{
+			_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(tc.store), kvpb.Header{
 				Txn:     actor,
 				RangeID: 1,
 			}, &gArgs)
@@ -6854,7 +6855,7 @@ func TestRequestLeaderEncounterGroupDeleteError(t *testing.T) {
 	gArgs := getArgs(roachpb.Key("a"))
 	// Force the read command request a new lease.
 	manual.MustAdvanceTo(leaseExpiry(tc.repl))
-	_, pErr := kv.SendWrappedWith(ctx, tc.store, kvpb.Header{
+	_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(tc.store), kvpb.Header{
 		Timestamp: tc.Clock().Now(),
 		RangeID:   1,
 	}, &gArgs)
@@ -7476,10 +7477,10 @@ func TestGCIncorrectRange(t *testing.T) {
 	ts2 := now.Add(2, 0)
 	ts1Header := kvpb.Header{RangeID: repl2.RangeID, Timestamp: ts1}
 	ts2Header := kvpb.Header{RangeID: repl2.RangeID, Timestamp: ts2}
-	if _, pErr := kv.SendWrappedWith(ctx, repl2, ts1Header, &putReq); pErr != nil {
+	if _, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(repl2), ts1Header, &putReq); pErr != nil {
 		t.Errorf("unexpected pError on put key request: %s", pErr)
 	}
-	if _, pErr := kv.SendWrappedWith(ctx, repl2, ts2Header, &putReq); pErr != nil {
+	if _, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(repl2), ts2Header, &putReq); pErr != nil {
 		t.Errorf("unexpected pError on put key request: %s", pErr)
 	}
 
@@ -7490,7 +7491,7 @@ func TestGCIncorrectRange(t *testing.T) {
 	gcReq := gcArgs(repl1.Desc().StartKey, repl1.Desc().EndKey, gKey)
 	if _, pErr := kv.SendWrappedWith(
 		ctx,
-		repl1,
+		ToSenderForTesting(repl1),
 		kvpb.Header{RangeID: 1, Timestamp: tc.Clock().Now()},
 		&gcReq,
 	); pErr != nil {
@@ -7499,7 +7500,7 @@ func TestGCIncorrectRange(t *testing.T) {
 
 	// Make sure the key still exists on range 2.
 	getReq := getArgs(key)
-	if res, pErr := kv.SendWrappedWith(ctx, repl2, ts1Header, &getReq); pErr != nil {
+	if res, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(repl2), ts1Header, &getReq); pErr != nil {
 		t.Errorf("unexpected pError on get request to correct range: %s", pErr)
 	} else if resVal := res.(*kvpb.GetResponse).Value; resVal == nil {
 		t.Errorf("expected value %s to exists after GC to incorrect range but before GC to correct range, found %v", val, resVal)
@@ -7509,7 +7510,7 @@ func TestGCIncorrectRange(t *testing.T) {
 	gcReq = gcArgs(repl2.Desc().StartKey, repl2.Desc().EndKey, gKey)
 	if _, pErr := kv.SendWrappedWith(
 		ctx,
-		repl2,
+		ToSenderForTesting(repl2),
 		kvpb.Header{RangeID: repl2.RangeID, Timestamp: tc.Clock().Now()},
 		&gcReq,
 	); pErr != nil {
@@ -7517,7 +7518,7 @@ func TestGCIncorrectRange(t *testing.T) {
 	}
 
 	// Make sure the key no longer exists on range 2.
-	if res, pErr := kv.SendWrappedWith(ctx, repl2, ts1Header, &getReq); pErr != nil {
+	if res, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(repl2), ts1Header, &getReq); pErr != nil {
 		t.Errorf("unexpected pError on get request to correct range: %s", pErr)
 	} else if resVal := res.(*kvpb.GetResponse).Value; resVal != nil {
 		t.Errorf("expected value at key %s to no longer exist after GC to correct range, found value %v", key, resVal)
@@ -7563,7 +7564,7 @@ func TestReplicaCancelRaft(t *testing.T) {
 			if err := ba.SetActiveTimestamp(tc.Clock()); err != nil {
 				t.Fatal(err)
 			}
-			_, _, pErr := tc.repl.executeBatchWithConcurrencyRetries(ctx, ba, (*Replica).executeWriteBatch)
+			_, _, pErr := tc.repl.executeBatchWithConcurrencyRetries(ctx, ba, (*Replica).executeWriteBatch, kvadmission.AdmissionInfo{})
 			if cancelEarly {
 				if !testutils.IsPError(pErr, context.Canceled.Error()) {
 					t.Fatalf("expected canceled error; got %v", pErr)
@@ -7619,7 +7620,7 @@ func TestReplicaAbandonProposal(t *testing.T) {
 	ba.Add(&kvpb.PutRequest{
 		RequestHeader: kvpb.RequestHeader{Key: []byte("acdfg")},
 	})
-	_, _, pErr := tc.repl.executeBatchWithConcurrencyRetries(ctx, ba, (*Replica).executeWriteBatch)
+	_, _, pErr := tc.repl.executeBatchWithConcurrencyRetries(ctx, ba, (*Replica).executeWriteBatch, kvadmission.AdmissionInfo{})
 	if pErr == nil {
 		t.Fatal("expected failure, but found success")
 	}
@@ -7764,6 +7765,7 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 			context.WithValue(ctx, magicKey{}, "foo"),
 			ba,
 			(*Replica).executeWriteBatch,
+			kvadmission.AdmissionInfo{},
 		)
 		if pErr != nil {
 			t.Fatalf("write batch returned error: %s", pErr)
@@ -7798,6 +7800,7 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 			context.WithValue(ctx, magicKey{}, "foo"),
 			ba,
 			(*Replica).executeWriteBatch,
+			kvadmission.AdmissionInfo{},
 		)
 		if pErr != nil {
 			t.Fatal(pErr)
@@ -7846,7 +7849,7 @@ func TestReplicaCancelRaftCommandProgress(t *testing.T) {
 		})
 		st := repl.CurrentLeaseStatus(ctx)
 		_, tok := repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-		ch, _, id, _, err := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+		ch, _, id, _, err := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -7918,7 +7921,7 @@ func TestReplicaBurstPendingCommandsAndRepropose(t *testing.T) {
 		})
 		_, tok := tc.repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
 		st := tc.repl.CurrentLeaseStatus(ctx)
-		ch, _, _, _, err := tc.repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+		ch, _, _, _, err := tc.repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -8461,11 +8464,11 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 			//  k@ts1 -> a
 			//  k@ts2 -> b
 			pArgs := putArgs(key, va)
-			_, pErr := kv.SendWrappedWith(ctx, writer, h1, &pArgs)
+			_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h1, &pArgs)
 			require.Nil(t, pErr)
 
 			pArgs = putArgs(key, vb)
-			_, pErr = kv.SendWrappedWith(ctx, writer, h2, &pArgs)
+			_, pErr = kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h2, &pArgs)
 			require.Nil(t, pErr)
 
 			// If the test wants to read from a follower, drop the closed timestamp
@@ -8482,7 +8485,7 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 					ba.Add(&kvpb.QueryResolvedTimestampRequest{
 						RequestHeader: kvpb.RequestHeader{Key: key, EndKey: key.Next()},
 					})
-					br, pErr := reader.Send(ctx, ba)
+					br, pErr := ToSenderForTesting(reader).Send(ctx, ba)
 					require.Nil(t, pErr)
 					rts := br.Responses[0].GetQueryResolvedTimestamp().ResolvedTS
 					if rts.Less(ts1) {
@@ -8494,7 +8497,7 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 
 			// Verify that a read @ ts1 returns "a".
 			gArgs := getArgs(key)
-			resp, pErr := kv.SendWrappedWith(ctx, reader, h1, &gArgs)
+			resp, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(reader), h1, &gArgs)
 			require.Nil(t, pErr)
 			require.NotNil(t, resp)
 			require.NotNil(t, resp.(*kvpb.GetResponse).Value)
@@ -8511,7 +8514,7 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 			// by the time they return, subsequent GC requests are guaranteed to see
 			// the latest keys.
 			gArgs = getArgs(key)
-			_, pErr = kv.SendWrappedWith(ctx, reader, h2, &gArgs)
+			_, pErr = kv.SendWrappedWith(ctx, ToSenderForTesting(reader), h2, &gArgs)
 			require.Nil(t, pErr)
 
 			// Perform two actions concurrently:
@@ -8528,7 +8531,7 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 				if thresholdFirst {
 					gcReq := gcArgs(key, key.Next())
 					gcReq.Threshold = ts2
-					_, pErr = kv.SendWrappedWith(ctx, writer, h3, &gcReq)
+					_, pErr = kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h3, &gcReq)
 					require.Nil(t, pErr)
 				}
 
@@ -8536,11 +8539,11 @@ func TestGCThresholdRacesWithRead(t *testing.T) {
 				if !thresholdFirst {
 					gcReq.Threshold = ts2
 				}
-				_, pErr = kv.SendWrappedWith(ctx, writer, h3, &gcReq)
+				_, pErr = kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h3, &gcReq)
 				require.Nil(t, pErr)
 			}
 			read := func() {
-				resp, pErr := kv.SendWrappedWith(ctx, reader, h1, &gArgs)
+				resp, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(reader), h1, &gArgs)
 				if pErr == nil {
 					t.Logf("read won race: %v", resp)
 					require.NotNil(t, resp)
@@ -9310,7 +9313,7 @@ func TestNoopRequestsNotProposed(t *testing.T) {
 		if err := ba.SetActiveTimestamp(repl.Clock()); err != nil {
 			t.Fatal(err)
 		}
-		_, pErr := repl.Send(ctx, ba)
+		_, pErr := ToSenderForTesting(repl).Send(ctx, ba)
 		return pErr
 	}
 
@@ -9507,7 +9510,7 @@ func TestNoopRequestsNotProposed(t *testing.T) {
 				assignSeqNumsForReqs(txn, c.req)
 			}
 			ba.Add(c.req)
-			_, pErr := repl.Send(ctx, ba)
+			_, pErr := ToSenderForTesting(repl).Send(ctx, ba)
 
 			// Check return error.
 			if c.expFailure == "" {
@@ -9619,7 +9622,7 @@ func TestErrorInRaftApplicationClearsIntents(t *testing.T) {
 	exLease, _ := repl.GetLease()
 	st := kvserverpb.LeaseStatus{Lease: exLease, State: kvserverpb.LeaseState_VALID}
 	_, tok := repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-	ch, _, _, _, pErr := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+	ch, _, _, _, pErr := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -9667,7 +9670,7 @@ func TestProposeWithAsyncConsensus(t *testing.T) {
 	atomic.StoreInt32(&filterActive, 1)
 	st := tc.repl.CurrentLeaseStatus(ctx)
 	_, tok := repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-	ch, _, _, _, pErr := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+	ch, _, _, _, pErr := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -9732,7 +9735,7 @@ func TestApplyPaginatedCommittedEntries(t *testing.T) {
 	atomic.StoreInt32(&filterActive, 1)
 	st := repl.CurrentLeaseStatus(ctx)
 	_, tok := repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-	_, _, _, _, pErr := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+	_, _, _, _, pErr := repl.evalAndPropose(ctx, ba, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -9751,7 +9754,7 @@ func TestApplyPaginatedCommittedEntries(t *testing.T) {
 
 		var pErr *kvpb.Error
 		_, tok := repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-		ch, _, _, _, pErr = repl.evalAndPropose(ctx, ba2, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx))
+		ch, _, _, _, pErr = repl.evalAndPropose(ctx, ba2, allSpansGuard(), &st, uncertainty.Interval{}, tok.Move(ctx), kvadmission.AdmissionInfo{})
 		if pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -14421,7 +14424,7 @@ func TestRangeSplitRacesWithRead(t *testing.T) {
 		val := []byte("value")
 		for _, k := range [][]byte{keyA, keyC} {
 			pArgs := putArgs(k, val)
-			_, pErr := kv.SendWrappedWith(ctx, writer, h1, &pArgs)
+			_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h1, &pArgs)
 			require.Nil(t, pErr)
 		}
 
@@ -14439,7 +14442,7 @@ func TestRangeSplitRacesWithRead(t *testing.T) {
 				ba.Add(&kvpb.QueryResolvedTimestampRequest{
 					RequestHeader: kvpb.RequestHeader{Key: key, EndKey: key.Next()},
 				})
-				br, pErr := reader.Send(ctx, ba)
+				br, pErr := ToSenderForTesting(reader).Send(ctx, ba)
 				require.Nil(t, pErr)
 				rts := br.Responses[0].GetQueryResolvedTimestamp().ResolvedTS
 				if rts.Less(ts1) {
@@ -14452,7 +14455,7 @@ func TestRangeSplitRacesWithRead(t *testing.T) {
 		read := func() {
 			scanArgs := scanArgs(keyA, keyD)
 			for {
-				resp, pErr := kv.SendWrappedWith(ctx, reader, h1, scanArgs)
+				resp, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(reader), h1, scanArgs)
 				if pErr == nil {
 					t.Logf("read won the race: %v", resp)
 					require.NotNil(t, resp)
@@ -14476,7 +14479,7 @@ func TestRangeSplitRacesWithRead(t *testing.T) {
 				},
 				SplitKey: splitKey,
 			}
-			_, pErr := kv.SendWrappedWith(ctx, writer, h1, splitArgs)
+			_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h1, splitArgs)
 			require.Nil(t, pErr, "err: %v", pErr.GoError())
 			rhsDesc := tc.LookupRangeOrFatal(t, splitKey.Next())
 			// Remove the RHS from the reader.
@@ -14563,7 +14566,7 @@ func TestRangeSplitAndRHSRemovalRacesWithFollowerRead(t *testing.T) {
 	val := []byte("value")
 	for _, k := range [][]byte{keyA, keyC} {
 		pArgs := putArgs(k, val)
-		_, pErr := kv.SendWrappedWith(ctx, writer, h1, &pArgs)
+		_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h1, &pArgs)
 		require.Nil(t, pErr)
 	}
 
@@ -14580,7 +14583,7 @@ func TestRangeSplitAndRHSRemovalRacesWithFollowerRead(t *testing.T) {
 		ba.Add(&kvpb.QueryResolvedTimestampRequest{
 			RequestHeader: kvpb.RequestHeader{Key: key, EndKey: key.Next()},
 		})
-		br, pErr := reader.Send(ctx, ba)
+		br, pErr := ToSenderForTesting(reader).Send(ctx, ba)
 		require.Nil(t, pErr)
 		rts := br.Responses[0].GetQueryResolvedTimestamp().ResolvedTS
 		if rts.Less(ts1) {
@@ -14595,7 +14598,7 @@ func TestRangeSplitAndRHSRemovalRacesWithFollowerRead(t *testing.T) {
 
 	read := func() {
 		scanArgs := scanArgs(keyA, keyD)
-		_, pErr := kv.SendWrappedWith(ctx, reader, h1, scanArgs)
+		_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(reader), h1, scanArgs)
 		require.NotNil(t, pErr)
 		mismatchErr := &kvpb.RangeKeyMismatchError{}
 		require.ErrorAs(t, pErr.GoError(), &mismatchErr)
@@ -14613,7 +14616,7 @@ func TestRangeSplitAndRHSRemovalRacesWithFollowerRead(t *testing.T) {
 			},
 			SplitKey: splitKey,
 		}
-		_, pErr := kv.SendWrappedWith(ctx, writer, h1, splitArgs)
+		_, pErr := kv.SendWrappedWith(ctx, ToSenderForTesting(writer), h1, splitArgs)
 		require.Nil(t, pErr, "err: %v", pErr.GoError())
 		rhsDesc := tc.LookupRangeOrFatal(t, splitKey.Next())
 		tc.RemoveVotersOrFatal(t, roachpb.Key(rhsDesc.StartKey), tc.Target(1))

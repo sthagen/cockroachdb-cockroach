@@ -46,9 +46,9 @@ var optimisticEvalLimitedScans = settings.RegisterBoolSetting(
 	true,
 )
 
-// Send executes a command on this range, dispatching it to the
-// read-only, read-write, or admin execution path as appropriate.
-// ctx should contain the log tags from the store (and up).
+// SendWithWriteBytes executes a command on this range, dispatching it to the
+// read-only, read-write, or admin execution path as appropriate. ctx should
+// contain the log tags from the store (and up).
 //
 // A rough schematic for the path requests take through a Replica
 // is presented below, with a focus on where requests may spend
@@ -65,7 +65,7 @@ var optimisticEvalLimitedScans = settings.RegisterBoolSetting(
 //	               Admission control
 //	                       │
 //	                       ▼
-//	                  Replica.Send
+//	              Replica.SendWithWriteBytes
 //	                       │
 //	                 Circuit breaker
 //	                       │
@@ -111,18 +111,8 @@ var optimisticEvalLimitedScans = settings.RegisterBoolSetting(
 //
 //	to commit the command, then signaling proposer and
 //	applying the command)
-func (r *Replica) Send(
-	ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchResponse, *kvpb.Error) {
-	br, writeBytes, pErr := r.SendWithWriteBytes(ctx, ba)
-	writeBytes.Release()
-	return br, pErr
-}
-
-// SendWithWriteBytes is the implementation of Send with an additional
-// *StoreWriteBytes return value.
 func (r *Replica) SendWithWriteBytes(
-	ctx context.Context, ba *kvpb.BatchRequest,
+	ctx context.Context, ba *kvpb.BatchRequest, admissionInfo kvadmission.AdmissionInfo,
 ) (*kvpb.BatchResponse, *kvadmission.StoreWriteBytes, *kvpb.Error) {
 	tenantIDOrZero, _ := roachpb.ClientTenantFromContext(ctx)
 
@@ -194,11 +184,11 @@ func (r *Replica) SendWithWriteBytes(
 	if isReadOnly {
 		log.Event(ctx, "read-only path")
 		fn := (*Replica).executeReadOnlyBatch
-		br, _, pErr = r.executeBatchWithConcurrencyRetries(ctx, ba, fn)
+		br, _, pErr = r.executeBatchWithConcurrencyRetries(ctx, ba, fn, admissionInfo)
 	} else if ba.IsWrite() {
 		log.Event(ctx, "read-write path")
 		fn := (*Replica).executeWriteBatch
-		br, writeBytes, pErr = r.executeBatchWithConcurrencyRetries(ctx, ba, fn)
+		br, writeBytes, pErr = r.executeBatchWithConcurrencyRetries(ctx, ba, fn, admissionInfo)
 	} else if ba.IsAdmin() {
 		log.Event(ctx, "admin path")
 		br, pErr = r.executeAdminBatch(ctx, ba)
@@ -392,7 +382,7 @@ func (r *Replica) maybeAddRangeInfoToResponse(
 
 // batchExecutionFn is a method on Replica that executes a BatchRequest. It is
 // called with the batch, along with a guard for the latches protecting the
-// request.
+// request, and admission control state.
 //
 // The function will return either a batch response or an error. The function
 // also has the option to pass ownership of the concurrency guard back to the
@@ -415,7 +405,7 @@ func (r *Replica) maybeAddRangeInfoToResponse(
 // the function returns one of these errors, it must also pass ownership of the
 // concurrency guard back to the caller.
 type batchExecutionFn func(
-	*Replica, context.Context, *kvpb.BatchRequest, *concurrency.Guard,
+	*Replica, context.Context, *kvpb.BatchRequest, *concurrency.Guard, kvadmission.AdmissionInfo,
 ) (*kvpb.BatchResponse, *concurrency.Guard, *kvadmission.StoreWriteBytes, *kvpb.Error)
 
 var _ batchExecutionFn = (*Replica).executeWriteBatch
@@ -436,7 +426,10 @@ var _ batchExecutionFn = (*Replica).executeReadOnlyBatch
 // a TransactionPushError it will propagate the error back to this method, which
 // handles the process of retrying batch execution after addressing the error.
 func (r *Replica) executeBatchWithConcurrencyRetries(
-	ctx context.Context, ba *kvpb.BatchRequest, fn batchExecutionFn,
+	ctx context.Context,
+	ba *kvpb.BatchRequest,
+	fn batchExecutionFn,
+	admissionInfo kvadmission.AdmissionInfo,
 ) (br *kvpb.BatchResponse, writeBytes *kvadmission.StoreWriteBytes, pErr *kvpb.Error) {
 	// Try to execute command; exit retry loop on success.
 	var latchSpans *spanset.SpanSet
@@ -525,7 +518,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 		}
 		latchSpans, lockSpans = nil, nil // ownership released
 
-		br, g, writeBytes, pErr = fn(r, ctx, ba, g)
+		br, g, writeBytes, pErr = fn(r, ctx, ba, g, admissionInfo)
 		if pErr == nil {
 			// Success.
 			return br, writeBytes, nil

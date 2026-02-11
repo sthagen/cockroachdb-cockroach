@@ -426,8 +426,16 @@ func authCert(
 	hbaEntry *hba.Entry,
 	identMap *identmap.Conf,
 ) (*AuthBehaviors, error) {
+	clientCertSANRequired := security.ClientCertSANRequired.Get(&execCfg.Settings.SV)
 	b := &AuthBehaviors{}
-	b.SetRoleMapper(HbaMapper(hbaEntry, identMap))
+	// Choose the appropriate mapper based on whether we have a map option
+	if hbaEntry.GetOption("map") != "" && clientCertSANRequired {
+		// Use enhanced mapper for SAN auth with mapping
+		b.SetEnhancedRoleMapper(HbaEnhancedMapper(hbaEntry, identMap))
+	} else {
+		// Use regular mapper for non-SAN authentication.
+		b.SetRoleMapper(HbaMapper(hbaEntry, identMap))
+	}
 	b.SetAuthenticator(func(
 		ctx context.Context,
 		systemIdentity string,
@@ -463,10 +471,30 @@ func authCert(
 		return hook(ctx, systemIdentity, clientConnection)
 	})
 	if len(tlsState.PeerCertificates) > 0 && hbaEntry.GetOption("map") != "" {
-		// The common name in the certificate is set as the system identity in case we have an HBAEntry for db user.
-		b.SetReplacementIdentity(
-			lexbase.NormalizeName(tlsState.PeerCertificates[0].Subject.CommonName),
-		)
+		if clientCertSANRequired {
+			identityList := make([]string, 0)
+			for _, uri := range tlsState.PeerCertificates[0].URIs {
+				identityList = append(identityList, fmt.Sprintf("SAN:URI:%s", lexbase.NormalizeName(uri.String())))
+			}
+
+			for _, ip := range tlsState.PeerCertificates[0].IPAddresses {
+				identityList = append(identityList, fmt.Sprintf("SAN:IP:%s", lexbase.NormalizeName(ip.String())))
+			}
+
+			for _, dns := range tlsState.PeerCertificates[0].DNSNames {
+				identityList = append(identityList, fmt.Sprintf("SAN:DNS:%s", lexbase.NormalizeName(dns)))
+			}
+
+			if len(identityList) == 0 {
+				return nil, errors.New("client certificate SAN is required, but no SAN found in the certificate.")
+			}
+			b.SetSANIdentities(identityList)
+		} else {
+			// The common name in the certificate is set as the system identity in case we have an HBAEntry for db user.
+			b.SetReplacementIdentity(
+				lexbase.NormalizeName(tlsState.PeerCertificates[0].Subject.CommonName),
+			)
+		}
 	}
 	return b, nil
 }
@@ -809,6 +837,7 @@ func authJwtToken(
 	_ *hba.Entry,
 	identMap *identmap.Conf,
 ) (*AuthBehaviors, error) {
+	// Initialize the jwt verifier if it hasn't been already.
 	if jwtVerifier == nil {
 		jwtVerifier = ConfigureJWTAuth(sctx, execCfg.AmbientCtx, execCfg.Settings, execCfg.NodeInfo.LogicalClusterID())
 	}
@@ -1198,49 +1227,75 @@ func AuthLDAP(
 				return err
 			}
 
-			// Audit the authZ start time.
-			ldapAuthZStartTime := timeutil.Now()
+			detailedErrors, authError := AuthorizeLDAPHelper(
+				ctx, b, ldapManager.m, execCfg, ldapUserDN, sessionUser, entry, identMap,
+			)
 
-			if ldapGroups, detailedErrors, authError := ldapManager.m.FetchLDAPGroups(
-				ctx, execCfg.Settings, ldapUserDN, sessionUser, entry, identMap,
-			); authError != nil {
-				errForLog := errors.Wrapf(authError, "LDAP authorization: error retrieving ldap groups for authorization")
+			if authError != nil {
+				errForLog := errors.Wrapf(authError, "LDAP authorization: error during role sync")
 				if detailedErrors != "" {
 					errForLog = errors.Join(errForLog, errors.Newf("%s", detailedErrors))
 				}
 				c.LogAuthFailed(ctx, eventpb.AuthFailReason_AUTHORIZATION_ERROR, errForLog)
 				return authError
-			} else {
-				// Add the total authZ time to the external auth time.
-				b.AddExternalAuthTime(timeutil.Since(ldapAuthZStartTime))
-
-				c.LogAuthInfof(ctx, redact.Sprintf("LDAP authorization sync succeeded; attempting to assign roles for LDAP groups: %s", ldapGroups))
-				// Parse and apply transformation to LDAP group DNs for roles granter.
-				sqlRoles := make([]username.SQLUsername, 0, len(ldapGroups))
-				for _, ldapGroup := range ldapGroups {
-					// Extract the CN from the LDAP group DN to use as the SQL role.
-					sqlRole, found, err := distinguishedname.ExtractCNAsSQLUsername(ldapGroup)
-					if err != nil {
-						err := errors.Wrapf(err, "LDAP authorization: error finding matching SQL role for group %s", ldapGroup.String())
-						c.LogAuthFailed(ctx, eventpb.AuthFailReason_AUTHORIZATION_ERROR, err)
-						return err
-					}
-					if !found {
-						c.LogAuthInfof(ctx, redact.Sprintf("skipping role assignment for group %s since there is no common name", ldapGroup.String()))
-						continue
-					}
-					sqlRoles = append(sqlRoles, sqlRole)
-				}
-
-				// Assign roles to the user.
-				if err := sql.EnsureUserOnlyBelongsToRoles(ctx, execCfg, sessionUser, sqlRoles); err != nil {
-					err = errors.Wrapf(err, "LDAP authorization: error assigning roles to user %s", sessionUser)
-					c.LogAuthFailed(ctx, eventpb.AuthFailReason_AUTHORIZATION_ERROR, err)
-					return err
-				}
-				return nil
 			}
+
+			return nil
 		})
 	}
 	return b, nil
+}
+
+// AuthorizeLDAPHelper synchronizes a user's roles from their LDAP group memberships.
+// It returns a generic, client-safe error and a detailed error for internal
+// logging.
+func AuthorizeLDAPHelper(
+	ctx context.Context,
+	b *AuthBehaviors,
+	ldapManager LDAPManager,
+	execCfg *sql.ExecutorConfig,
+	ldapUserDN *ldap.DN,
+	user username.SQLUsername,
+	entry *hba.Entry,
+	identMap *identmap.Conf,
+) (redact.RedactableString, error) {
+	// Audit the authZ start time.
+	ldapAuthZStartTime := timeutil.Now()
+
+	ldapGroups, detailedErrors, authError := ldapManager.FetchLDAPGroups(
+		ctx, execCfg.Settings, ldapUserDN, user, entry, identMap,
+	)
+	if authError != nil {
+		return detailedErrors, authError
+	}
+
+	if b != nil {
+		// Add the total authZ time to the external auth time.
+		b.AddExternalAuthTime(timeutil.Since(ldapAuthZStartTime))
+	}
+
+	// Parse and apply transformation to LDAP group DNs for roles granter.
+	sqlRoles := make([]username.SQLUsername, 0, len(ldapGroups))
+	for _, ldapGroup := range ldapGroups {
+		// Extract the CN from the LDAP group DN to use as the SQL role.
+		sqlRole, found, err := distinguishedname.ExtractCNAsSQLUsername(ldapGroup)
+		if err != nil {
+			detailedErr := errors.Wrapf(err, "LDAP authorization: error finding matching SQL role for group %s", ldapGroup.String())
+			clientErr := errors.New("LDAP authorization: could not map LDAP group to a valid role")
+			return redact.Sprint(detailedErr), clientErr
+		}
+		if !found {
+			log.Dev.VInfof(ctx, 1, "LDAP authorization: skipping group %s for user %s as it lacks a common name (CN)", ldapGroup.String(), user.Normalized())
+			continue
+		}
+		sqlRoles = append(sqlRoles, sqlRole)
+	}
+
+	// Assign roles to the user.
+	if err := sql.EnsureUserOnlyBelongsToRoles(ctx, execCfg, user, sqlRoles); err != nil {
+		detailedErr := errors.Wrapf(err, "LDAP authorization: error assigning roles to user %s", user)
+		clientErr := errors.New("LDAP authorization: failed to synchronize roles")
+		return redact.Sprint(detailedErr), clientErr
+	}
+	return "", nil
 }

@@ -1498,7 +1498,9 @@ func (og *operationGenerator) createTableAs(ctx context.Context, tx pgx.Tx) (*op
 				}
 				selectStatement.Exprs = append(selectStatement.Exprs, selectExpr)
 
-				if _, exists := uniqueColumnNames[columnNamesForTable[j]]; exists {
+				// Internal columns will always be aliased to unique names, so they can
+				// never generate duplicate column errors.
+				if _, exists := uniqueColumnNames[columnNamesForTable[j]]; exists && !usingInternalColumn {
 					duplicateColumns = true
 				} else {
 					uniqueColumnNames[columnNamesForTable[j]] = true
@@ -2002,13 +2004,21 @@ func (og *operationGenerator) dropConstraint(ctx context.Context, tx pgx.Tx) (*o
 
 	// DROP INDEX CASCADE is preferred for dropping unique constraints, and
 	// dropping the constraint with ALTER TABLE ... DROP CONSTRAINT is not
-	// supported by the legacy schema changer.
+	// supported by the legacy schema changer. The declarative schema changer
+	// added support for this in v26.2, so in mixed-version clusters running
+	// older versions, the error is still expected.
 	constraintIsUnique, err := og.constraintIsUnique(ctx, tx, tableName, constraintName)
 	if err != nil {
 		return nil, err
 	}
-	if constraintIsUnique && !og.useDeclarativeSchemaChanger {
-		stmt.expectedExecErrors.add(pgcode.FeatureNotSupported)
+	if constraintIsUnique {
+		uniqueDropNotSupported, err := isClusterVersionLessThan(ctx, tx, clusterversion.V26_2.Version())
+		if err != nil {
+			return nil, err
+		}
+		if !og.useDeclarativeSchemaChanger || uniqueDropNotSupported {
+			stmt.expectedExecErrors.add(pgcode.FeatureNotSupported)
+		}
 	}
 
 	constraintAddingOrDropping, err := og.constraintInAddOrDropState(ctx, tx, tableName, constraintName)

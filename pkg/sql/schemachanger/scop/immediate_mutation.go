@@ -1044,6 +1044,11 @@ type SetFunctionBody struct {
 	Body scpb.FunctionBody
 }
 
+type SetFunctionParams struct {
+	immediateMutationOp
+	Params scpb.FunctionParams
+}
+
 type SetFunctionSecurity struct {
 	immediateMutationOp
 	FunctionID descpb.ID
@@ -1065,13 +1070,15 @@ type UpdateFunctionRelationReferences struct {
 	FunctionReferences []descpb.ID
 }
 
-// UpdateTableBackReferencesInRelations updates the DependedOnBy metadata in
-// relation descriptors (e.g., tableDesc) for triggers. It handles both adding
-// and removing dependencies. The function relies on forward references being
-// set beforehand to determine whether a back-reference should be added or removed.
-type UpdateTableBackReferencesInRelations struct {
+// UpdateTriggerBackReferencesInRelations updates the DependedOnBy metadata in
+// relation descriptors for triggers. It handles both adding and removing
+// trigger-specific dependencies. The function relies on forward references
+// being set beforehand to determine whether a back-reference should be added
+// or removed.
+type UpdateTriggerBackReferencesInRelations struct {
 	immediateMutationOp
 	TableID            descpb.ID
+	TriggerID          descpb.TriggerID
 	RelationReferences []scpb.TriggerDeps_RelationReference
 }
 

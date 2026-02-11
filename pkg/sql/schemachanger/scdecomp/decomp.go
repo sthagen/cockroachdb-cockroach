@@ -960,6 +960,14 @@ func (w *walkCtx) buildTriggerRelationDependencies(
 			if dep.ID != tbl.GetID() {
 				return nil
 			}
+			// Only include backreferences for this specific trigger. Legacy backrefs
+			// created before V26_2_TriggerBackrefRepair have TriggerID=0, so we treat
+			// them as matching any trigger until the upgrade repairs them.
+			if dep.TriggerID != t.ID {
+				if w.clusterVersion.IsActive(clusterversion.V26_2_TriggerBackrefRepair) || dep.TriggerID != 0 {
+					return nil
+				}
+			}
 			usesRelations = append(usesRelations, scpb.TriggerDeps_RelationReference{
 				ID:        id,
 				IndexID:   dep.IndexID,
@@ -1122,6 +1130,12 @@ func (w *walkCtx) walkFunction(fnDesc catalog.FunctionDescriptor) {
 		FunctionID: fnDesc.GetID(),
 		Security:   catpb.FunctionSecurity{Security: fnDesc.GetSecurity()},
 	})
+	if w.clusterVersion.IsActive(clusterversion.V26_2) {
+		w.ev(scpb.Status_PUBLIC, &scpb.FunctionParams{
+			FunctionID: fnDesc.GetID(),
+			Params:     fn.Params,
+		})
+	}
 
 	fnBody := &scpb.FunctionBody{
 		FunctionID:  fnDesc.GetID(),

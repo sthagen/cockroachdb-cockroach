@@ -5,6 +5,7 @@ go_library(
     name = "scbuildstmt",
     srcs = [
         "alter_policy.go",
+        "alter_sequence.go",
         "alter_table.go",
         "alter_table_add_column.go",
         "alter_table_add_constraint.go",
@@ -83,6 +84,7 @@ go_library(
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/fetchpb",
+        "//pkg/sql/catalog/funcdesc",
         "//pkg/sql/catalog/funcinfo",
         "//pkg/sql/catalog/multiregion",
         "//pkg/sql/catalog/schemadesc",

@@ -69,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsqlwatcher"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
@@ -413,6 +414,10 @@ type sqlServerArgs struct {
 	// admissionPacerFactory is used for elastic CPU control when performing
 	// CPU intensive operations, such as CDC event encoding/decoding.
 	admissionPacerFactory admission.PacerFactory
+
+	// sqlCPUProvider is used to report CPU usage and foreground (non-elastic)
+	// SQL CPU admission control.
+	sqlCPUProvider admission.SQLCPUProvider
 
 	// rangeDescIteratorFactory is used to construct iterators over range
 	// descriptors.
@@ -860,6 +865,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		TenantCostController:     cfg.costController,
 		RangeStatsFetcher:        rangeStatsFetcher,
 		AdmissionPacerFactory:    cfg.admissionPacerFactory,
+		SQLCPUProvider:           cfg.sqlCPUProvider,
 		ExecutorConfig:           execCfg,
 		RootSQLMemoryPoolSize:    cfg.MemoryPoolSize,
 		VecIndexManager:          vecIndexManager,
@@ -1657,6 +1663,7 @@ func (s *SQLServer) preStart(
 
 	s.execCfg.GCJobNotifier.Start(ctx)
 	s.temporaryObjectCleaner.Start(ctx, stopper)
+	s.startOrphanedBulkFileCleanup(ctx, stopper)
 	s.distSQLServer.Start()
 	s.pgServer.Start(ctx, stopper)
 
@@ -1852,6 +1859,14 @@ func (s *SQLServer) startJobScheduler(ctx context.Context, knobs base.TestingKno
 		},
 		scheduledjobs.ProdJobSchedulerEnv,
 	)
+}
+
+func (s *SQLServer) startOrphanedBulkFileCleanup(ctx context.Context, stopper *stop.Stopper) {
+	_ = stopper.RunAsyncTask(ctx, "bulk-file-cleaner", func(ctx context.Context) {
+		if err := bulkutil.CleanupOrphanedFiles(ctx, s.distSQLServer.ExternalStorageFromURI, s.internalDB); err != nil {
+			log.Dev.Warningf(ctx, "bulk file cleanup encountered errors: %v", err)
+		}
+	})
 }
 
 // startCheckService verifies that the tenant has the right

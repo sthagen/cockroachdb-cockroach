@@ -348,12 +348,11 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					lcErr := &kvpb.LockConflictError{Locks: locks}
 					guard, err := m.HandleLockConflictError(ctx, prev, leaseSeq, lcErr)
 					if err != nil {
-						log.Eventf(ctx, "handled %v, returned error: %v", lcErr, err)
+						log.Eventf(ctx, "returned error: %v", err)
 						c.mu.Lock()
 						delete(c.guardsByReqName, reqName)
 						c.mu.Unlock()
 					} else {
-						log.Eventf(ctx, "handled %v, released latches", lcErr)
 						c.mu.Lock()
 						c.guardsByReqName[reqName] = guard
 						c.mu.Unlock()
@@ -444,7 +443,6 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				txnAcquire.Sequence = seqNum
 
 				mon.runSync("acquire lock", func(ctx context.Context) {
-					log.Eventf(ctx, "txn %s @ %s", txn.Short(), key)
 					acq := roachpb.MakeLockAcquisition(txnAcquire.TxnMeta, roachpb.Key(key), dur, str, nil)
 					m.OnLockAcquired(ctx, &acq)
 				})
@@ -699,9 +697,11 @@ func newCluster() *cluster {
 }
 
 func newClusterWithSettings(st *clustersettings.Settings) *cluster {
-	// Set the latch manager's long latch threshold to infinity to disable
-	// logging, which could cause a test to erroneously fail.
+	// Set the latch manager's long latch hold and slow latch request thresholds
+	// to infinity to disable logging, which could cause a test to erroneously
+	// fail when wall-clock time exceeds the threshold.
 	spanlatch.LongLatchHoldThreshold.Override(context.Background(), &st.SV, math.MaxInt64)
+	spanlatch.SlowLatchRequestThreshold.Override(context.Background(), &st.SV, math.MaxInt64)
 	concurrency.UnreplicatedLockReliabilitySplit.Override(context.Background(), &st.SV, true)
 	concurrency.UnreplicatedLockReliabilityMerge.Override(context.Background(), &st.SV, true)
 	concurrency.UnreplicatedLockReliabilityLeaseTransfer.Override(context.Background(), &st.SV, true)

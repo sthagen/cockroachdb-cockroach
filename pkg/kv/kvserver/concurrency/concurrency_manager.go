@@ -177,6 +177,16 @@ var VirtualIntentResolution = settings.RegisterBoolSetting(
 	}),
 )
 
+// PushUsingCachedClockObservation controls whether we allow intents from
+// PENDING transactions to be resolved by requests with uncertainty intervals by
+// using a cached clock observation from the original pusher.
+var PushUsingCachedClockObservation = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.concurrency.push_pending_from_cache.enabled",
+	"whether intents from pending transactions can be resolved using cached clock observations",
+	true,
+)
+
 // MaxLockFlushSize is the maximum number of lock bytes that we will attempt to
 // flush during merge and transfer operations.
 func GetMaxLockFlushSize(sv *settings.Values) int64 {
@@ -964,6 +974,15 @@ func (g *Guard) IsKeyLockedByConflictingTxn(
 	ctx context.Context, key roachpb.Key, strength lock.Strength,
 ) (bool, *enginepb.TxnMeta, error) {
 	return g.ltg.IsKeyLockedByConflictingTxn(ctx, key, strength)
+}
+
+// IntentsToResolveVirtually delegates listing the locks to be resolved to the
+// lock table guard.
+func (g *Guard) IntentsToResolveVirtually() []roachpb.LockUpdate {
+	if g.ltg != nil {
+		return g.ltg.IntentsToResolveVirtually()
+	}
+	return nil
 }
 
 func (g *Guard) moveLatchGuard() latchGuard {

@@ -404,9 +404,13 @@ type lockTableGuardImpl struct {
 	ts         hlc.Timestamp
 	spans      *lockspanset.LockSpanSet
 	waitPolicy lock.WaitPolicy
+
 	// virtuallyResolveIntents represents the state of VirtuallyDeferrerIntents at
 	// the outset of this request.
 	virtuallyResolveIntents bool
+	// pushUsingCachedClockObservations represents the state of the
+	// PushUsingCachedClockObservation cluster setting at the this request.
+	pushUsingCachedClockObs bool
 	maxWaitQueueLength      int
 
 	// Snapshot of the tree for which this request has some spans. Note that
@@ -579,8 +583,22 @@ func (g *lockTableGuardImpl) ShouldWait() bool {
 	return g.mu.startWait || len(g.toResolve) > 0
 }
 
+// ResolveBeforeScanning implements the lockTableGuard interface. The locks to
+// resolve are returned only if virtualized resolution is disabled.
 func (g *lockTableGuardImpl) ResolveBeforeScanning() []roachpb.LockUpdate {
-	return g.toResolve
+	if !g.virtuallyResolveIntents {
+		return g.toResolve
+	}
+	return nil
+}
+
+// IntentsToResolveVirtually implements the lockTableGuard interface. The locks
+// to resolve are returned only if virtualized resolution is enabled.
+func (g *lockTableGuardImpl) IntentsToResolveVirtually() []roachpb.LockUpdate {
+	if g.virtuallyResolveIntents {
+		return g.toResolve
+	}
+	return nil
 }
 
 func (g *lockTableGuardImpl) NewStateChan() chan struct{} {
@@ -877,7 +895,11 @@ func (g *lockTableGuardImpl) pendingPushedTransactionCanBeResolved(
 	// uncertainty interval, or we need to be sure that the request was concurrent
 	// with our transaction so that rewritten intent can be ignored even if it is
 	// inside our uncertainty interval.
-	return !g.hasUncertaintyInterval() || g.hasObservationAtOrBefore(pushed.ClockWhilePending)
+	if !g.hasUncertaintyInterval() {
+		return true
+	}
+
+	return g.pushUsingCachedClockObs && g.hasObservationAtOrBefore(pushed.ClockWhilePending)
 }
 
 func (g *lockTableGuardImpl) isSameTxn(txn *enginepb.TxnMeta) bool {
@@ -4330,6 +4352,7 @@ func (t *lockTableImpl) newGuardForReq(req Request) *lockTableGuardImpl {
 	g.maxWaitQueueLength = req.MaxLockWaitQueueLength
 	g.str = lock.MaxStrength
 	g.index = -1
+	g.pushUsingCachedClockObs = PushUsingCachedClockObservation.Get(&g.lt.settings.SV)
 	g.virtuallyResolveIntents = VirtualIntentResolution.Get(&g.lt.settings.SV) && req.canVirtuallyResolve()
 	return g
 }

@@ -226,6 +226,11 @@ top-level error is just "command failed" or similarly uninformative,
 dig into the artifact logs to find the actual underlying failure
 from the command's output.>
 
+<When referencing file:line(s) in code, make it a link specific to this repo and
+SHA. Example:
+[server.go:251](https://github.com/cockroachdb/cockroach/blob/<sha>/pkg/server/server.go#L251).
+For multi-line sections, e.g. [server.go:251-300], use suffix like #L251-L300>
+
 ### Analysis
 
 <Your hypotheses about the failure, ordered by likelihood. For each:

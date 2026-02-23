@@ -3,22 +3,20 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-package pgcryptoccl_test
+package pgcrypto_test
 
 import (
 	"context"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
 )
 
-func TestCipherFunctionEnterpriseLicense(t *testing.T) {
+func TestCipherFunctions(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -36,17 +34,9 @@ func TestCipherFunctionEnterpriseLicense(t *testing.T) {
 		"encrypt_iv": `SELECT encrypt_iv('abc', 'key', '123', 'aes')`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			testutils.RunTrueAndFalse(t, "enterprise_license", func(t *testing.T, hasLicense bool) {
-				if hasLicense {
-					defer ccl.TestingEnableEnterprise()()
-				} else {
-					defer ccl.TestingDisableEnterprise()()
-				}
-
-				rows, err := db.QueryContext(ctx, query)
-				require.NoError(t, err)
-				require.NoError(t, rows.Close())
-			})
+			rows, err := db.QueryContext(ctx, query)
+			require.NoError(t, err)
+			require.NoError(t, rows.Close())
 		})
 	}
 }

@@ -599,7 +599,7 @@ func (r *Replica) evaluate1PC(
 	if !etArg.Commit {
 		clonedTxn.Status = roachpb.ABORTED
 		batch.Close()
-		batch = r.store.TODOEngine().NewBatch()
+		batch = r.store.StateEngine().NewBatch()
 		ms.Reset()
 	} else {
 		// Run commit trigger manually.

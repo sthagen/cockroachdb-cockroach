@@ -3,7 +3,7 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-package pgcryptocipherccl
+package pgcryptocipher
 
 // Note: The encrypted values were manually checked against the results of
 // the equivalent function on Postgres 15.3.

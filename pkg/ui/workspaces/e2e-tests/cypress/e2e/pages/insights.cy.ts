@@ -65,7 +65,7 @@ describe("insights page", () => {
       "not.contain.text",
       "Full Scan",
     );
-    cy.contains("Columns").click();
+    cy.contains("button", "Columns").should("be.visible").click();
     cy.get('[class*="dropdown-area"]')
       .should("exist")
       .within(() => {

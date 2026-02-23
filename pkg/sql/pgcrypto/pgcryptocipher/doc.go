@@ -3,6 +3,6 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-// Package pgcryptocipherccl contains the implementation of pgcrypto
+// Package pgcryptocipher contains the implementation of pgcrypto
 // cipher functions.
-package pgcryptocipherccl
+package pgcryptocipher

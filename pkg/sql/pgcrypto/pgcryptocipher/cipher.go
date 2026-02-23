@@ -3,7 +3,7 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-package pgcryptocipherccl
+package pgcryptocipher
 
 import (
 	"crypto/aes"
@@ -17,7 +17,7 @@ import (
 var (
 	// ErrInvalidDataLength reports an attempt to either Encrypt or Decrypt data
 	// of invalid length.
-	ErrInvalidDataLength = pgerror.New(pgcode.InvalidParameterValue, "pgcryptocipherccl: invalid data length")
+	ErrInvalidDataLength = pgerror.New(pgcode.InvalidParameterValue, "pgcryptocipher: invalid data length")
 )
 
 // Encrypt returns the ciphertext obtained by running the encryption

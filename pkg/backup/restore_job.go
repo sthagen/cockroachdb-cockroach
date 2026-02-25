@@ -489,7 +489,7 @@ func restore(
 	defer introducedSpanFrontier.Release()
 
 	targetSize := targetRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV)
-	if details.OnlineImpl() {
+	if details.OnlineImpl() && !onlineRestoreUseDistFlow.Get(&execCtx.ExecCfg().Settings.SV) {
 		targetSize = targetOnlineRestoreSpanSize.Get(&execCtx.ExecCfg().Settings.SV)
 	}
 	maxFileCount := maxFileCount.Get(&execCtx.ExecCfg().Settings.SV)

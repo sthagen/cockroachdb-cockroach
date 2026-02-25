@@ -42,7 +42,6 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/amazon"
 	"github.com/cockroachdb/cockroach/pkg/cloud/azure"
@@ -55,7 +54,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	_ "github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -84,6 +82,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/fingerprintutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
@@ -4197,9 +4196,9 @@ func checkBackupStatsEncrypted(t *testing.T, rawDir string) {
 				return err
 			}
 			if strings.Contains(fName, "foo/cleartext") {
-				assert.False(t, storageccl.AppearsEncrypted(statsBytes))
+				assert.False(t, storage.AppearsEncrypted(statsBytes))
 			} else {
-				assert.True(t, storageccl.AppearsEncrypted(statsBytes))
+				assert.True(t, storage.AppearsEncrypted(statsBytes))
 			}
 		}
 		return nil
@@ -8337,7 +8336,7 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 	defer dirCleanupFn()
 
 	st := cluster.MakeTestingClusterSettings()
-	storage, err := cloud.ExternalStorageFromURI(ctx,
+	extStore, err := cloud.ExternalStorageFromURI(ctx,
 		"nodelocal://1/test",
 		base.ExternalIODirConfig{},
 		st,
@@ -8357,7 +8356,7 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 	mem := m.MakeBoundAccount()
 	encOpts := &jobspb.BackupEncryptionOptions{
 		Mode: jobspb.EncryptionMode_Passphrase,
-		Key:  storageccl.GenerateKey([]byte("passphrase"), []byte("sodium")),
+		Key:  storage.GenerateKey([]byte("passphrase"), []byte("sodium")),
 	}
 	desc := &backuppb.BackupManifest{}
 	magic := 5500
@@ -8370,9 +8369,9 @@ func TestReadBackupManifestMemoryMonitoring(t *testing.T) {
 		db:               nil,
 		user:             username.RootUserName(),
 	}
-	require.NoError(t, backupinfo.WriteBackupManifest(ctx, storage, "testmanifest", encOpts,
+	require.NoError(t, backupinfo.WriteBackupManifest(ctx, extStore, "testmanifest", encOpts,
 		&kmsEnv, desc))
-	_, sz, err := backupinfo.ReadBackupManifest(ctx, &mem, storage, "testmanifest",
+	_, sz, err := backupinfo.ReadBackupManifest(ctx, &mem, extStore, "testmanifest",
 		encOpts, &kmsEnv)
 	require.NoError(t, err)
 	mem.Shrink(ctx, sz)
@@ -11280,6 +11279,7 @@ func TestStrictLocalityAwareBackup(t *testing.T) {
 func TestStrictPartitionedBackup(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 163998)
 	skip.UnderDuress(t, "takes too long under duress")
 
 	knobs := base.TestingKnobs{

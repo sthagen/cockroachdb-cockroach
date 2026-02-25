@@ -1342,7 +1342,7 @@ func validateSink(
 
 	var nilOracle timestampLowerBoundOracle
 	canarySink, err := getAndDialSink(ctx, &p.ExecCfg().DistSQLSrv.ServerConfig, details,
-		nilOracle, p.User(), jobID, sli, targets)
+		nilOracle, p.User(), jobID, sli, targets, true /* initialValidation */)
 	if err != nil {
 		return err
 	}

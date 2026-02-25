@@ -3,8 +3,8 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-// Package followerreads implements and injects the functionality needed to
-// expose follower reads to clients.
+// Package followerreads implements the functionality needed to expose follower
+// reads to clients.
 package followerreads
 
 import (
@@ -15,30 +15,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
-)
-
-// ClosedTimestampPropagationSlack is used by follower_read_timestamp() as a
-// measure of how long closed timestamp updates are supposed to take from the
-// leaseholder to the followers.
-var ClosedTimestampPropagationSlack = settings.RegisterDurationSetting(
-	settings.SystemVisible,
-	"kv.closed_timestamp.propagation_slack",
-	"a conservative estimate of the amount of time expect for closed timestamps to "+
-		"propagate from a leaseholder to followers. This is taken into account by "+
-		"follower_read_timestamp().",
-	time.Second,
 )
 
 // getFollowerReadLag returns the (negative) offset duration from hlc.Now()
@@ -48,7 +32,7 @@ var ClosedTimestampPropagationSlack = settings.RegisterDurationSetting(
 func getFollowerReadLag(st *cluster.Settings) time.Duration {
 	targetDuration := closedts.TargetDuration.Get(&st.SV)
 	sideTransportInterval := closedts.SideTransportCloseInterval.Get(&st.SV)
-	slack := ClosedTimestampPropagationSlack.Get(&st.SV)
+	slack := closedts.ClosedTimestampPropagationSlack.Get(&st.SV)
 	// Zero targetDuration means follower reads are disabled.
 	if targetDuration == 0 {
 		// Returning an infinitely large negative value would push safe
@@ -68,13 +52,17 @@ func getGlobalReadsLead(clock *hlc.Clock) time.Duration {
 }
 
 func checkFollowerReadsEnabled(ctx context.Context, st *cluster.Settings) bool {
-	return kvserver.FollowerReadsEnabled.Get(&st.SV)
+	return closedts.FollowerReadsEnabled.Get(&st.SV)
 }
 
-func evalFollowerReadOffset(st *cluster.Settings) (time.Duration, error) {
-	// NOTE: we assume that at least some of the ranges being queried use a
-	// LAG_BY_CLUSTER_SETTING closed timestamp policy. Otherwise, there would
-	// be no reason to use AS OF SYSTEM TIME follower_read_timestamp().
+// EvalFollowerReadOffset returns the (negative) time offset from now that is
+// likely to be safe for follower reads. It is used by the
+// follower_read_timestamp() builtin.
+//
+// NOTE: we assume that at least some of the ranges being queried use a
+// LAG_BY_CLUSTER_SETTING closed timestamp policy. Otherwise, there would be no
+// reason to use AS OF SYSTEM TIME follower_read_timestamp().
+func EvalFollowerReadOffset(st *cluster.Settings) (time.Duration, error) {
 	return getFollowerReadLag(st), nil
 }
 
@@ -102,16 +90,16 @@ func closedTimestampLikelySufficient(
 	return requiredFrontierTS.LessEq(expectedClosedTS)
 }
 
-// canSendToFollower implements the logic for checking whether a batch request
+// CanSendToFollower implements the logic for checking whether a batch request
 // may be sent to a follower.
-func canSendToFollower(
+func CanSendToFollower(
 	ctx context.Context,
 	st *cluster.Settings,
 	clock *hlc.Clock,
 	ctPolicy roachpb.RangeClosedTimestampPolicy,
 	ba *kvpb.BatchRequest,
 ) bool {
-	result := kvserver.BatchCanBeEvaluatedOnFollower(ctx, ba) &&
+	result := kvpb.BatchCanBeEvaluatedOnFollower(ctx, ba) &&
 		closedTimestampLikelySufficient(ctx, st, clock, ctPolicy, ba.RequiredFrontier()) &&
 		// NOTE: this call can be expensive, so perform it last. See #62447.
 		checkFollowerReadsEnabled(ctx, st)
@@ -174,9 +162,9 @@ func (o *followerReadOracle) useClosestOracle(
 		checkFollowerReadsEnabled(ctx, o.st)
 }
 
-// followerReadOraclePolicy is a leaseholder choosing policy that detects
+// FollowerReadOraclePolicy is a leaseholder choosing policy that detects
 // whether a query can be used with a follower read.
-var followerReadOraclePolicy = replicaoracle.RegisterPolicy(newFollowerReadOracle)
+var FollowerReadOraclePolicy = replicaoracle.RegisterPolicy(newFollowerReadOracle)
 
 type bulkOracle struct {
 	cfg        replicaoracle.Config
@@ -299,10 +287,4 @@ func (r bulkOracle) ChoosePreferredReplica(
 	}
 
 	return replicas[randutil.FastUint32()%uint32(len(replicas))].ReplicaDescriptor, true, nil
-}
-
-func init() {
-	sql.ReplicaOraclePolicy = followerReadOraclePolicy
-	builtins.EvalFollowerReadOffset = evalFollowerReadOffset
-	kvcoord.CanSendToFollower = canSendToFollower
 }

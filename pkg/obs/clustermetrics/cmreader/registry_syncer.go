@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/obs/clustermetrics/cmwatcher"
+	clustermetricutils "github.com/cockroachdb/cockroach/pkg/obs/clustermetrics/utils"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
@@ -26,6 +27,7 @@ type registrySyncer struct {
 	tableWatcher *cmwatcher.Watcher
 	registry     *registry
 	stopper      *stop.Stopper
+	knobs        *clustermetricutils.TestingKnobs
 	mu           struct {
 		syncutil.Mutex
 		trackedMetrics map[string]metric.Iterable           // name → metric
@@ -34,11 +36,17 @@ type registrySyncer struct {
 }
 
 func newRegistrySyncer(
-	reg *registry, codec keys.SQLCodec, clock *hlc.Clock, f *rangefeed.Factory, stopper *stop.Stopper,
+	reg *registry,
+	codec keys.SQLCodec,
+	clock *hlc.Clock,
+	f *rangefeed.Factory,
+	stopper *stop.Stopper,
+	knobs *clustermetricutils.TestingKnobs,
 ) *registrySyncer {
 	s := &registrySyncer{
 		registry: reg,
 		stopper:  stopper,
+		knobs:    knobs,
 	}
 	s.mu.trackedMetrics = make(map[string]metric.Iterable)
 	s.mu.trackedRows = make(map[int64]cmwatcher.ClusterMetricRow)
@@ -132,6 +140,9 @@ func (s *registrySyncer) start(
 	s.stopper.AddCloser(stop.CloserFn(func() {
 		s.stop()
 	}))
+	if s.knobs != nil && s.knobs.OnRegistrySyncerStart != nil {
+		s.knobs.OnRegistrySyncerStart()
+	}
 	return nil
 }
 
@@ -175,23 +186,40 @@ func (s *registrySyncer) reloadAllMetrics(
 	}
 }
 
-// Start initializes the cluster metrics registrySyncer, which watches the
-// system.cluster_metrics table via a rangefeed and syncs rows into
-// the server's cluster metric registry.
-func Start(ctx context.Context, config *sql.ExecutorConfig) error {
+type Syncer struct {
+	registrySyncer *registrySyncer
+	tableResolver  catalog.SystemTableIDResolver
+	started        bool
+}
+
+func NewSyncer(ctx context.Context, config *sql.ExecutorConfig) (*Syncer, error) {
 	rr := config.MetricsRecorder.ClusterMetricRegistry(config.Codec.TenantID)
 	if reg, ok := rr.(*registry); ok {
-		return newRegistrySyncer(
+		rs := newRegistrySyncer(
 			reg,
 			config.Codec,
 			config.Clock,
 			config.RangeFeedFactory,
-			config.Stopper).start(ctx, config.SystemTableIDResolver)
+			config.Stopper,
+			config.ClusterMetricsKnobs)
+		return &Syncer{registrySyncer: rs, tableResolver: config.SystemTableIDResolver}, nil
 	}
 
 	if buildutil.CrdbTestBuild {
 		panic("expected cmreader.registry type")
 	} else {
-		return errors.New("expected cmreader.registry type")
+		return nil, errors.New("expected cmreader.registry type")
 	}
+}
+
+func (s *Syncer) Start(ctx context.Context) error {
+	if err := s.registrySyncer.start(ctx, s.tableResolver); err != nil {
+		return err
+	}
+	s.started = true
+	return nil
+}
+
+func (s *Syncer) Started() bool {
+	return s.started
 }

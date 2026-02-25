@@ -4,6 +4,7 @@ go_library(
     name = "admission",
     srcs = [
         "admission.go",
+        "cpu_time_token_burst.go",
         "cpu_time_token_estimation.go",
         "cpu_time_token_filler.go",
         "cpu_time_token_grant_coordinator.go",
@@ -42,6 +43,7 @@ go_library(
         "//pkg/util/admission/admissionpb",
         "//pkg/util/buildutil",
         "//pkg/util/ctxutil",
+        "//pkg/util/envutil",
         "//pkg/util/goschedstats",
         "//pkg/util/grunning",
         "//pkg/util/humanizeutil",

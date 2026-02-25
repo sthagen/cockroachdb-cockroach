@@ -482,8 +482,12 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 		default:
 		}
 
-		// Reset task tracking for this iteration.
+		// Reset task tracking for this iteration and set progress so that we
+		// persist it.
 		progress.MergeIterationCompletedTasks = nil
+		if err := tracker.SetBackfillProgress(ctx, *progress); err != nil {
+			return err
+		}
 
 		genOutputURIAndRecordPrefix := func(instanceID base.SQLInstanceID) (string, error) {
 			// Use nodelocal for temporary storage of merged SSTs. These SSTs are
@@ -539,6 +543,8 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			return nil
 		}
 
+		ib.cleanupRedoIterationSSTs(ctx, job.ID(), iteration, maxIterations, progress.SSTStoragePrefixes)
+
 		merged, err := invokeBulkMerge(
 			ctx,
 			jobExecCtx,
@@ -550,6 +556,7 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			writeTS,
 			enforceUniqueness,
 			onProgress,
+			execinfrapb.BulkMergeSpec_BACKFILL_MONITOR,
 		)
 		if err != nil {
 			return err
@@ -614,4 +621,38 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 	}
 
 	return nil
+}
+
+// cleanupRedoIterationSSTs removes leftover output SSTs from a previous attempt
+// of a non-final merge iteration. When an iteration is interrupted (e.g., job
+// paused/crashed) and restarted from scratch, the new attempt writes to the
+// same output directory. This cleanup prevents orphaned files from the previous
+// attempt from wasting storage.
+//
+// Cleanup is best-effort: errors are logged as warnings rather than failing the
+// job, consistent with the existing cleanup pattern in backfiller/cleanup.go.
+func (ib *IndexBackfillPlanner) cleanupRedoIterationSSTs(
+	ctx context.Context,
+	jobID jobspb.JobID,
+	iteration int,
+	maxIterations int,
+	storagePrefixes []string,
+) {
+	if iteration >= maxIterations || len(storagePrefixes) == 0 {
+		return
+	}
+	outputSubdir := bulkutil.NewDistMergePaths(jobID).MergeSubdir(iteration)
+	cleaner := bulkutil.NewBulkJobCleaner(
+		ib.execCfg.DistSQLSrv.ExternalStorageFromURI, username.NodeUserName(),
+	)
+	defer func() {
+		if err := cleaner.Close(); err != nil {
+			log.Dev.Warningf(ctx, "error closing cleaner after SST cleanup: %v", err)
+		}
+	}()
+	if err := cleaner.CleanupJobSubdirectory(
+		ctx, jobID, storagePrefixes, outputSubdir,
+	); err != nil {
+		log.Dev.Warningf(ctx, "failed to clean up SSTs in %s before redo: %v", outputSubdir, err)
+	}
 }

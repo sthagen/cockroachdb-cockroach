@@ -9,9 +9,9 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/errors"
 )
 
@@ -71,14 +71,12 @@ func (c *ExternalStorageMux) getStore(
 // StoreFile splits a URI into its storage prefix and file path, caching the
 // storage instance for reuse. For example, "nodelocal://1/import/123/file.sst"
 // is split into storage "nodelocal://1" and path "/import/123/file.sst".
-func (c *ExternalStorageMux) StoreFile(
-	ctx context.Context, uri string,
-) (storageccl.StoreFile, error) {
+func (c *ExternalStorageMux) StoreFile(ctx context.Context, uri string) (storage.StoreFile, error) {
 	store, filepath, err := c.getStore(ctx, uri)
 	if err != nil {
-		return storageccl.StoreFile{}, err
+		return storage.StoreFile{}, err
 	}
-	return storageccl.StoreFile{
+	return storage.StoreFile{
 		Store:    store,
 		FilePath: filepath,
 	}, nil

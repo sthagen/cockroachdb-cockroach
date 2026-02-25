@@ -30,11 +30,16 @@ import (
 
 func registerInspectThoughput(r registry.Registry) {
 	// Short run: 12 nodes × 8 CPUs, 500M rows, 1 index check, ~1 hour (in v25.4)
-	r.Add(makeInspectThroughputTest(r, 12, 8, 500_000_000, 3*time.Hour, 1))
+	r.Add(makeInspectThroughputTest(r, 12, 8, 500_000_000, 3*time.Hour, 1, true))
 
 	// Long run: 12 nodes × 8 CPUs, 1B rows, 2 index checks (runs INSPECT twice: 1 index, then 2 indexes), ~5 hours (in v25.4)
 	const indexesForLongRun = 2
-	r.Add(makeInspectThroughputTest(r, 12, 8, 1_000_000_000, 11*time.Hour, indexesForLongRun))
+	r.Add(makeInspectThroughputTest(r, 12, 8, 1_000_000_000, 11*time.Hour, indexesForLongRun, true))
+
+	// Variants with admission control disabled, allowing INSPECT throughput
+	// to be measured independently of elastic CPU control.
+	r.Add(makeInspectThroughputTest(r, 12, 8, 500_000_000, 3*time.Hour, 1, false))
+	r.Add(makeInspectThroughputTest(r, 12, 8, 1_000_000_000, 11*time.Hour, indexesForLongRun, false))
 }
 
 // initInspectHistograms creates a histogram registry with multiple named metrics.
@@ -61,7 +66,11 @@ func initInspectHistograms(
 }
 
 func makeInspectThroughputTest(
-	r registry.Registry, numNodes, numCPUs, numRows int, length time.Duration, numChecks int,
+	r registry.Registry,
+	numNodes, numCPUs, numRows int,
+	length time.Duration,
+	numChecks int,
+	admissionControl bool,
 ) registry.TestSpec {
 	// Define index names that will be created.
 	indexNames := []string{
@@ -78,8 +87,13 @@ func makeInspectThroughputTest(
 		numChecks = 1
 	}
 
+	name := fmt.Sprintf("inspect/throughput/bulkingest/nodes=%d/cpu=%d/rows=%d/checks=%d", numNodes, numCPUs, numRows, numChecks)
+	if !admissionControl {
+		name += "/elastic=false"
+	}
+
 	return registry.TestSpec{
-		Name:                fmt.Sprintf("inspect/throughput/bulkingest/nodes=%d/cpu=%d/rows=%d/checks=%d", numNodes, numCPUs, numRows, numChecks),
+		Name:                name,
 		Owner:               registry.OwnerSQLFoundations,
 		Benchmark:           true,
 		Cluster:             r.MakeClusterSpec(numNodes, spec.WorkloadNode(), spec.CPU(numCPUs)),
@@ -141,6 +155,13 @@ func makeInspectThroughputTest(
 			defer db.Close()
 
 			disableRowCountValidation(t, db)
+
+			if !admissionControl {
+				t.L().Printf("Disabling admission control for INSPECT")
+				if _, err := db.ExecContext(ctx, "SET CLUSTER SETTING sql.inspect.admission_control.enabled = false"); err != nil {
+					t.Fatal(err)
+				}
+			}
 
 			// Import bulkingest data without the default index. We'll create custom
 			// indexes based on the checks parameter.

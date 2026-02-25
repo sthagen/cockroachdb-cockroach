@@ -3,7 +3,7 @@
 // Use of this software is governed by the CockroachDB Software License
 // included in the /LICENSE file.
 
-package followerreads
+package followerreads_test
 
 import (
 	"context"
@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -58,7 +59,7 @@ const (
 func TestEvalFollowerReadOffset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	st := cluster.MakeTestingClusterSettings()
-	if offset, err := evalFollowerReadOffset(st); err != nil {
+	if offset, err := followerreads.EvalFollowerReadOffset(st); err != nil {
 		t.Fatal(err)
 	} else if offset != expectedFollowerReadOffset {
 		t.Fatalf("expected %v, got %v", expectedFollowerReadOffset, offset)
@@ -71,7 +72,7 @@ func TestZeroDurationDisablesFollowerReadOffset(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 	closedts.TargetDuration.Override(ctx, &st.SV, 0)
-	if offset, err := evalFollowerReadOffset(st); err != nil {
+	if offset, err := followerreads.EvalFollowerReadOffset(st); err != nil {
 		t.Fatal(err)
 	} else if offset != math.MinInt64 {
 		t.Fatalf("expected %v, got %v", math.MinInt64, offset)
@@ -457,12 +458,12 @@ func TestCanSendToFollower(t *testing.T) {
 	for _, c := range testCases {
 		t.Run(c.name, func(t *testing.T) {
 			st := cluster.MakeTestingClusterSettings()
-			kvserver.FollowerReadsEnabled.Override(ctx, &st.SV, !c.disabledFollowerReads)
+			closedts.FollowerReadsEnabled.Override(ctx, &st.SV, !c.disabledFollowerReads)
 			if c.zeroTargetDuration {
 				closedts.TargetDuration.Override(ctx, &st.SV, 0)
 			}
 
-			can := canSendToFollower(ctx, st, clock, c.ctPolicy, c.ba)
+			can := followerreads.CanSendToFollower(ctx, st, clock, c.ctPolicy, c.ba)
 			require.Equal(t, c.exp, can)
 		})
 	}
@@ -653,9 +654,9 @@ func TestOracle(t *testing.T) {
 	for _, c := range testCases {
 		t.Run(c.name, func(t *testing.T) {
 			st := cluster.MakeTestingClusterSettings()
-			kvserver.FollowerReadsEnabled.Override(ctx, &st.SV, !c.disabledFollowerReads)
+			closedts.FollowerReadsEnabled.Override(ctx, &st.SV, !c.disabledFollowerReads)
 
-			o := replicaoracle.NewOracle(followerReadOraclePolicy, cfg(st))
+			o := replicaoracle.NewOracle(followerreads.FollowerReadOraclePolicy, cfg(st))
 
 			res, _, err := o.ChoosePreferredReplica(ctx, c.txn, desc, c.lh, c.ctPolicy, replicaoracle.QueryState{})
 			require.NoError(t, err)
@@ -666,14 +667,14 @@ func TestOracle(t *testing.T) {
 	t.Run("bulk", func(t *testing.T) {
 		st := cluster.MakeTestingClusterSettings()
 		stNoFollowers := cluster.MakeTestingClusterSettings()
-		kvserver.FollowerReadsEnabled.Override(ctx, &stNoFollowers.SV, false)
+		closedts.FollowerReadsEnabled.Override(ctx, &stNoFollowers.SV, false)
 
 		ctx := context.Background()
 		var noTxn *kv.Txn
 		var noLeaseholder *roachpb.ReplicaDescriptor
 		var noCTPolicy roachpb.RangeClosedTimestampPolicy
 		var noQueryState replicaoracle.QueryState
-		sk := StreakConfig{Min: 10, SmallPlanMin: 3, SmallPlanThreshold: 3, MaxSkew: 0.95}
+		sk := followerreads.StreakConfig{Min: 10, SmallPlanMin: 3, SmallPlanThreshold: 3, MaxSkew: 0.95}
 		// intMap(k1, v1, k2, v2, ...) is a FastIntMaps constructor shorthand.
 		intMap := func(pairs ...int) util.FastIntMap {
 			f := util.FastIntMap{}
@@ -684,35 +685,35 @@ func TestOracle(t *testing.T) {
 		}
 
 		t.Run("no-followers", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(stNoFollowers), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(stNoFollowers), sk)
 			leaseholder := &roachpb.ReplicaDescriptor{NodeID: 99}
 			picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, leaseholder, noCTPolicy, noQueryState)
 			require.NoError(t, err)
 			require.Equal(t, leaseholder.NodeID, picked.NodeID, "no follower reads means we pick the leaseholder")
 		})
 		t.Run("no-filter", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(st), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(st), sk)
 			picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, noLeaseholder, noCTPolicy, noQueryState)
 			require.NoError(t, err)
 			require.NotNil(t, picked, "no filter picks some node but could be any node")
 		})
 		t.Run("filter", func(t *testing.T) {
 			localites := []roachpb.Locality{region("z"), region("b"), region("y")}
-			br, err := NewLocalityFilteringBulkOracle(cfg(st), localites)
+			br, err := followerreads.NewLocalityFilteringBulkOracle(cfg(st), localites)
 			require.NoError(t, err)
 			picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, noLeaseholder, noCTPolicy, noQueryState)
 			require.NoError(t, err)
 			require.Equal(t, roachpb.NodeID(2), picked.NodeID, "filter means we pick the node that matches the filter")
 		})
 		t.Run("filter-no-match", func(t *testing.T) {
-			br, err := NewLocalityFilteringBulkOracle(cfg(st), sql.SingleLocalityFilter(region("z")))
+			br, err := followerreads.NewLocalityFilteringBulkOracle(cfg(st), sql.SingleLocalityFilter(region("z")))
 			require.NoError(t, err)
 			picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, noLeaseholder, noCTPolicy, noQueryState)
 			require.NoError(t, err)
 			require.NotNil(t, picked, "no match still picks some non-zero node")
 		})
 		t.Run("streak-short", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(st), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(st), sk)
 			for _, r := range replicas { // Check for each to show it isn't random.
 				picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, noLeaseholder, noCTPolicy, replicaoracle.QueryState{
 					NodeStreak:     1,
@@ -723,7 +724,7 @@ func TestOracle(t *testing.T) {
 			}
 		})
 		t.Run("streak-medium", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(st), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(st), sk)
 			for _, r := range replicas { // Check for each to show it isn't random.
 				picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, noLeaseholder, noCTPolicy, replicaoracle.QueryState{
 					NodeStreak:     9,
@@ -735,7 +736,7 @@ func TestOracle(t *testing.T) {
 			}
 		})
 		t.Run("streak-long-even", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(st), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(st), sk)
 			for _, r := range replicas { // Check for each to show it isn't random.
 				picked, _, err := br.ChoosePreferredReplica(ctx, noTxn, desc, noLeaseholder, noCTPolicy, replicaoracle.QueryState{
 					NodeStreak:     50,
@@ -747,7 +748,7 @@ func TestOracle(t *testing.T) {
 			}
 		})
 		t.Run("streak-long-skewed-to-other", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(st), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(st), sk)
 			for i := 0; i < 10; i++ { // Prove it isn't just randomly picking n2.
 				qs := replicaoracle.QueryState{
 					NodeStreak:     50,
@@ -760,7 +761,7 @@ func TestOracle(t *testing.T) {
 			}
 		})
 		t.Run("streak-long-skewed-randomizes", func(t *testing.T) {
-			br := NewStreakBulkOracle(cfg(st), sk)
+			br := followerreads.NewStreakBulkOracle(cfg(st), sk)
 			qs := replicaoracle.QueryState{
 				NodeStreak:     50,
 				RangesPerNode:  intMap(1, 10, 2, 10, 3, 1005),
@@ -1270,7 +1271,7 @@ func TestDrainStopsFollowerReads(t *testing.T) {
 	closeTime := 10 * time.Millisecond
 	closedts.TargetDuration.Override(ctx, sv, closeTime)
 	closedts.SideTransportCloseInterval.Override(ctx, sv, closeTime)
-	ClosedTimestampPropagationSlack.Override(ctx, sv, closeTime)
+	closedts.ClosedTimestampPropagationSlack.Override(ctx, sv, closeTime)
 
 	// Configure localities so n3 and n4 are in the same locality.
 	// SQL runs on n4 (west).

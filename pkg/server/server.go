@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/keyvissubscriber"
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer/spanstatskvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
@@ -490,6 +491,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		FirstRangeProvider: g,
 		Locality:           cfg.Locality,
 		TestingKnobs:       clientTestingKnobs,
+		CanSendToFollower:  followerreads.CanSendToFollower,
 		HealthFunc: func(id roachpb.NodeID) bool {
 			return livenessCache.GetNodeVitality(id).IsLive(livenesspb.DistSender)
 		},

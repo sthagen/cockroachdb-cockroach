@@ -10,7 +10,6 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
@@ -28,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/taskset"
 	"github.com/cockroachdb/errors"
@@ -169,7 +169,7 @@ func (m *bulkMergeProcessor) handleRow(row rowenc.EncDatumRow) (rowenc.EncDatumR
 
 	if knobs, ok := m.flowCtx.Cfg.TestingKnobs.BulkMergeTestingKnobs.(*TestingKnobs); ok {
 		if knobs.RunBeforeMergeTask != nil {
-			if err := knobs.RunBeforeMergeTask(m.Ctx(), m.flowCtx.ID, input.taskID); err != nil {
+			if err := knobs.RunBeforeMergeTask(m.Ctx(), m.flowCtx, input.taskID, m.spec); err != nil {
 				return nil, err
 			}
 		}
@@ -427,7 +427,7 @@ func (m *bulkMergeProcessor) ingestFinalIteration(
 		disallowShadowingBelow,
 		false, // writeAtBatchTs
 		true,  // scatterSplitRanges
-		m.flowCtx.Cfg.BackupMonitor.MakeConcurrentBoundAccount(),
+		resolveMemoryMonitor(m.flowCtx, m.spec.MemoryMonitor).MakeConcurrentBoundAccount(),
 		m.flowCtx.Cfg.BulkSenderLimiter,
 		nil, // range cache
 	)
@@ -438,6 +438,19 @@ func (m *bulkMergeProcessor) ingestFinalIteration(
 	writer := newKVStorageWriter(batcher, writeTS)
 	defer writer.Close(ctx)
 	return m.processMergedData(ctx, iter, mergeSpan, writer)
+}
+
+// resolveMemoryMonitor returns the BytesMonitor indicated by the given
+// MemoryMonitor enum.
+func resolveMemoryMonitor(
+	flowCtx *execinfra.FlowCtx, m execinfrapb.BulkMergeSpec_MemoryMonitor,
+) *mon.BytesMonitor {
+	switch m {
+	case execinfrapb.BulkMergeSpec_BACKFILL_MONITOR:
+		return flowCtx.Cfg.BackfillerMonitor
+	default: // execinfrapb.BulkMergeSpec_BULK_MONITOR
+		return flowCtx.Cfg.BulkMonitor
+	}
 }
 
 // createIter builds an iterator over all input SSTs. When EnforceUniqueness
@@ -471,7 +484,7 @@ func (m *bulkMergeProcessor) createIter(ctx context.Context) (storage.SimpleMVCC
 func (m *bulkMergeProcessor) createStandardIter(
 	ctx context.Context, iterOpts storage.IterOptions,
 ) (storage.SimpleMVCCIterator, error) {
-	var storeFiles []storageccl.StoreFile
+	var storeFiles []storage.StoreFile
 	for _, sst := range m.spec.SSTs {
 		file, err := m.storageMux.StoreFile(ctx, sst.URI)
 		if err != nil {
@@ -479,7 +492,7 @@ func (m *bulkMergeProcessor) createStandardIter(
 		}
 		storeFiles = append(storeFiles, file)
 	}
-	return storageccl.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
+	return storage.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
 }
 
 // createSuffixedIter creates individual iterators for each SST, wraps them
@@ -505,8 +518,8 @@ func (m *bulkMergeProcessor) createSuffixedIter(
 		}
 
 		// Create iterator for single SST.
-		baseIter, err := storageccl.ExternalSSTReader(
-			ctx, []storageccl.StoreFile{file}, nil, iterOpts,
+		baseIter, err := storage.ExternalSSTReader(
+			ctx, []storage.StoreFile{file}, nil, iterOpts,
 		)
 		if err != nil {
 			cleanup()
@@ -568,7 +581,7 @@ func (m *bulkMergeProcessor) createIterLocalOnly(
 		return m.createSuffixedIter(ctx, localSSTs, iterOpts)
 	}
 
-	var storeFiles []storageccl.StoreFile
+	var storeFiles []storage.StoreFile
 	for _, sst := range localSSTs {
 		file, err := m.storageMux.StoreFile(ctx, sst.URI)
 		if err != nil {
@@ -576,7 +589,7 @@ func (m *bulkMergeProcessor) createIterLocalOnly(
 		}
 		storeFiles = append(storeFiles, file)
 	}
-	return storageccl.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
+	return storage.ExternalSSTReader(ctx, storeFiles, nil, iterOpts)
 }
 
 // containsKey returns true if the given key is within the mergeSpan.

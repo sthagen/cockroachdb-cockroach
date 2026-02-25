@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/followerreads"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -12400,30 +12400,9 @@ func CleanEncodingName(s string) string {
 	return string(b)
 }
 
-// EvalFollowerReadOffset is a function used often with AS OF SYSTEM TIME queries
-// to determine the appropriate offset from now which is likely to be safe for
-// follower reads. It is injected by followerreadsccl. An error may be returned
-// if an enterprise license is not installed.
-var EvalFollowerReadOffset func(_ *cluster.Settings) (time.Duration, error)
-
-func recentTimestamp(ctx context.Context, evalCtx *eval.Context) (time.Time, error) {
-	if EvalFollowerReadOffset == nil {
-		telemetry.Inc(sqltelemetry.FollowerReadDisabledCCLCounter)
-		evalCtx.ClientNoticeSender.BufferClientNotice(
-			ctx,
-			pgnotice.Newf("follower reads disabled because you are running a non-CCL distribution"),
-		)
-		return evalCtx.StmtTimestamp.Add(builtinconstants.DefaultFollowerReadDuration), nil
-	}
-	offset, err := EvalFollowerReadOffset(evalCtx.Settings)
+func recentTimestamp(_ context.Context, evalCtx *eval.Context) (time.Time, error) {
+	offset, err := followerreads.EvalFollowerReadOffset(evalCtx.Settings)
 	if err != nil {
-		if code := pgerror.GetPGCode(err); code == pgcode.CCLValidLicenseRequired {
-			telemetry.Inc(sqltelemetry.FollowerReadDisabledNoEnterpriseLicense)
-			evalCtx.ClientNoticeSender.BufferClientNotice(
-				ctx, pgnotice.Newf("follower reads disabled: %s", err.Error()),
-			)
-			return evalCtx.StmtTimestamp.Add(builtinconstants.DefaultFollowerReadDuration), nil
-		}
 		return time.Time{}, err
 	}
 	return evalCtx.StmtTimestamp.Add(offset), nil
@@ -12438,27 +12417,6 @@ func followerReadTimestamp(
 	}
 	return tree.MakeDTimestampTZ(ts, time.Microsecond)
 }
-
-var (
-	// WithMinTimestamp is an injectable function containing the implementation of the
-	// with_min_timestamp builtin.
-	WithMinTimestamp = func(_ context.Context, _ *eval.Context, t time.Time) (time.Time, error) {
-		return time.Time{}, pgerror.Newf(
-			pgcode.CCLRequired,
-			"%s can only be used with a CCL distribution",
-			asof.WithMinTimestampFunctionName,
-		)
-	}
-	// WithMaxStaleness is an injectable function containing the implementation of the
-	// with_max_staleness builtin.
-	WithMaxStaleness = func(_ context.Context, _ *eval.Context, d duration.Duration) (time.Time, error) {
-		return time.Time{}, pgerror.Newf(
-			pgcode.CCLRequired,
-			"%s can only be used with a CCL distribution",
-			asof.WithMaxStalenessFunctionName,
-		)
-	}
-)
 
 const nearestOnlyInfo = `
 
@@ -12497,7 +12455,7 @@ Note this function requires an enterprise license on a CCL distribution.`,
 }
 
 func withMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (tree.Datum, error) {
-	t, err := WithMinTimestamp(ctx, evalCtx, t)
+	t, err := followerreads.EvalMinTimestamp(ctx, evalCtx, t)
 	if err != nil {
 		return nil, err
 	}
@@ -12507,7 +12465,7 @@ func withMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (
 func withMaxStaleness(
 	ctx context.Context, evalCtx *eval.Context, d duration.Duration,
 ) (tree.Datum, error) {
-	t, err := WithMaxStaleness(ctx, evalCtx, d)
+	t, err := followerreads.EvalMaxStaleness(ctx, evalCtx, d)
 	if err != nil {
 		return nil, err
 	}

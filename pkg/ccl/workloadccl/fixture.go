@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -490,7 +489,7 @@ func importFixtureTable(
 		fmt.Fprintf(&buf, `, transform=$%d`, len(params))
 	}
 	var rows, index, tableBytes int64
-	var discard driver.Value
+	var discard any
 	res, err := sqlDB.Query(buf.String(), params...)
 	if err != nil {
 		return 0, err

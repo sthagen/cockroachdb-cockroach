@@ -178,7 +178,6 @@ go_test(
         "//pkg/jobs/jobstest",
         "//pkg/keys",
         "//pkg/kv",
-        "//pkg/kv/followerreads",
         "//pkg/kv/kvclient/kvcoord",
         "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",

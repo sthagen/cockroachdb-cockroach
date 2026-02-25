@@ -17,7 +17,7 @@ env:
 jobs:
   auto-solve-issue:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     if: github.event.label.name == 'c-autosolve'
     permissions:
       contents: write
@@ -173,6 +173,7 @@ jobs:
         id: implement
         if: steps.assess_result.outputs.assessment == 'PROCEED'
         env:
+          CLAUDE_CODE_USE_VERTEX: "1"
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
           CLOUD_ML_REGION: us-east5
           ISSUE_TITLE: ${{ github.event.issue.title }}
@@ -209,7 +210,12 @@ jobs:
           2. Read and understand the issue
           3. Implement the minimal fix required
           4. Add or update tests to verify the fix
-          5. Run tests with ./dev test or ./dev testlogic
+          5. Run ONLY targeted tests for the packages/files you changed:
+             - For Go tests: ./dev test <package> -f=<TestName> -v
+             - For logic tests: ./dev testlogic --files=<testfile> -v
+             Do NOT run broad test suites (e.g. ./dev test pkg/sql or
+             ./dev testlogic without --files). Only test the specific
+             packages and files affected by your changes.
           6. Stage all changes with git add
 
           When formatting commits and PRs, follow the guidelines in CLAUDE.md.
@@ -237,9 +243,9 @@ jobs:
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?
             else
-              # Retry - resume existing session
+              # Retry - resume existing session with a retry prompt
               echo "Resuming session $SESSION_ID..."
-              claude --print \
+              echo "The previous attempt did not succeed. Please try again to fix the issue. Remember to end your response with IMPLEMENTATION_RESULT - SUCCESS or IMPLEMENTATION_RESULT - FAILED." | claude --print \
                 --resume "$SESSION_ID" \
                 --model claude-opus-4-6 \
                 --output-format json \
@@ -258,7 +264,7 @@ jobs:
             fi
 
             # Extract session ID for potential retry
-            NEW_SESSION_ID=$(jq -r '.[] | select(.type == "system") | .session_id // empty' "$EXECUTION_FILE" 2>/dev/null | head -1 || true)
+            NEW_SESSION_ID=$(jq -r 'select(.type == "result") | .session_id // empty' "$EXECUTION_FILE" 2>/dev/null | head -1 || true)
             if [ -n "$NEW_SESSION_ID" ]; then
               SESSION_ID="$NEW_SESSION_ID"
               echo "Session ID: $SESSION_ID"
@@ -266,7 +272,7 @@ jobs:
 
             # Check if implementation succeeded by looking for SUCCESS marker in result
             # Allow flexible formatting: IMPLEMENTATION_RESULT - SUCCESS, IMPLEMENTATION_RESULT: SUCCESS, etc.
-            RESULT=$(jq -r '.[] | select(.type == "result") | .result // empty' "$EXECUTION_FILE" 2>/dev/null || true)
+            RESULT=$(jq -r 'select(.type == "result") | .result // empty' "$EXECUTION_FILE" 2>/dev/null || true)
             if echo "$RESULT" | grep -qiE 'IMPLEMENTATION_RESULT[[:space:]]*[-:][[:space:]]*SUCCESS'; then
               echo "Implementation succeeded on attempt $ATTEMPT"
               EXIT_CODE=0
@@ -305,7 +311,7 @@ jobs:
             exit 1
           fi
 
-          RESULT=$(jq -r '.[] | select(.type == "result") | .result' "$EXECUTION_FILE") || {
+          RESULT=$(jq -r 'select(.type == "result") | .result' "$EXECUTION_FILE") || {
             echo "::error::Failed to parse execution file with jq"
             exit 1
           }
@@ -528,6 +534,7 @@ jobs:
 
       - name: Comment on issue - Failed
         if: |
+          always() &&
           (steps.implement.conclusion == 'failure' ||
            steps.implement_result.outputs.implementation == 'FAILED') &&
           steps.assess_result.outputs.assessment != 'SKIP'

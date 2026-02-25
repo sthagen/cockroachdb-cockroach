@@ -12,13 +12,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
-func evalMaxStaleness(
+// EvalMaxStaleness implements the with_max_staleness builtin.
+func EvalMaxStaleness(
 	ctx context.Context, evalCtx *eval.Context, d duration.Duration,
 ) (time.Time, error) {
 	if d.Compare(duration.FromInt64(0)) < 0 {
@@ -31,7 +31,8 @@ func evalMaxStaleness(
 	return duration.Add(evalCtx.GetStmtTimestamp(), d.Mul(-1)), nil
 }
 
-func evalMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (time.Time, error) {
+// EvalMinTimestamp implements the with_min_timestamp builtin.
+func EvalMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (time.Time, error) {
 	t = t.Round(time.Microsecond)
 	if stmtTimestamp := evalCtx.GetStmtTimestamp().Round(time.Microsecond); t.After(stmtTimestamp) {
 		return time.Time{}, errors.WithDetailf(
@@ -46,9 +47,4 @@ func evalMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (
 		)
 	}
 	return t, nil
-}
-
-func init() {
-	builtins.WithMinTimestamp = evalMinTimestamp
-	builtins.WithMaxStaleness = evalMaxStaleness
 }

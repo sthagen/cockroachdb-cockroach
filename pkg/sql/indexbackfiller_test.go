@@ -1676,6 +1676,15 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 					state.manifestCountByIteration[iteration] = len(manifests)
 					t.Logf("[%s] after distributed merge iteration %d, manifests count: %d", state.currentTestName, iteration, len(manifests))
 
+					if len(manifests) > 0 {
+						for i, m := range manifests {
+							if len(m.RowSample) == 0 {
+								t.Errorf("[%s] iteration %d: manifest %d has empty RowSample",
+									state.currentTestName, iteration, i)
+							}
+						}
+					}
+
 					if len(manifests) == 0 {
 						t.Logf("[%s] final iteration %d completed (direct KV ingest)", state.currentTestName, iteration)
 						state.finalIterationCompleted.Store(true)
@@ -1961,6 +1970,16 @@ func TestDistributedMergeResumePreservesProgress(t *testing.T) {
 				require.True(t, state.finalIterationCompleted.Load(),
 					"expected final iteration (KV ingest) to complete after pause/resume at iteration %d",
 					tc.pauseAfterIteration)
+
+				// Verify that the paused iteration produced multiple manifests. Combined
+				// with the RowSample assertion in AfterDistributedMergeIteration, this
+				// guarantees that CombineFileInfo can split work into multiple merge spans
+				// on resume, preserving parallelism.
+				manifestCount := state.manifestCountByIteration[tc.pauseAfterIteration]
+				require.Greater(t, manifestCount, 1,
+					"expected multiple manifests from iteration %d for parallelism on resume",
+					tc.pauseAfterIteration)
+
 				t.Logf("resumption from iteration %d completed with final KV ingest (total iterations: %d)",
 					tc.pauseAfterIteration, state.currentIteration.Load())
 			}

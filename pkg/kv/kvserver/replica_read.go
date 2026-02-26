@@ -39,10 +39,10 @@ import (
 // iterator to evaluate the batch and then updates the timestamp cache to
 // reflect the key spans that it read.
 func (r *Replica) executeReadOnlyBatch(
-	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard, _ kvadmission.AdmissionInfo,
+	ctx context.Context, ba *kvpb.BatchRequest, g concurrency.Guard, _ kvadmission.AdmissionInfo,
 ) (
 	br *kvpb.BatchResponse,
-	_ *concurrency.Guard,
+	_ concurrency.Guard,
 	_ *kvadmission.StoreWriteBytes,
 	pErr *kvpb.Error,
 ) {
@@ -70,9 +70,6 @@ func (r *Replica) executeReadOnlyBatch(
 
 	var rw storage.ReadWriter
 	intentsToResolveVirtually := g.IntentsToResolveVirtually()
-	if itrv := r.store.TestingKnobs().InjectIntentsToResolveVirtually; itrv != nil {
-		intentsToResolveVirtually = itrv()
-	}
 	// If there are intents to be resolved virtually, use a storage batch in which
 	// the intent resolution will be evaluated before the read-only batch request.
 	if len(intentsToResolveVirtually) > 0 {
@@ -186,7 +183,7 @@ func (r *Replica) executeReadOnlyBatch(
 	// If the request hit a server-side concurrency retry error, immediately
 	// propagate the error. Don't assume ownership of the concurrency guard.
 	if isConcurrencyRetryError(pErr) {
-		if g != nil && g.EvalKind == concurrency.OptimisticEval {
+		if g != nil && g.EvalKind() == concurrency.OptimisticEval {
 			// Since this request was not holding latches, it could have raced with
 			// intent resolution. So we can't trust it to add discovered locks, if
 			// there is a latch conflict. This means that a discovered lock plus a
@@ -208,7 +205,7 @@ func (r *Replica) executeReadOnlyBatch(
 		return nil, g, nil, pErr
 	}
 
-	if g != nil && g.EvalKind == concurrency.OptimisticEval {
+	if g != nil && g.EvalKind() == concurrency.OptimisticEval {
 		if pErr == nil {
 			// Gather the spans that were read -- we distinguish the spans in the
 			// request from the spans that were actually read, using resume spans in
@@ -311,7 +308,7 @@ func (r *Replica) executeReadOnlyBatch(
 // ResumeSpans.
 func (r *Replica) updateTimestampCacheAndDropLatches(
 	ctx context.Context,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	ba *kvpb.BatchRequest,
 	br *kvpb.BatchResponse,
 	pErr *kvpb.Error,
@@ -357,7 +354,7 @@ func (r *Replica) canDropLatchesBeforeEval(
 	ctx context.Context,
 	rw storage.ReadWriter,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st kvserverpb.LeaseStatus,
 ) (ok, stillNeedsIntentInterleaving bool, pErr *kvpb.Error) {
 	if !allowDroppingLatchesBeforeEval.Get(&r.store.cfg.Settings.SV) ||
@@ -475,7 +472,7 @@ func (r *Replica) executeReadOnlyBatchWithServersideRefreshes(
 	rw storage.ReadWriter,
 	rec batcheval.EvalContext,
 	ba *kvpb.BatchRequest,
-	g *concurrency.Guard,
+	g concurrency.Guard,
 	st *kvserverpb.LeaseStatus,
 	ui uncertainty.Interval,
 	evalPath batchEvalPath,

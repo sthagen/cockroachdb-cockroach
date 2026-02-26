@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -597,6 +598,13 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 				URI:      sst.URI,
 				Span:     &span,
 				KeyCount: sst.KeyCount,
+				// Populate RowSample so CombineFileInfo can split schema spans on
+				// resume. StartKey is already a row prefix (family suffix stripped
+				// by SSTWriter.Flush), but CombineFileInfo passes samples through
+				// keys.EnsureSafeSplitKey which expects a full key including the
+				// column family suffix. Re-appending family 0 makes the key valid
+				// for that function.
+				RowSample: keys.MakeFamilyKey(append(roachpb.Key(nil), sst.StartKey...), 0),
 			})
 		}
 		progress.SSTManifests = newManifests

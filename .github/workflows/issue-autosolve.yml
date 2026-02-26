@@ -182,7 +182,7 @@ jobs:
           MAX_RETRIES=10
           RETRY_COUNT=0
           SESSION_ID=""
-          EXECUTION_FILE="execution_stage2.json"
+          EXECUTION_FILE="/tmp/execution_stage2.json"
           EXIT_CODE=1
 
           # Build the prompt
@@ -227,7 +227,7 @@ jobs:
           PROMPTEOF
           )
 
-          STDERR_FILE="execution_stage2_stderr.log"
+          STDERR_FILE="/tmp/execution_stage2_stderr.log"
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             ATTEMPT=$((RETRY_COUNT + 1))
@@ -375,9 +375,14 @@ jobs:
             exit 1
           fi
 
-          git add -A
+          # Claude was instructed to stage its changes (step 6 of the prompt).
+          # Use git add -u as a safety net for tracked files it may have missed.
+          # Do NOT stage untracked files — Claude should have staged any new
+          # files it created. This avoids accidentally committing temp files
+          # (execution logs, GCP credentials, build artifacts, etc.).
+          git add -u
 
-          # Double-check after staging (defense in depth)
+          # Defense in depth: verify no workflow files were staged
           if git diff --name-only --cached | grep -qiE '^\.github/workflows/'; then
             echo "::error::Workflow files (.github/workflows/) were staged - aborting"
             git reset HEAD
@@ -429,6 +434,14 @@ jobs:
             printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n'
           } > "$COMMIT_MSG_FILE"
           git commit -F "$COMMIT_MSG_FILE"
+
+          # Sync the fork's default branch with upstream so the push doesn't
+          # include upstream workflow file changes that the fork hasn't seen yet.
+          # Without this, GitHub rejects the push if the PAT lacks 'workflow' scope.
+          GH_TOKEN="${AUTOSOLVER_PAT}" gh api \
+            "repos/${AUTOSOLVER_FORK_OWNER}/${AUTOSOLVER_FORK_REPO}/merge-upstream" \
+            --method POST --field branch=master 2>/dev/null \
+            || echo "::warning::Failed to sync fork with upstream (may already be in sync)"
 
           # Push to the fork
           # NOTE: Force push is safe here because we're pushing to a new branch on the bot's fork,

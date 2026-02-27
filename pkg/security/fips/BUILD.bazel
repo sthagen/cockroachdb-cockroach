@@ -1,24 +1,14 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
-    name = "fipsccl",
+    name = "fips",
     srcs = [
         "fips_linux.go",
         "fips_nolinux.go",
-        "sql.go",
     ],
-    importpath = "github.com/cockroachdb/cockroach/pkg/ccl/securityccl/fipsccl",
+    importpath = "github.com/cockroachdb/cockroach/pkg/security/fips",
     visibility = ["//visibility:public"],
-    deps = [
-        "//pkg/ccl/utilccl",
-        "//pkg/sql/pgwire/pgcode",
-        "//pkg/sql/pgwire/pgerror",
-        "//pkg/sql/privilege",
-        "//pkg/sql/sem/eval",
-        "//pkg/sql/sem/tree",
-        "//pkg/sql/sem/volatility",
-        "//pkg/sql/types",
-    ] + select({
+    deps = select({
         "@io_bazel_rules_go//go/platform:aix": [
             "@com_github_cockroachdb_errors//:errors",
         ],

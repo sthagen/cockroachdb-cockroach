@@ -155,7 +155,7 @@ func (c *remoteClient) Writer(ctx context.Context, file string) (io.WriteCloser,
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 0, chunkSize)
+	buf := make([]byte, 0, ChunkSize)
 	return &streamWriter{s: stream, buf: blobspb.StreamChunk{Payload: buf}}, nil
 }
 

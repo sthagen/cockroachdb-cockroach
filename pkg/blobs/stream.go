@@ -25,13 +25,13 @@ import (
 // The function streamContent() is used on the _sender's_ side to split
 // the content and send it using Blob_GetStreamServer or Blob_PutStreamClient.
 
-// chunkSize was decided to be 128K after running an experiment benchmarking
+// ChunkSize was decided to be 128K after running an experiment benchmarking
 // ReadFile and WriteFile. It seems like the benefits of streaming do not appear
 // until files of 1 MB or larger, and for those files, 128K chunks are optimal.
 // For ReadFile, larger chunks are more efficient but the gains are not as significant
 // past 128K. For WriteFile, 128K chunks perform best, and past that, performance
 // starts decreasing.
-const chunkSize = 128 * 1 << 10
+const ChunkSize = 128 * 1 << 10
 
 // FlowControlWindow is a cluster setting that controls the number of
 // unacknowledged chunks the blob service can have in flight at any time.
@@ -48,7 +48,7 @@ var FlowControlWindow = settings.RegisterIntSetting(
 // Using a pool reduces allocations during high-throughput file transfers.
 var chunkBufferPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, chunkSize)
+		buf := make([]byte, ChunkSize)
 		return &buf
 	},
 }
@@ -145,7 +145,7 @@ type streamSender interface {
 	Send(*blobspb.StreamChunk) error
 }
 
-// streamContent splits the content into chunks, of size `chunkSize`,
+// streamContent splits the content into chunks, of size `ChunkSize`,
 // and streams those chunks to sender.
 // Note: This does not close the stream.
 func streamContent(ctx context.Context, sender streamSender, content ioctx.ReaderCtx) error {
@@ -179,7 +179,7 @@ func streamContentWithFlowControl(
 ) error {
 	bufPtr := chunkBufferPool.Get().(*[]byte)
 	defer chunkBufferPool.Put(bufPtr)
-	payload := (*bufPtr)[:chunkSize]
+	payload := (*bufPtr)[:ChunkSize]
 	inFlight := 0
 	eofReached := false
 

@@ -10,8 +10,8 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/cockroachdb/cockroach/pkg/ccl/securityccl/fipsccl"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/security/fips"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
@@ -54,7 +54,7 @@ func runCheckFips(cmd *cobra.Command, args []string) error {
 
 	fipsEnabled := fips140.Enabled()
 	emit("FIPS-ready build", fipsEnabled, "")
-	isKernelEnabled, err := fipsccl.IsKernelEnabled()
+	isKernelEnabled, err := fips.IsKernelEnabled()
 	detail := ""
 	if err != nil {
 		detail = err.Error()

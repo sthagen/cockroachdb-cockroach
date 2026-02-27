@@ -611,9 +611,9 @@ func TestFlowControlledStreamLargeFile(t *testing.T) {
 		localExternalDir, remoteExternalDir, st,
 	)
 
-	// Create a file larger than window * chunkSize (2 * 128KB = 256KB).
+	// Create a file larger than window * ChunkSize (2 * 128KB = 256KB).
 	// 5 chunks = 640KB, requiring multiple ack round-trips.
-	fileSize := 5 * chunkSize
+	fileSize := 5 * ChunkSize
 	fileContent := make([]byte, fileSize)
 	_, err := rand.Read(fileContent)
 	require.NoError(t, err)

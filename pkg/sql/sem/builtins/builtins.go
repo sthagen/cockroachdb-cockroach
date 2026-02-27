@@ -8,6 +8,7 @@ package builtins
 import (
 	"bytes"
 	"context"
+	"crypto/fips140"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -6271,6 +6272,39 @@ SELECT
 			Info:             "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility:       volatility.Volatile,
 			DistsqlBlocklist: true, // applicable only on the gateway
+		},
+	),
+
+	"crdb_internal.fips_ready": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// It's debatable whether we need a permission check here at all.
+				// It's not very sensitive and is (currently) a very cheap function
+				// call. However, it's something that regular users should have no
+				// reason to look at so in the interest of least privilege we put it
+				// behind the VIEWCLUSTERSETTING privilege.
+				session := evalCtx.SessionAccessor
+				hasView, err := session.HasGlobalPrivilegeOrRoleOption(ctx, privilege.VIEWCLUSTERSETTING)
+				if err != nil {
+					return nil, err
+				} else if !hasView {
+					return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
+						"user %s does not have %s system privilege",
+						evalCtx.SessionData().User(),
+						privilege.VIEWCLUSTERSETTING,
+					)
+				}
+
+				return tree.MakeDBool(tree.DBool(fips140.Enabled())), nil
+			},
+			Info:       "Returns true if all FIPS readiness checks pass.",
+			Class:      tree.NormalClass,
+			Volatility: volatility.Stable,
 		},
 	),
 

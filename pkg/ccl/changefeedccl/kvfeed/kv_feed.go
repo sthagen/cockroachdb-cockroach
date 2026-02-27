@@ -104,7 +104,30 @@ type Config struct {
 
 // Run will run the kvfeed. The feed runs synchronously and returns an
 // error when it finishes.
-func Run(ctx context.Context, cfg Config) error {
+func Run(ctx context.Context, cfg Config) (retErr error) {
+	// The writer must always be closed to release resources and signal to the
+	// consumer (changeAggregator) that no more writes are expected, allowing it
+	// to transition to draining state. The defer ensures cleanup even if Drain
+	// panics, while the success path explicitly closes before waiting for the
+	// changeAggregator to finish.
+	//
+	// Closed tracks whether we've already closed the writer, preventing the
+	// defer from closing twice.
+	closed := false
+
+	defer func() {
+		if closed {
+			return
+		}
+		closeReason := retErr
+		if closeReason == nil {
+			// A nil retErr indicates a panic occurred.
+			closeReason = errors.New("kvfeed terminated abnormally")
+		}
+		if closeErr := cfg.Writer.CloseWithReason(ctx, closeReason); closeErr != nil {
+			retErr = errors.CombineErrors(retErr, closeErr)
+		}
+	}()
 
 	var sc kvScanner
 	{
@@ -153,8 +176,8 @@ func Run(ctx context.Context, cfg Config) error {
 	if !isChangefeedCompleted && !errors.As(err, &scErr) {
 		log.Changefeed.Errorf(ctx, "stopping kv feed due to error: %s", err)
 		// Regardless of whether we exited KV feed with or without an error, that error
-		// is not a schema change; so, close the writer and return.
-		return errors.CombineErrors(err, f.writer.CloseWithReason(ctx, err))
+		// is not a schema change; so, return and let the defer handle cleanup.
+		return err
 	}
 
 	if isChangefeedCompleted {
@@ -165,14 +188,14 @@ func Run(ctx context.Context, cfg Config) error {
 
 	// Drain the writer before we close it so that all events emitted prior to schema change
 	// or changefeed completion boundary are consumed by the change aggregator.
-	// Regardless of whether drain succeeds, we must also close the buffer to release
-	// any resources, and to let the consumer (changeAggregator) know that no more writes
-	// are expected so that it can transition to a draining state.
-	if err := f.writer.Drain(ctx); err != nil {
-		err := errors.Wrap(err, "failed to drain kv feed writer")
-		return errors.CombineErrors(err, f.writer.CloseWithReason(ctx, err))
+	if drainErr := f.writer.Drain(ctx); drainErr != nil {
+		return errors.Wrap(drainErr, "failed to drain kv feed writer")
 	}
-	if err := f.writer.CloseWithReason(ctx, kvevent.ErrNormalRestartReason); err != nil {
+
+	// Close the writer to signal completion, then wait for the
+	// changeAggregator to finish consuming all buffered events.
+	closed = true
+	if err := cfg.Writer.CloseWithReason(ctx, kvevent.ErrNormalRestartReason); err != nil {
 		return err
 	}
 

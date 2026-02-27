@@ -125,7 +125,6 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/build",
-        "//pkg/ccl/securityccl/fipsccl",
         "//pkg/ccl/sqlproxyccl",
         "//pkg/ccl/sqlproxyccl/tenant",
         "//pkg/ccl/sqlproxyccl/tenantdirsvr",
@@ -171,6 +170,7 @@ go_library(
         "//pkg/security",
         "//pkg/security/certnames",
         "//pkg/security/clientsecopts",
+        "//pkg/security/fips",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",

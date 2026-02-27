@@ -13,8 +13,8 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/ccl/jwtauthccl",
-        "//pkg/ccl/securityccl/jwthelper",
         "//pkg/roachpb",
+        "//pkg/security/jwthelper",
         "//pkg/security/provisioning",
         "//pkg/security/username",
         "//pkg/server",

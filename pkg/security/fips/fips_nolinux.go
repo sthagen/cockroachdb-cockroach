@@ -5,7 +5,7 @@
 //
 //go:build !linux
 
-package fipsccl
+package fips
 
 import "github.com/cockroachdb/errors"
 

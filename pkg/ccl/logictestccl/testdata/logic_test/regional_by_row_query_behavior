@@ -354,24 +354,24 @@ SELECT * FROM [
 └── • render
     │
     └── • lookup join (anti)
-        │ table: regional_by_row_table@uniq_idx (partial index)
-        │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column4 = a)
-        │ pred: column5 > 0
+        │ table: regional_by_row_table@regional_by_row_table_b_key
+        │ equality cols are key
+        │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column5 = b)
         │
         └── • lookup join (anti)
-            │ table: regional_by_row_table@uniq_idx (partial index)
-            │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column4 = a)
-            │ pred: column5 > 0
+            │ table: regional_by_row_table@regional_by_row_table_b_key
+            │ equality cols are key
+            │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column5 = b)
             │
             └── • lookup join (anti)
-                │ table: regional_by_row_table@regional_by_row_table_b_key
-                │ equality cols are key
-                │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column5 = b)
+                │ table: regional_by_row_table@uniq_idx (partial index)
+                │ lookup condition: (crdb_region IN ('ca-central-1', 'us-east-1')) AND (column4 = a)
+                │ pred: column5 > 0
                 │
                 └── • lookup join (anti)
-                    │ table: regional_by_row_table@regional_by_row_table_b_key
-                    │ equality cols are key
-                    │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column5 = b)
+                    │ table: regional_by_row_table@uniq_idx (partial index)
+                    │ lookup condition: (crdb_region = 'ap-southeast-2') AND (column4 = a)
+                    │ pred: column5 > 0
                     │
                     └── • cross join (anti)
                         │

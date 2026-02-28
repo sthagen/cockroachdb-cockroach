@@ -1160,3 +1160,7 @@ func (m *SessionDataMutator) notifyTCPKeepAliveChange() {
 		)
 	}
 }
+
+func (m *SessionDataMutator) SetOptimizerUseMinRowCountAntiJoinFix(val bool) {
+	m.Data.OptimizerUseMinRowCountAntiJoinFix = val
+}

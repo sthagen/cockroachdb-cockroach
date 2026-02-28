@@ -42,7 +42,8 @@ type replicaAppBatch struct {
 	r          *Replica
 	applyStats *applyCommittedEntriesStats
 
-	// batch accumulates writes implied by the raft entries in this batch.
+	// batch accumulates writes implied by the raft entries in this batch. If
+	// engines are separated, only contains the StateEngine writes.
 	batch storage.Batch
 	// raftBatch accumulates writes to the raft log engine. It is lazily
 	// initialized when RaftBatch() is called.
@@ -527,9 +528,13 @@ func (b *replicaAppBatch) stageTruncation(
 
 	// This truncation will apply synchronously in this batch. Stage the write
 	// into the batch, and compute metadata used after applying it.
+	//
+	// TODO(sep-raft-log): with separated engines, this strongly-coupled
+	// truncation path must not be taken. Add guardrails for that. This is allowed
+	// for now only to enable experimental testing.
 	if err := handleTruncatedStateBelowRaftPreApply(
 		ctx, b.truncState, *truncatedState,
-		b.r.raftMu.stateLoader.StateLoader, b.batch,
+		b.r.raftMu.stateLoader.StateLoader, b.RaftBatch(),
 	); err != nil {
 		return errors.Wrap(err, "unable to handle truncated state")
 	}

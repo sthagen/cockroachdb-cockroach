@@ -132,7 +132,7 @@ func selectAppropriateTests(
 	if len(candidates) == 0 {
 		return nil, nil, nil
 	}
-	targetSet := strings.Join(candidates, " + ")
+	targetSet := strings.Join(candidates, " ")
 	query := fmt.Sprintf(
 		"set(%s) except attr(\"tags\", \"[\\[ ]integration[,\\]]\", set(%s))",
 		targetSet, targetSet,
@@ -140,6 +140,10 @@ func selectAppropriateTests(
 	cmd := exec.CommandContext(ctx, "bazel", "query", query)
 	outputBytes, err := cmd.Output()
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return nil, nil, fmt.Errorf("unable to filter integration tests: bazel query: %w\nstderr: %s", err, exitErr.Stderr)
+		}
 		return nil, nil, fmt.Errorf("unable to filter integration tests: bazel query: %w", err)
 	}
 	output := strings.TrimSpace(string(outputBytes))

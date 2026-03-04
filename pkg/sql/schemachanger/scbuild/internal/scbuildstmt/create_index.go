@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -44,11 +43,6 @@ import (
 
 // CreateIndex implements CREATE INDEX.
 func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
-	// Ensure that the cluster is fully upgraded to 25.2 before creating a vector index.
-	if n.Type == idxtype.VECTOR && !b.EvalCtx().Settings.Version.ActiveVersion(b).AtLeast(clusterversion.V25_2.Version()) {
-		panic(pgerror.Newf(pgcode.FeatureNotSupported, "cannot create a vector index until finalizing on 25.2"))
-	}
-
 	b.IncrementSchemaChangeCreateCounter("index")
 	// Resolve the table name and start building the new index element.
 	relationElements := b.ResolveRelation(n.Table.ToUnresolvedObjectName(), ResolveParams{
@@ -665,6 +659,7 @@ func addColumnsForSecondaryIndex(
 	// Set the key suffix column IDs.
 	// We want to find the key column IDs
 	var keySuffixColumns []*scpb.IndexColumn
+	primaryKeyStoringCols := map[string]struct{}{}
 	scpb.ForEachIndexColumn(relationElements, func(
 		current scpb.Status, target scpb.TargetStatus, e *scpb.IndexColumn,
 	) {
@@ -697,11 +692,16 @@ func addColumnsForSecondaryIndex(
 		// earlier so this covers any extra columns.
 		columnName := mustRetrieveColumnNameElem(b, e.TableID, e.ColumnID)
 		if _, found := columnRefs[columnName.Name]; found {
-			panic(errors.WithDetailf(
-				sqlerrors.NewColumnAlreadyExistsInIndexError(string(n.Name), columnName.Name),
-				"column %q is part of the primary index and therefore implicit in all indexes", columnName.Name))
+			b.EvalCtx().ClientNoticeSender.BufferClientNotice(b,
+				pgnotice.Newf(
+					"index %q already contains column %q which is part of the primary key and therefore implicit in all indexes",
+					string(n.Name), columnName.Name,
+				),
+			)
+			primaryKeyStoringCols[columnName.Name] = struct{}{}
+		} else {
+			columnRefs[columnName.Name] = struct{}{}
 		}
-		columnRefs[columnName.Name] = struct{}{}
 		keySuffixColumns = append(keySuffixColumns, e)
 	})
 	sort.Slice(keySuffixColumns, func(i, j int) bool {
@@ -721,7 +721,11 @@ func addColumnsForSecondaryIndex(
 	}
 
 	// Set the storing column IDs.
-	for i, storingNode := range n.Storing {
+	storeOrdinal := uint32(0)
+	for _, storingNode := range n.Storing {
+		if _, skip := primaryKeyStoringCols[string(storingNode)]; skip {
+			continue
+		}
 		colElts := b.ResolveColumn(tableID, storingNode, ResolveParams{
 			RequiredPrivilege: privilege.CREATE,
 		})
@@ -732,10 +736,11 @@ func addColumnsForSecondaryIndex(
 			TableID:       idxSpec.secondary.TableID,
 			IndexID:       idxSpec.secondary.IndexID,
 			ColumnID:      column.ColumnID,
-			OrdinalInKind: uint32(i),
+			OrdinalInKind: storeOrdinal,
 			Kind:          scpb.IndexColumn_STORED,
 		}
 		idxSpec.columns = append(idxSpec.columns, c)
+		storeOrdinal++
 	}
 	// Set up sharding.
 	if n.Sharded != nil {

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -1533,27 +1534,31 @@ func TestGetDescriptorsFromStoreForIntervalCPULimiterPagination(t *testing.T) {
 
 	ctx := context.Background()
 	var numRequests int
+	var sqlCodec atomic.Pointer[keys.SQLCodec]
 	srv, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{
-		Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
-			TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
-				for _, ru := range request.Requests {
-					if _, ok := ru.GetInner().(*kvpb.ExportRequest); ok {
-						numRequests++
-						h := admission.ElasticCPUWorkHandleFromContext(ctx)
-						if h == nil {
-							t.Fatalf("expected context to have CPU work handle")
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+					for _, ru := range request.Requests {
+						if export, ok := ru.GetInner().(*kvpb.ExportRequest); ok && TestIsLeasingTxnExportRequest(sqlCodec.Load(), request, export) {
+							numRequests++
+							h := admission.ElasticCPUWorkHandleFromContext(ctx)
+							if h == nil {
+								t.Fatalf("expected context to have CPU work handle")
+							}
+							h.TestingOverrideOverLimit(func() (bool, time.Duration) {
+								return true, 0
+							})
 						}
-						h.TestingOverrideOverLimit(func() (bool, time.Duration) {
-							return true, 0
-						})
 					}
-				}
-				return nil
-			},
-		}},
+					return nil
+				},
+			}},
 	})
 	defer srv.Stopper().Stop(ctx)
 	s := srv.ApplicationLayer()
+	codec := s.Codec()
+	sqlCodec.Store(&codec)
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
 	beforeCreate := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
@@ -1567,7 +1572,7 @@ func TestGetDescriptorsFromStoreForIntervalCPULimiterPagination(t *testing.T) {
 		beforeCreate, afterCreate, false /*isOffline */)
 	require.NoError(t, err)
 	require.Len(t, descs, 3)
-	require.Equal(t, numRequests, 1)
+	require.Equal(t, 1, numRequests)
 }
 
 // TestLeaseCountDetailSessionBased will test out the extra debugging info that
@@ -1855,6 +1860,14 @@ func TestLeaseManagerLockedTimestampCluster(t *testing.T) {
 
 	var blockUpdates atomic.Bool
 	updateCh := make(chan struct{})
+	updateChClosed := false
+	closeUpdateCh := func() {
+		if updateChClosed {
+			return
+		}
+		updateChClosed = true
+		close(updateCh)
+	}
 
 	st := cluster.MakeTestingClusterSettings()
 	ctx := context.Background()
@@ -1870,11 +1883,12 @@ func TestLeaseManagerLockedTimestampCluster(t *testing.T) {
 			ServerArgsPerNode: map[int]base.TestServerArgs{2: {
 				Knobs: base.TestingKnobs{
 					SQLLeaseManager: &ManagerTestingKnobs{
-						TestingDescriptorRefreshedEvent: func(descriptor *descpb.Descriptor) {
+						TestingDescriptorUpdateEvent: func(descriptor *descpb.Descriptor) error {
 							if !blockUpdates.Load() {
-								return
+								return nil
 							}
 							<-updateCh
+							return nil
 						},
 					},
 				},
@@ -1882,12 +1896,14 @@ func TestLeaseManagerLockedTimestampCluster(t *testing.T) {
 			},
 		})
 	defer tc.Stopper().Stop(context.Background())
+	defer closeUpdateCh()
 
 	node1Conn := tc.ServerConn(0)
 	r := sqlutils.MakeSQLRunner(node1Conn)
 	node2Conn := tc.ServerConn(2)
 	execConn := sqlutils.MakeSQLRunner(node2Conn)
-
+	// Disable automatic stats collection, since it can interfere with this test.
+	r.Exec(t, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false")
 	r.Exec(t, "CREATE DATABASE d1")
 	r.Exec(t, "CREATE TABLE d1.public.t1(n int)")
 	var id int
@@ -1904,22 +1920,45 @@ func TestLeaseManagerLockedTimestampCluster(t *testing.T) {
 	assertDescriptorsCount := func(expectedCount int) {
 		state := lm.findDescriptorState(descpb.ID(id), false)
 		require.NotNilf(t, state, "the descriptor was not leased yet")
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		require.Equal(t, expectedCount, len(state.mu.active.data),
-			"unexpected number of descriptors in active state: %s",
-			state.mu.active)
+		// Since the testing knob being used for moving to the next version
+		// is invoked before a descriptor is fully processed. Its possible that
+		// we may temporarily see extra old versions, until they are purged.
+		require.NoError(t, testutils.SucceedsSoonError(func() error {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if len(state.mu.active.data) == expectedCount {
+				return nil
+			}
+			return errors.AssertionFailedf("expected %d descriptors, got %d (state: %s)", expectedCount, len(state.mu.active.data), state.mu.active.String())
+		}))
+	}
+	// Allows the next version of the descriptor to be processed
+	// and then confirms a newer version is available to lease.
+	moveToNextDescriptorVersion := func() {
+		newest, _ := lm.findNewest(descpb.ID(id))
+		require.NotNil(t, newest)
+		lastVersion := newest.GetVersion()
+		updateCh <- struct{}{}
+		require.NoError(t, testutils.SucceedsSoonError(func() error {
+			// Ensure a new version is available
+			newest, _ = lm.findNewest(descpb.ID(id))
+			require.NotNil(t, newest)
+			if newest.GetVersion() > lastVersion {
+				return nil
+			}
+			return errors.AssertionFailedf("new version was not leased yet")
+		}))
 	}
 	// Initial state we only expect a single version.
 	assertDescriptorsCount(1)
-	updateCh <- struct{}{}
+	moveToNextDescriptorVersion()
 	execConn.Exec(t, "SELECT * FROM d1.public.t1")
-	updateCh <- struct{}{}
+	moveToNextDescriptorVersion()
 	txn := execConn.Begin(t)
 	_, err := txn.Exec("SELECT * FROM d1.public.t1")
 	require.NoError(t, err)
 	assertDescriptorsCount(1)
-	updateCh <- struct{}{}
+	moveToNextDescriptorVersion()
 	_, err = txn.Exec("SELECT * FROM d1.public.t1")
 	require.NoError(t, err)
 	_, err = txn.Exec("SELECT * FROM d1.public.t1")
@@ -1931,8 +1970,8 @@ func TestLeaseManagerLockedTimestampCluster(t *testing.T) {
 	require.NoError(t, err)
 	assertDescriptorsCount(2)
 	require.NoError(t, txn.Commit())
-	updateCh <- struct{}{}
-	close(updateCh)
+	moveToNextDescriptorVersion()
+	closeUpdateCh()
 	assertDescriptorsCount(1)
 	require.NoError(t, grp.Wait())
 }

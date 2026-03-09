@@ -167,6 +167,13 @@ func TestLogic_alter_primary_key(
 	runLogicTest(t, "alter_primary_key")
 }
 
+func TestLogic_alter_primary_key_regressions(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "alter_primary_key_regressions")
+}
+
 func TestLogic_alter_role(
 	t *testing.T,
 ) {
@@ -592,6 +599,13 @@ func TestLogic_datetime(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "datetime")
+}
+
+func TestLogic_datetime_parsing(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "datetime_parsing")
 }
 
 func TestLogic_decimal(
@@ -1488,6 +1502,13 @@ func TestLogic_notice(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "notice")
+}
+
+func TestLogic_numeric_formatting(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "numeric_formatting")
 }
 
 func TestLogic_numeric_references(

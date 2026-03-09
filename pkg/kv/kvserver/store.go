@@ -2725,12 +2725,12 @@ func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
 				// adjacent table. This results in a single update, corresponding to the
 				// new table's span, which forms the right-hand side post split.
 
-				conf, sp, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, startKey)
+				conf, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, startKey)
 				if err != nil {
 					log.KvDistribution.Errorf(replCtx, "skipped applying update, unexpected error reading from subscriber: %v", err)
 					return err
 				}
-				changed = repl.SetSpanConfig(conf, sp)
+				changed = repl.SetSpanConfig(conf)
 			}
 			if changed {
 				repl.MaybeQueue(ctx, now)
@@ -2750,13 +2750,13 @@ func (s *Store) applyAllFromSpanConfigStore(ctx context.Context) {
 	newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
 		replCtx := repl.AnnotateCtx(ctx)
 		key := repl.Desc().StartKey
-		conf, confSpan, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, key)
+		conf, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, key)
 		if err != nil {
 			log.KvDistribution.Errorf(ctx, "skipped applying config update, unexpected error reading from subscriber: %v", err)
 			return true // more
 		}
 
-		changed := repl.SetSpanConfig(conf, confSpan)
+		changed := repl.SetSpanConfig(conf)
 		if changed {
 			repl.MaybeQueue(replCtx, now)
 		}
@@ -3091,6 +3091,12 @@ func (s *Store) TODOEngine() storage.Engine {
 	return s.internalEngines.TODOEngine()
 }
 
+// TODOBothEngines is a placeholder for cases in which the caller needs to be
+// updated because it likely needs to handle both engines.
+func (s *Store) TODOBothEngines() storage.Engine {
+	return s.internalEngines.TODOBothEngines()
+}
+
 // LogEngine returns the raft/log engine.
 func (s *Store) LogEngine() storage.Engine {
 	return s.internalEngines.LogEngine()
@@ -3122,13 +3128,12 @@ func (s *Store) AllocateRangeID(ctx context.Context) (roachpb.RangeID, error) {
 
 // Attrs returns the attributes of the underlying store.
 func (s *Store) Attrs() roachpb.Attributes {
-	return s.TODOEngine().Attrs()
+	return s.LogEngine().Attrs()
 }
 
 // Properties returns the properties of the underlying store.
 func (s *Store) Properties() roachpb.StoreProperties {
-	// TODO(sep-raft-log): see if this needs to exist for the logEngine too.
-	return s.TODOEngine().Properties()
+	return s.TODOBothEngines().Properties()
 }
 
 // Capacity returns the capacity of the underlying storage engine. Note that
@@ -3143,7 +3148,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 		}
 	}
 
-	capacity, err := s.TODOEngine().Capacity()
+	capacity, err := s.TODOBothEngines().Capacity()
 	if err != nil {
 		return roachpb.StoreCapacity{}, err
 	}
@@ -3718,19 +3723,19 @@ func (s *Store) computeMetricsLocked(ctx context.Context) (m storage.Metrics, er
 	}
 
 	// Get the latest engine metrics.
-	m = s.TODOEngine().GetMetrics()
-	_ = s.TODOEngine() // TODO(sep-raft-log): log engine should also have metrics
+	eng := s.TODOBothEngines()
+	m = eng.GetMetrics()
 	s.metrics.updateEngineMetrics(m)
 
 	// Get engine Env stats.
-	envStats, err := s.TODOEngine().GetEnvStats()
+	envStats, err := eng.GetEnvStats()
 	if err != nil {
 		return m, err
 	}
 	s.metrics.updateEnvStats(*envStats)
 
 	{
-		dirs, err := s.TODOEngine().Env().List(s.checkpointsDir())
+		dirs, err := eng.Env().List(s.checkpointsDir())
 		if err != nil { // skip NotFound or any other error
 			dirs = nil
 		}
@@ -3968,7 +3973,7 @@ func (s *Store) AllocatorCheckRange(
 		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err
 	}
 
-	conf, _, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
+	conf, err := confReader.GetSpanConfigForKey(ctx, desc.StartKey)
 	if err != nil {
 		log.Eventf(ctx, "error retrieving span config for range %s: %s", desc, err)
 		return allocatorimpl.AllocatorNoop, roachpb.ReplicationTarget{}, sp.FinishAndGetConfiguredRecording(), err

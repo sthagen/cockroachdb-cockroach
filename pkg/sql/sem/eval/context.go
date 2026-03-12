@@ -363,6 +363,13 @@ type Context struct {
 
 	// WorkloadID for ASH sampling.
 	WorkloadID uint64
+
+	// AppNameID is the hash of the application name, for ASH
+	// sampling. Set alongside WorkloadID in the connExecutor.
+	// Note(alyshan): This will eventually be replaced by a general
+	// enrichment_id field which will enable the ASH sampler to
+	// enrich samples with more workload context.
+	AppNameID uint64
 }
 
 // RoutineStatementCounters encapsulates metrics for tracking the execution
@@ -609,9 +616,12 @@ func (ec *Context) SessionData() *sessiondata.SessionData {
 	return ec.SessionDataStack.Top()
 }
 
-// Copy returns a deep copy of ctx.
+// Copy returns a copy of the EvalCtx that can safely be used concurrently with
+// the original.
 func (ec *Context) Copy() *Context {
 	ctxCopy := *ec
+	// CollationEnvironment is not thread safe.
+	ctxCopy.CollationEnv = tree.CollationEnvironment{}
 	ctxCopy.iVarContainerStack = make([]tree.IndexedVarContainer, len(ec.iVarContainerStack), cap(ec.iVarContainerStack))
 	copy(ctxCopy.iVarContainerStack, ec.iVarContainerStack)
 	return &ctxCopy

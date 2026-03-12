@@ -160,6 +160,13 @@ func TestLogic_alter_external_connection(
 	runLogicTest(t, "alter_external_connection")
 }
 
+func TestLogic_alter_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "alter_index")
+}
+
 func TestLogic_alter_primary_key(
 	t *testing.T,
 ) {
@@ -2993,6 +3000,13 @@ func TestLogic_views(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "views")
+}
+
+func TestLogic_views_definer_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "views_definer_privileges")
 }
 
 func TestLogic_virtual_columns(

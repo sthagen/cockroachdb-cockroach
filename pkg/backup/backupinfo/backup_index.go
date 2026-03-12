@@ -45,7 +45,7 @@ var (
 		settings.ApplicationLevel,
 		"backup.index.read.enabled",
 		"if true, the backup index will be read when reading from a backup collection",
-		metamorphic.ConstantWithTestBool("backup.index.read.enabled", false),
+		metamorphic.ConstantWithTestBool("backup.index.read.enabled", true),
 	)
 )
 
@@ -943,7 +943,7 @@ func readIndexFile(
 	if err != nil {
 		return backuppb.BackupIndexMetadata{}, errors.Wrapf(err, "reading index file %s", indexFilePath)
 	}
-	defer besteffort.Error(ctx, "cleanup-index-reader", func(ctx context.Context) error {
+	defer besteffort.Cleanup(ctx, "cleanup-index-reader", func() error {
 		return reader.Close(ctx)
 	})
 

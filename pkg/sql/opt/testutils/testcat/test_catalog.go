@@ -878,6 +878,11 @@ func (tv *View) Trigger(i int) cat.Trigger {
 	return &tv.Triggers[i]
 }
 
+// Owner is part of the cat.View interface.
+func (tv *View) Owner() username.SQLUsername {
+	return username.MakeSQLUsernameFromPreNormalizedString("root")
+}
+
 // Table implements the cat.Table interface for testing purposes.
 type Table struct {
 	TabID      cat.StableID
@@ -1873,9 +1878,8 @@ func (u *UniqueConstraint) Validated() bool {
 	return u.validated
 }
 
-// UniquenessGuaranteedByAnotherIndex is part of the cat.UniqueConstraint
-// interface.
-func (u *UniqueConstraint) UniquenessGuaranteedByAnotherIndex() bool {
+// CanElideUniqueCheck is part of the cat.UniqueConstraint interface.
+func (u *UniqueConstraint) CanElideUniqueCheck() bool {
 	return false
 }
 

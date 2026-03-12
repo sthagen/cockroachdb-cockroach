@@ -3183,6 +3183,18 @@ alter_index_cmd:
       PartitionByIndex: $1.partitionByIndex(),
     }
   }
+| SET '(' storage_parameter_list ')'
+  {
+    $$.val = &tree.AlterIndexSetStorageParams{
+      StorageParams: $3.storageParams(),
+    }
+  }
+| RESET '(' storage_parameter_key_list ')'
+  {
+    $$.val = &tree.AlterIndexResetStorageParams{
+      Params: $3.storageParamKeys(),
+    }
+  }
 
 alter_column_default:
   SET DEFAULT a_expr
@@ -4239,6 +4251,10 @@ restore_options:
 | REMOVE_REGIONS
   {
     $$.val = &tree.RestoreOptions{RemoveRegions: true, SkipLocalitiesCheck: true}
+  }
+| GRANTS
+  {
+    $$.val = &tree.RestoreOptions{Grants: true}
   }
 
 virtual_cluster_opt:

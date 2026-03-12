@@ -1086,7 +1086,6 @@ type cdcCheckpointType int
 
 const (
 	cdcNormalCheckpoint cdcCheckpointType = iota
-	cdcShutdownCheckpoint
 	cdcFrontierPersistence
 )
 
@@ -1157,19 +1156,11 @@ func runCDCInitialScanRollingRestart(
 	case cdcNormalCheckpoint:
 		setupStmts = append(setupStmts,
 			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '5s'`,
-			`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'false'`,
-			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '10m'`,
-		)
-	case cdcShutdownCheckpoint:
-		setupStmts = append(setupStmts,
-			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '0'`,
-			`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'true'`,
 			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '10m'`,
 		)
 	case cdcFrontierPersistence:
 		setupStmts = append(setupStmts,
 			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '0'`,
-			`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'false'`,
 			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '5s'`,
 		)
 	}
@@ -1289,6 +1280,279 @@ WITH initial_scan='only', min_checkpoint_frequency='1s'`, sinkURL),
 	}
 }
 
+type rollingRestartParams struct {
+	maxBackoff string
+	doRestarts bool
+	// testDuration is the total duration of the test, including the kv workload
+	// and changefeed monitoring. It may be longer than restartDuration to allow
+	// time for the changefeed to catch up after we finish restarting.
+	testDuration time.Duration
+	// restartDuration is how long the rolling restart loop runs. It must be less
+	// than or equal to testDuration.
+	restartDuration time.Duration
+}
+
+// runCDCRollingRestart tests changefeed behavior during rolling node restarts.
+// It runs a kv workload while periodically draining and restarting nodes to
+// simulate rolling upgrades. The doRestarts parameter controls whether restarts
+// actually occur (a false value runs a control baseline without restarts).
+//
+// During rolling restarts, each node restart triggers changefeed retries with
+// exponential backoff, and if the max backoff is too large the changefeed can't
+// make enough progress between restarts, causing lag to accumulate.
+func runCDCRollingRestart(
+	ctx context.Context, t test.Test, c cluster.Cluster, params rollingRestartParams,
+) {
+	if params.testDuration <= 0 {
+		t.Fatal("testDuration must be greater than 0")
+	}
+	if params.doRestarts && params.restartDuration <= 0 {
+		t.Fatal("restartDuration must be greater than 0 when doRestarts is true")
+	}
+	if params.restartDuration > params.testDuration {
+		t.Fatal("restartDuration must be less than or equal to testDuration")
+	}
+
+	startOpts := option.DefaultStartOpts()
+	racks := install.MakeClusterSettings(install.NumRacksOption(c.Spec().NodeCount))
+	// Override the initial retry backoff so it doesn't take many retries to
+	// reach the max backoff behavior.
+	racks.Env = append(racks.Env, `COCKROACH_CHANGEFEED_TESTING_INITIAL_RETRY_BACKOFF=32s`)
+	c.Start(ctx, t.L(), startOpts, racks)
+
+	// Set up prometheus on the workload node for roachperf export. The
+	// workload node is never restarted, so prometheus scraping is stable.
+	workloadNode := c.Spec().NodeCount
+	promCfg := (&prometheus.Config{}).
+		WithPrometheusNode(c.Node(workloadNode).InstallNodes()[0]).
+		WithCluster(c.All().InstallNodes()).
+		WithNodeExporter(c.All().InstallNodes())
+	if err := c.StartGrafana(ctx, t.L(), promCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	restart := func(n int) error {
+		t.L().Printf("draining and restarting node %d", n)
+		cmd := fmt.Sprintf("./cockroach node drain --certs-dir=%s --port={pgport:%d} --self", install.CockroachNodeCertsDir, n)
+		if err := c.RunE(ctx, option.WithNodes(c.Node(n)), cmd); err != nil {
+			return err
+		}
+		t.Monitor().ExpectProcessDead(c.Node(n))
+		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(n))
+		opts := startOpts
+		opts.RoachprodOpts.IsRestart = true
+		c.Start(ctx, t.L(), opts, racks, c.Node(n))
+		t.Monitor().ExpectProcessAlive(c.Node(n))
+		t.L().Printf("node %d restarted successfully", n)
+		return nil
+	}
+
+	// Connect to the workload node for queries since we'll be restarting the
+	// other nodes during the test.
+	db := c.Conn(ctx, t.L(), workloadNode)
+	defer db.Close()
+	t.L().Printf("setting up test with maxBackoff=%s, doRestarts=%t",
+		params.maxBackoff, params.doRestarts)
+	setupStmts := []string{
+		`SET CLUSTER SETTING kv.rangefeed.enabled = true`,
+		fmt.Sprintf(`SET CLUSTER SETTING changefeed.max_retry_backoff = '%s'`, params.maxBackoff),
+	}
+
+	for _, s := range setupStmts {
+		t.L().Printf(s)
+		if _, err := db.Exec(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cmd := fmt.Sprintf("./cockroach workload init kv --splits 50 {pgurl:%d}", c.Spec().NodeCount)
+	if err := c.RunE(ctx, option.WithNodes(c.Node(c.Spec().NodeCount)), cmd); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run the kv workload for the full test duration.
+	t.Go(func(ctx context.Context, l *logger.Logger) error {
+		cmd := fmt.Sprintf("./cockroach workload run kv --zipfian --duration=%s {pgurl:%d} --tolerate-errors",
+			params.testDuration, c.Spec().NodeCount)
+		return c.RunE(ctx, option.WithNodes(c.Node(c.Spec().NodeCount)), cmd)
+	})
+
+	var jobID int
+	if err := db.QueryRow(`CREATE CHANGEFEED FOR TABLE kv.kv INTO 'null://' WITH initial_scan='no'`).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	t.L().Printf("changefeed %d will run for %s", jobID, params.testDuration)
+
+	beginTime := timeutil.Now()
+
+	// Start rolling restarts in a background goroutine if enabled. We
+	// restart all nodes except the workload node.
+	if params.doRestarts {
+		// With restarts every 2 minutes and a 1m max backoff, the changefeed
+		// should get at least 1m of forward progress between each disruption,
+		// which is sufficient to keep up with the workload. With a higher max
+		// backoff (e.g. 10m), the changefeed spends most of each restart
+		// interval waiting to retry and falls behind.
+		const restartInterval = 2 * time.Minute
+		restartNodes := make([]int, 0, workloadNode-1)
+		for i := 1; i < workloadNode; i++ {
+			restartNodes = append(restartNodes, i)
+		}
+		t.Go(func(ctx context.Context, l *logger.Logger) error {
+			defer func() {
+				l.Printf("[%s] done restarting nodes", timeutil.Since(beginTime))
+			}()
+
+			l.Printf("starting rolling drain+restarts of nodes %v at %s interval for %s...", restartNodes, restartInterval, params.restartDuration)
+
+			timer := time.NewTimer(0)
+			defer timer.Stop()
+			restartDeadline := beginTime.Add(params.restartDuration)
+			for {
+				for _, n := range restartNodes {
+					if timeutil.Now().After(restartDeadline) {
+						l.Printf("restart deadline reached after %s, stopping restarts", timeutil.Since(beginTime))
+						return nil
+					}
+
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-timer.C:
+					}
+
+					if err := restart(n); err != nil {
+						return err
+					}
+					// Wait between restarts to let changefeeds make progress and
+					// allow backoff to climb higher before the next disruption.
+					timer.Reset(restartInterval)
+				}
+			}
+		})
+	}
+
+	getCurrentJobInfo := func() (time.Duration, string, string, error) {
+		var status string
+		var hwNanos gosql.NullFloat64
+		var runningStatus gosql.NullString
+		err := db.QueryRow(
+			`SELECT status, running_status, high_water_timestamp FROM [SHOW CHANGEFEED JOB $1]`, jobID,
+		).Scan(&status, &runningStatus, &hwNanos)
+		if err != nil {
+			return 0, "", "", err
+		}
+
+		var currentLag time.Duration
+		if hwNanos.Valid {
+			highwater := timeutil.Unix(0, int64(hwNanos.Float64))
+			currentLag = timeutil.Since(highwater)
+		}
+		return currentLag, status, runningStatus.String, nil
+	}
+
+	// Run the monitoring loop every 10 seconds until the end of the test
+	// to check that the changefeed lag doesn't exceed the maximum.
+	const lagPollInterval = 10 * time.Second
+	testDeadline := beginTime.Add(params.testDuration)
+	const maxAllowedLag = 5 * time.Minute
+
+	var maxHighwaterLag time.Duration
+	ticker := time.NewTicker(lagPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if timeutil.Now().After(testDeadline) {
+			break
+		}
+
+		currentLag, status, runningStatus, err := getCurrentJobInfo()
+		if err != nil {
+			t.L().Printf("[%s] error querying changefeed status: %v", timeutil.Since(beginTime), err)
+			continue
+		}
+		t.L().Printf("[%s] changefeed lag: %s, status: %s, running_status: %s",
+			timeutil.Since(beginTime), currentLag, status, runningStatus)
+		if currentLag > maxHighwaterLag {
+			maxHighwaterLag = currentLag
+		}
+		if status == "failed" {
+			t.Fatalf("changefeed entered failed status: %s", runningStatus)
+		}
+		if currentLag > maxAllowedLag {
+			t.Fatalf("changefeed lag %s exceeded maximum allowed (%s) during rolling restarts",
+				currentLag, maxAllowedLag)
+		}
+	}
+
+	// After the test, verify lag has recovered below a tighter threshold.
+	finalLag, _, _, err := getCurrentJobInfo()
+	if err != nil {
+		t.Fatalf("error querying final changefeed status: %v", err)
+	}
+	t.L().Printf("[%s] changefeed %d completed %s test run, final_lag=%s max_lag=%s",
+		timeutil.Since(beginTime), jobID, params.testDuration,
+		finalLag, maxHighwaterLag)
+	const maxLagAfterRecovery = 2 * time.Minute
+	if finalLag > maxLagAfterRecovery {
+		t.Fatalf("changefeed lag %s exceeded maximum allowed (%s) after recovery period",
+			finalLag, maxLagAfterRecovery)
+	}
+
+	// Export metrics to roachperf.
+	promClient, err := clusterstats.SetupCollectorPromClient(ctx, c, t.L(), promCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxBehindNanos := clusterstats.ClusterStat{
+		LabelName: "node", Query: "changefeed_max_behind_nanos",
+	}
+	maxBehindSecondsAgg := clusterstats.AggQuery{
+		Stat:  maxBehindNanos,
+		Query: "max(changefeed_max_behind_nanos) / (1000*1000*1000)",
+		Tag:   "Max Behind (s)",
+	}
+	statsCollector := clusterstats.NewStatsCollector(ctx, promClient)
+	if _, err := statsCollector.Exporter().Export(ctx, c, t, false, /* dryRun */
+		beginTime,
+		timeutil.Now(),
+		[]clusterstats.AggQuery{maxBehindSecondsAgg},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Max highwater lag (s)",
+				Value:          roachtestutil.MetricPoint(maxHighwaterLag.Seconds()),
+				Unit:           "seconds",
+				IsHigherBetter: false,
+			}
+		},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			var maxVal float64
+			if stat, ok := stats[maxBehindNanos.Query]; ok {
+				for _, v := range stat.Value {
+					if v > maxVal {
+						maxVal = v
+					}
+				}
+			}
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Max behind lag (s)",
+				Value:          roachtestutil.MetricPoint(maxVal),
+				Unit:           "seconds",
+				IsHigherBetter: false,
+			}
+		},
+		func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+			return &roachtestutil.AggregatedMetric{
+				Name:           "Final highwater lag (s)",
+				Value:          roachtestutil.MetricPoint(finalLag.Seconds()),
+				Unit:           "seconds",
+				IsHigherBetter: false,
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type fineGrainedCheckpointingParams struct {
 	numRanges               int
 	transientErrorFrequency time.Duration
@@ -1377,7 +1641,6 @@ func runCDCFineGrainedCheckpointingBenchmark(
 	setupStmts := []string{
 		`CREATE TABLE foo (id INT PRIMARY KEY, val INT)`,
 		`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '1s'`,
-		`SET CLUSTER SETTING changefeed.shutdown_checkpoint.enabled = 'false'`,
 		`SET CLUSTER SETTING changefeed.frontier_highwater_lag_checkpoint_threshold = '100ms'`,
 		`SET CLUSTER SETTING changefeed.frontier_checkpoint_frequency = '1s'`,
 		// We do not set timestamp quantization here since it is off by default
@@ -2171,17 +2434,6 @@ CONFIGURE ZONE USING
 		},
 	})
 	r.Add(registry.TestSpec{
-		Name:             "cdc/initial-scan-rolling-restart/shutdown-checkpoint",
-		Owner:            registry.OwnerCDC,
-		Cluster:          r.MakeClusterSpec(4),
-		CompatibleClouds: registry.OnlyGCE,
-		Suites:           registry.Suites(registry.Nightly),
-		Timeout:          30 * time.Minute,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runCDCInitialScanRollingRestart(ctx, t, c, cdcShutdownCheckpoint)
-		},
-	})
-	r.Add(registry.TestSpec{
 		Name:             "cdc/initial-scan-rolling-restart/frontier-persistence",
 		Owner:            registry.OwnerCDC,
 		Cluster:          r.MakeClusterSpec(4),
@@ -2194,6 +2446,44 @@ CONFIGURE ZONE USING
 		// TODO(#155015): Unskip this test.
 		Skip: "frontier persistence will not happen during an initial-scan only changefeed " +
 			"without periodic aggregator frontier flushes",
+	})
+	r.Add(registry.TestSpec{
+		Name:             "cdc/rolling-restart",
+		Owner:            registry.OwnerCDC,
+		Benchmark:        true,
+		Cluster:          r.MakeClusterSpec(4),
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.Suites(registry.Nightly),
+		Timeout:          30 * time.Minute,
+		Monitor:          true,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runCDCRollingRestart(ctx, t, c, rollingRestartParams{
+				maxBackoff:      "1m",
+				doRestarts:      true,
+				testDuration:    20 * time.Minute,
+				restartDuration: 15 * time.Minute,
+			})
+		},
+	})
+	// This test serves as a control for cdc/rolling-restart, running the same
+	// workload but without rolling restarts. This helps to isolate issues to
+	// rolling restarts in particular.
+	r.Add(registry.TestSpec{
+		Name:             "cdc/no-rolling-restart",
+		Owner:            registry.OwnerCDC,
+		Benchmark:        true,
+		Cluster:          r.MakeClusterSpec(4),
+		CompatibleClouds: registry.OnlyGCE,
+		Suites:           registry.Suites(registry.Nightly),
+		Timeout:          30 * time.Minute,
+		Monitor:          true,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runCDCRollingRestart(ctx, t, c, rollingRestartParams{
+				maxBackoff:   "1m",
+				doRestarts:   false,
+				testDuration: 20 * time.Minute,
+			})
+		},
 	})
 	r.Add(registry.TestSpec{
 		Name:             "cdc/fine-grained-checkpointing",

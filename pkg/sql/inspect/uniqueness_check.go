@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -22,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -152,7 +150,7 @@ func (c *uniquenessCheck) Start(
 WITH all_regions AS (
   %s
 )
-SELECT %s, array_agg(remote_region) as remote_regions
+SELECT %s, array_agg(remote_region ORDER BY remote_region) as remote_regions
 FROM all_regions
 GROUP BY %s
 `,
@@ -404,10 +402,8 @@ func (c *uniquenessCheck) loadCatalogInfo(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !tableDesc.IsLocalityRegionalByRow() {
-		if !buildutil.CrdbTestBuild && !testing.Testing() { // For ease of testing, allow faked multi-region databases.
-			return errors.AssertionFailedf("uniqueness check is only supported for tables with REGIONAL BY ROW locality")
-		}
+	if !isRegionalByRow(tableDesc) {
+		return errors.AssertionFailedf("uniqueness check is only supported for tables with REGIONAL BY ROW locality")
 	}
 	c.tableDesc = tableDesc
 

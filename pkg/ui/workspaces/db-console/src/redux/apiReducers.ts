@@ -468,16 +468,6 @@ const schemaInsightsReducerObj = new CachedDataReducer(
 );
 export const refreshSchemaInsights = schemaInsightsReducerObj.refresh;
 
-export const scheduleKey = (scheduleID: Long): string => scheduleID.toString();
-
-const scheduleReducerObj = new KeyedCachedDataReducer(
-  clusterUiApi.getSchedule,
-  "schedule",
-  scheduleKey,
-  moment.duration(10, "s"),
-);
-export const refreshSchedule = scheduleReducerObj.refresh;
-
 const snapshotsReducerObj = new KeyedCachedDataReducer(
   clusterUiApi.listTracingSnapshots,
   "snapshots",
@@ -517,15 +507,6 @@ const tenantsListObj = new CachedDataReducer(
 );
 
 export const refreshTenantsList = tenantsListObj.refresh;
-
-const connectivityObj = new CachedDataReducer(
-  api.getNetworkConnectivity,
-  "connectivity",
-  moment.duration(30, "s"),
-  moment.duration(1, "minute"),
-);
-
-export const refreshConnectivity = connectivityObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
@@ -580,12 +561,10 @@ export interface APIReducersState {
   statementFingerprintInsights: KeyedCachedDataReducerState<
     clusterUiApi.SqlApiResponse<StmtInsightEvent[]>
   >;
-  schedule: KeyedCachedDataReducerState<clusterUiApi.Schedule>;
   snapshots: KeyedCachedDataReducerState<clusterUiApi.ListTracingSnapshotsResponse>;
   snapshot: KeyedCachedDataReducerState<clusterUiApi.GetTracingSnapshotResponse>;
   rawTrace: KeyedCachedDataReducerState<clusterUiApi.GetTraceResponse>;
   tenants: CachedDataReducerState<api.ListTenantsResponseMessage>;
-  connectivity: CachedDataReducerState<api.NetworkConnectivityResponse>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -631,14 +610,12 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
     txnInsightDetailsReducerObj.reducer,
   [stmtInsightsReducerObj.actionNamespace]: stmtInsightsReducerObj.reducer,
   [schemaInsightsReducerObj.actionNamespace]: schemaInsightsReducerObj.reducer,
-  [scheduleReducerObj.actionNamespace]: scheduleReducerObj.reducer,
   [snapshotsReducerObj.actionNamespace]: snapshotsReducerObj.reducer,
   [snapshotReducerObj.actionNamespace]: snapshotReducerObj.reducer,
   [rawTraceReducerObj.actionNamespace]: rawTraceReducerObj.reducer,
   [statementFingerprintInsightsReducerObj.actionNamespace]:
     statementFingerprintInsightsReducerObj.reducer,
   [tenantsListObj.actionNamespace]: tenantsListObj.reducer,
-  [connectivityObj.actionNamespace]: connectivityObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
 	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/hintpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/hints"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -48,6 +50,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionmutator"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
@@ -656,11 +659,13 @@ func (ex *connExecutor) execStmtInOpenState(
 	ctx = ih.Setup(ctx, ex, p, &stmt, os.ImplicitTxn.Get(),
 		ex.state.mu.priority, ex.state.mu.autoRetryCounter)
 
-	// Set workload ID for ASH sampling. ih.Setup already computed the
-	// statement fingerprint ID, so reuse it here.
+	// Set workload ID and app name ID for ASH sampling. ih.Setup
+	// already computed the statement fingerprint ID, so reuse it here.
 	p.extendedEvalCtx.WorkloadID = uint64(ih.fingerprintId)
+	appNameID := ash.GetOrStoreAppNameID(p.SessionData().ApplicationName)
+	p.extendedEvalCtx.AppNameID = appNameID
 	if p.txn != nil {
-		p.txn.SetWorkloadID(uint64(ih.fingerprintId))
+		p.txn.SetWorkloadInfo(uint64(ih.fingerprintId), appNameID)
 	}
 
 	// Note that here we always unconditionally defer a function that takes care
@@ -945,6 +950,12 @@ func (ex *connExecutor) execStmtInOpenState(
 		ev, payload := ex.execShowCommitTimestampInOpenState(ctx, s, res, canAutoCommit)
 		return ev, payload, nil
 	}
+
+	// Apply session variable hints after the transaction control switch. This
+	// ensures hints don't interact with BEGIN/COMMIT/SAVEPOINT stack operations.
+	// The cleanup function pops the pushed hint session data frame on return.
+	hintCleanup := ex.applySessionVariableHints(ctx, p, &stmt)
+	defer hintCleanup()
 
 	if s, ok := ast.(*tree.Prepare); ok {
 		// This is handling the SQL statement "PREPARE". See execPrepare for
@@ -1736,11 +1747,13 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	p.semaCtx.Placeholders.Assign(pinfo, vars.stmt.NumPlaceholders)
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 
-	// Set workload ID for ASH sampling. ih.Setup already computed the
-	// statement fingerprint ID, so reuse it here.
+	// Set workload ID and app name ID for ASH sampling. ih.Setup
+	// already computed the statement fingerprint ID, so reuse it here.
 	p.extendedEvalCtx.WorkloadID = uint64(ih.fingerprintId)
+	appNameID2 := ash.GetOrStoreAppNameID(p.SessionData().ApplicationName)
+	p.extendedEvalCtx.AppNameID = appNameID2
 	if p.txn != nil {
-		p.txn.SetWorkloadID(uint64(ih.fingerprintId))
+		p.txn.SetWorkloadInfo(uint64(ih.fingerprintId), appNameID2)
 	}
 
 	if buildutil.CrdbTestBuild {
@@ -1948,6 +1961,13 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 		ev, payload := ex.execShowCommitTimestampInOpenState(ctx, s, res, canAutoCommit)
 		return ev, payload, nil
 	}
+
+	// Apply session variable hints after the transaction control switch.
+	// Use a regular defer (not processCleanupFunc) because the pushed session
+	// data must be popped on every execution return, not deferred until portal
+	// close. Each invocation pushes/pops its own frame.
+	hintCleanup := ex.applySessionVariableHints(ctx, p, &vars.stmt)
+	defer hintCleanup()
 
 	if s, ok := vars.ast.(*tree.Prepare); ok {
 		// This is handling the SQL statement "PREPARE". See execPrepare for
@@ -2281,6 +2301,18 @@ func (ex *connExecutor) handleAOST(ctx context.Context, stmt tree.Statement) err
 	}
 	if asOf == nil {
 		return nil
+	}
+
+	// On a PCR reader tenant, explicit AOST is not allowed unless the session
+	// variable bypass_pcr_reader_catalog_aost is set.
+	if ex.isPCRReaderCatalog && !ex.sessionData().BypassPCRReaderCatalogAOST {
+		return errors.WithHint(
+			pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"explicit AS OF SYSTEM TIME is not allowed on a physical cluster replication reader virtual cluster",
+			),
+			"use SET bypass_pcr_reader_catalog_aost = true to override, after reaching out to support for guidance",
+		)
 	}
 
 	// Implicit transactions can have multiple statements, so we need to check
@@ -3654,7 +3686,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	}
 
 	if err == nil && res.Err() == nil {
-		recv.maybeLogMisestimates(ctx, planner)
+		recv.handleMisestimates(ctx, planner)
 	}
 	return recv.stats, err
 }
@@ -3702,6 +3734,17 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 			}
 		}
 		return rwMode, now, nil, nil
+	}
+	// On a PCR reader tenant, explicit AOST is not allowed unless the session
+	// variable bypass_pcr_reader_catalog_aost is set.
+	if ex.isPCRReaderCatalog && !ex.sessionData().BypassPCRReaderCatalogAOST {
+		return 0, time.Time{}, nil, errors.WithHint(
+			pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"explicit AS OF SYSTEM TIME is not allowed on a physical cluster replication reader virtual cluster",
+			),
+			"use SET bypass_pcr_reader_catalog_aost = true to override, after reaching out to support for guidance",
+		)
 	}
 	ex.statsCollector.Reset(ex.applicationStats, ex.phaseTimes)
 	asOf, err := p.EvalAsOfTimestamp(ctx, asOfClause)
@@ -4726,4 +4769,78 @@ func isSQLOkayToThrottle(ast tree.Statement) bool {
 	default:
 		return true
 	}
+}
+
+// applySessionVariableHints pushes statement-level session data and applies all
+// enabled session variable hints. Returns a cleanup function that pops the
+// statement-level overlay. If no hints need applying, returns a no-op cleanup
+// function.
+//
+// The cache should have already resolved any duplicate hints. If applying a
+// hint fails, the error is logged and the hint is skipped, but the other hints
+// are still applied and statement execution continues.
+func (ex *connExecutor) applySessionVariableHints(
+	ctx context.Context, p *planner, stmt *Statement,
+) func() {
+	var pushedSessionData bool
+	for i := range stmt.Hints {
+		hint := &stmt.Hints[i]
+		if !hint.Enabled || hint.Err != nil || hint.SessionVariable == nil {
+			continue
+		}
+		varHint := hint.SessionVariable
+		if !pushedSessionData {
+			ex.sessionDataStack.PushStmtLevel()
+			pushedSessionData = true
+		}
+		if err := ex.applySessionVariableHint(ctx, p, varHint); err != nil {
+			log.Eventf(ctx, "skipping session variable hint for %s: %v",
+				redact.Safe(varHint.VariableName), err)
+		} else {
+			log.Eventf(ctx, "applied session variable hint: %s = %s",
+				redact.Safe(varHint.VariableName), varHint.VariableValue)
+		}
+	}
+	if !pushedSessionData {
+		return func() {}
+	}
+	return func() {
+		ex.sessionDataStack.PopStmtLevel()
+	}
+}
+
+// applySessionVariableHint applies a single session variable change from a
+// statement hint.
+func (ex *connExecutor) applySessionVariableHint(
+	ctx context.Context, p *planner, hint *hintpb.SessionVariableHint,
+) error {
+	varName := hint.VariableName
+	varValue := hint.VariableValue
+
+	v, ok := varGen[varName]
+	if !ok {
+		return errors.New("unknown session variable")
+	}
+
+	// Normalize the value via GetStringVal if available (e.g. for booleans,
+	// this canonicalizes "TRUE"/"1" to "on").
+	if v.GetStringVal != nil {
+		values := []tree.TypedExpr{tree.NewDString(varValue)}
+		normalized, err := v.GetStringVal(ctx, &p.extendedEvalCtx, values, p.Txn())
+		if err != nil {
+			return err
+		}
+		varValue = normalized
+	}
+
+	if v.Set != nil {
+		return ex.dataMutatorIterator.ApplyOnStmtScopedMutator(
+			func(m sessionmutator.SessionDataMutator) error {
+				return v.Set(ctx, m, varValue)
+			},
+		)
+	} else if v.SetWithPlanner != nil {
+		return v.SetWithPlanner(ctx, p, setScopeStmt, varValue)
+	}
+	return errors.New("cannot set session variable")
 }

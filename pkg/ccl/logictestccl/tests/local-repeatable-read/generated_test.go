@@ -171,6 +171,13 @@ func TestRepeatableReadLogic_alter_default_privileges_with_grant_option(
 	runLogicTest(t, "alter_default_privileges_with_grant_option")
 }
 
+func TestRepeatableReadLogic_alter_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "alter_index")
+}
+
 func TestRepeatableReadLogic_alter_primary_key(
 	t *testing.T,
 ) {
@@ -2647,6 +2654,13 @@ func TestRepeatableReadLogic_views(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "views")
+}
+
+func TestRepeatableReadLogic_views_definer_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "views_definer_privileges")
 }
 
 func TestRepeatableReadLogic_virtual_columns(

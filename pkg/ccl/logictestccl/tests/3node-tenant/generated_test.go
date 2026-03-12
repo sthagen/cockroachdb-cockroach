@@ -200,6 +200,13 @@ func TestTenantLogic_alter_default_privileges_with_grant_option(
 	runLogicTest(t, "alter_default_privileges_with_grant_option")
 }
 
+func TestTenantLogic_alter_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "alter_index")
+}
+
 func TestTenantLogic_alter_primary_key(
 	t *testing.T,
 ) {
@@ -2725,6 +2732,13 @@ func TestTenantLogic_views(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "views")
+}
+
+func TestTenantLogic_views_definer_privileges(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "views_definer_privileges")
 }
 
 func TestTenantLogic_virtual_columns(

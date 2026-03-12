@@ -78,6 +78,11 @@ const (
 	restoreOptForceTenantID             = "virtual_cluster"
 )
 
+// testFastRestore is a hook set by backup_test.go to enable OR for all
+// restores in test builds, without importing testonly packages into production
+// code. It returns false in production.
+var testFastRestore = func() bool { return false }
+
 // featureRestoreEnabled is used to enable and disable the RESTORE feature.
 var featureRestoreEnabled = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
@@ -1236,6 +1241,7 @@ func resolveOptionsForRestoreJobDescription(
 		ExperimentalOnline:               opts.ExperimentalOnline,
 		ExperimentalCopy:                 opts.ExperimentalCopy,
 		RemoveRegions:                    opts.RemoveRegions,
+		Grants:                           opts.Grants,
 	}
 
 	if opts.EncryptionPassphrase != nil {
@@ -1318,6 +1324,9 @@ func restoreTypeCheck(
 	if !ok {
 		return false, nil, nil
 	}
+	if testFastRestore() && !restoreStmt.Options.ExperimentalCopy && !restoreStmt.Options.ExperimentalOnline {
+		restoreStmt.Options.ExperimentalCopy = true
+	}
 	if err := exprutil.TypeCheck(
 		ctx, "RESTORE", p.SemaCtx(),
 		exprutil.StringArrays{
@@ -1361,6 +1370,9 @@ func restorePlanHook(
 	restoreStmt, ok := stmt.(*tree.Restore)
 	if !ok {
 		return nil, nil, false, nil
+	}
+	if testFastRestore() && !restoreStmt.Options.ExperimentalCopy && !restoreStmt.Options.ExperimentalOnline {
+		restoreStmt.Options.ExperimentalCopy = true
 	}
 
 	if err := featureflag.CheckEnabled(
@@ -1434,6 +1446,24 @@ func restorePlanHook(
 
 	if restoreStmt.Options.OnlineImpl() && restoreStmt.Options.VerifyData {
 		return nil, nil, false, errors.New("cannot run online restore with verify_backup_table_data")
+	}
+
+	if restoreStmt.Options.Grants {
+		if !p.ExecCfg().Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V26_2.Version()) {
+			return nil, nil, false, errors.New(
+				"RESTORE ... WITH GRANTS is only supported on clusters with version 26.2 or later",
+			)
+		}
+		switch restoreStmt.DescriptorCoverage {
+		case tree.AllDescriptors:
+			return nil, nil, false, errors.New(
+				"RESTORE ... WITH GRANTS is only supported for database and table level restores",
+			)
+		case tree.SystemUsers:
+			return nil, nil, false, errors.New(
+				"RESTORE SYSTEM USERS does not support the WITH GRANTS option",
+			)
+		}
 	}
 
 	var newTenantID *roachpb.TenantID
@@ -2141,6 +2171,7 @@ func doRestorePlan(
 		RemoveRegions:                    restoreStmt.Options.RemoveRegions,
 		UnsafeRestoreIncompatibleVersion: restoreStmt.Options.UnsafeRestoreIncompatibleVersion,
 		TempSystemID:                     tempSysDBID,
+		Grants:                           restoreStmt.Options.Grants,
 	}
 
 	jr := jobs.Record{

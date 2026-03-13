@@ -398,6 +398,12 @@ https://www.postgresql.org/docs/9.5/catalog-pg-attrdef.html`,
 	},
 	nil)
 
+// pg_attribute has an incomplete virtual index on attrelid. Lookups using table
+// descriptor OIDs resolve directly, but hashed index OIDs (e.g.  from
+// pg_index.indexrelid) miss the index and fall back to a full table scan.
+// Queries joining pg_attribute on a potentially hashed OID should use
+// pg_attribute@primary to force a hash join rather than an expensive lookup
+// join that silently degrades to a full scan.
 var pgCatalogAttributeTable = makeAllRelationsVirtualTableWithDescriptorIDIndex(
 	`table columns (incomplete - see also information_schema.columns)
 https://www.postgresql.org/docs/12/catalog-pg-attribute.html`,
@@ -785,6 +791,12 @@ var (
 	relPersistenceTemporary = tree.NewDString("t")
 )
 
+// pg_class has an incomplete virtual index on oid. Lookups using table
+// descriptor OIDs resolve directly, but hashed index OIDs (e.g. from
+// pg_index.indexrelid) miss the index and fall back to a full table scan.
+// Queries joining pg_class on a potentially hashed OID should use
+// pg_class@primary to force a hash join rather than an expensive lookup join
+// that silently degrades to a full scan.
 var pgCatalogClassTable = makeAllRelationsVirtualTableWithDescriptorIDIndex(
 	`tables and relation-like objects (incomplete - see also information_schema.tables/sequences/views)
 https://www.postgresql.org/docs/9.5/catalog-pg-class.html`,
@@ -815,14 +827,22 @@ https://www.postgresql.org/docs/9.5/catalog-pg-class.html`,
 			relPersistence = relPersistenceTemporary
 		}
 		var relOptions tree.Datum = tree.DNull
-		storageParams, err := table.GetStorageParams(false /* spaceBetweenEqual */)
+		var withOptions []string
+		var err error
+		if table.IsView() && !table.MaterializedView() {
+			// Show view options in reloptions.
+			withOptions, err = table.GetViewOptions(false /* spaceBetweenEqual */)
+		} else {
+			// Show table storage parameters in reloptions.
+			withOptions, err = table.GetStorageParams(false /* spaceBetweenEqual */)
+		}
 		if err != nil {
 			return err
 		}
-		if len(storageParams) > 0 {
+		if len(withOptions) > 0 {
 			relOptionsArr := tree.NewDArray(types.String)
-			for _, storageParam := range storageParams {
-				if err := relOptionsArr.Append(tree.NewDString(storageParam)); err != nil {
+			for _, opt := range withOptions {
+				if err := relOptionsArr.Append(tree.NewDString(opt)); err != nil {
 					return err
 				}
 			}

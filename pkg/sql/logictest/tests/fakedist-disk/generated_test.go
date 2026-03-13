@@ -895,13 +895,6 @@ func TestLogic_fuzzystrmatch(
 	runLogicTest(t, "fuzzystrmatch")
 }
 
-func TestLogic_geospatial(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "geospatial")
-}
-
 func TestLogic_geospatial_index(
 	t *testing.T,
 ) {
@@ -1796,6 +1789,13 @@ func TestLogic_secondary_index_column_families(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "secondary_index_column_families")
+}
+
+func TestLogic_security_invoker_view(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "security_invoker_view")
 }
 
 func TestLogic_select(

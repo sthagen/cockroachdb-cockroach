@@ -854,6 +854,62 @@ func (m *AlterTypeOwner) AppendJSONFields(printComma bool, b redact.RedactableBy
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *AshWorkloadSummary) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
+
+	if m.WindowDurationMillis != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"WindowDurationMillis\":"...)
+		b = strconv.AppendInt(b, int64(m.WindowDurationMillis), 10)
+	}
+
+	if m.WorkEventType != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"WorkEventType\":\""...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.WorkEventType)))
+		b = append(b, '"')
+	}
+
+	if m.WorkEvent != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"WorkEvent\":\""...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.WorkEvent)))
+		b = append(b, '"')
+	}
+
+	if m.WorkloadID != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"WorkloadID\":\""...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.WorkloadID)))
+		b = append(b, '"')
+	}
+
+	if m.SampleCount != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"SampleCount\":"...)
+		b = strconv.AppendInt(b, int64(m.SampleCount), 10)
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *BulkIngestCompleted) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
@@ -6251,6 +6307,16 @@ func (m *SetSessionVariableHint) AppendJSONFields(printComma bool, b redact.Reda
 		printComma = true
 		b = append(b, "\"HintID\":"...)
 		b = strconv.AppendInt(b, int64(m.HintID), 10)
+	}
+
+	if m.Database != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"Database\":\""...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.Database)))
+		b = append(b, '"')
 	}
 
 	return printComma, b

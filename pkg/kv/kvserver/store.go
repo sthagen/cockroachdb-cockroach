@@ -881,6 +881,7 @@ type Store struct {
 	cfg                  StoreConfig
 	internalEngines      kvstorage.Engines
 	wagSeq               wag.Seq
+	batchFactory         kvstorage.BatchFactory
 	db                   *kv.DB
 	tsCache              tscache.Cache           // Most recent timestamps for keys / key ranges
 	allocator            allocatorimpl.Allocator // Makes allocation decisions
@@ -1497,6 +1498,7 @@ func NewStore(
 		ioThresholds:                      &iot,
 		rangeFeedSlowClosedTimestampNudge: singleflight.NewGroup("rangfeed-ct-nudge", "range"),
 	}
+	s.batchFactory = kvstorage.MakeBatchFactory(&s.internalEngines, &s.wagSeq)
 	s.ioThreshold.t = &admissionpb.IOThreshold{}
 	// Track the maxScore over the last 5 minutes, in one minute windows.
 	now := cfg.Clock.Now().GoTime()
@@ -3072,6 +3074,11 @@ func (s *Store) StoreID() roachpb.StoreID { return s.Ident.StoreID }
 // Clock accessor.
 func (s *Store) Clock() *hlc.Clock { return s.cfg.Clock }
 
+// Engines returns the storage engines wrapper.
+func (s *Store) Engines() kvstorage.Engines {
+	return s.internalEngines
+}
+
 // EnginesSeparated returns true iff the Store uses separated engines.
 func (s *Store) EnginesSeparated() bool {
 	return s.internalEngines.Separated()
@@ -3080,12 +3087,6 @@ func (s *Store) EnginesSeparated() bool {
 // StateEngine returns the state machine engine.
 func (s *Store) StateEngine() storage.Engine {
 	return s.internalEngines.StateEngine()
-}
-
-// TODOEngine is a placeholder for cases in which the caller needs to be updated
-// in order to use only one engine, or a closer check is still pending.
-func (s *Store) TODOEngine() storage.Engine {
-	return s.internalEngines.TODOEngine()
 }
 
 // TODOBothEngines is a placeholder for cases in which the caller needs to be
@@ -3608,7 +3609,7 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 }
 
 func (s *Store) checkpointsDir() string {
-	return filepath.Join(s.TODOEngine().GetAuxiliaryDir(), "checkpoints")
+	return filepath.Join(s.TODOBothEngines().GetAuxiliaryDir(), "checkpoints")
 }
 
 // checkpointSpans returns key spans containing the given range. The spans may
@@ -3617,7 +3618,7 @@ func (s *Store) checkpointsDir() string {
 // storage issues, e.g. in situations when a recent reconfiguration like split
 // or merge occurred.
 func (s *Store) checkpointSpans(desc *roachpb.RangeDescriptor) []roachpb.Span {
-	_ = s.TODOEngine() // this method needs to return two sets of spans, one for each engine
+	_ = s.TODOBothEngines() // need to return two sets of spans, one for each engine
 	// Find immediate left and right neighbours by range ID.
 	var prevID, nextID roachpb.RangeID
 	s.mu.replicasByRangeID.Range(func(rangeID roachpb.RangeID, _ *Replica) bool {
@@ -3686,16 +3687,17 @@ func (s *Store) checkpointSpans(desc *roachpb.RangeDescriptor) []roachpb.Span {
 // the provided key spans. If spans is empty, it includes the entire store.
 func (s *Store) checkpoint(tag string, spans []roachpb.Span) (string, error) {
 	checkpointBase := s.checkpointsDir()
-	_ = s.TODOEngine().Env().MkdirAll(checkpointBase, os.ModePerm)
+	eng := s.TODOBothEngines()
+	_ = eng.Env().MkdirAll(checkpointBase, os.ModePerm)
 	// Create the checkpoint in a "pending" directory first. If we fail midway, it
 	// should be clear that the directory contains an incomplete checkpoint.
 	pendingDir := filepath.Join(checkpointBase, tag+"_pending")
-	if err := s.TODOEngine().CreateCheckpoint(pendingDir, spans); err != nil {
+	if err := eng.CreateCheckpoint(pendingDir, spans); err != nil {
 		return "", err
 	}
 	// Atomically rename the directory when it represents a complete checkpoint.
 	checkpointDir := filepath.Join(checkpointBase, tag)
-	if err := s.TODOEngine().Env().Rename(pendingDir, checkpointDir); err != nil {
+	if err := eng.Env().Rename(pendingDir, checkpointDir); err != nil {
 		return "", err
 	}
 	return checkpointDir, nil

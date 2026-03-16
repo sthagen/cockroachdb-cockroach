@@ -138,35 +138,12 @@ export const invalidateIndexStats =
   indexStatsReducerObj.cachedDataReducer.invalidateData;
 export const refreshIndexStats = indexStatsReducerObj.refresh;
 
-const nonTableStatsReducerObj = new CachedDataReducer(
-  api.getNonTableStats,
-  "nonTableStats",
-  moment.duration(1, "m"),
-);
-export const refreshNonTableStats = nonTableStatsReducerObj.refresh;
-
-const logsReducerObj = new CachedDataReducer(
-  api.getLogs,
-  "logs",
-  moment.duration(10, "s"),
-);
-export const refreshLogs = logsReducerObj.refresh;
-
 export const livenessReducerObj = new CachedDataReducer(
   api.getLiveness,
   "liveness",
   moment.duration(10, "s"),
 );
 export const refreshLiveness = livenessReducerObj.refresh;
-
-export const queryToID = (req: api.QueryPlanRequestMessage): string =>
-  req.query;
-
-const queryPlanReducerObj = new CachedDataReducer(
-  api.getQueryPlan,
-  "queryPlan",
-);
-export const refreshQueryPlan = queryPlanReducerObj.refresh;
 
 export const problemRangesRequestKey = (
   req: api.ProblemRangesRequestMessage,
@@ -328,13 +305,6 @@ export const invalidateStatementDiagnosticsRequests =
 export const RECEIVE_STATEMENT_DIAGNOSTICS_REPORT =
   statementDiagnosticsReportsReducerObj.RECEIVE;
 
-const dataDistributionReducerObj = new CachedDataReducer(
-  api.getDataDistribution,
-  "dataDistribution",
-  moment.duration(1, "m"),
-);
-export const refreshDataDistribution = dataDistributionReducerObj.refresh;
-
 const metricMetadataReducerObj = new CachedDataReducer(
   api.getAllMetricMetadata,
   "metricMetadata",
@@ -406,14 +376,6 @@ const statementFingerprintInsightsReducerObj = new KeyedCachedDataReducer(
 export const refreshStatementFingerprintInsights =
   statementFingerprintInsightsReducerObj.refresh;
 
-const schemaInsightsReducerObj = new CachedDataReducer(
-  clusterUiApi.getSchemaInsights,
-  "schemaInsights",
-  null,
-  moment.duration(5, "m"),
-);
-export const refreshSchemaInsights = schemaInsightsReducerObj.refresh;
-
 const snapshotsReducerObj = new KeyedCachedDataReducer(
   clusterUiApi.listTracingSnapshots,
   "snapshots",
@@ -465,10 +427,7 @@ export interface APIReducersState {
   locations: CachedDataReducerState<api.LocationsResponseMessage>;
   databases: CachedDataReducerState<clusterUiApi.DatabasesListResponse>;
   indexStats: KeyedCachedDataReducerState<api.IndexStatsResponseMessage>;
-  nonTableStats: CachedDataReducerState<api.NonTableStatsResponseMessage>;
-  logs: CachedDataReducerState<api.LogEntriesResponseMessage>;
   liveness: CachedDataReducerState<api.LivenessResponseMessage>;
-  queryPlan: CachedDataReducerState<api.QueryPlanResponseMessage>;
   problemRanges: KeyedCachedDataReducerState<api.ProblemRangesResponseMessage>;
   certificates: KeyedCachedDataReducerState<api.CertificatesResponseMessage>;
   range: KeyedCachedDataReducerState<api.RangeResponseMessage>;
@@ -480,7 +439,6 @@ export interface APIReducersState {
   statements: CachedDataReducerState<clusterUiApi.SqlStatsResponse>;
   transactions: CachedDataReducerState<clusterUiApi.SqlStatsResponse>;
   statementDetails: KeyedCachedDataReducerState<api.StatementDetailsResponseMessage>;
-  dataDistribution: CachedDataReducerState<api.DataDistributionResponseMessage>;
   metricMetadata: CachedDataReducerState<api.MetricMetadataResponseMessage>;
   statementDiagnosticsReports: CachedDataReducerState<clusterUiApi.StatementDiagnosticsResponse>;
   userSQLRoles: CachedDataReducerState<api.UserSQLRolesResponseMessage>;
@@ -496,9 +454,6 @@ export interface APIReducersState {
   >;
   txnInsights: CachedDataReducerState<
     clusterUiApi.SqlApiResponse<TxnInsightEvent[]>
-  >;
-  schemaInsights: CachedDataReducerState<
-    clusterUiApi.SqlApiResponse<clusterUiApi.InsightRecommendation[]>
   >;
   statementFingerprintInsights: KeyedCachedDataReducerState<
     clusterUiApi.SqlApiResponse<StmtInsightEvent[]>
@@ -518,10 +473,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [locationsReducerObj.actionNamespace]: locationsReducerObj.reducer,
   [databasesReducerObj.actionNamespace]: databasesReducerObj.reducer,
   [indexStatsReducerObj.actionNamespace]: indexStatsReducerObj.reducer,
-  [nonTableStatsReducerObj.actionNamespace]: nonTableStatsReducerObj.reducer,
-  [logsReducerObj.actionNamespace]: logsReducerObj.reducer,
   [livenessReducerObj.actionNamespace]: livenessReducerObj.reducer,
-  [queryPlanReducerObj.actionNamespace]: queryPlanReducerObj.reducer,
   [problemRangesReducerObj.actionNamespace]: problemRangesReducerObj.reducer,
   [certificatesReducerObj.actionNamespace]: certificatesReducerObj.reducer,
   [rangeReducerObj.actionNamespace]: rangeReducerObj.reducer,
@@ -535,8 +487,6 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
     txnFingerprintStatsReducerObj.reducer,
   [statementDetailsReducerObj.actionNamespace]:
     statementDetailsReducerObj.reducer,
-  [dataDistributionReducerObj.actionNamespace]:
-    dataDistributionReducerObj.reducer,
   [metricMetadataReducerObj.actionNamespace]: metricMetadataReducerObj.reducer,
   [statementDiagnosticsReportsReducerObj.actionNamespace]:
     statementDiagnosticsReportsReducerObj.reducer,
@@ -547,7 +497,6 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [txnInsightDetailsReducerObj.actionNamespace]:
     txnInsightDetailsReducerObj.reducer,
   [stmtInsightsReducerObj.actionNamespace]: stmtInsightsReducerObj.reducer,
-  [schemaInsightsReducerObj.actionNamespace]: schemaInsightsReducerObj.reducer,
   [snapshotsReducerObj.actionNamespace]: snapshotsReducerObj.reducer,
   [snapshotReducerObj.actionNamespace]: snapshotReducerObj.reducer,
   [rawTraceReducerObj.actionNamespace]: rawTraceReducerObj.reducer,

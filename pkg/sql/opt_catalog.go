@@ -687,6 +687,7 @@ func (oc *optCatalog) dataSourceForTable(
 	// Even if we have a cached data source, we still have to cross-check that
 	// statistics and the zone config haven't changed.
 	var tableStats []*stats.TableStatistic
+	var statsDiffer bool
 	if !flags.NoTableStats {
 		var typeResolver *descs.DistSQLTypeResolver
 		if p := oc.planner; p != nil {
@@ -698,11 +699,12 @@ func (oc *optCatalog) dataSourceForTable(
 		var statsCanaryWindow time.Duration
 		var statsAsOf hlc.Timestamp
 		if desc.TableDesc() != nil && oc.planner != nil && oc.planner.EvalContext() != nil {
-			stable = desc.TableDesc().StatsCanaryWindow > 0 && !oc.planner.EvalContext().UseCanaryStats
+			stable = desc.TableDesc().StatsCanaryWindow > 0 &&
+				oc.planner.EvalContext().StatsRollout == eval.StatsRolloutStable
 			statsCanaryWindow = desc.TableDesc().StatsCanaryWindow
 			statsAsOf = oc.planner.EvalContext().SessionData().StatsAsOf
 		}
-		tableStats, err = oc.planner.execCfg.TableStatsCache.GetTableStatsMaybeStable(ctx, desc, typeResolver, stable, statsCanaryWindow, statsAsOf)
+		tableStats, statsDiffer, err = oc.planner.execCfg.TableStatsCache.GetTableStatsMaybeStable(ctx, desc, typeResolver, stable, statsCanaryWindow, statsAsOf)
 		if err != nil {
 			// Ignore any error. We still want to be able to run queries even if we lose
 			// access to the statistics table.
@@ -722,7 +724,7 @@ func (oc *optCatalog) dataSourceForTable(
 		return ds, nil
 	}
 
-	ds, err := newOptTable(ctx, desc, oc.codec(), tableStats, zoneConfig)
+	ds, err := newOptTable(ctx, desc, oc.codec(), tableStats, zoneConfig, statsDiffer)
 	if err != nil {
 		return nil, err
 	}
@@ -963,6 +965,11 @@ type optTable struct {
 
 	triggers []optTrigger
 
+	// canaryAndStableStatsDiffer is true when the canary (newest) and stable
+	// (second-newest) statistics for this table genuinely differ within the
+	// canary window.
+	canaryAndStableStatsDiffer bool
+
 	// Row-level security (RLS) fields
 	rlsEnabled bool
 	rlsForced  bool
@@ -981,12 +988,14 @@ func newOptTable(
 	codec keys.SQLCodec,
 	stats []*stats.TableStatistic,
 	tblZone cat.Zone,
+	canaryAndStableStatsDiffer bool,
 ) (*optTable, error) {
 	ot := &optTable{
-		desc:     desc,
-		codec:    codec,
-		rawStats: stats,
-		zone:     tblZone,
+		desc:                       desc,
+		codec:                      codec,
+		rawStats:                   stats,
+		zone:                       tblZone,
+		canaryAndStableStatsDiffer: canaryAndStableStatsDiffer,
 	}
 
 	// Determine the primary key columns.
@@ -1698,6 +1707,11 @@ func (ot *optTable) Policies() *cat.Policies {
 		return nil
 	}
 	return &ot.policies
+}
+
+// CanaryAndStableStatsDiffer is part of the cat.Table interface.
+func (ot *optTable) CanaryAndStableStatsDiffer() bool {
+	return ot.canaryAndStableStatsDiffer
 }
 
 // LookupColumnOrdinal returns the ordinal of the column with the given ID. A
@@ -2866,6 +2880,9 @@ func (ot *optVirtualTable) IsRowLevelSecurityForced() bool { return false }
 
 // Policies is part of the cat.Table interface.
 func (ot *optVirtualTable) Policies() *cat.Policies { return nil }
+
+// CanaryAndStableStatsDiffer is part of the cat.Table interface.
+func (ot *optVirtualTable) CanaryAndStableStatsDiffer() bool { return false }
 
 // optVirtualIndex is a dummy implementation of cat.Index for the indexes
 // reported by a virtual table. The index assumes that table column 0 is a dummy

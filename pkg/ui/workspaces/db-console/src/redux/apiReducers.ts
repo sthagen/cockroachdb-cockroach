@@ -52,13 +52,6 @@ export const clusterReducerObj = new CachedDataReducer(
 );
 export const refreshCluster = clusterReducerObj.refresh;
 
-const eventsReducerObj = new CachedDataReducer(
-  clusterUiApi.getNonRedactedEvents,
-  "events",
-  moment.duration(10, "s"),
-);
-export const refreshEvents = eventsReducerObj.refresh;
-
 function rollupStoreMetrics(
   res: api.NodesResponseExternalMessage,
 ): INodeStatus[] {
@@ -93,13 +86,6 @@ export const refreshRaft = raftReducerObj.refresh;
 
 export const versionReducerObj = new CachedDataReducer(versionCheck, "version");
 export const refreshVersion = versionReducerObj.refresh;
-
-export const locationsReducerObj = new CachedDataReducer(
-  api.getLocations,
-  "locations",
-  moment.duration(10, "m"),
-);
-export const refreshLocations = locationsReducerObj.refresh;
 
 const databasesReducerObj = new CachedDataReducer(
   clusterUiApi.getDatabasesList,
@@ -418,13 +404,10 @@ export const refreshTenantsList = tenantsListObj.refresh;
 
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
-  events: CachedDataReducerState<
-    clusterUiApi.SqlApiResponse<clusterUiApi.EventsResponse>
-  >;
   nodes: CachedDataReducerState<INodeStatus[]>;
   raft: CachedDataReducerState<api.RaftDebugResponseMessage>;
   version: CachedDataReducerState<VersionList>;
-  locations: CachedDataReducerState<api.LocationsResponseMessage>;
+
   databases: CachedDataReducerState<clusterUiApi.DatabasesListResponse>;
   indexStats: KeyedCachedDataReducerState<api.IndexStatsResponseMessage>;
   liveness: CachedDataReducerState<api.LivenessResponseMessage>;
@@ -466,11 +449,10 @@ export interface APIReducersState {
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
   [clusterReducerObj.actionNamespace]: clusterReducerObj.reducer,
-  [eventsReducerObj.actionNamespace]: eventsReducerObj.reducer,
   [nodesReducerObj.actionNamespace]: nodesReducerObj.reducer,
   [raftReducerObj.actionNamespace]: raftReducerObj.reducer,
   [versionReducerObj.actionNamespace]: versionReducerObj.reducer,
-  [locationsReducerObj.actionNamespace]: locationsReducerObj.reducer,
+
   [databasesReducerObj.actionNamespace]: databasesReducerObj.reducer,
   [indexStatsReducerObj.actionNamespace]: indexStatsReducerObj.reducer,
   [livenessReducerObj.actionNamespace]: livenessReducerObj.reducer,

@@ -923,6 +923,9 @@ type Engine interface {
 	Attrs() roachpb.Attributes
 	// Capacity returns capacity details for the engine's available storage.
 	Capacity() (roachpb.StoreCapacity, error)
+	// WALFailoverDiskUsage returns disk usage for the WAL failover secondary
+	// volume. Returns vfs.ErrUnsupported if WAL failover is not configured.
+	WALFailoverDiskUsage() (vfs.DiskUsage, error)
 	// Properties returns the low-level properties for the engine's underlying storage.
 	Properties() roachpb.StoreProperties
 	// ProfileSeparatedValueRetrievals collects a profile of the engine's
@@ -1974,6 +1977,7 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	intents *[]roachpb.Intent,
 	maxLockConflicts int64,
 	targetLockConflictBytes int64,
+	preferDistinctTxns bool,
 ) (needIntentHistory bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -2017,6 +2021,16 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	var meta enginepb.MVCCMetadata
 	var ok bool
 	intentSize := int64(0)
+	// When preferDistinctTxns is set, we skip intents from transactions we've
+	// already collected, maximizing the number of distinct conflicting txns
+	// discovered within the maxLockConflicts budget.
+	// TODO(mira): consider collecting the first and last intent per transaction
+	// so that range resolve requests can be constructed more precisely, rather
+	// than widening to the full request span.
+	var seenTxns map[uuid.UUID]struct{}
+	if preferDistinctTxns {
+		seenTxns = make(map[uuid.UUID]struct{})
+	}
 	for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: ltStart}); ok; ok, err = iter.NextEngineKey() {
 		if maxLockConflicts != 0 && int64(len(*intents)) >= maxLockConflicts {
 			// Return early if we're done accumulating intents; make no claims about
@@ -2071,6 +2085,12 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 		}
 		if intentConflicts := meta.Timestamp.ToTimestamp().LessEq(ts); !intentConflicts {
 			continue
+		}
+		if seenTxns != nil {
+			if _, seen := seenTxns[meta.Txn.ID]; seen {
+				continue
+			}
+			seenTxns[meta.Txn.ID] = struct{}{}
 		}
 		key, err := iter.EngineKey()
 		if err != nil {

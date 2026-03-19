@@ -1677,8 +1677,12 @@ func (og *operationGenerator) createView(ctx context.Context, tx pgx.Tx) (*opStm
 	})
 	// Descriptor ID generator may be temporarily unavailable, so
 	// allow uncategorized errors temporarily.
-	opStmt.sql = fmt.Sprintf(`CREATE VIEW %s AS %s`,
-		destViewName, selectStatement.String())
+	securityInvokerClause, err := og.randSecurityInvokerClause(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	opStmt.sql = fmt.Sprintf(`CREATE VIEW %s%s AS %s`,
+		destViewName, securityInvokerClause, selectStatement.String())
 	return opStmt, nil
 }
 
@@ -2517,6 +2521,66 @@ func (og *operationGenerator) renameView(ctx context.Context, tx pgx.Tx) (*opStm
 	return stmt, nil
 }
 
+func (og *operationGenerator) alterViewSetViewOption(
+	ctx context.Context, tx pgx.Tx,
+) (*opStmt, error) {
+	viewName, err := og.randView(ctx, tx, og.pctExisting(true), "")
+	if err != nil {
+		return nil, err
+	}
+	viewExists, err := og.viewExists(ctx, tx, viewName)
+	if err != nil {
+		return nil, err
+	}
+	notSupported, err := isClusterVersionLessThan(
+		ctx, tx, clusterversion.V26_2.Version(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	stmt := makeOpStmt(OpStmtDDL)
+	stmt.expectedExecErrors.addAll(codesWithConditions{
+		{code: pgcode.UndefinedTable, condition: !viewExists},
+		{code: pgcode.Syntax, condition: notSupported},
+		{code: pgcode.FeatureNotSupported, condition: notSupported},
+	})
+	value := "true"
+	if og.params.rng.Intn(2) == 0 {
+		value = "false"
+	}
+	stmt.sql = fmt.Sprintf(`ALTER VIEW %s SET (security_invoker = %s)`, viewName, value)
+	return stmt, nil
+}
+
+func (og *operationGenerator) alterViewResetViewOption(
+	ctx context.Context, tx pgx.Tx,
+) (*opStmt, error) {
+	viewName, err := og.randView(ctx, tx, og.pctExisting(true), "")
+	if err != nil {
+		return nil, err
+	}
+	viewExists, err := og.viewExists(ctx, tx, viewName)
+	if err != nil {
+		return nil, err
+	}
+	notSupported, err := isClusterVersionLessThan(
+		ctx, tx, clusterversion.V26_2.Version(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	stmt := makeOpStmt(OpStmtDDL)
+	stmt.expectedExecErrors.addAll(codesWithConditions{
+		{code: pgcode.UndefinedTable, condition: !viewExists},
+		{code: pgcode.Syntax, condition: notSupported},
+		{code: pgcode.FeatureNotSupported, condition: notSupported},
+	})
+	stmt.sql = fmt.Sprintf(`ALTER VIEW %s RESET (security_invoker)`, viewName)
+	return stmt, nil
+}
+
 func (og *operationGenerator) setColumnDefault(ctx context.Context, tx pgx.Tx) (*opStmt, error) {
 
 	tableName, err := og.randTable(ctx, tx, og.pctExisting(true), "")
@@ -3016,7 +3080,12 @@ func (og *operationGenerator) commentOn(ctx context.Context, tx pgx.Tx) (*opStmt
 	// COMMENT ON TYPE is only implemented in the declarative schema changer in v24.2.
 	if og.useDeclarativeSchemaChanger {
 		onType = `UNION ALL
-	SELECT 'TYPE ' || quote_ident(schema) || '.' || quote_ident(name) FROM [SHOW TYPES]`
+	SELECT 'TYPE ' || quote_ident(nsp.nspname) || '.' || quote_ident(types.typname)
+	  FROM pg_catalog.pg_type AS types
+	  JOIN pg_catalog.pg_namespace AS nsp ON (types.typnamespace = nsp.oid)
+	  WHERE types.typtype IN ('e','c')
+	    AND types.typrelid IN (0, types.oid)
+	    AND nsp.nspname NOT IN ('information_schema', 'pg_catalog', 'crdb_internal', 'pg_extension')`
 	}
 	q := With([]CTE{
 		{"descriptors", descJSONQuery},
@@ -3025,7 +3094,7 @@ func (og *operationGenerator) commentOn(ctx context.Context, tx pgx.Tx) (*opStmt
 		{"indexes", `SELECT schema_id::REGNAMESPACE::TEXT as schema_name, name AS table_name, jsonb_array_elements(descriptor->'table'->'indexes') AS index FROM tables`},
 		{"constraints", `SELECT schema_id::REGNAMESPACE::TEXT as schema_name, name AS table_name, jsonb_array_elements(descriptor->'table'->'checks') AS constraint FROM tables`},
 	}, fmt.Sprintf(`
-	SELECT 'SCHEMA ' || quote_ident(schema_name) FROM [SHOW SCHEMAS] WHERE owner != 'node'
+	SELECT 'SCHEMA ' || quote_ident(schema_name) FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_extension', 'crdb_internal')
 		UNION ALL
 	SELECT 'TABLE ' || quote_ident(table_schema) || '.' || quote_ident(table_name) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_extension', 'crdb_internal')
 		UNION ALL
@@ -3809,6 +3878,35 @@ func (og *operationGenerator) randReferenceActions(
 	return acts
 }
 
+// randSecurityInvokerClause randomly returns a WITH (security_invoker) clause
+// for use in CREATE VIEW statements. It returns one of:
+// - " WITH (security_invoker = true)"
+// - " WITH (security_invoker = false)"
+// - "" (no clause)
+// The security_invoker option is only available in v26.2+, so an empty string
+// is always returned on older versions.
+func (og *operationGenerator) randSecurityInvokerClause(
+	ctx context.Context, tx pgx.Tx,
+) (string, error) {
+	notSupported, err := isClusterVersionLessThan(
+		ctx, tx, clusterversion.V26_2.Version(),
+	)
+	if err != nil {
+		return "", err
+	}
+	if notSupported {
+		return "", nil
+	}
+	switch og.params.rng.Intn(3) {
+	case 0:
+		return " WITH (security_invoker = true)", nil
+	case 1:
+		return " WITH (security_invoker = false)", nil
+	default:
+		return "", nil
+	}
+}
+
 // randParentColumnForFkRelation fetches a column and table to use as the parent in a single-column foreign key relation.
 // To successfully use a column as the parent, the column must be unique and must not be generated.
 func (og *operationGenerator) randParentColumnForFkRelation(
@@ -4019,9 +4117,13 @@ func (og *operationGenerator) randTypeName(
 		return &typeName, false, nil
 	}
 	var q = fmt.Sprintf(`
-		SELECT schema, name
-		    FROM [SHOW TYPES]
-		   WHERE name LIKE '%s'
+		SELECT nsp.nspname AS schema, types.typname AS name
+		    FROM pg_catalog.pg_type AS types
+		    JOIN pg_catalog.pg_namespace AS nsp ON (types.typnamespace = nsp.oid)
+		   WHERE types.typtype IN ('e','c')
+		     AND types.typrelid IN (0, types.oid)
+		     AND nsp.nspname NOT IN ('information_schema', 'pg_catalog', 'crdb_internal', 'pg_extension')
+		     AND types.typname LIKE '%s'
 		ORDER BY random()
 		   LIMIT 1;
 		`, prefix+"%")

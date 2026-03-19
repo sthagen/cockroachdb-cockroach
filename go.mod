@@ -130,7 +130,7 @@ require (
 	github.com/biogo/store v0.0.0-20160505134755-913427a1d5e8
 	github.com/blevesearch/snowballstem v0.9.0
 	github.com/charmbracelet/bubbles v0.15.1-0.20230123181021-a6a12c4a31eb
-	github.com/cockroachdb/apd/v3 v3.2.1
+	github.com/cockroachdb/apd/v3 v3.2.2
 	github.com/cockroachdb/changefeedpb v0.0.0-20250818184245-aab9e65dff20
 	github.com/cockroachdb/cmux v0.0.0-20250514152509-914d3bf9ec58
 	github.com/cockroachdb/cockroach-go/v2 v2.4.1
@@ -139,8 +139,8 @@ require (
 	github.com/cockroachdb/errors v1.12.1-0.20251010171200-64801262cd6f
 	github.com/cockroachdb/gostdlib v1.19.0
 	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506
-	github.com/cockroachdb/pebble v0.0.0-20260313172920-1454d2bc0f37
-	github.com/cockroachdb/redact v1.1.7
+	github.com/cockroachdb/pebble v0.0.0-20260317195521-a3b8dfe9e850
+	github.com/cockroachdb/redact v1.1.8
 	github.com/cockroachdb/returncheck v0.0.0-20200612231554-92cdbca611dd
 	github.com/cockroachdb/tokenbucket v0.0.0-20250429170803-42689b6311bb
 	github.com/cockroachdb/ttycolor v0.0.0-20210902133924-c7d7dcdde4e8

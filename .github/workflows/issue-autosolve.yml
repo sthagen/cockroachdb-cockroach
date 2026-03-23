@@ -18,7 +18,7 @@ jobs:
   auto-solve-issue:
     runs-on: [self-hosted, ubuntu_2404]
     timeout-minutes: 180
-    if: github.event.label.name == 'c-autosolve'
+    if: github.event.label.name == 'autosolve' || github.event.label.name == 'c-autosolve'
     permissions:
       contents: write
       pull-requests: write
@@ -469,6 +469,8 @@ jobs:
         if: steps.push.conclusion == 'success'
         env:
           GH_TOKEN: ${{ secrets.AUTOSOLVER_CREATE_PRS_PAT }}
+          # The user who added the autosolve label, passed via env to avoid injection.
+          TRIGGER_USER: ${{ github.event.sender.login }}
         run: |
           # For single-commit PRs, the PR title matches the commit subject
           # and the PR body matches the commit body (per commit-helper guidelines).
@@ -491,7 +493,8 @@ jobs:
             echo "*Please review carefully before approving.*"
           )
 
-          # Create the PR from fork to upstream
+          # Create the PR from fork to upstream.
+          # Assign and request review from the user who triggered autosolve.
           PR_URL=$(gh pr create \
             --repo ${{ github.repository }} \
             --head "${AUTOSOLVER_FORK_OWNER}:${{ steps.push.outputs.branch_name }}" \
@@ -499,7 +502,9 @@ jobs:
             --draft \
             --title "$COMMIT_TITLE" \
             --body "$PR_BODY" \
-            --label "o-autosolver")
+            --label "o-autosolver" \
+            --assignee "$TRIGGER_USER" \
+            --reviewer "$TRIGGER_USER")
 
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Created PR: $PR_URL"
@@ -563,14 +568,6 @@ jobs:
 
           [Workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
 
-      - name: Remove c-autosolve label
-        # Only remove label after assessment has run (success or failure).
-        # This allows retrying if the workflow fails before assessment completes.
-        if: always() && (steps.assess.conclusion == 'success' || steps.assess.conclusion == 'failure')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh issue edit ${{ github.event.issue.number }} --remove-label "c-autosolve" || true
 
       - name: Cleanup credentials and keys
         if: always()

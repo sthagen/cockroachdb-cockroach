@@ -78,6 +78,13 @@ var upgrades = []upgradebase.Upgrade{
 		tableStatisticsDelayDeleteColumnMigration,
 		upgrade.RestoreActionNotRequired("cluster restore does not restore the new column"),
 	),
+	upgrade.NewTenantUpgrade(
+		"add request_id column/index to system.statement_diagnostics",
+		clusterversion.V26_2_StmtDiagnosticsRequestID.Version(),
+		upgrade.NoPrecondition,
+		stmtDiagnosticsAddRequestIDColumnAndIndex,
+		upgrade.RestoreActionNotRequired("cluster restore does not restore this table"),
+	),
 
 	upgrade.NewTenantUpgrade(
 		"create cluster_metrics table",
@@ -168,6 +175,15 @@ var upgrades = []upgradebase.Upgrade{
 		upgrade.RestoreActionNotRequired("privilege is granted on restore via NewBaseDatabasePrivilegeDescriptor"),
 	),
 
+	upgrade.NewTenantUpgrade(
+		"create statements table",
+		clusterversion.V26_2_AddSystemStatementsTable.Version(),
+		upgrade.NoPrecondition,
+		createStatementsTable,
+		upgrade.RestoreActionNotRequired(
+			"restore for a cluster predating this table can leave it empty",
+		),
+	),
 	// Note: when starting a new release version, the first upgrade (for
 	// Vxy_zStart) must be a newFirstUpgrade. Keep this comment at the bottom.
 }

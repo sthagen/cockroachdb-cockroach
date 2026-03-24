@@ -3997,6 +3997,8 @@ func generateTableIndexesRow(
 	// indexes are not reported as a part of ForeachIndex.
 	return catalog.ForEachIndex(table, catalog.IndexOpts{
 		NonPhysicalPrimaryIndex: true,
+		AddMutations:            true,
+		DropMutations:           true,
 	}, func(idx catalog.Index) error {
 		idxType := secondary
 		if idx.Primary() {
@@ -9859,6 +9861,7 @@ CREATE TABLE crdb_internal.node_active_session_history (
 			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
+		ctx = roachpb.ContextWithClientTenant(ctx, p.extendedEvalCtx.Codec.TenantID)
 		response, err := p.extendedEvalCtx.SQLStatusServer.ListLocalActiveSessionHistory(ctx, &serverpb.ListActiveSessionHistoryRequest{})
 		if err != nil {
 			return err
@@ -9919,6 +9922,7 @@ CREATE TABLE crdb_internal.cluster_active_session_history (
 			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
 
+		ctx = roachpb.ContextWithClientTenant(ctx, p.extendedEvalCtx.Codec.TenantID)
 		response, err := p.extendedEvalCtx.SQLStatusServer.ListActiveSessionHistory(ctx, &serverpb.ListActiveSessionHistoryRequest{})
 		if err != nil {
 			return err

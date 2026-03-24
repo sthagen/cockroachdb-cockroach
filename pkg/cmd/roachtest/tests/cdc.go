@@ -283,6 +283,18 @@ func (ct *cdcTester) setupSink(args feedArgs) string {
 		kafka.mon = ct.mon
 		kafka.validateOrder = args.kafkaArgs.validateOrder
 
+		// Manually create Kafka topics so that topic consumers can start
+		// without racing on auto-creation by the changefeed.
+		for _, target := range args.targets {
+			topic := target
+			if i := strings.LastIndex(topic, "."); i != -1 {
+				topic = topic[i+1:]
+			}
+			if err := kafka.createTopic(ct.ctx, topic); err != nil {
+				ct.t.Fatal(err)
+			}
+		}
+
 		if err := kafka.startTopicConsumers(ct.ctx, args.targets, ct.doneCh); err != nil {
 			ct.t.Fatal(err)
 		}
@@ -704,6 +716,9 @@ func (ct *cdcTester) runFeedLatencyVerifierWithCallback(
 
 		err := verifier.pollLatencyUntilJobSucceeds(ctx, ct.DB(), cj.jobID, time.Second, ct.doneCh)
 		if err != nil {
+			if zipErr := ct.cluster.FetchDebugZip(context.Background(), ct.logger, fmt.Sprintf("latency_debug_%s.zip", cj.Label())); zipErr != nil {
+				ct.logger.Printf("failed to fetch debug zip on latency failure: %s", zipErr)
+			}
 			return err
 		}
 
@@ -1082,20 +1097,11 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster, cfg cdcBank
 	m.Wait()
 }
 
-type cdcCheckpointType int
-
-const (
-	cdcNormalCheckpoint cdcCheckpointType = iota
-	cdcFrontierPersistence
-)
-
 // runCDCInitialScanRollingRestart runs multiple initial-scan-only changefeeds
 // on a 4-node cluster, using node 1 as the coordinator and continuously
 // restarting nodes 2-4 to hopefully force the changefeed to replan and exercise
 // the checkpoint restore logic.
-func runCDCInitialScanRollingRestart(
-	ctx context.Context, t test.Test, c cluster.Cluster, checkpointType cdcCheckpointType,
-) {
+func runCDCInitialScanRollingRestart(ctx context.Context, t test.Test, c cluster.Cluster) {
 	startOpts := option.DefaultStartOpts()
 	ips, err := c.ExternalIP(ctx, t.L(), c.Node(1))
 	sinkURL := fmt.Sprintf("https://%s:%d", ips[0], debug.WebhookServerPort)
@@ -1151,18 +1157,13 @@ func runCDCInitialScanRollingRestart(
 		// Finish splitting, so that drained ranges spread out evenly.
 		fmt.Sprintf(`ALTER TABLE large SPLIT AT SELECT id FROM large ORDER BY random() LIMIT %d`, largeSplitCount),
 		`ALTER TABLE large SCATTER`,
-	}
-	switch checkpointType {
-	case cdcNormalCheckpoint:
-		setupStmts = append(setupStmts,
-			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '5s'`,
-			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '10m'`,
-		)
-	case cdcFrontierPersistence:
-		setupStmts = append(setupStmts,
-			`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '0'`,
-			`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '5s'`,
-		)
+		// Configure frequent checkpointing.
+		// NB: We set changefeed.span_checkpoint.interval because in addition
+		// to controlling how often we saved the now-deprecated legacy span-level
+		// checkpoint, it also controls how often a change aggregator will flush
+		// its frontier to the coordinator during a backfill.
+		`SET CLUSTER SETTING changefeed.span_checkpoint.interval = '1s'`,
+		`SET CLUSTER SETTING changefeed.progress.frontier_persistence.interval = '5s'`,
 	}
 	for _, s := range setupStmts {
 		t.L().Printf(s)
@@ -2482,29 +2483,15 @@ CONFIGURE ZONE USING
 		},
 	})
 	r.Add(registry.TestSpec{
-		Name:             "cdc/initial-scan-rolling-restart/normal-checkpoint",
+		Name:             "cdc/initial-scan-rolling-restart",
 		Owner:            registry.OwnerCDC,
 		Cluster:          r.MakeClusterSpec(4),
 		CompatibleClouds: registry.OnlyGCE,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          30 * time.Minute,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runCDCInitialScanRollingRestart(ctx, t, c, cdcNormalCheckpoint)
+			runCDCInitialScanRollingRestart(ctx, t, c)
 		},
-	})
-	r.Add(registry.TestSpec{
-		Name:             "cdc/initial-scan-rolling-restart/frontier-persistence",
-		Owner:            registry.OwnerCDC,
-		Cluster:          r.MakeClusterSpec(4),
-		CompatibleClouds: registry.OnlyGCE,
-		Suites:           registry.Suites(registry.Nightly),
-		Timeout:          30 * time.Minute,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runCDCInitialScanRollingRestart(ctx, t, c, cdcFrontierPersistence)
-		},
-		// TODO(#155015): Unskip this test.
-		Skip: "frontier persistence will not happen during an initial-scan only changefeed " +
-			"without periodic aggregator frontier flushes",
 	})
 	r.Add(registry.TestSpec{
 		Name:             "cdc/rolling-restart",
@@ -3252,10 +3239,10 @@ CONFIGURE ZONE USING
 			// topics that changefeeds need but not for all topics on the kafka
 			// cluster. The test verifies the work by 1. creating lots of random kafka
 			// topics on the kafka cluster 2. running some tpcc workload with a
-			// changefeed configured to watch all tpcc tables (note that cdc creates
-			// kafka topics for every target tables internally) 3. assert that
-			// changefeed only fetches metadata for tpcc tables but not for other
-			// random topics created in 1.
+			// changefeed configured to watch all tpcc tables (note that even though
+			// cdc creates kafka topics for every target table internally, we create
+			// them ourselves to avoid a race) 3. assert that changefeed only fetches
+			// metadata for tpcc tables but not for other random topics created in 1.
 
 			// Run minimal level of tpcc workload and changefeed.
 			ct.runTPCCWorkload(tpccArgs{warehouses: 1, duration: "30s"})
@@ -3563,6 +3550,11 @@ CONFIGURE ZONE USING
 						"spanconfig.range_coalescing.application.enabled": "'false'",
 						// TODO(#158779): When we add back per-table PTS, make sure that this test
 						// turns it off, to avoid it impacting the results.
+						//
+						// This is a latency sensitive scale test, use the default granularity.
+						// The benchmark has a 2 minute latency threshold, and up to 30
+						// seconds of quantization delay eats into that budget significantly.
+						"changefeed.resolved_timestamp.granularity": "'1s'",
 					} {
 						stmt := fmt.Sprintf(`SET CLUSTER SETTING %s = %s`, name, value)
 						if _, err := db.ExecContext(ctx, stmt); err != nil {

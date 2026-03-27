@@ -724,7 +724,9 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `[node ?] ? execution traces found`)
 
 	// Remove license-related NOTICE messages that may appear intermittently.
-	re = regexp.MustCompile(`(?m)^NOTICE: No license is installed.*\n?`)
+	// Most NOTICE messages are stripped earlier in RunWithCapture, but this
+	// catches any that appear outside of SQL data retrieval lines.
+	re = regexp.MustCompile(`(?m)NOTICE: No license is installed[^\n]*\n?`)
 	out = re.ReplaceAllString(out, ``)
 
 	return out
@@ -1520,6 +1522,9 @@ func trimNonDeterministicZipOutputFiles(out string) string {
 	re = regexp.MustCompile(`(?m).*(memprof|memstats|memmonitoring).*\.(txt|pprof)$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 	re = regexp.MustCompile(`(?m).*goroutine_dump.*\.pb\.gz$` + "\n")
+	out = re.ReplaceAllString(out, ``)
+	// ASH report files have timestamps in filenames, making them non-deterministic.
+	re = regexp.MustCompile(`(?m).*ash_report.*\.(json|txt)$` + "\n")
 	out = re.ReplaceAllString(out, ``)
 	// CPU profiles are non-deterministic: stored profiles have timestamps in
 	// filenames, and live profile collection may fail producing error files.

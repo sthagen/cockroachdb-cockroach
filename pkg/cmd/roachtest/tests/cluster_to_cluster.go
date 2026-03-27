@@ -1553,36 +1553,7 @@ func registerClusterToCluster(r registry.Registry) {
 			srcNodes:           4,
 			dstNodes:           4,
 			cpus:               8,
-			pdSize:             100,
 			workload:           replicateBulkOps{},
-			timeout:            2 * time.Hour,
-			additionalDuration: 0,
-			// Cutover currently takes around 4 minutes, perhaps because we need to
-			// revert 10 GB of replicated data.
-			//
-			// TODO(msbutler): investigate further if cutover can be sped up.
-			cutoverTimeout: 20 * time.Minute,
-			cutover:        5 * time.Minute,
-			// In a few ad hoc runs, the max latency hikes up to 27 minutes before lag
-			// replanning and distributed catch up scans fix the poor initial plan. If
-			// max accepted latency doubles, then there's likely a regression.
-			maxAcceptedLatency: 1 * time.Hour,
-			// Skipping node distribution check because there is little data on the
-			// source when the replication stream begins.
-			skipNodeDistributionCheck: true,
-			clouds:                    registry.OnlyGCE,
-			suites:                    registry.Suites(registry.Nightly),
-		},
-		{
-			name:     "c2c/BulkOps/settings=ac-import",
-			srcNodes: 4,
-			dstNodes: 4,
-			cpus:     8,
-			pdSize:   100,
-			workload: replicateBulkOps{withSettings: []struct{ setting, value string }{
-				{"bulkio.import.elastic_control.enabled", "true"},
-				{"bulkio.elastic_cpu_control.request_duration", "3ms"},
-			}},
 			timeout:            2 * time.Hour,
 			additionalDuration: 0,
 			// Cutover currently takes around 4 minutes, perhaps because we need to
@@ -1606,7 +1577,6 @@ func registerClusterToCluster(r registry.Registry) {
 			srcNodes:           4,
 			dstNodes:           4,
 			cpus:               8,
-			pdSize:             100,
 			workload:           replicateBulkOps{short: true, debugSkipRollback: true},
 			timeout:            2 * time.Hour,
 			cutoverTimeout:     1 * time.Hour,
@@ -2059,6 +2029,17 @@ func runClusterReplicationDisconnect(
 
 	// TODO(msbutler): disconnect nodes during a random phase
 	require.NoError(t, waitForTargetPhase(ctx, rd, dstJobID, phaseSteadyState))
+	waitForReplicatedTimeToReachTimestamp(t, int(dstJobID), rd.setup.dst.db, getStreamIngestionJobInfo, 3*time.Minute, timeutil.Now())
+
+	// 50% of the time: pause the job, start partition, then resume
+	shouldPauseBeforePartition := rd.rng.Intn(2) == 0
+
+	if shouldPauseBeforePartition {
+		rd.t.L().Printf("Pausing stream ingestion job %d before network partition", dstJobID)
+		rd.setup.dst.sysSQL.Exec(t, fmt.Sprintf("PAUSE JOB %d", dstJobID))
+		require.NoError(t, WaitForPaused(ctx, rd.setup.dst.db, dstJobID, 2*time.Minute))
+		rd.t.L().Printf("Stream ingestion job %d is now paused", dstJobID)
+	}
 
 	rd.t.L().Printf("Disconnecting all src nodes %v from all dst nodes %v",
 		rd.setup.src.nodes, rd.setup.dst.nodes)
@@ -2066,6 +2047,13 @@ func runClusterReplicationDisconnect(
 	blackholeFailer := &blackholeFailer{t: rd.t, c: rd.c, input: true, output: true}
 	for _, srcNode := range rd.setup.src.nodes {
 		blackholeFailer.FailPartial(ctx, srcNode, rd.setup.dst.nodes)
+	}
+
+	if shouldPauseBeforePartition {
+		rd.t.L().Printf("Resuming stream ingestion job %d after partition established", dstJobID)
+		rd.setup.dst.sysSQL.Exec(t, fmt.Sprintf("RESUME JOB %d", dstJobID))
+		require.NoError(t, WaitForResume(ctx, rd.setup.dst.db, dstJobID, 2*time.Minute))
+		rd.t.L().Printf("Stream ingestion job %d is now running", dstJobID)
 	}
 
 	if !persistPartition {

@@ -43,10 +43,12 @@ export * from "./text";
 export * from "./tracez";
 export { util, api };
 export { useCluster, useClusterLabel } from "./api/clusterApi";
+export { useDatabasesList } from "./api/databasesApi";
 export { useNodes } from "./api/nodesApi";
 export { useNodesSummary } from "./api/nodesSummaryApi";
 export { useHealth } from "./api/healthApi";
 export { useLiveWorkload } from "./api/liveWorkloadApi";
+export { useSessions } from "./api/sessionsApi";
 export type {
   LiveWorkloadData,
   UseLiveWorkloadResult,

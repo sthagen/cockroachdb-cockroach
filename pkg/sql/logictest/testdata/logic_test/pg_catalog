@@ -533,8 +533,8 @@ view_table_usage              false
 query OTOTT colnames
 SELECT oid, spcname, spcowner, spcacl, spcoptions FROM pg_tablespace
 ----
-oid  spcname     spcowner  spcacl  spcoptions
-0    pg_default  NULL      NULL    NULL
+oid  spcname     spcowner    spcacl  spcoptions
+0    pg_default  3233629770  NULL    NULL
 
 ## pg_catalog.pg_views
 
@@ -542,7 +542,7 @@ query TTTT colnames
 SELECT * FROM pg_catalog.pg_views
 ----
 schemaname  viewname  viewowner  definition
-public      v1        root       SELECT p, a, b, c FROM constraint_db.public.t1
+public      v1        root       SELECT p, a, b, c FROM constraint_db.public.t1;
 
 ## pg_catalog.pg_matviews
 
@@ -553,7 +553,7 @@ query TTTTBBT colnames
 SELECT * FROM pg_catalog.pg_matviews
 ----
 schemaname  matviewname  matviewowner  tablespace  hasindexes  ispopulated  definition
-public      mv1          root          NULL        false       true         SELECT 1
+public      mv1          root          NULL        false       true         SELECT 1;
 
 ## pg_catalog.pg_class
 
@@ -699,70 +699,70 @@ JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
 WHERE n.nspname = 'public'
 ----
 relname            attname                       atttypid  attstattarget  attlen  attnum  attndims  attcacheoff
-t1                 p                             701       0              8       1       0         -1
-t1                 a                             20        0              8       2       0         -1
-t1                 b                             20        0              8       3       0         -1
-t1                 c                             20        0              8       4       0         -1
-t1                 d                             1043      0              -1      5       0         -1
-t1                 e                             1560      0              -1      6       0         -1
-t1                 f                             1700      0              -1      7       0         -1
-t1                 g                             20        0              8       8       0         -1
-t1                 h                             1014      0              -1      9       0         -1
-t1                 i                             1015      0              -1      10      0         -1
-t1                 j                             18        0              1       11      0         -1
-t1                 k                             1043      0              -1      12      0         -1
-t1                 l                             20        0              8       13      0         -1
-t1                 m                             20        0              8       14      0         -1
-t1                 n                             20        0              8       15      0         -1
-t1_pkey            p                             701       0              8       1       0         -1
-t1_a_key           a                             20        0              8       1       0         -1
-index_key          b                             20        0              8       1       0         -1
-index_key          c                             20        0              8       2       0         -1
-t1_m_seq           value                         20        0              8       1       0         -1
-t1_n_seq           value                         20        0              8       1       0         -1
-t2                 t1_id                         20        0              8       1       0         -1
-t2                 rowid                         20        0              8       2       0         -1
-t2_pkey            rowid                         20        0              8       1       0         -1
-t2_t1_id_idx       t1_id                         20        0              8       1       0         -1
-t3                 a                             20        0              8       1       0         -1
-t3                 b                             20        0              8       2       0         -1
-t3                 c                             25        0              -1      3       0         -1
-t3                 rowid                         20        0              8       4       0         -1
-t3_pkey            rowid                         20        0              8       1       0         -1
-t3_a_b_idx         a                             20        0              8       1       0         -1
-t3_a_b_idx         b                             20        0              8       2       0         -1
-t3_a_b_idx         c                             25        0              -1      3       0         -1
-v1                 p                             701       0              8       1       0         -1
-v1                 a                             20        0              8       2       0         -1
-v1                 b                             20        0              8       3       0         -1
-v1                 c                             20        0              8       4       0         -1
-t4                 a                             20        0              8       1       0         -1
-t4                 b                             701       0              8       2       0         -1
-t4                 c                             25        0              -1      3       0         -1
-t4                 rowid                         20        0              8       4       0         -1
-t4_pkey            rowid                         20        0              8       1       0         -1
-t5                 a                             20        0              8       1       0         -1
-t5                 b                             701       0              8       2       0         -1
-t5                 c                             25        0              -1      3       0         -1
-t5                 rowid                         20        0              8       4       0         -1
-t5_pkey            rowid                         20        0              8       1       0         -1
-t6                 a                             20        0              8       1       0         -1
-t6                 b                             20        0              8       2       0         -1
-t6                 c                             25        0              -1      3       0         -1
-t6                 m                             100118    0              -1      4       0         -1
-t6                 rowid                         20        0              8       6       0         -1
-t6                 ........pg.dropped.5........  0         0              -1      5       0         -1
-t6                 ........pg.dropped.7........  0         0              -1      7       0         -1
-t6                 ........pg.dropped.8........  0         0              -1      8       0         -1
-t6_pkey            rowid                         20        0              8       1       0         -1
-t6_expr_idx        crdb_internal_idx_expr        20        0              8       1       0         -1
-t6_expr_expr1_idx  crdb_internal_idx_expr_1      25        0              -1      1       0         -1
-t6_expr_expr1_idx  crdb_internal_idx_expr        20        0              8       2       0         -1
-t6_expr_key        crdb_internal_idx_expr_1      25        0              -1      1       0         -1
-t6_expr_idx1       crdb_internal_idx_expr_2      16        0              1       1       0         -1
-mv1                ?column?                      20        0              8       1       0         -1
-mv1                rowid                         20        0              8       2       0         -1
-mv1_pkey           rowid                         20        0              8       1       0         -1
+t1                 p                             701       NULL           8       1       0         -1
+t1                 a                             20        NULL           8       2       0         -1
+t1                 b                             20        NULL           8       3       0         -1
+t1                 c                             20        NULL           8       4       0         -1
+t1                 d                             1043      NULL           -1      5       0         -1
+t1                 e                             1560      NULL           -1      6       0         -1
+t1                 f                             1700      NULL           -1      7       0         -1
+t1                 g                             20        NULL           8       8       0         -1
+t1                 h                             1014      NULL           -1      9       0         -1
+t1                 i                             1015      NULL           -1      10      0         -1
+t1                 j                             18        NULL           1       11      0         -1
+t1                 k                             1043      NULL           -1      12      0         -1
+t1                 l                             20        NULL           8       13      0         -1
+t1                 m                             20        NULL           8       14      0         -1
+t1                 n                             20        NULL           8       15      0         -1
+t1_pkey            p                             701       NULL           8       1       0         -1
+t1_a_key           a                             20        NULL           8       1       0         -1
+index_key          b                             20        NULL           8       1       0         -1
+index_key          c                             20        NULL           8       2       0         -1
+t1_m_seq           value                         20        NULL           8       1       0         -1
+t1_n_seq           value                         20        NULL           8       1       0         -1
+t2                 t1_id                         20        NULL           8       1       0         -1
+t2                 rowid                         20        NULL           8       2       0         -1
+t2_pkey            rowid                         20        NULL           8       1       0         -1
+t2_t1_id_idx       t1_id                         20        NULL           8       1       0         -1
+t3                 a                             20        NULL           8       1       0         -1
+t3                 b                             20        NULL           8       2       0         -1
+t3                 c                             25        NULL           -1      3       0         -1
+t3                 rowid                         20        NULL           8       4       0         -1
+t3_pkey            rowid                         20        NULL           8       1       0         -1
+t3_a_b_idx         a                             20        NULL           8       1       0         -1
+t3_a_b_idx         b                             20        NULL           8       2       0         -1
+t3_a_b_idx         c                             25        NULL           -1      3       0         -1
+v1                 p                             701       NULL           8       1       0         -1
+v1                 a                             20        NULL           8       2       0         -1
+v1                 b                             20        NULL           8       3       0         -1
+v1                 c                             20        NULL           8       4       0         -1
+t4                 a                             20        NULL           8       1       0         -1
+t4                 b                             701       NULL           8       2       0         -1
+t4                 c                             25        NULL           -1      3       0         -1
+t4                 rowid                         20        NULL           8       4       0         -1
+t4_pkey            rowid                         20        NULL           8       1       0         -1
+t5                 a                             20        NULL           8       1       0         -1
+t5                 b                             701       NULL           8       2       0         -1
+t5                 c                             25        NULL           -1      3       0         -1
+t5                 rowid                         20        NULL           8       4       0         -1
+t5_pkey            rowid                         20        NULL           8       1       0         -1
+t6                 a                             20        NULL           8       1       0         -1
+t6                 b                             20        NULL           8       2       0         -1
+t6                 c                             25        NULL           -1      3       0         -1
+t6                 m                             100118    NULL           -1      4       0         -1
+t6                 rowid                         20        NULL           8       6       0         -1
+t6                 ........pg.dropped.5........  0         NULL           -1      5       0         -1
+t6                 ........pg.dropped.7........  0         NULL           -1      7       0         -1
+t6                 ........pg.dropped.8........  0         NULL           -1      8       0         -1
+t6_pkey            rowid                         20        NULL           8       1       0         -1
+t6_expr_idx        crdb_internal_idx_expr        20        NULL           8       1       0         -1
+t6_expr_expr1_idx  crdb_internal_idx_expr_1      25        NULL           -1      1       0         -1
+t6_expr_expr1_idx  crdb_internal_idx_expr        20        NULL           8       2       0         -1
+t6_expr_key        crdb_internal_idx_expr_1      25        NULL           -1      1       0         -1
+t6_expr_idx1       crdb_internal_idx_expr_2      16        NULL           1       1       0         -1
+mv1                ?column?                      20        NULL           8       1       0         -1
+mv1                rowid                         20        NULL           8       2       0         -1
+mv1_pkey           rowid                         20        NULL           8       1       0         -1
 
 query TTIBTTBBTT colnames,rowsort
 SELECT c.relname, attname, atttypmod, attbyval, attstorage, attalign, attnotnull, atthasdef, attidentity, attgenerated
@@ -1649,7 +1649,7 @@ SELECT * FROM pg_collation
 WHERE collname='en-US'
 ----
 oid      collname  collnamespace  collowner  collencoding  collcollate  collctype  collprovider  collversion  collisdeterministic
-__OID__  en-US     __OID__        NULL       6             NULL         NULL       NULL          NULL         NULL
+__OID__  en-US     __OID__        __OID__    6             NULL         NULL       NULL          NULL         NULL
 
 user testuser
 
@@ -2011,104 +2011,104 @@ WHERE oid < 4194967002 -- exclude implicit types for virtual tables
 ORDER BY oid
 ----
 oid     typname                typnamespace  typowner  typlen  typbyval  typtype
-16      bool                   __OID__       NULL      1       true      b
-17      bytea                  __OID__       NULL      -1      false     b
-18      char                   __OID__       NULL      1       true      b
-19      name                   __OID__       NULL      -1      false     b
-20      int8                   __OID__       NULL      8       true      b
-21      int2                   __OID__       NULL      2       true      b
-22      int2vector             __OID__       NULL      -1      false     b
-23      int4                   __OID__       NULL      4       true      b
-24      regproc                __OID__       NULL      4       true      b
-25      text                   __OID__       NULL      -1      false     b
-26      oid                    __OID__       NULL      4       true      b
-30      oidvector              __OID__       NULL      -1      false     b
-700     float4                 __OID__       NULL      4       true      b
-701     float8                 __OID__       NULL      8       true      b
-705     unknown                __OID__       NULL      0       true      b
-869     inet                   __OID__       NULL      24      true      b
-1000    _bool                  __OID__       NULL      -1      false     b
-1001    _bytea                 __OID__       NULL      -1      false     b
-1002    _char                  __OID__       NULL      -1      false     b
-1003    _name                  __OID__       NULL      -1      false     b
-1005    _int2                  __OID__       NULL      -1      false     b
-1006    _int2vector            __OID__       NULL      -1      false     b
-1007    _int4                  __OID__       NULL      -1      false     b
-1008    _regproc               __OID__       NULL      -1      false     b
-1009    _text                  __OID__       NULL      -1      false     b
-1013    _oidvector             __OID__       NULL      -1      false     b
-1014    _bpchar                __OID__       NULL      -1      false     b
-1015    _varchar               __OID__       NULL      -1      false     b
-1016    _int8                  __OID__       NULL      -1      false     b
-1021    _float4                __OID__       NULL      -1      false     b
-1022    _float8                __OID__       NULL      -1      false     b
-1028    _oid                   __OID__       NULL      -1      false     b
-1033    aclitem                __OID__       NULL      -1      false     b
-1034    _aclitem               __OID__       NULL      -1      false     b
-1041    _inet                  __OID__       NULL      -1      false     b
-1042    bpchar                 __OID__       NULL      -1      false     b
-1043    varchar                __OID__       NULL      -1      false     b
-1082    date                   __OID__       NULL      4       true      b
-1083    time                   __OID__       NULL      8       true      b
-1114    timestamp              __OID__       NULL      8       true      b
-1115    _timestamp             __OID__       NULL      -1      false     b
-1182    _date                  __OID__       NULL      -1      false     b
-1183    _time                  __OID__       NULL      -1      false     b
-1184    timestamptz            __OID__       NULL      8       true      b
-1185    _timestamptz           __OID__       NULL      -1      false     b
-1186    interval               __OID__       NULL      24      true      b
-1187    _interval              __OID__       NULL      -1      false     b
-1231    _numeric               __OID__       NULL      -1      false     b
-1266    timetz                 __OID__       NULL      12      true      b
-1270    _timetz                __OID__       NULL      -1      false     b
-1560    bit                    __OID__       NULL      -1      false     b
-1561    _bit                   __OID__       NULL      -1      false     b
-1562    varbit                 __OID__       NULL      -1      false     b
-1563    _varbit                __OID__       NULL      -1      false     b
-1700    numeric                __OID__       NULL      -1      false     b
-1790    refcursor              __OID__       NULL      -1      false     b
-2201    _refcursor             __OID__       NULL      -1      false     b
-2202    regprocedure           __OID__       NULL      4       true      b
-2205    regclass               __OID__       NULL      4       true      b
-2206    regtype                __OID__       NULL      4       true      b
-2207    _regprocedure          __OID__       NULL      -1      false     b
-2210    _regclass              __OID__       NULL      -1      false     b
-2211    _regtype               __OID__       NULL      -1      false     b
-2249    record                 __OID__       NULL      0       true      p
-2276    any                    __OID__       NULL      -1      false     p
-2277    anyarray               __OID__       NULL      -1      false     p
-2278    void                   __OID__       NULL      0       true      p
-2279    trigger                __OID__       NULL      4       true      p
-2283    anyelement             __OID__       NULL      -1      false     p
-2287    _record                __OID__       NULL      -1      false     b
-2950    uuid                   __OID__       NULL      16      true      b
-2951    _uuid                  __OID__       NULL      -1      false     b
-3220    pg_lsn                 __OID__       NULL      8       true      b
-3221    _pg_lsn                __OID__       NULL      -1      false     b
-3614    tsvector               __OID__       NULL      -1      false     b
-3615    tsquery                __OID__       NULL      -1      false     b
-3643    _tsvector              __OID__       NULL      -1      false     b
-3645    _tsquery               __OID__       NULL      -1      false     b
-3802    jsonb                  __OID__       NULL      -1      false     b
-3807    _jsonb                 __OID__       NULL      -1      false     b
-4072    jsonpath               __OID__       NULL      -1      false     b
-4073    _jsonpath              __OID__       NULL      -1      false     b
-4089    regnamespace           __OID__       NULL      4       true      b
-4090    _regnamespace          __OID__       NULL      -1      false     b
-4096    regrole                __OID__       NULL      4       true      b
-4097    _regrole               __OID__       NULL      -1      false     b
-90000   geometry               __OID__       NULL      -1      false     b
-90001   _geometry              __OID__       NULL      -1      false     b
-90002   geography              __OID__       NULL      -1      false     b
-90003   _geography             __OID__       NULL      -1      false     b
-90004   box2d                  __OID__       NULL      32      true      b
-90005   _box2d                 __OID__       NULL      -1      false     b
-90006   vector                 __OID__       NULL      -1      false     b
-90007   _vector                __OID__       NULL      -1      false     b
-90008   citext                 __OID__       NULL      -1      false     b
-90009   _citext                __OID__       NULL      -1      false     b
-90010   ltree                  __OID__       NULL      -1      false     b
-90011   _ltree                 __OID__       NULL      -1      false     b
+16      bool                   __OID__       __OID__   1       true      b
+17      bytea                  __OID__       __OID__   -1      false     b
+18      char                   __OID__       __OID__   1       true      b
+19      name                   __OID__       __OID__   -1      false     b
+20      int8                   __OID__       __OID__   8       true      b
+21      int2                   __OID__       __OID__   2       true      b
+22      int2vector             __OID__       __OID__   -1      false     b
+23      int4                   __OID__       __OID__   4       true      b
+24      regproc                __OID__       __OID__   4       true      b
+25      text                   __OID__       __OID__   -1      false     b
+26      oid                    __OID__       __OID__   4       true      b
+30      oidvector              __OID__       __OID__   -1      false     b
+700     float4                 __OID__       __OID__   4       true      b
+701     float8                 __OID__       __OID__   8       true      b
+705     unknown                __OID__       __OID__   0       true      b
+869     inet                   __OID__       __OID__   24      true      b
+1000    _bool                  __OID__       __OID__   -1      false     b
+1001    _bytea                 __OID__       __OID__   -1      false     b
+1002    _char                  __OID__       __OID__   -1      false     b
+1003    _name                  __OID__       __OID__   -1      false     b
+1005    _int2                  __OID__       __OID__   -1      false     b
+1006    _int2vector            __OID__       __OID__   -1      false     b
+1007    _int4                  __OID__       __OID__   -1      false     b
+1008    _regproc               __OID__       __OID__   -1      false     b
+1009    _text                  __OID__       __OID__   -1      false     b
+1013    _oidvector             __OID__       __OID__   -1      false     b
+1014    _bpchar                __OID__       __OID__   -1      false     b
+1015    _varchar               __OID__       __OID__   -1      false     b
+1016    _int8                  __OID__       __OID__   -1      false     b
+1021    _float4                __OID__       __OID__   -1      false     b
+1022    _float8                __OID__       __OID__   -1      false     b
+1028    _oid                   __OID__       __OID__   -1      false     b
+1033    aclitem                __OID__       __OID__   -1      false     b
+1034    _aclitem               __OID__       __OID__   -1      false     b
+1041    _inet                  __OID__       __OID__   -1      false     b
+1042    bpchar                 __OID__       __OID__   -1      false     b
+1043    varchar                __OID__       __OID__   -1      false     b
+1082    date                   __OID__       __OID__   4       true      b
+1083    time                   __OID__       __OID__   8       true      b
+1114    timestamp              __OID__       __OID__   8       true      b
+1115    _timestamp             __OID__       __OID__   -1      false     b
+1182    _date                  __OID__       __OID__   -1      false     b
+1183    _time                  __OID__       __OID__   -1      false     b
+1184    timestamptz            __OID__       __OID__   8       true      b
+1185    _timestamptz           __OID__       __OID__   -1      false     b
+1186    interval               __OID__       __OID__   24      true      b
+1187    _interval              __OID__       __OID__   -1      false     b
+1231    _numeric               __OID__       __OID__   -1      false     b
+1266    timetz                 __OID__       __OID__   12      true      b
+1270    _timetz                __OID__       __OID__   -1      false     b
+1560    bit                    __OID__       __OID__   -1      false     b
+1561    _bit                   __OID__       __OID__   -1      false     b
+1562    varbit                 __OID__       __OID__   -1      false     b
+1563    _varbit                __OID__       __OID__   -1      false     b
+1700    numeric                __OID__       __OID__   -1      false     b
+1790    refcursor              __OID__       __OID__   -1      false     b
+2201    _refcursor             __OID__       __OID__   -1      false     b
+2202    regprocedure           __OID__       __OID__   4       true      b
+2205    regclass               __OID__       __OID__   4       true      b
+2206    regtype                __OID__       __OID__   4       true      b
+2207    _regprocedure          __OID__       __OID__   -1      false     b
+2210    _regclass              __OID__       __OID__   -1      false     b
+2211    _regtype               __OID__       __OID__   -1      false     b
+2249    record                 __OID__       __OID__   0       true      p
+2276    any                    __OID__       __OID__   -1      false     p
+2277    anyarray               __OID__       __OID__   -1      false     p
+2278    void                   __OID__       __OID__   0       true      p
+2279    trigger                __OID__       __OID__   4       true      p
+2283    anyelement             __OID__       __OID__   -1      false     p
+2287    _record                __OID__       __OID__   -1      false     b
+2950    uuid                   __OID__       __OID__   16      true      b
+2951    _uuid                  __OID__       __OID__   -1      false     b
+3220    pg_lsn                 __OID__       __OID__   8       true      b
+3221    _pg_lsn                __OID__       __OID__   -1      false     b
+3614    tsvector               __OID__       __OID__   -1      false     b
+3615    tsquery                __OID__       __OID__   -1      false     b
+3643    _tsvector              __OID__       __OID__   -1      false     b
+3645    _tsquery               __OID__       __OID__   -1      false     b
+3802    jsonb                  __OID__       __OID__   -1      false     b
+3807    _jsonb                 __OID__       __OID__   -1      false     b
+4072    jsonpath               __OID__       __OID__   -1      false     b
+4073    _jsonpath              __OID__       __OID__   -1      false     b
+4089    regnamespace           __OID__       __OID__   4       true      b
+4090    _regnamespace          __OID__       __OID__   -1      false     b
+4096    regrole                __OID__       __OID__   4       true      b
+4097    _regrole               __OID__       __OID__   -1      false     b
+90000   geometry               __OID__       __OID__   -1      false     b
+90001   _geometry              __OID__       __OID__   -1      false     b
+90002   geography              __OID__       __OID__   -1      false     b
+90003   _geography             __OID__       __OID__   -1      false     b
+90004   box2d                  __OID__       __OID__   32      true      b
+90005   _box2d                 __OID__       __OID__   -1      false     b
+90006   vector                 __OID__       __OID__   -1      false     b
+90007   _vector                __OID__       __OID__   -1      false     b
+90008   citext                 __OID__       __OID__   -1      false     b
+90009   _citext                __OID__       __OID__   -1      false     b
+90010   ltree                  __OID__       __OID__   -1      false     b
+90011   _ltree                 __OID__       __OID__   -1      false     b
 100110  t1                     109           __OID__   -1      false     c
 100111  t1_m_seq               109           __OID__   -1      false     c
 100112  t1_n_seq               109           __OID__   -1      false     c
@@ -2647,8 +2647,8 @@ SELECT oid, typname, typowner, typlen, typbyval, typtype
 FROM pg_catalog.pg_type WHERE typname = 'uuid'
 ORDER BY oid
 ----
-oid    typname  typowner  typlen  typbyval  typtype
-2950   uuid     NULL      16      true      b
+oid   typname  typowner    typlen  typbyval  typtype
+2950  uuid     3233629770  16      true      b
 
 user root
 
@@ -2658,7 +2658,7 @@ FROM pg_catalog.pg_type
 WHERE oid = 1000
 ----
 oid   typname  typnamespace  typowner  typlen  typbyval  typtype
-1000  _bool    __OID__       NULL      -1      false     b
+1000  _bool    __OID__       __OID__   -1      false     b
 
 query OTOOIBT colnames
 SELECT oid, typname, typnamespace, typowner, typlen, typbyval, typtype
@@ -2726,15 +2726,15 @@ FROM pg_catalog.pg_proc p
 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 WHERE proname='substring'
 ----
-proname    pronamespace  nspname     proowner  prolang  procost  prorows  provariadic
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
-substring  4294967089    pg_catalog  NULL      12       NULL     NULL     0
+proname    pronamespace  nspname     proowner    prolang  procost  prorows  provariadic
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
+substring  4294967089    pg_catalog  3233629770  12       NULL     NULL     0
 
 query TTBB colnames,rowsort
 SELECT proname, prokind, prosecdef, proleakproof
@@ -3910,7 +3910,7 @@ query OTOOTBBOOOOOOOO colnames,strip-oids
 SELECT * FROM pg_catalog.pg_operator where oprname='+' and oprleft='float8'::regtype
 ----
 oid       oprname  oprnamespace  oprowner  oprkind  oprcanmerge  oprcanhash  oprleft  oprright  oprresult  oprcom  oprnegate  oprcode  oprrest  oprjoin
-74817020  +        __OID__       NULL      b        false        false       701      701       701        NULL    NULL       NULL     NULL     NULL
+74817020  +        __OID__       __OID__   b        false        false       701      701       701        NULL    NULL       NULL     NULL     NULL
 
 # Verify proper functionality of system information functions.
 
@@ -5183,11 +5183,11 @@ SELECT
 FROM pg_statistic_ext
 JOIN pg_class ON pg_statistic_ext.stxrelid = pg_class.oid
 ----
-relname  stxname  stxnamespace  stxowner  stxstattarget  stxkeys  stxkind
-stxtbl   stxobj   105           NULL      -1             {2,3}    {d}
-stxtbl2  stxobj2  198           NULL      -1             {1,3}    {d}
-stx      NULL     105           NULL      -1             {2}      {d}
-stx      NULL     105           NULL      -1             {1}      {d}
+relname  stxname  stxnamespace  stxowner    stxstattarget  stxkeys  stxkind
+stxtbl   stxobj   105           3233629770  -1             {2,3}    {d}
+stxtbl2  stxobj2  198           3233629770  -1             {1,3}    {d}
+stx      NULL     105           3233629770  -1             {2}      {d}
+stx      NULL     105           3233629770  -1             {1}      {d}
 
 # Regression test for https://github.com/cockroachdb/cockroach/issues/108813:
 # pg_statistic_ext should still work after dropping the table.
@@ -5206,10 +5206,10 @@ SELECT
 FROM pg_statistic_ext
 JOIN pg_class ON pg_statistic_ext.stxrelid = pg_class.oid
 ----
-relname  stxname  stxnamespace  stxowner  stxstattarget  stxkeys  stxkind
-stxtbl   stxobj   105           NULL      -1             {2,3}    {d}
-stx      NULL     105           NULL      -1             {2}      {d}
-stx      NULL     105           NULL      -1             {1}      {d}
+relname  stxname  stxnamespace  stxowner    stxstattarget  stxkeys  stxkind
+stxtbl   stxobj   105           3233629770  -1             {2,3}    {d}
+stx      NULL     105           3233629770  -1             {2}      {d}
+stx      NULL     105           3233629770  -1             {1}      {d}
 
 # Test that pg_shadow doesn't include roles that can't login
 query B colnames

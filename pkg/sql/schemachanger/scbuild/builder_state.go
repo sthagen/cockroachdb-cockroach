@@ -463,11 +463,11 @@ func (b *builderState) CurrentUserHasAdminOrIsMemberOf(role username.SQLUsername
 	if b.evalCtx.SessionData().User() == role {
 		return true
 	}
-	memberships, err := b.auth.MemberOfWithAdminOption(b.ctx, role)
+	memberships, err := b.auth.MemberOfWithAdminOption(b.ctx, b.evalCtx.SessionData().User())
 	if err != nil {
 		panic(err)
 	}
-	_, ok := memberships[b.evalCtx.SessionData().User()]
+	_, ok := memberships[role]
 	return ok
 }
 
@@ -1230,6 +1230,8 @@ func (b *builderState) ResolveUserDefinedTypeType(
 	case descpb.TypeDescriptor_ENUM:
 		b.ensureDescriptor(typ.GetID())
 	case descpb.TypeDescriptor_COMPOSITE:
+		b.ensureDescriptor(typ.GetID())
+	case descpb.TypeDescriptor_DOMAIN:
 		b.ensureDescriptor(typ.GetID())
 	case descpb.TypeDescriptor_TABLE_IMPLICIT_RECORD_TYPE:
 		// Implicit record types are not directly modifiable.

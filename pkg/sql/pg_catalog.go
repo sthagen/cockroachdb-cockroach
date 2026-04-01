@@ -1740,8 +1740,9 @@ func createDefACLItem(
 // included; CockroachDB-specific privileges (BACKUP, CHANGEFEED, etc.)
 // are silently skipped by ListToACL.
 //
-// Grant option markers ('*') are stripped for admin, root, and the owner,
-// since their grant options are implicit (matching PostgreSQL behavior).
+// Grant option markers ('*') are stripped for the owner, since the owner's
+// grant option is implicit in PostgreSQL (acldefault never includes '*' for
+// the owner).
 //
 // If the resulting ACL matches the default privileges for the object type,
 // NULL is returned (matching PostgreSQL behavior where NULL means defaults).
@@ -1769,10 +1770,12 @@ func privilegeDescriptorToACLArray(
 				return nil, err
 			}
 		}
-		// Strip grant options for admin, root, and owner — their grant
-		// options are implicit in PostgreSQL convention.
+		// Strip grant options for the owner — the owner's grant option is
+		// implicit in PostgreSQL (acldefault never includes '*' for the
+		// owner). However, root and admin always show explicit grant
+		// options since they appear in every ACL with grants.
 		var grantOptions privilege.List
-		if !grantee.IsAdminRole() && !grantee.IsRootUser() && grantee != owner {
+		if grantee != owner || grantee.IsRootUser() || grantee.IsAdminRole() {
 			grantOptions, err = privilege.ListFromBitField(
 				userPriv.WithGrantOption, objectType,
 			)
@@ -2369,11 +2372,11 @@ https://www.postgresql.org/docs/9.5/view-pg-indexes.html`,
 		opts := forEachTableDescOptions{virtualOpts: hideVirtual} /* virtual tables do not have indexes */
 		return forEachTableDesc(ctx, p, dbContext, opts,
 			func(ctx context.Context, descCtx tableDescContext) error {
-				db, sc, table := descCtx.database, descCtx.schema, descCtx.table
+				sc, table := descCtx.schema, descCtx.table
 				scNameName := tree.NewDName(sc.GetName())
 				tblName := tree.NewDName(table.GetName())
 				return catalog.ForEachIndex(table, catalog.IndexOpts{}, func(index catalog.Index) error {
-					def, err := indexDefFromDescriptor(ctx, p, db, sc, table, index)
+					def, err := indexDefFromDescriptor(ctx, p, sc, table, index)
 					if err != nil {
 						return err
 					}
@@ -2391,17 +2394,19 @@ https://www.postgresql.org/docs/9.5/view-pg-indexes.html`,
 }
 
 // indexDefFromDescriptor creates an index definition (`CREATE INDEX ... ON (...)`) from
-// and index descriptor by reconstructing a CreateIndex parser node and calling its
-// String method.
+// an index descriptor by reconstructing a CreateIndex parser node and calling its
+// String method. The table name is schema-qualified only (no database prefix),
+// matching PostgreSQL's format. Cross-database index references are not possible
+// in either PostgreSQL or CockroachDB.
 func indexDefFromDescriptor(
 	ctx context.Context,
 	p *planner,
-	db catalog.DatabaseDescriptor,
 	sc catalog.SchemaDescriptor,
 	table catalog.TableDescriptor,
 	index catalog.Index,
 ) (string, error) {
-	tableName := tree.MakeTableNameWithSchema(tree.Name(db.GetName()), tree.Name(sc.GetName()), tree.Name(table.GetName()))
+	tableName := tree.MakeTableNameWithSchema("", tree.Name(sc.GetName()), tree.Name(table.GetName()))
+	tableName.ExplicitCatalog = false
 	partitionStr := ""
 	fmtStr, err := catformat.IndexForDisplay(
 		ctx,

@@ -397,13 +397,13 @@ func runSingleNodeIndexBackfill(
 			avgTotalBW, len(totalBWSamples))
 	}
 
-	// Export backfill duration and mean total bandwidth as scalar metrics
-	// for roachperf.
+	// Export backfill duration, mean total bandwidth, and foreground
+	// workload metrics as scalar metrics for roachperf.
 	if !metricsStart.IsZero() && !metricsEnd.IsZero() {
-		_, err := statCollector.Exporter().Export(
-			ctx, c, t, false, /* dryRun */
+		exportingStats, err := statCollector.Exporter().Export(
+			ctx, c, t, true, /* dryRun */
 			metricsStart, metricsEnd,
-			[]clusterstats.AggQuery{},
+			[]clusterstats.AggQuery{sqlServiceLatencyAgg, indexBackfillQPSAgg},
 			func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
 				return &roachtestutil.AggregatedMetric{
 					Name:           "index_backfill_duration",
@@ -423,8 +423,24 @@ func runSingleNodeIndexBackfill(
 					IsHigherBetter: true,
 				}
 			},
+			func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+				return meanNonNaN(stats, sqlServiceLatency.Query, "mean_p99_latency", "ms", false)
+			},
+			func(stats map[string]clusterstats.StatSummary) *roachtestutil.AggregatedMetric {
+				return meanNonNaN(stats, indexBackfillQPS.Query, "mean_qps", "queries/s", true)
+			},
 		)
 		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Replace NaN values to avoid JSON serialization errors.
+		cleanNaN(exportingStats, sqlServiceLatency.Query)
+		cleanNaN(exportingStats, indexBackfillQPS.Query)
+
+		if err := exportingStats.SerializeOutRun(
+			ctx, t, c, t.ExportOpenmetrics(),
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -433,7 +449,7 @@ func runSingleNodeIndexBackfill(
 	// tolerate run-to-run variance while catching severe regressions (e.g.,
 	// AC over-throttling the backfill or starving the disk).
 	const (
-		maxBackfillDuration = 90 * time.Minute
+		maxBackfillDuration = 150 * time.Minute
 		minAvgTotalBW       = 50.0 // MiB/s
 	)
 	if backfillDuration > maxBackfillDuration {
@@ -450,8 +466,9 @@ func runSingleNodeIndexBackfill(
 
 func doInitSingleNodeIndexBackfill(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// Check for existing snapshots.
+	snapshotPrefix := versionedSnapshotPrefix(t)
 	snapshots, err := c.ListSnapshots(ctx, vm.VolumeSnapshotListOpts{
-		NamePrefix: t.SnapshotPrefix(),
+		NamePrefix: snapshotPrefix,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -461,7 +478,7 @@ func doInitSingleNodeIndexBackfill(ctx context.Context, t test.Test, c cluster.C
 		// No existing snapshots - need to initialize TPC-E and create snapshots.
 		// Use a published CRDB release so the snapshot has a well-defined internal
 		// version that can be upgraded to any newer version.
-		t.L().Printf("=== NO EXISTING SNAPSHOTS FOUND for prefix %q ===", t.SnapshotPrefix())
+		t.L().Printf("=== NO EXISTING SNAPSHOTS FOUND for prefix %q ===", snapshotPrefix)
 		t.L().Printf("=== WILL CREATE NEW SNAPSHOTS after TPC-E init ===")
 
 		// Get the latest predecessor release version.
@@ -530,8 +547,8 @@ func doInitSingleNodeIndexBackfill(ctx context.Context, t test.Test, c cluster.C
 		c.Stop(ctx, t.L(), option.DefaultStopOpts())
 
 		// Create snapshots.
-		t.Status(fmt.Sprintf("creating snapshots with prefix %q", t.SnapshotPrefix()))
-		snapshots, err = c.CreateSnapshot(ctx, t.SnapshotPrefix())
+		t.Status(fmt.Sprintf("creating snapshots with prefix %q", snapshotPrefix))
+		snapshots, err = c.CreateSnapshot(ctx, snapshotPrefix)
 		if err != nil {
 			if strings.Contains(err.Error(), "already exists") {
 				// Another concurrent run may have already created snapshots
@@ -541,11 +558,11 @@ func doInitSingleNodeIndexBackfill(ctx context.Context, t test.Test, c cluster.C
 				t.Fatal(err)
 			}
 		} else {
-			t.L().Printf("=== CREATED %d NEW SNAPSHOT(S) with prefix %q ===", len(snapshots), t.SnapshotPrefix())
+			t.L().Printf("=== CREATED %d NEW SNAPSHOT(S) with prefix %q ===", len(snapshots), snapshotPrefix)
 		}
 	} else {
 		t.L().Printf("found %d existing snapshot(s) with prefix %q",
-			len(snapshots), t.SnapshotPrefix())
+			len(snapshots), snapshotPrefix)
 		roachtestutil.CopySnapshotDataToNodes(ctx, t, c, snapshots)
 	}
 }

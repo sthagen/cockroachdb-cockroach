@@ -238,7 +238,14 @@ func (ep *DummyEvalPlanner) ResetLeaseTimestamp(ctx context.Context) {
 	panic(errors.WithStack(errEvalPlanner))
 }
 
-// UserHasAdminRole is part of the Planner interface.
+// MaybeResolveSystemRoleOID is part of the eval.Planner interface.
+func (ep *DummyEvalPlanner) MaybeResolveSystemRoleOID(
+	ctx context.Context, roleOID oid.Oid,
+) (string, bool) {
+	return "", false
+}
+
+// UserHasAdminRole is part of the eval.Planner interface.
 func (ep *DummyEvalPlanner) UserHasAdminRole(
 	ctx context.Context, user username.SQLUsername,
 ) (bool, error) {
@@ -679,6 +686,20 @@ func (ep *DummyPrivilegedAccessor) LookupZoneConfigByNamespaceID(
 // IsSystemTable is part of the tree.PrivilegedAccessor interface.
 func (ep *DummyPrivilegedAccessor) IsSystemTable(ctx context.Context, id int64) (bool, error) {
 	return false, errors.WithStack(errEvalPrivileged)
+}
+
+// ResolvedZoneConfigForKey is part of the eval.PrivilegedAccessor interface.
+func (ep *DummyPrivilegedAccessor) ResolvedZoneConfigForKey(
+	ctx context.Context, key roachpb.Key,
+) (tree.Datum, error) {
+	return nil, errors.WithStack(errEvalPrivileged)
+}
+
+// ZoneConfigSpanEnd is part of the eval.PrivilegedAccessor interface.
+func (ep *DummyPrivilegedAccessor) ZoneConfigSpanEnd(
+	ctx context.Context, key roachpb.Key,
+) (roachpb.Key, error) {
+	return nil, errors.WithStack(errEvalPrivileged)
 }
 
 // DummySessionAccessor implements the eval.SessionAccessor interface by returning errors.

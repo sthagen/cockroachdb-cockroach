@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag/wagpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 )
 
@@ -51,10 +52,8 @@ func (s *Seq) Init(ctx context.Context, logEngine storage.Reader) error {
 	return nil
 }
 
-// Next allocates the given number of consecutive WAG nodes in the sequence, and
-// returns the index of the first allocated node. The caller can subsequently
-// use indices [Next, Next+count) for writing WAG nodes, and must not use
-// indices outside this span.
+// Next allocates the next WAG node sequence number. The caller can subsequently
+// use this index for writing a WAG node, and must not use any other index.
 //
 // The caller must make sure that conflicting writers call Next and do the
 // corresponding writes according to the topological ordering of these
@@ -62,8 +61,8 @@ func (s *Seq) Init(ctx context.Context, logEngine storage.Reader) error {
 // ordered. Independent / concurrent writers can call Next and perform the
 // corresponding writes in any order (e.g. different ranges can write their
 // events concurrently).
-func (s *Seq) Next(count uint64) uint64 {
-	return s.index.Add(count) - count + 1
+func (s *Seq) Next() uint64 {
+	return s.index.Add(1)
 }
 
 // Write puts the WAG node under the specific sequence number into the given
@@ -92,8 +91,6 @@ func Delete(w storage.Writer, index uint64) error {
 //	if err := iter.Error(); err != nil {
 //		return err
 //	}
-//
-// TODO(pav-kv): make it more flexible, e.g. iterate from a particular index.
 type Iterator struct {
 	// err is the last error encountered during the WAG iteration.
 	err error
@@ -102,6 +99,14 @@ type Iterator struct {
 // Iter returns an iterator that scans the WAG sequence. The iterator yields a
 // pair containing the WAG node index and the WAG node itself.
 func (it *Iterator) Iter(ctx context.Context, r storage.Reader) iter.Seq2[uint64, wagpb.Node] {
+	return it.IterFrom(ctx, r, keys.StoreWAGPrefix())
+}
+
+// IterFrom is similar to Iter, but allows specifying a starting point for the
+// iteration.
+func (it *Iterator) IterFrom(
+	ctx context.Context, r storage.Reader, seekKey roachpb.Key,
+) iter.Seq2[uint64, wagpb.Node] {
 	prefix := keys.StoreWAGPrefix()
 	mi, err := r.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
 		UpperBound: prefix.PrefixEnd(),
@@ -110,7 +115,7 @@ func (it *Iterator) Iter(ctx context.Context, r storage.Reader) iter.Seq2[uint64
 		it.err = err
 		return nil
 	}
-	mi.SeekGE(storage.MakeMVCCMetadataKey(prefix))
+	mi.SeekGE(storage.MakeMVCCMetadataKey(seekKey))
 
 	return func(yield func(uint64, wagpb.Node) bool) {
 		defer mi.Close()

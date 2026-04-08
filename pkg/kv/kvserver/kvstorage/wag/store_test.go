@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag/wagpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/print"
@@ -49,7 +50,7 @@ func TestWrite(t *testing.T) {
 	write("create", func(w storage.Writer) error { return createReplica(&s, w, id) })
 	// Intentionally introduce a gap in the sequence. We will later make sure that
 	// the iterator correctly skips over this gap.
-	s.seq.Next(1)
+	s.seq.Next()
 	write("init", func(w storage.Writer) error { return initReplica(&s, w, id, 10) })
 	write("split", func(w storage.Writer) error { return splitReplica(&s, w, id, rhsID, 200) })
 
@@ -125,7 +126,7 @@ func createReplica(s *store, w storage.Writer, id roachpb.FullReplicaID) error {
 	if err := writeStateMachine(b, "state-machine-key", "state"); err != nil {
 		return err
 	}
-	return Write(w, s.seq.Next(1), wagpb.Node{
+	return Write(w, s.seq.Next(), wagpb.Node{
 		Events: []wagpb.Event{
 			{Addr: wagpb.MakeAddr(id, 0), Type: wagpb.EventCreate},
 		},
@@ -134,7 +135,7 @@ func createReplica(s *store, w storage.Writer, id roachpb.FullReplicaID) error {
 }
 
 func initReplica(s *store, w storage.Writer, id roachpb.FullReplicaID, index uint64) error {
-	return Write(w, s.seq.Next(1), wagpb.Node{
+	return Write(w, s.seq.Next(), wagpb.Node{
 		Events: []wagpb.Event{
 			{Addr: wagpb.MakeAddr(id, kvpb.RaftIndex(index)), Type: wagpb.EventInit},
 		},
@@ -154,7 +155,7 @@ func splitReplica(
 	} else if err := writeStateMachine(b, "rhs-key", "rhs-state"); err != nil {
 		return err
 	}
-	return Write(w, s.seq.Next(1), wagpb.Node{
+	return Write(w, s.seq.Next(), wagpb.Node{
 		Events: []wagpb.Event{
 			{Addr: wagpb.MakeAddr(rhsID, 10), Type: wagpb.EventInit},
 			{Addr: wagpb.MakeAddr(lhsID, kvpb.RaftIndex(index)), Type: wagpb.EventSplit},
@@ -165,6 +166,43 @@ func splitReplica(
 
 func writeStateMachine(w storage.Writer, k, v string) error {
 	return w.PutUnversioned(roachpb.Key(k), []byte(v))
+}
+
+func TestIterFrom(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	eng := storage.NewDefaultInMemForTesting()
+	defer eng.Close()
+
+	// Write 3 WAG nodes at indices 1, 5, 10.
+	id := roachpb.FullReplicaID{RangeID: 1, ReplicaID: 1}
+	node := wagpb.Node{
+		Events: []wagpb.Event{
+			{Addr: wagpb.MakeAddr(id, 10), Type: wagpb.EventApply},
+		},
+	}
+	require.NoError(t, Write(eng, 1, node))
+	require.NoError(t, Write(eng, 5, node))
+	require.NoError(t, Write(eng, 10, node))
+
+	readIndicesFrom := func(fromIndex uint64) []uint64 {
+		var it Iterator
+		var res []uint64
+		for index := range it.IterFrom(ctx, eng, keys.StoreWAGNodeKey(fromIndex)) {
+			res = append(res, index)
+		}
+		require.NoError(t, it.Error())
+		return res
+	}
+
+	require.Equal(t, []uint64{1, 5, 10}, readIndicesFrom(0))
+	require.Equal(t, []uint64{1, 5, 10}, readIndicesFrom(1))
+	require.Equal(t, []uint64{5, 10}, readIndicesFrom(4))
+	require.Equal(t, []uint64{10}, readIndicesFrom(6))
+	require.Equal(t, []uint64{10}, readIndicesFrom(10))
+	require.Empty(t, readIndicesFrom(11))
 }
 
 func TestSeqInit(t *testing.T) {
@@ -178,7 +216,7 @@ func TestSeqInit(t *testing.T) {
 
 		var seq Seq
 		require.NoError(t, seq.Init(ctx, eng))
-		require.Equal(t, uint64(1), seq.Next(1))
+		require.Equal(t, uint64(1), seq.Next())
 	})
 
 	t.Run("resumes after last node", func(t *testing.T) {
@@ -192,14 +230,14 @@ func TestSeqInit(t *testing.T) {
 		b := eng.NewWriteBatch()
 		require.NoError(t, createReplica(&s, b, id))
 		require.NoError(t, initReplica(&s, b, id, 10))
-		s.seq.Next(3) // skip indices 3-5
+		s.seq.Next() // skip index 3
 		require.NoError(t, splitReplica(&s, b, id, rhsID, 20))
 		require.NoError(t, b.Commit(false /* sync */))
 
 		// Init a fresh sequencer from the log engine.
 		var seq2 Seq
 		require.NoError(t, seq2.Init(ctx, eng))
-		// Next allocation should be after the last persisted index (6).
-		require.Equal(t, uint64(7), seq2.Next(1))
+		// Next allocation should be after the last persisted index (5).
+		require.Equal(t, uint64(5), seq2.Next())
 	})
 }

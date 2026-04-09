@@ -62,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/taskset"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -2012,25 +2013,25 @@ func TestMergeSameSSTDuplicateDetection(t *testing.T) {
 			name:            "non-final iteration duplicate at start",
 			injectIteration: 1,
 			injectAfterRows: 0,
-			expErrRegex:     `duplicate key:`,
+			expErrRegex:     `duplicate key value violates unique constraint`,
 		},
 		{
 			name:            "non-final iteration duplicate after few rows",
 			injectIteration: 1,
 			injectAfterRows: 80,
-			expErrRegex:     `duplicate key:`,
+			expErrRegex:     `duplicate key value violates unique constraint`,
 		},
 		{
 			name:            "final iteration duplicate at start",
 			injectIteration: maxMergeIterations,
 			injectAfterRows: 0,
-			expErrRegex:     `duplicate key:`,
+			expErrRegex:     `duplicate key value violates unique constraint`,
 		},
 		{
 			name:            "final iteration duplicate after few rows",
 			injectIteration: maxMergeIterations,
 			injectAfterRows: 57,
-			expErrRegex:     `duplicate key:`,
+			expErrRegex:     `duplicate key value violates unique constraint`,
 		},
 	}
 
@@ -2195,11 +2196,16 @@ func TestKVWriteCrossSSTDuplicateDetection(t *testing.T) {
 
 			require.Error(t, err, "expected duplicate key error for cross-SST duplicates")
 
-			// Verify the error indicates a duplicate key violation with key details
-			// (e.g., "/Table/104/2/100/0" or "/Tenant/10/Table/104/2/100/0"). The error
-			// is now detected during the merge process and includes the offending key.
-			require.Regexp(t, `duplicate key: (/Tenant/\d+)?/Table/\d+/\d+/\d+`, err.Error(),
-				"expected error to include key details, got: %v", err)
+			// Verify the error is a proper uniqueness constraint violation. The
+			// DuplicateKeyError from the merge processor crosses the DistSQL
+			// boundary and is converted to a user-facing PG error with
+			// constraint name and key details.
+			require.Regexp(t, `duplicate key value violates unique constraint`, err.Error(),
+				"expected uniqueness constraint violation, got: %v", err)
+			var pgErr *pq.Error
+			require.True(t, errors.As(err, &pgErr), "expected pq.Error, got: %T", err)
+			require.Contains(t, pgErr.Detail, "100",
+				"expected error detail to reference the duplicate value, got: %s", pgErr.Detail)
 		})
 	}
 }
@@ -2318,4 +2324,42 @@ func TestDistributedMergeRedoCleanupSSTs(t *testing.T) {
 	require.True(t, orphanPlanted.Load(), "expected orphan file to be planted during map phase")
 	require.True(t, orphanCleanedBeforeJobEnd.Load(),
 		"expected orphan to be cleaned up before merge task, not by final job cleanup")
+}
+
+// TestDistributedMergeNoExternalIODir verifies behavior when ExternalIODir is
+// not configured and distributed merge is requested. Without ExternalIODir,
+// nodelocal storage is unavailable, so the distributed merge pipeline cannot
+// write temporary SSTs.
+func TestDistributedMergeNoExternalIODir(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// Intentionally omit ExternalIODir.
+		DefaultTestTenant: base.ExternalTestTenantAlwaysEnabled,
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	// 'declarative' forces distributed merge unconditionally (Force mode),
+	// which should fail because nodelocal storage is unavailable.
+	t.Run("force-fails", func(t *testing.T) {
+		tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'declarative'`)
+		tdb.Exec(t, `CREATE TABLE t_force (k INT PRIMARY KEY, v INT)`)
+		tdb.Exec(t, `INSERT INTO t_force SELECT i, i*10 FROM generate_series(1, 100) AS g(i)`)
+		_, err := db.ExecContext(ctx, `CREATE INDEX idx_force ON t_force (v)`)
+		require.Error(t, err)
+	})
+
+	// 'enabled' allows fallback when nodelocal is unavailable. The backfill
+	// should succeed via the non-distributed-merge code path.
+	t.Run("enabled-falls-back", func(t *testing.T) {
+		tdb.Exec(t, `SET CLUSTER SETTING bulkio.index_backfill.distributed_merge.mode = 'enabled'`)
+		tdb.Exec(t, `CREATE TABLE t_fallback (k INT PRIMARY KEY, v INT)`)
+		tdb.Exec(t, `INSERT INTO t_fallback SELECT i, i*10 FROM generate_series(1, 100) AS g(i)`)
+
+		tdb.Exec(t, `CREATE INDEX idx_fallback ON t_fallback (v)`)
+	})
 }

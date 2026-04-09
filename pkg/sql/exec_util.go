@@ -1829,6 +1829,10 @@ type ExecutorConfig struct {
 
 	ExternalIODirConfig base.ExternalIODirConfig
 
+	// ExternalIODir is the path to the directory used for nodelocal storage.
+	// An empty string indicates nodelocal storage is disabled.
+	ExternalIODir string
+
 	GCJobNotifier *gcjobnotifier.Notifier
 
 	RangeFeedFactory *rangefeed.Factory
@@ -2186,12 +2190,6 @@ type ExecutorTestingKnobs struct {
 	// internal executor. This can be used in tests to intercept session
 	// method calls like ExecutePrepared.
 	SessionWrapper func(isql.Session) isql.Session
-
-	// ForceWaitForOneVersionWithJobs, forces declarative schema changer
-	// DDL statements to issue WaitForOneVersion, even if they create jobs.
-	// In practice this doesn't matter for actual customer workloads, but
-	// for internal DML injection testing.
-	ForceWaitForOneVersionWithJobs bool
 }
 
 // PGWireTestingKnobs contains knobs for the pgwire module.

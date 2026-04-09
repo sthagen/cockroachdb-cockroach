@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
@@ -135,7 +137,7 @@ func (ib *IndexBackfillPlanner) BackfillIndexes(
 		}
 		return tracker.SetBackfillProgress(ctx, progress)
 	}
-	useDistributedMerge, err := shouldUseDistributedMerge(ctx, mode, descriptor, progress)
+	useDistributedMerge, err := shouldUseDistributedMerge(ctx, mode, descriptor, progress, ib.execCfg.ExternalIODir)
 	if err != nil {
 		return err
 	}
@@ -371,17 +373,25 @@ func getIndexBackfillDistributedMergeMode(
 // shouldUseDistributedMerge decides whether the backfill should run through
 // the distributed merge pipeline. Force mode always enables it. Enabled mode
 // falls back to the regular path when every destination index shares leading
-// key columns with the source, since the SSTs are already non-overlapping.
+// key columns with the source, since the SSTs are already non-overlapping,
+// or when nodelocal storage is unavailable (ExternalIODir is not configured).
 func shouldUseDistributedMerge(
 	ctx context.Context,
 	mode jobspb.IndexBackfillDistributedMergeMode,
 	descriptor catalog.TableDescriptor,
 	progress scexec.BackfillProgress,
+	externalIODir string,
 ) (bool, error) {
 	if mode == jobspb.IndexBackfillDistributedMergeMode_Force {
 		return true, nil
 	}
 	if mode != jobspb.IndexBackfillDistributedMergeMode_Enabled {
+		return false, nil
+	}
+	// The distributed merge pipeline writes temporary SSTs to nodelocal
+	// storage, which requires ExternalIODir to be configured. When it is
+	// not available, fall back to the regular backfill path.
+	if externalIODir == "" {
 		return false, nil
 	}
 	// Mode is Enabled: check whether the backfill data is already sorted
@@ -559,6 +569,18 @@ func (ib *IndexBackfillPlanner) runDistributedMerge(
 			execinfrapb.BulkMergeSpec_BACKFILL_MONITOR,
 		)
 		if err != nil {
+			// Convert DuplicateKeyError into a user-facing uniqueness
+			// constraint violation, matching the non-distributed backfill
+			// path (see indexBackfiller.wrapDupError).
+			var dupErr *kvserverbase.DuplicateKeyError
+			if errors.As(err, &dupErr) {
+				desc, descErr := descriptor.MakeFirstMutationPublic()
+				if descErr != nil {
+					return descErr
+				}
+				v := &roachpb.Value{RawBytes: dupErr.Value}
+				return row.NewUniquenessConstraintViolationError(ctx, desc, dupErr.Key, v)
+			}
 			return err
 		}
 

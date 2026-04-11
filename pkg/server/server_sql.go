@@ -716,6 +716,9 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	bulkMemoryMonitor.SetMetrics(bulkMetrics.CurBytesCount, bulkMetrics.MaxBytesHist)
 	bulkMemoryMonitor.StartNoReserved(ctx, rootSQLMemoryMonitor)
 
+	bulkMergeMetrics := execinfra.MakeBulkMergeMetrics(cfg.HistogramWindowInterval())
+	cfg.registry.AddMetricStruct(bulkMergeMetrics)
+
 	backfillMemoryMonitor := execinfra.NewMonitor(ctx, bulkMemoryMonitor, mon.MakeName("backfill-mon"))
 	backfillMemoryMonitor.MarkLongLiving()
 	backupMemoryMonitor := execinfra.NewMonitor(ctx, bulkMemoryMonitor, mon.MakeName("backup-mon"))
@@ -835,6 +838,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		BulkMonitor:       bulkMemoryMonitor,
 		ChangefeedMonitor: changefeedMemoryMonitor,
 		BulkSenderLimiter: bulkSenderLimiter,
+		BulkMergeMetrics:  &bulkMergeMetrics,
 
 		ParentMemoryMonitor: rootSQLMemoryMonitor,
 		BulkAdder: func(
@@ -1692,7 +1696,7 @@ func (s *SQLServer) preStart(
 	// run.
 
 	s.leaseMgr.StartRefreshLeasesTask(ctx, stopper, s.execCfg.DB)
-	s.leaseMgr.RunBackgroundLeasingTask(ctx)
+	s.leaseMgr.RunBackgroundLeasingTasks(ctx)
 
 	if err := s.jobRegistry.Start(ctx, stopper); err != nil {
 		return err

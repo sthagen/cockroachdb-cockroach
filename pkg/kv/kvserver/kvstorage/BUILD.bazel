@@ -8,6 +8,7 @@ go_library(
         "doc.go",
         "init.go",
         "initial.go",
+        "replica_mark.go",
         "replica_state.go",
         "stateloader.go",
         "storage.go",
@@ -28,6 +29,7 @@ go_library(
         "//pkg/kv/kvserver/spanset",
         "//pkg/raft/raftpb",
         "//pkg/roachpb",
+        "//pkg/settings/cluster",
         "//pkg/storage",
         "//pkg/storage/enginepb",
         "//pkg/storage/fs",
@@ -38,6 +40,7 @@ go_library(
         "//pkg/util/protoutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@org_golang_x_time//rate",
     ],
 )
 
@@ -49,6 +52,7 @@ go_test(
         "destroy_test.go",
         "init_test.go",
         "initial_test.go",
+        "replica_mark_test.go",
         "stateloader_test.go",
         "storage_test.go",
         "wag_replay_test.go",

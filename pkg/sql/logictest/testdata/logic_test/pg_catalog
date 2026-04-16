@@ -533,8 +533,8 @@ view_table_usage              false
 query OTOTT colnames
 SELECT oid, spcname, spcowner, spcacl, spcoptions FROM pg_tablespace
 ----
-oid  spcname     spcowner    spcacl  spcoptions
-0    pg_default  3233629770  NULL    NULL
+oid   spcname     spcowner    spcacl  spcoptions
+1663  pg_default  3233629770  NULL    NULL
 
 ## pg_catalog.pg_views
 
@@ -1008,6 +1008,20 @@ oid         amname    amstrategies  amsupport  amcanorder  amcanorderbyop  amcan
 2631952481  prefix    0             0          true        false           true           true         true           true           true           true           false      false          false        0          NULL      NULL         0           0            NULL      NULL       NULL       NULL        NULL     NULL          NULL          NULL             NULL         NULL            NULL       NULL       i
 4004609370  inverted  0             0          false       false           false          false        false          false          false          true           false      false          false        0          NULL      NULL         0           0            NULL      NULL       NULL       NULL        NULL     NULL          NULL          NULL             NULL         NULL            NULL       NULL       i
 
+# With pg_dump_compatibility enabled, pg_am should report btree/heap instead
+# of prefix/inverted.
+statement ok
+SET pg_dump_compatibility = 'postgres'
+
+query OT rowsort
+SELECT oid, amname FROM pg_catalog.pg_am
+----
+403  btree
+2    heap
+
+statement ok
+RESET pg_dump_compatibility
+
 ## pg_catalog.pg_attrdef
 
 query OTOITTT colnames
@@ -1246,6 +1260,7 @@ ORDER BY indexrelid
 ----
 indexrelid  indrelid  indnatts  indisunique  indnullsnotdistinct  indisprimary  indisexclusion  indimmediate  indisclustered  indisvalid  indcheckxmin  indisready  indislive  indisreplident  indkey                                                       indcollation               indclass       indoption      indexprs  indpred                                                                                                             indnkeyatts
 51576700    64        5         true         false                true          false           true          false           true        false         true        true       false           6 1 2 3 4                                                    0 0 0 0 0                  0 0 0 0 0      2 2 2 2 2      NULL      NULL                                                                                                                5
+97972364    80        3         true         false                true          false           true          false           true        false         true        true       false           1 2 3                                                        0 0 0                      0 0 0          2 2 2          NULL      NULL                                                                                                                3
 144368028   32        1         true         false                true          false           true          false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 190763692   48        1         false        false                true          false           false         false           true        false         true        true       false           1                                                            0                          0              2              NULL      NULL                                                                                                                1
 311312971   71        3         true         false                true          false           true          false           true        false         true        true       false           1 2 3                                                        0 0 3403232968             0 0 0          2 1 2          NULL      NULL                                                                                                                3
@@ -1400,6 +1415,9 @@ indexrelid  operator_argument_type_oid  operator_argument_position
 51576700    0                           3
 51576700    0                           4
 51576700    0                           5
+97972364    0                           1
+97972364    0                           2
+97972364    0                           3
 144368028   0                           1
 190763692   0                           1
 311312971   0                           1
@@ -1984,6 +2002,51 @@ ORDER BY c.relname
 rulename  relname                ev_type  ev_enabled  is_instead  ev_qual
 _RETURN   depend_view            1        NULL        true        NULL
 _RETURN   view_dependingon_view  1        NULL        true        NULL
+
+# Verify pg_dump's dependency resolution pattern works.
+# pg_dump joins pg_depend to pg_rewrite using CatalogId = (classid, objid)
+# matching (tableoid, oid). If classid != pg_rewrite's tableoid, the
+# dependency is silently dropped and views are dumped before their tables.
+
+# Test with default settings.
+query TT colnames,rowsort
+SELECT depend_class.relname AS view_name,
+       source_class.relname AS depends_on
+FROM pg_depend d
+JOIN pg_rewrite r ON d.classid = r.tableoid AND d.objid = r.oid
+JOIN pg_class depend_class ON r.ev_class = depend_class.oid
+JOIN pg_class source_class ON d.refobjid = source_class.oid
+WHERE r.rulename = '_RETURN'
+  AND d.deptype NOT IN ('p', 'e')
+  AND source_class.relname = 'source_table'
+ORDER BY 1, 2
+----
+view_name      depends_on
+depend_view    source_table
+depend_view    source_table
+
+# Test with pg_dump_compatibility = postgres (OID remapping active).
+statement ok
+SET pg_dump_compatibility = postgres
+
+query TT colnames,rowsort
+SELECT depend_class.relname AS view_name,
+       source_class.relname AS depends_on
+FROM pg_depend d
+JOIN pg_rewrite r ON d.classid = r.tableoid AND d.objid = r.oid
+JOIN pg_class depend_class ON r.ev_class = depend_class.oid
+JOIN pg_class source_class ON d.refobjid = source_class.oid
+WHERE r.rulename = '_RETURN'
+  AND d.deptype NOT IN ('p', 'e')
+  AND source_class.relname = 'source_table'
+ORDER BY 1, 2
+----
+view_name      depends_on
+depend_view    source_table
+depend_view    source_table
+
+statement ok
+RESET pg_dump_compatibility
 
 ## pg_catalog.pg_enum
 statement ok
@@ -2893,10 +2956,10 @@ statement ok
 DROP PROCEDURE pro
 
 ## pg_catalog.pg_range
-query IIIIII colnames
+query IIIIIII colnames
 SELECT * from pg_catalog.pg_range
 ----
-rngtypid  rngsubtype  rngcollation  rngsubopc  rngcanonical  rngsubdiff
+rngtypid  rngsubtype  rngmultitypid rngsubopc rngcollation  rngcanonical  rngsubdiff
 
 ## pg_catalog.pg_roles
 
@@ -3067,10 +3130,10 @@ oid  extname  extowner  extnamespace  extrelocatable  extversion  extconfig  ext
 
 ## pg_catalog.pg_stat_activity
 
-query OTIOTTTTITTTTTTTIITTT colnames
+query OTIIOTTTTITTTTTTTIIITT colnames
 SELECT * FROM pg_catalog.pg_stat_activity
 ----
-datid  datname  pid  usesysid  usename  application_name  client_addr  client_hostname  client_port  backend_start  xact_start  query_start  state_change  wait_event_type  wait_event  state  backend_xid  backend_xmin  query  backend_type  leader_pid
+datid  datname  pid  leader_pid  usesysid  usename  application_name  client_addr  client_hostname  client_port  backend_start  xact_start  query_start  state_change  wait_event_type  wait_event  state  backend_xid  backend_xmin  query_id  query  backend_type
 
 query TTBTTTB colnames,rowsort
 SHOW COLUMNS FROM pg_catalog.pg_stat_activity
@@ -3079,6 +3142,7 @@ column_name       data_type    is_nullable  column_default  generation_expressio
 datid             OID          true         NULL            ·                      {}       false
 datname           NAME         true         NULL            ·                      {}       false
 pid               INT8         true         NULL            ·                      {}       false
+leader_pid        INT4         true         NULL            ·                      {}       false
 usesysid          OID          true         NULL            ·                      {}       false
 usename           NAME         true         NULL            ·                      {}       false
 application_name  STRING       true         NULL            ·                      {}       false
@@ -3094,9 +3158,9 @@ wait_event        STRING       true         NULL            ·                  
 state             STRING       true         NULL            ·                      {}       false
 backend_xid       INT8         true         NULL            ·                      {}       false
 backend_xmin      INT8         true         NULL            ·                      {}       false
+query_id          INT8         true         NULL            ·                      {}       false
 query             STRING       true         NULL            ·                      {}       false
 backend_type      STRING       true         NULL            ·                      {}       false
-leader_pid        INT4         true         NULL            ·                      {}       false
 
 ## pg_catalog.pg_settings
 
@@ -3289,6 +3353,7 @@ parallelize_multi_key_lookup_joins_enabled                       off            
 parallelize_multi_key_lookup_joins_max_lookup_ratio              10000               NULL      NULL        NULL        string
 parallelize_multi_key_lookup_joins_only_on_mr_mutations          on                  NULL      NULL        NULL        string
 password_encryption                                              scram-sha-256       NULL      NULL        NULL        string
+pg_dump_compatibility                                            off                 NULL      NULL        NULL        string
 pg_trgm.similarity_threshold                                     0.3                 NULL      NULL        NULL        string
 plan_cache_mode                                                  auto                NULL      NULL        NULL        string
 plpgsql_use_strict_into                                          off                 NULL      NULL        NULL        string
@@ -3547,6 +3612,7 @@ parallelize_multi_key_lookup_joins_enabled                       off            
 parallelize_multi_key_lookup_joins_max_lookup_ratio              10000               NULL  user     NULL      10000               10000
 parallelize_multi_key_lookup_joins_only_on_mr_mutations          on                  NULL  user     NULL      on                  on
 password_encryption                                              scram-sha-256       NULL  user     NULL      scram-sha-256       scram-sha-256
+pg_dump_compatibility                                            off                 NULL  user     NULL      off                 off
 pg_trgm.similarity_threshold                                     0.3                 NULL  user     NULL      0.3                 0.3
 plan_cache_mode                                                  auto                NULL  user     NULL      auto                auto
 plpgsql_use_strict_into                                          off                 NULL  user     NULL      off                 off
@@ -3796,6 +3862,7 @@ parallelize_multi_key_lookup_joins_enabled                       NULL    NULL   
 parallelize_multi_key_lookup_joins_max_lookup_ratio              NULL    NULL     NULL     NULL        NULL
 parallelize_multi_key_lookup_joins_only_on_mr_mutations          NULL    NULL     NULL     NULL        NULL
 password_encryption                                              NULL    NULL     NULL     NULL        NULL
+pg_dump_compatibility                                            NULL    NULL     NULL     NULL        NULL
 pg_trgm.similarity_threshold                                     NULL    NULL     NULL     NULL        NULL
 plan_cache_mode                                                  NULL    NULL     NULL     NULL        NULL
 plpgsql_use_strict_into                                          NULL    NULL     NULL     NULL        NULL
@@ -5994,5 +6061,61 @@ query T
 SELECT nspacl FROM pg_namespace WHERE nspname = 'testowner_schema'
 ----
 NULL
+
+subtest pg_shdepend_compat
+
+statement ok
+SET pg_dump_compatibility = 'postgres'
+
+# With compat mode, pg_shdepend classid/refclassid should use PostgreSQL OIDs.
+# pg_class = 1259, pg_authid = 1260, pg_database = 1262.
+query OO colnames,rowsort
+SELECT DISTINCT classid, refclassid FROM pg_shdepend
+WHERE classid != 0
+LIMIT 5
+----
+classid  refclassid
+1259     1260
+1262     1260
+
+statement ok
+RESET pg_dump_compatibility
+
+subtest end
+
+subtest pg_description_compat
+
+statement ok
+CREATE TABLE desc_compat_test (id INT PRIMARY KEY)
+
+statement ok
+COMMENT ON TABLE desc_compat_test IS 'test comment'
+
+statement ok
+SET pg_dump_compatibility = 'postgres'
+
+# With compat mode, pg_description.classoid should be PostgreSQL's
+# pg_class OID (1259), not CockroachDB's internal descriptor ID.
+query OT
+SELECT classoid, description FROM pg_description
+WHERE description = 'test comment'
+----
+1259  test comment
+
+statement ok
+RESET pg_dump_compatibility
+
+# Without compat mode, classoid should be CockroachDB's descriptor ID.
+let $crdb_pg_class_oid
+SELECT oid FROM pg_class WHERE relname = 'pg_class' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog')
+
+query BT
+SELECT classoid = $crdb_pg_class_oid, description FROM pg_description
+WHERE description = 'test comment'
+----
+true  test comment
+
+statement ok
+DROP TABLE desc_compat_test
 
 subtest end

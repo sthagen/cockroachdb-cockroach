@@ -149,6 +149,27 @@ func (og *operationGenerator) tableHasDependencies(
 	return og.scanBool(ctx, tx, q, tableName.Object(), tableName.Schema(), skipSelfRef)
 }
 
+// sequenceHasDependencies reports whether the given sequence has any schema
+// dependencies (e.g., column defaults, views, or trigger functions that
+// reference the sequence via nextval).
+func (og *operationGenerator) sequenceHasDependencies(
+	ctx context.Context, tx pgx.Tx, seqName *tree.TableName,
+) (bool, error) {
+	return og.scanBool(ctx, tx, `
+	SELECT EXISTS(
+		SELECT fd.descriptor_name
+		  FROM crdb_internal.forward_dependencies AS fd
+		 WHERE fd.descriptor_id
+		       = (
+		            SELECT c.oid
+		              FROM pg_catalog.pg_class AS c
+		              JOIN pg_catalog.pg_namespace AS ns ON
+		                    ns.oid = c.relnamespace
+		             WHERE c.relname = $1 AND ns.nspname = $2
+		        )
+	)`, seqName.Object(), seqName.Schema())
+}
+
 func (og *operationGenerator) columnIsDependedOn(
 	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName tree.Name, includeFKs bool,
 ) (bool, error) {
@@ -1193,6 +1214,37 @@ SELECT
 	)
 }
 
+// tableHasIncompatibleIndexesForRBR checks whether the table has any indexes
+// that would be incompatible with REGIONAL BY ROW. Specifically:
+//  1. A secondary index that stores the region column.
+//  2. Any index (primary or secondary) with the region column as a non-leading
+//     key column.
+//  3. A hash-sharded index that includes the region column as a key column.
+func (og *operationGenerator) tableHasIncompatibleIndexesForRBR(
+	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, regionColName tree.Name,
+) (bool, error) {
+	return og.scanBool(ctx, tx, `
+SELECT EXISTS(
+  SELECT 1
+  FROM information_schema.statistics AS s
+  JOIN crdb_internal.table_indexes AS ti
+    ON ti.descriptor_id = $1::REGCLASS
+   AND ti.index_name = s.index_name
+  WHERE s.table_schema = $2
+    AND s.table_name = $3
+    AND s.column_name = $4
+    AND (
+      -- region col stored in a secondary index
+      (s.storing = 'YES' AND ti.index_type != 'primary')
+      -- region col as a non-leading key column
+      OR (s.storing = 'NO' AND s.seq_in_index > 1)
+      -- region col in a hash-sharded index
+      OR (s.storing = 'NO' AND ti.is_sharded)
+    )
+)`,
+		tableName.String(), tableName.Schema(), tableName.Object(), string(regionColName))
+}
+
 // databaseHasMultiRegion determines whether the database is multi-region
 // enabled.
 func (og *operationGenerator) databaseIsMultiRegion(ctx context.Context, tx pgx.Tx) (bool, error) {
@@ -1279,7 +1331,7 @@ SELECT (
 			mut
 		FROM
 			(
-				-- no schema changes on regional by row tables
+				-- no schema change mutations on regional by row tables
 				SELECT
 					json_array_elements(d->'mutations')
 						AS mut
@@ -1293,7 +1345,7 @@ SELECT (
 				)
 			)
 	) OR EXISTS (
-		-- no primary key swaps in the current database
+		-- no legacy primary key swaps in the current database
 		SELECT mut FROM (
 			SELECT
 				json_array_elements(d->'mutations')
@@ -1302,6 +1354,18 @@ SELECT (
 		)
 		WHERE
 			(mut->'primaryKeySwap') IS NOT NULL
+	) OR EXISTS (
+		-- no declarative schema changes involving a primary index swap
+		-- (includes a change to/from regional by row)
+		SELECT 1 FROM descriptors
+		WHERE d->'declarativeSchemaChangerState' IS NOT NULL
+			AND EXISTS (
+				SELECT 1
+				FROM jsonb_array_elements(
+					d->'declarativeSchemaChangerState'->'targets'
+				) AS target
+				WHERE target->'elementProto'->'primaryIndex' IS NOT NULL
+			)
 	)
 );
 		`,

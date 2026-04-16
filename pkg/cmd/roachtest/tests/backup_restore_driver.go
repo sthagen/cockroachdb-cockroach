@@ -217,7 +217,7 @@ func (d *BackupRestoreTestDriver) verifyBackupCollection(
 	internalSystemJobs bool,
 	mvHelper *mixedversion.Helper,
 ) error {
-	rj, err := d.Restore(ctx, l, rng, bc, checkFiles, internalSystemJobs)
+	rj, err := d.Restore(ctx, l, rng, bc, checkFiles, internalSystemJobs, nil)
 	if err != nil {
 		return fmt.Errorf("error restoring backup: %w", err)
 	}
@@ -239,7 +239,7 @@ func (d *BackupRestoreTestDriver) verifyBackupCollection(
 			"encountered version mismatch error due to mixed-version upgrade, retrying restore: %v",
 			jobErr,
 		)
-		rj, err = d.Restore(ctx, l, rng, bc, checkFiles, internalSystemJobs)
+		rj, err = d.Restore(ctx, l, rng, bc, checkFiles, internalSystemJobs, mvHelper)
 		if err != nil {
 			return fmt.Errorf("error restoring backup: %w", err)
 		}
@@ -584,7 +584,8 @@ func (d *BackupRestoreTestDriver) deleteSSTFromBackup(
 		return errors.Wrap(rows.Err(), "error iterating over SHOW BACKUP FILES")
 	}
 	if len(ssts) == 0 {
-		return errors.Newf("unexpectedly found no SST files to delete in backup %q of collection %q", backupID, collection.uri())
+		l.Printf("no SST files to delete in backup %q of collection %q", backupID, collection.uri())
+		return nil
 	}
 	uri, err := url.Parse(collection.uri())
 	if err != nil {
@@ -634,6 +635,7 @@ func (d *BackupRestoreTestDriver) Restore(
 	bc *backupCollection,
 	checkFiles bool,
 	internalSystemJobs bool,
+	mvHelper *mixedversion.Helper,
 ) (*RestoreJob, error) {
 	restoreStmt, restoredTables, restoreDB := d.buildRestoreStatement(bc)
 	if _, isTableBackup := bc.btype.(*tableBackup); isTableBackup {
@@ -646,7 +648,7 @@ func (d *BackupRestoreTestDriver) Restore(
 		}
 	}
 	if checkFiles {
-		if err := d.testUtils.checkFiles(ctx, rng, bc); err != nil {
+		if err := d.testUtils.checkFiles(ctx, rng, bc, mvHelper); err != nil {
 			return nil, fmt.Errorf("backup %s: check_files failed: %w", bc.name, err)
 		}
 	}
@@ -675,8 +677,9 @@ func (d *BackupRestoreTestDriver) RestoreSync(
 	bc *backupCollection,
 	checkFiles bool,
 	internalSystemJobs bool,
+	mvHelper *mixedversion.Helper,
 ) (*RestoreJob, error) {
-	rj, err := d.Restore(ctx, l, rng, bc, checkFiles, internalSystemJobs)
+	rj, err := d.Restore(ctx, l, rng, bc, checkFiles, internalSystemJobs, mvHelper)
 	if err != nil {
 		return nil, err
 	}

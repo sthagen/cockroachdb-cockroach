@@ -432,31 +432,69 @@ func (e QoSLevel) ValidateInternal() QoSLevel {
 	panic(errors.AssertionFailedf("use of illegal internal QoSLevel: %s", e.String()))
 }
 
-// CanaryStatsMode controls whether all queries will deterministically use
-// canary or stable stats. See the comments on each mode for details.
-// This session variable is intended for troubleshooting.
+// PgDumpCompatibility values for the pg_dump_compatibility session setting.
+const (
+	// PgDumpCompatibilityOff disables all pg_dump compatibility adjustments.
+	// pg_catalog reports CockroachDB's native OIDs and objects.
+	PgDumpCompatibilityOff = "off"
+	// PgDumpCompatibilityPostgres remaps pg_catalog OIDs to match PostgreSQL,
+	// hides CockroachDB-internal objects, and suppresses CRDB-specific storage
+	// parameters so that pg_dump output can run on non-CockroachDB servers.
+	PgDumpCompatibilityPostgres = "postgres"
+	// PgDumpCompatibilityCockroachDB applies the same pg_catalog OID fixes as
+	// "postgres" mode but retains CockroachDB-specific syntax and objects so
+	// the dump is intended for import into another CockroachDB cluster.
+	PgDumpCompatibilityCockroachDB = "cockroachdb"
+)
+
+// IsPgDumpCompatibilityEnabled returns true if the pg_dump_compatibility
+// setting is set to anything other than "off" (or the zero value).
+func IsPgDumpCompatibilityEnabled(val string) bool {
+	return val != "" && val != PgDumpCompatibilityOff
+}
+
+// PgDumpCompatibilityFromString converts a string into a validated
+// pg_dump_compatibility value. Returns false if the input is not recognized.
+func PgDumpCompatibilityFromString(val string) (_ string, ok bool) {
+	switch strings.ToLower(val) {
+	case PgDumpCompatibilityOff:
+		return PgDumpCompatibilityOff, true
+	case PgDumpCompatibilityPostgres:
+		return PgDumpCompatibilityPostgres, true
+	case PgDumpCompatibilityCockroachDB:
+		return PgDumpCompatibilityCockroachDB, true
+	default:
+		return "", false
+	}
+}
+
+// CanaryStatsMode controls which table statistics the optimizer uses for
+// query planning in this session. See the comments on each mode for details.
 type CanaryStatsMode int64
 
 const (
 	// CanaryStatsModeAuto means that the system will automatically decide
-	// to use the canary stats or the stable stats for each query in this session.
+	// to use the canary stats or the stable stats for each query in this
+	// session, based on the sql.stats.canary_fraction cluster setting.
 	CanaryStatsModeAuto CanaryStatsMode = iota
-	// CanaryStatsModeOff means that the optimizer always uses the stable stats
-	// for all queries in this session.
-	CanaryStatsModeOff
-	// CanaryStatsModeOn means that the optimizer always uses the canary stats
-	// for all queries in this session.
-	CanaryStatsModeOn
+	// CanaryStatsModeForceStable means that the optimizer always uses the
+	// stable (second-newest) stats for all queries in this session,
+	// regardless of the sql.stats.canary_fraction cluster setting.
+	CanaryStatsModeForceStable
+	// CanaryStatsModeForceCanary means that the optimizer always uses the
+	// canary (newest) stats for all queries in this session, regardless
+	// of the sql.stats.canary_fraction cluster setting.
+	CanaryStatsModeForceCanary
 )
 
 func (m CanaryStatsMode) String() string {
 	switch m {
 	case CanaryStatsModeAuto:
 		return "auto"
-	case CanaryStatsModeOff:
-		return "off"
-	case CanaryStatsModeOn:
-		return "on"
+	case CanaryStatsModeForceStable:
+		return "force_stable"
+	case CanaryStatsModeForceCanary:
+		return "force_canary"
 	default:
 		return fmt.Sprintf("invalid (%d)", m)
 	}
@@ -467,10 +505,10 @@ func CanaryStatsModeFromString(val string) (_ CanaryStatsMode, ok bool) {
 	switch strings.ToUpper(val) {
 	case "AUTO":
 		return CanaryStatsModeAuto, true
-	case "OFF":
-		return CanaryStatsModeOff, true
-	case "ON":
-		return CanaryStatsModeOn, true
+	case "FORCE_STABLE":
+		return CanaryStatsModeForceStable, true
+	case "FORCE_CANARY":
+		return CanaryStatsModeForceCanary, true
 	default:
 		return 0, false
 	}

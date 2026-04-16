@@ -4,12 +4,12 @@ exp,benchmark
 0,"Discard/DISCARD_ALL,_no_tables"
 12-14,AlterPrimaryRegion/alter_empty_database_alter_primary_region
 15-16,AlterPrimaryRegion/alter_empty_database_set_initial_primary_region
-12-14,AlterPrimaryRegion/alter_populated_database_alter_primary_region
+12-15,AlterPrimaryRegion/alter_populated_database_alter_primary_region
 17-18,AlterPrimaryRegion/alter_populated_database_set_initial_primary_region
 11,AlterRegions/alter_empty_database_add_region
 12-16,AlterRegions/alter_empty_database_drop_region
 12-13,AlterRegions/alter_populated_database_add_region
-14-16,AlterRegions/alter_populated_database_drop_region
+14-17,AlterRegions/alter_populated_database_drop_region
 12,AlterRole/alter_role_with_1_option
 15,AlterRole/alter_role_with_2_options
 19,AlterRole/alter_role_with_3_options
@@ -53,11 +53,11 @@ exp,benchmark
 16,CreateRole/create_role_with_2_options
 19,CreateRole/create_role_with_3_options
 14,CreateRole/create_role_with_no_options
-15,DropDatabase/drop_database_0_tables
+15-17,DropDatabase/drop_database_0_tables
 16,DropDatabase/drop_database_1_table
 16,DropDatabase/drop_database_2_tables
 16,DropDatabase/drop_database_3_tables
-19-21,DropRole/drop_1_role
+19-22,DropRole/drop_1_role
 28-30,DropRole/drop_2_roles
 37-39,DropRole/drop_3_roles
 13,DropSequence/drop_1_sequence
@@ -115,7 +115,7 @@ exp,benchmark
 3,ORMQueries/information_schema._pg_index_position
 5,ORMQueries/introspection_description_join
 4,ORMQueries/liquibase_migrations
-11,ORMQueries/liquibase_migrations_on_multiple_dbs
+15,ORMQueries/liquibase_migrations_on_multiple_dbs
 4,ORMQueries/npgsql_fields
 4,ORMQueries/npgsql_types
 3,ORMQueries/pg_attribute

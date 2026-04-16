@@ -1793,6 +1793,33 @@ var varGen = map[string]sessionVar{
 		},
 	},
 
+	// CockroachDB extension.
+	`pg_dump_compatibility`: {
+		Description: sessionVarDescriptions["pg_dump_compatibility"],
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			val := evalCtx.SessionData().PgDumpCompatibility
+			if val == "" {
+				return sessiondatapb.PgDumpCompatibilityOff, nil
+			}
+			return val, nil
+		},
+		Set: func(_ context.Context, m sessionmutator.SessionDataMutator, s string) error {
+			val, ok := sessiondatapb.PgDumpCompatibilityFromString(s)
+			if !ok {
+				return newVarValueError("pg_dump_compatibility", s,
+					sessiondatapb.PgDumpCompatibilityOff,
+					sessiondatapb.PgDumpCompatibilityPostgres,
+					sessiondatapb.PgDumpCompatibilityCockroachDB,
+				)
+			}
+			m.SetPgDumpCompatibility(val)
+			return nil
+		},
+		GlobalDefault: func(_ *settings.Values) string {
+			return sessiondatapb.PgDumpCompatibilityOff
+		},
+	},
+
 	// Supported for PG compatibility only.
 	// See https://www.postgresql.org/docs/10/static/runtime-config-compatible.html#GUC-STANDARD-CONFORMING-STRINGS
 	// If this gets properly implemented, we will need to re-evaluate how escape_string_warning is implemented
@@ -4815,7 +4842,7 @@ var varGen = map[string]sessionVar{
 		Set: func(ctx context.Context, m sessionmutator.SessionDataMutator, s string) error {
 			mode, ok := sessiondatapb.CanaryStatsModeFromString(s)
 			if !ok {
-				return newVarValueError(`canary_stats_mode`, s, "auto", "off", "on")
+				return newVarValueError(`canary_stats_mode`, s, "auto", "force_stable", "force_canary")
 			}
 			m.SetCanaryStatsMode(mode)
 			return nil

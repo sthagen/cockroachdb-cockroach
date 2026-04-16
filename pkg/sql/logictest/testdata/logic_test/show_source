@@ -52,7 +52,7 @@ backslash_quote                                                  safe_encoding  
 buffered_writes_use_locking_on_non_unique_indexes                off                 Controls whether buffered writes use locking on non-unique indexes.
 bypass_pcr_reader_catalog_aost                                   off                 Disables the AOST used by all user queries on the PCR reader catalog.
 bytea_output                                                     hex                 Controls how to encode byte arrays when converting to string.
-canary_stats_mode                                                auto                When sql.stats.canary_fraction > 0, controls which table statistics are used for query planning: 'on' always uses the newest stats as soon as they are available, 'off' delays using new stats until they outlive the canary window, and 'auto' selects probabilistically based on the canary fraction. Has no effect when sql.stats.canary_fraction is 0.
+canary_stats_mode                                                auto                Controls which table statistics are used for query planning: 'force_canary' always uses the newest stats, 'force_stable' always uses the second-newest stats, and 'auto' (default) defers to the sql.stats.canary_fraction cluster setting to decide probabilistically.
 check_function_bodies                                            on                  Controls whether functions are validated during function creation.
 client_encoding                                                  UTF8                Controls the client-side character encoding. Only UTF8 is supported.
 client_min_messages                                              notice              Controls which message levels are sent to the client.
@@ -201,6 +201,7 @@ parallelize_multi_key_lookup_joins_enabled                       off            
 parallelize_multi_key_lookup_joins_max_lookup_ratio              10000               Sets the maximum lookup ratio threshold for parallelizing multi-key lookup joins.
 parallelize_multi_key_lookup_joins_only_on_mr_mutations          on                  Controls whether parallelization of multi-key lookup joins is restricted to multi-row mutations only.
 password_encryption                                              scram-sha-256       The encryption method used for passwords.
+pg_dump_compatibility                                            off                 Controls how CockroachDB presents metadata to external tools. Valid values: off (default), postgres (suppress CRDB-specific syntax for pg_dump compatibility), cockroachdb (show CRDB syntax explicitly).
 pg_trgm.similarity_threshold                                     0.3                 Sets the value used to compare trigram similarities for the string % string overload.
 plan_cache_mode                                                  auto                Controls the method that the optimizer should use to choose between a custom and generic query plan.
 plpgsql_use_strict_into                                          off                 Causes PL/pgSQL "SELECT ... INTO" and "RETURNING INTO" syntax to always behave as if specified with STRICT option.
@@ -518,7 +519,7 @@ query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM CURRENT_CATALOG WITH DETAILS]
 ----
 start_key  end_key  replicas  lease_holder
-/Table/79  /Max     {1}       1
+/Table/80  /Max     {1}       1
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE system.descriptor WITH DETAILS]

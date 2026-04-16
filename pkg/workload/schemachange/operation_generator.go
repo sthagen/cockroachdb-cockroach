@@ -395,12 +395,13 @@ func (og *operationGenerator) addUniqueConstraint(ctx context.Context, tx pgx.Tx
 	if err != nil {
 		return nil, err
 	}
+
 	stmt := makeOpStmt(OpStmtDDL)
 	stmt.expectedExecErrors.addAll(codesWithConditions{
 		{code: pgcode.UndefinedColumn, condition: !columnExistsOnTable},
 		{code: pgcode.DuplicateRelation, condition: constraintExists},
 		{code: pgcode.FeatureNotSupported, condition: columnExistsOnTable && !colinfo.ColumnTypeIsIndexable(columnForConstraint.typ)},
-		{pgcode.FeatureNotSupported, hasAlterPKSchemaChange && !og.useDeclarativeSchemaChanger},
+		{code: pgcode.FeatureNotSupported, condition: hasAlterPKSchemaChange && !og.useDeclarativeSchemaChanger},
 		{code: pgcode.ObjectNotInPrerequisiteState, condition: databaseHasRegionChange && tableIsRegionalByRow},
 	})
 
@@ -513,6 +514,20 @@ func (og *operationGenerator) alterTableLocality(ctx context.Context, tx pgx.Tx)
 						stmt.expectedExecErrors.add(pgcode.InvalidTableDefinition)
 					}
 				}
+			}
+
+			// Check if any existing indexes are incompatible with the region
+			// column becoming an implicit partitioning column.
+			regionCol := tree.Name(tree.RegionalByRowRegionDefaultCol)
+			if columnForAsUsed {
+				regionCol = columnForAs.name
+			}
+			hasIncompat, err := og.tableHasIncompatibleIndexesForRBR(ctx, tx, tableName, regionCol)
+			if err != nil {
+				return "", err
+			}
+			if hasIncompat {
+				stmt.expectedExecErrors.add(pgcode.FeatureNotSupported)
 			}
 
 			return ret, nil
@@ -802,19 +817,30 @@ func (og *operationGenerator) primaryRegion(ctx context.Context, tx pgx.Tx) (*op
 			pgcode.InvalidName, pgcode.InvalidDatabaseDefinition), nil
 	}
 
-	// Conversion to multi-region is only allowed if the data is not already
-	// partitioned.
 	stmt := makeOpStmt(OpStmtDDL)
-	hasPartitioning, err := og.databaseHasTablesWithPartitioning(ctx, tx, database)
+
+	// Changing the primary region is blocked while a REGIONAL BY ROW transition
+	// is in progress on any table in the database. This is a potential error
+	// because the RBR change may complete before the primary region change executes.
+	databaseHasRegionalByRowChange, err := og.databaseHasRegionalByRowChange(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
-	if hasPartitioning {
-		stmt.expectedExecErrors.add(pgcode.ObjectNotInPrerequisiteState)
-	}
+	stmt.potentialExecErrors.addAll(codesWithConditions{
+		{code: pgcode.ObjectNotInPrerequisiteState, condition: databaseHasRegionalByRowChange},
+	})
 
 	// No regions in database, set a random region to be the PRIMARY REGION.
+	// Conversion to multi-region is only allowed if the data is not already
+	// partitioned.
 	if len(regionsInDB) == 0 {
+		hasPartitioning, err := og.databaseHasTablesWithPartitioning(ctx, tx, database)
+		if err != nil {
+			return nil, err
+		}
+		if hasPartitioning {
+			stmt.expectedExecErrors.add(pgcode.ObjectNotInPrerequisiteState)
+		}
 		idx := og.params.rng.Intn(len(regionInfos))
 		stmt.sql = fmt.Sprintf(
 			`ALTER DATABASE %s PRIMARY REGION "%s"`,
@@ -1070,18 +1096,12 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 	// as stored columns.
 	stmt := makeOpStmt(OpStmtDDL)
 	isStoringVirtualComputed := false
-	regionColStored := false
 	storingPKCol := false
 	columnNames = columnNames[len(def.Columns):]
 	if n := len(columnNames); n > 0 {
 		def.Storing = make(tree.NameList, og.randIntn(1+n))
 		for i := range def.Storing {
 			def.Storing[i] = columnNames[i].name
-
-			// The region column can not be stored.
-			if tableIsRegionalByRow && columnNames[i].name == regionColumn {
-				regionColStored = true
-			}
 
 			colIsPK, err := og.colIsPrimaryKey(ctx, tx, tableName, columnNames[i].name)
 			if err != nil {
@@ -1159,7 +1179,6 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 			{code: pgcode.InvalidSQLStatementName, condition: def.Unique && def.Type == idxtype.INVERTED},
 			{code: pgcode.InvalidSQLStatementName, condition: def.Type == idxtype.INVERTED && len(def.Storing) > 0},
 			{code: pgcode.FeatureNotSupported, condition: nonIndexableType},
-			{code: pgcode.FeatureNotSupported, condition: regionColStored},
 			{code: pgcode.FeatureNotSupported, condition: duplicateRegionColumn},
 			{code: pgcode.FeatureNotSupported, condition: isStoringVirtualComputed},
 			{code: pgcode.FeatureNotSupported, condition: hasAlterPKSchemaChange && !og.useDeclarativeSchemaChanger},
@@ -2125,20 +2144,29 @@ func (og *operationGenerator) dropSequence(ctx context.Context, tx pgx.Tx) (*opS
 	if err != nil {
 		return nil, err
 	}
-	ifExists := og.randIntn(2) == 0
-	dropSeq := &tree.DropSequence{
-		Names:    tree.TableNames{*sequenceName},
-		IfExists: ifExists,
-	}
-
-	stmt := makeOpStmt(OpStmtDDL)
 	sequenceExists, err := og.sequenceExists(ctx, tx, sequenceName)
 	if err != nil {
 		return nil, err
 	}
-	if !sequenceExists && !ifExists {
-		stmt.expectedExecErrors.add(pgcode.UndefinedTable)
+	seqHasDependencies, err := og.sequenceHasDependencies(ctx, tx, sequenceName)
+	if err != nil {
+		return nil, err
 	}
+
+	dropBehavior := tree.DropBehavior(og.randIntn(3))
+
+	ifExists := og.randIntn(2) == 0
+	dropSeq := &tree.DropSequence{
+		Names:        tree.TableNames{*sequenceName},
+		IfExists:     ifExists,
+		DropBehavior: dropBehavior,
+	}
+
+	stmt := makeOpStmt(OpStmtDDL)
+	stmt.expectedExecErrors.addAll(codesWithConditions{
+		{pgcode.UndefinedTable, !ifExists && !sequenceExists},
+		{pgcode.DependentObjectsStillExist, dropBehavior != tree.DropCascade && seqHasDependencies},
+	})
 	stmt.sql = tree.Serialize(dropSeq)
 	return stmt, nil
 }
@@ -2226,6 +2254,7 @@ func (og *operationGenerator) alterTypeDropValue(ctx context.Context, tx pgx.Tx)
 				COALESCE(member->>'direction' = 'REMOVE', false) AS dropping,
 				COALESCE(json_array_length(descriptor->'referencingDescriptorIds') > 0, false) AS has_references
 			FROM enum_members
+			WHERE name NOT LIKE 'crdb_internal_region'
 	`)
 
 	enumMembers, err := Collect(ctx, og, tx, pgx.RowToMap, query)
@@ -2233,11 +2262,11 @@ func (og *operationGenerator) alterTypeDropValue(ctx context.Context, tx pgx.Tx)
 		return nil, err
 	}
 
-	// TODO(chrisseto): We're currently missing cases around enum members being
-	// referenced as it's quite difficult to tell if an individual member is
-	// referenced. Unreferenced members can be dropped but referenced members may
-	// not. For now, we skip over all enums where the type itself is being
-	// referenced.
+	// It's difficult to tell if an individual enum member is referenced, so
+	// for the success case we allow any non-dropping member regardless of
+	// whether the type has references, and flag DependentObjectsStillExist as
+	// a potential error when the selected member's type is referenced.
+	var pickedReferenced bool
 
 	stmt, code, err := Generate[*tree.AlterType](og.params.rng, og.produceError(), []GenerationCase{
 		// Fail to drop values from a type that doesn't exist.
@@ -2246,22 +2275,36 @@ func (og *operationGenerator) alterTypeDropValue(ctx context.Context, tx pgx.Tx)
 		{pgcode.ObjectNotInPrerequisiteState, `{ with (EnumValue true false) } ALTER TYPE { .name } DROP VALUE { .value } { end }`},
 		// Fail to drop values that don't exist.
 		{pgcode.UndefinedObject, `{ with (EnumValue false false) } ALTER TYPE { .name } DROP VALUE 'ValueThatDoesntExist' { end }`},
-		// Successful drop of an enum value.
-		{pgcode.SuccessfulCompletion, `{ with (EnumValue false false) } ALTER TYPE { .name } DROP VALUE { .value } { end }`},
+		// Successful drop of an enum value. The member may belong to a
+		// referenced type, in which case the drop could fail.
+		{pgcode.SuccessfulCompletion, `{ with (AnyEnumValue false) } ALTER TYPE { .name } DROP VALUE { .value } { end }`},
 	}, template.FuncMap{
 		"EnumValue": func(dropping, referenced bool) (map[string]any, error) {
 			return PickOne(og.params.rng, util.Filter(enumMembers, func(enum map[string]any) bool {
 				return enum["has_references"].(bool) == referenced && enum["dropping"].(bool) == dropping
 			}))
 		},
+		"AnyEnumValue": func(dropping bool) (map[string]any, error) {
+			member, err := PickOne(og.params.rng, util.Filter(enumMembers, func(enum map[string]any) bool {
+				return enum["dropping"].(bool) == dropping
+			}))
+			if err == nil {
+				pickedReferenced = member["has_references"].(bool)
+			}
+			return member, err
+		},
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return newOpStmt(stmt, codesWithConditions{
+	opStmt := newOpStmt(stmt, codesWithConditions{
 		{code, true},
-	}), nil
+	})
+	if pickedReferenced {
+		opStmt.potentialExecErrors.add(pgcode.DependentObjectsStillExist)
+	}
+	return opStmt, nil
 }
 
 func (og *operationGenerator) renameColumn(ctx context.Context, tx pgx.Tx) (*opStmt, error) {
@@ -3066,6 +3109,17 @@ func (og *operationGenerator) survive(ctx context.Context, tx pgx.Tx) (*opStmt, 
 		},
 	})
 
+	// Changing the survival goal is blocked while a REGIONAL BY ROW transition
+	// is in progress on any table in the database. This is a potential error
+	// because the RBR change may complete before the survival goal change executes.
+	databaseHasRegionalByRowChange, err := og.databaseHasRegionalByRowChange(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	stmt.potentialExecErrors.addAll(codesWithConditions{
+		{code: pgcode.ObjectNotInPrerequisiteState, condition: databaseHasRegionalByRowChange},
+	})
+
 	dbName, err := og.getDatabase(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -3085,7 +3139,8 @@ func (og *operationGenerator) commentOn(ctx context.Context, tx pgx.Tx) (*opStmt
 	  JOIN pg_catalog.pg_namespace AS nsp ON (types.typnamespace = nsp.oid)
 	  WHERE types.typtype IN ('e','c')
 	    AND types.typrelid IN (0, types.oid)
-	    AND nsp.nspname NOT IN ('information_schema', 'pg_catalog', 'crdb_internal', 'pg_extension')`
+	    AND nsp.nspname NOT IN ('information_schema', 'pg_catalog', 'crdb_internal', 'pg_extension')
+	    AND types.typname != 'crdb_internal_region'`
 	}
 	q := With([]CTE{
 		{"descriptors", descJSONQuery},
@@ -4475,19 +4530,6 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 				COALESCE((descriptor->'state')::INT != 0, false) AS non_public
 			FROM enums
 		`)
-	enumMemberQuery := With([]CTE{
-		{"descriptors", descJSONQuery},
-		{"enums", enumDescsQuery},
-		{"enum_members", enumMemberDescsQuery},
-	}, `SELECT
-				quote_ident(schema_id::REGNAMESPACE::TEXT) || '.' || quote_ident(name) AS name,
-				quote_literal(member->>'logicalRepresentation') AS value,
-				(
-					COALESCE(member->>'direction' = 'REMOVE', false) OR
-					COALESCE(member->>'capability' = 'READ_ONLY', false)
-				) AS non_public
-			FROM enum_members
-		`)
 	schemasQuery := With([]CTE{
 		{"descriptors", descJSONQuery},
 	}, `SELECT quote_ident(name) FROM descriptors WHERE descriptor ? 'schema'`)
@@ -4510,7 +4552,7 @@ FROM
 	if err != nil {
 		return nil, err
 	}
-	enumMembers, err := Collect(ctx, og, tx, pgx.RowToMap, enumMemberQuery)
+	enumMembers, err := og.collectEnumMembers(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -5657,11 +5699,51 @@ func (og *operationGenerator) createTriggerFunction(
 		return nil, err
 	}
 
+	// Sometimes include a sequence reference to exercise trigger-sequence
+	// dependency tracking.
+	seqSelectStmt := ""
+	if og.randIntn(2) == 0 {
+		seqName, err := og.randSequence(ctx, tx, og.alwaysExisting(), "")
+		if err != nil {
+			// No sequences exist — skip the sequence reference.
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return nil, err
+			}
+		} else {
+			seqSelectStmt = fmt.Sprintf("SELECT nextval('%s');", seqName.String())
+		}
+	}
+
+	// Sometimes include an enum cast expression to exercise trigger-enum
+	// dependency tracking (TriggerDeps.uses_type_ids).
+	enumSelectStmt := ""
+	if og.randIntn(2) == 0 {
+		enumMembers, err := og.collectEnumMembers(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		var publicEnumExprs []string
+		for _, member := range enumMembers {
+			if member["non_public"].(bool) {
+				continue
+			}
+			publicEnumExprs = append(publicEnumExprs,
+				fmt.Sprintf(`(%s::%s IS NULL)`, member["value"], member["name"]))
+		}
+		if len(publicEnumExprs) > 0 {
+			picked, err := PickOne(og.params.rng, publicEnumExprs)
+			if err != nil {
+				return nil, err
+			}
+			enumSelectStmt = fmt.Sprintf("SELECT %s;", picked)
+		}
+	}
+
 	// The trigger function always returns NEW to avoid breaking inserts.
 	opStmt := makeOpStmt(OpStmtDDL)
 	opStmt.sql = fmt.Sprintf(
-		`CREATE FUNCTION %s() RETURNS TRIGGER AS $FUNC_BODY$ BEGIN %s;RETURN NEW;END; $FUNC_BODY$ LANGUAGE PLpgSQL`,
-		resolvedName, selectStmt.sql,
+		`CREATE FUNCTION %s() RETURNS TRIGGER AS $FUNC_BODY$ BEGIN %s%s%s;RETURN NEW;END; $FUNC_BODY$ LANGUAGE PLpgSQL`,
+		resolvedName, seqSelectStmt, enumSelectStmt, selectStmt.sql,
 	)
 	og.LogMessage(fmt.Sprintf("createTriggerFunction: %s", opStmt.sql))
 
@@ -5740,12 +5822,16 @@ func (og *operationGenerator) createTrigger(ctx context.Context, tx pgx.Tx) (*op
 		{code: pgcode.UndefinedTable, condition: !triggerTableExists},
 	})
 	opStmt.potentialExecErrors.addAll(codesWithConditions{
-		// References within the trigger function are evaluated lazily when the
-		// TRIGGER is created. Not when the function is created. What may have
-		// existed when the function was created could no longer exist.
+		// References within the trigger function body (tables, functions,
+		// columns, enum types, enum members) are evaluated lazily at CREATE
+		// TRIGGER time, not when the function is created. Any referenced
+		// object may have been dropped or transitioned to a non-public state
+		// in the interim.
 		{code: pgcode.UndefinedTable, condition: true},
 		{code: pgcode.UndefinedFunction, condition: true},
 		{code: pgcode.UndefinedColumn, condition: true},
+		{code: pgcode.UndefinedObject, condition: true},
+		{code: pgcode.InvalidParameterValue, condition: true},
 	})
 
 	return opStmt, nil
@@ -5778,6 +5864,28 @@ func (og *operationGenerator) dropTrigger(ctx context.Context, tx pgx.Tx) (*opSt
 type triggerInfo struct {
 	table       tree.TableName
 	triggerName string
+}
+
+// collectEnumMembers returns all enum members in the current database. Each
+// result row is a map with keys "name" (qualified enum type name), "value"
+// (quoted member literal), and "non_public" (bool indicating a DROPPING member).
+func (og *operationGenerator) collectEnumMembers(
+	ctx context.Context, tx pgx.Tx,
+) ([]map[string]any, error) {
+	q := With([]CTE{
+		{"descriptors", descJSONQuery},
+		{"enums", enumDescsQuery},
+		{"enum_members", enumMemberDescsQuery},
+	}, `SELECT
+			quote_ident(schema_id::REGNAMESPACE::TEXT) || '.' || quote_ident(name) AS name,
+			quote_literal(member->>'logicalRepresentation') AS value,
+			(
+				COALESCE(member->>'direction' = 'REMOVE', false) OR
+				COALESCE(member->>'capability' = 'READ_ONLY', false)
+			) AS non_public
+		FROM enum_members
+	`)
+	return Collect(ctx, og, tx, pgx.RowToMap, q)
 }
 
 // findExistingTriggerFunctions returns existing trigger functions (RETURNS
@@ -5997,6 +6105,14 @@ func (og *operationGenerator) setTableStorageParam(
 		}
 		if hasPgcodeBug {
 			stmt.potentialExecErrors.add(pgcode.Uncategorized)
+		}
+	} else if param == catpb.CanaryStatsWindowSettingName {
+		canaryNotSupported, err := isClusterVersionLessThan(ctx, tx, clusterversion.V26_2.Version())
+		if err != nil {
+			return nil, err
+		}
+		if canaryNotSupported {
+			stmt.potentialExecErrors.add(pgcode.FeatureNotSupported)
 		}
 	}
 

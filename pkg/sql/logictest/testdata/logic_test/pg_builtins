@@ -403,7 +403,7 @@ CREATE TYPE typ AS ENUM ('hello')
 query T
 SELECT format_type(oid, 0) FROM pg_catalog.pg_type WHERE typname = 'typ'
 ----
-public.typ
+typ
 
 # Nothing breaks if we put a non-existing oid into format_type.
 query T
@@ -1570,5 +1570,28 @@ DROP TABLE stxtest_kw
 
 statement ok
 DROP TABLE stxtest
+
+subtest end
+
+subtest pg_cast_oids_pg_dump_compat
+
+statement ok
+SET pg_dump_compatibility = 'postgres'
+
+# All cast OIDs should be below 16384 (PostgreSQL's FirstNormalObjectId)
+# so pg_dump treats them as built-in and skips them.
+query B
+SELECT bool_and(oid < 16384) FROM pg_cast
+----
+true
+
+statement ok
+SET pg_dump_compatibility = 'off'
+
+# Without compat mode, cast OIDs should be above 16384.
+query B
+SELECT bool_and(oid > 16384) FROM pg_cast
+----
+true
 
 subtest end

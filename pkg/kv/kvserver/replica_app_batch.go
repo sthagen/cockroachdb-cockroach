@@ -382,6 +382,8 @@ func (b *replicaAppBatch) runPostAddTriggersReplicaOnly(
 		rhsRepl.readOnlyCmdMu.Unlock()
 
 		if err := mergePreApply(ctx, b.ReadWriter(), b.batch.WagWriter(), mergePreApplyInput{
+			lhsID:          b.r.ID(),
+			raftIndex:      cmd.Index(),
 			rhsDestroyInfo: rhsRepl.destroyInfoRaftMuLocked(),
 		}); err != nil {
 			return errors.Wrapf(err, "unable to subsume replica before merge")

@@ -426,9 +426,15 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				require.NoError(t, err)
 
 				batchRepr := batch.Repr()
+				lhsRepl := lhsRS.replica
+				require.NotNil(t, lhsRepl, "LHS replica must exist on n1/s1")
+				// Bump the raft index to account for where the merge command
+				// would go in the raft log.
+				lhsRepl.lastIdx++
 				tc.merges[lhsRangeID] = pendingMerge{
 					trigger:   merge,
 					batchRepr: batchRepr,
+					raftIndex: lhsRepl.lastIdx,
 				}
 				batch.Close()
 
@@ -463,6 +469,8 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 						State: kvstorage.WrapState(b.State()),
 						Raft:  kvstorage.Raft{RO: tc.eng.LogEngine(), WO: b.Raft()},
 					}, b.WagWriter(), mergePreApplyInput{
+						lhsID:     lhsRS.replica.FullReplicaID,
+						raftIndex: pm.raftIndex,
 						rhsDestroyInfo: kvstorage.DestroyReplicaInfo{
 							FullReplicaID: rhsRS.replica.FullReplicaID,
 							// TODO(pav-kv): support the applied index properly.
@@ -653,6 +661,7 @@ type pendingSplit struct {
 type pendingMerge struct {
 	trigger   roachpb.MergeTrigger
 	batchRepr []byte
+	raftIndex kvpb.RaftIndex
 }
 
 // testCtx is a single test's context. It tracks the state of all ranges and any

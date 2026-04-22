@@ -3583,6 +3583,7 @@ opt_clear_data:
 //
 // Options:
 //    revision_history: enable revision history
+//    revision stream: establish a continuous backup (revlog) job for the destination
 //    encryption_passphrase="secret": encrypt backups
 //    kms="[kms_provider]://[kms_host]/[master_key_identifier]?[parameters]" : encrypt backups using KMS
 //    detached: execute backup job asynchronously, without waiting for its completion
@@ -3720,6 +3721,10 @@ backup_options:
 | STRICT STORAGE LOCALITY
   {
     $$.val = &tree.BackupOptions{Strict: true}
+  }
+| REVISION STREAM
+  {
+    $$.val = &tree.BackupOptions{RevisionStream: true}
   }
 
 include_all_clusters:
@@ -12402,6 +12407,13 @@ sequence_option_elem:
                                  $$.val = tree.SequenceOption{Name: tree.SeqOptRestart, IntVal: &x} }
 
 | VIRTUAL                      { $$.val = tree.SequenceOption{Name: tree.SeqOptVirtual} }
+| SEQUENCE NAME db_object_name {
+                                 /* SKIP DOC */
+                                 // SEQUENCE NAME is only valid as a GENERATED AS IDENTITY option;
+                                 // the BNF docs for CREATE/ALTER SEQUENCE shouldn't advertise it.
+                                 name := $3.unresolvedObjectName().ToTableName()
+                                 $$.val = tree.SequenceOption{Name: tree.SeqOptName, NameVal: &name}
+                               }
 
 // %Help: TRUNCATE - empty one or more tables
 // %Category: DML
@@ -19255,6 +19267,7 @@ unreserved_keyword:
 | MULTIPOLYGONM
 | MULTIPOLYGONZ
 | MULTIPOLYGONZM
+| NAME
 | NAMES
 | NAN
 | NEVER
@@ -19836,6 +19849,7 @@ bare_label_keywords:
 | MULTIPOLYGONM
 | MULTIPOLYGONZ
 | MULTIPOLYGONZM
+| NAME
 | NAMES
 | NAN
 | NATURAL

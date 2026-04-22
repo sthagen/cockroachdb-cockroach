@@ -50,7 +50,7 @@ CREATE TABLE pg_catalog.pg_am (
 	amcanreturn OID,
 	amcostestimate OID,
 	amoptions OID,
-	amhandler OID,
+	amhandler REGPROC,
 	amtype "char"
 )`
 
@@ -268,7 +268,7 @@ CREATE TABLE pg_catalog.pg_conversion (
 	conowner OID,
 	conforencoding INT4,
 	contoencoding INT4,
-	conproc OID,
+	conproc REGPROC,
 	condefault BOOL
 )`
 
@@ -362,7 +362,7 @@ CREATE TABLE pg_catalog.pg_enum (
   oid OID,
   enumtypid OID,
   enumsortorder FLOAT4,
-  enumlabel STRING
+  enumlabel NAME
 )`
 
 // PGCatalogEventTrigger describes the schema of the pg_catalog.pg_event_trigger
@@ -389,8 +389,8 @@ CREATE TABLE pg_catalog.pg_extension (
   extnamespace OID,
   extrelocatable BOOL,
   extversion STRING,
-  extconfig STRING,
-  extcondition STRING
+  extconfig OID[],
+  extcondition STRING[]
 )`
 
 // PGCatalogForeignDataWrapper describes the schema of the
@@ -576,9 +576,9 @@ CREATE TABLE pg_catalog.pg_operator (
 	oprresult OID,
 	oprcom OID,
 	oprnegate OID,
-	oprcode OID,
-	oprrest OID,
-	oprjoin OID
+	oprcode REGPROC,
+	oprrest REGPROC,
+	oprjoin REGPROC
 )`
 
 // PGCatalogPreparedXacts describes the schema of the
@@ -658,8 +658,8 @@ CREATE TABLE pg_catalog.pg_range (
 	rngmultitypid OID,
 	rngsubopc OID,
 	rngcollation OID,
-	rngcanonical OID,
-	rngsubdiff OID
+	rngcanonical REGPROC,
+	rngsubdiff REGPROC
 )`
 
 // PGCatalogRewrite describes the schema of the pg_catalog.pg_rewrite table.
@@ -739,7 +739,7 @@ CREATE TABLE pg_catalog.pg_settings (
     source STRING,
     min_val STRING,
     max_val STRING,
-    enumvals STRING,
+    enumvals STRING[],
     boot_val STRING,
     reset_val STRING,
     sourcefile STRING,
@@ -884,14 +884,14 @@ const PGCatalogStatActivity = `
 CREATE TABLE pg_catalog.pg_stat_activity (
 	datid OID,
 	datname NAME,
-	pid INTEGER,
+	pid INT4,
 	leader_pid INT4,
 	usesysid OID,
 	usename NAME,
 	application_name TEXT,
 	client_addr INET,
 	client_hostname TEXT,
-	client_port INTEGER,
+	client_port INT4,
 	backend_start TIMESTAMPTZ,
 	xact_start TIMESTAMPTZ,
 	query_start TIMESTAMPTZ,
@@ -913,7 +913,7 @@ const PGCatalogSecurityLabel = `
 CREATE TABLE pg_catalog.pg_seclabel (
 	objoid OID,
 	classoid OID,
-	objsubid INTEGER,
+	objsubid INT4,
 	provider TEXT,
 	label TEXT
 )`
@@ -2096,4 +2096,219 @@ CREATE TABLE pg_catalog.pg_stat_subscription (
 	latest_end_lsn STRING,
 	latest_end_time TIMESTAMPTZ,
 	worker_type TEXT
+)`
+
+// PgCatalogStatReplicationSlots is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatReplicationSlots = `
+CREATE TABLE pg_catalog.pg_stat_replication_slots (
+	slot_name STRING,
+	spill_txns INT,
+	spill_count INT,
+	spill_bytes INT,
+	stream_txns INT,
+	stream_count INT,
+	stream_bytes INT,
+	total_txns INT,
+	total_bytes INT,
+	stats_reset TIMESTAMPTZ
+)`
+
+// PgCatalogStatSubscriptionStats is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatSubscriptionStats = `
+CREATE TABLE pg_catalog.pg_stat_subscription_stats (
+	subid OID,
+	subname NAME,
+	apply_error_count INT,
+	sync_error_count INT,
+	confl_insert_exists INT,
+	confl_update_origin_differs INT,
+	confl_update_exists INT,
+	confl_update_missing INT,
+	confl_delete_origin_differs INT,
+	confl_delete_missing INT,
+	confl_multiple_unique_conflicts INT,
+	stats_reset TIMESTAMPTZ
+)`
+
+// PgCatalogBackendMemoryContexts is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogBackendMemoryContexts = `
+CREATE TABLE pg_catalog.pg_backend_memory_contexts (
+	name STRING,
+	ident STRING,
+	type STRING,
+	level INT4,
+	path INT4[],
+	total_bytes INT,
+	total_nblocks INT,
+	free_bytes INT,
+	free_chunks INT,
+	used_bytes INT
+)`
+
+// PgCatalogWaitEvents is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogWaitEvents = `
+CREATE TABLE pg_catalog.pg_wait_events (
+	type STRING,
+	name STRING,
+	description STRING
+)`
+
+// PgCatalogIdentFileMappings is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogIdentFileMappings = `
+CREATE TABLE pg_catalog.pg_ident_file_mappings (
+	map_number INT4,
+	file_name STRING,
+	line_number INT4,
+	map_name STRING,
+	sys_name STRING,
+	pg_username STRING,
+	error STRING
+)`
+
+// PgCatalogStatIo is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatIo = `
+CREATE TABLE pg_catalog.pg_stat_io (
+	backend_type STRING,
+	object STRING,
+	context STRING,
+	reads INT,
+	read_bytes DECIMAL,
+	read_time FLOAT,
+	writes INT,
+	write_bytes DECIMAL,
+	write_time FLOAT,
+	writebacks INT,
+	writeback_time FLOAT,
+	extends INT,
+	extend_bytes DECIMAL,
+	extend_time FLOAT,
+	hits INT,
+	evictions INT,
+	reuses INT,
+	fsyncs INT,
+	fsync_time FLOAT,
+	stats_reset TIMESTAMPTZ
+)`
+
+// PgCatalogStatWal is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatWal = `
+CREATE TABLE pg_catalog.pg_stat_wal (
+	wal_records INT,
+	wal_fpi INT,
+	wal_bytes DECIMAL,
+	wal_buffers_full INT,
+	stats_reset TIMESTAMPTZ
+)`
+
+// PgCatalogStatRecoveryPrefetch is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatRecoveryPrefetch = `
+CREATE TABLE pg_catalog.pg_stat_recovery_prefetch (
+	stats_reset TIMESTAMPTZ,
+	prefetch INT,
+	hit INT,
+	skip_init INT,
+	skip_new INT,
+	skip_fpw INT,
+	skip_rep INT,
+	wal_distance INT4,
+	block_distance INT4,
+	io_depth INT4
+)`
+
+// PgCatalogStatCheckpointer is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatCheckpointer = `
+CREATE TABLE pg_catalog.pg_stat_checkpointer (
+	num_timed INT,
+	num_requested INT,
+	num_done INT,
+	restartpoints_timed INT,
+	restartpoints_req INT,
+	restartpoints_done INT,
+	write_time FLOAT,
+	sync_time FLOAT,
+	buffers_written INT,
+	slru_written INT,
+	stats_reset TIMESTAMPTZ
+)`
+
+// PgCatalogAios is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogAios = `
+CREATE TABLE pg_catalog.pg_aios (
+	pid INT4,
+	io_id INT4,
+	io_generation INT,
+	state STRING,
+	operation STRING,
+	off INT,
+	length INT,
+	target STRING,
+	handle_data_len INT2,
+	raw_result INT4,
+	result STRING,
+	target_desc STRING,
+	f_sync BOOL,
+	f_localmem BOOL,
+	f_buffered BOOL
+)`
+
+// PgCatalogParameterACL is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogParameterACL = `
+CREATE TABLE pg_catalog.pg_parameter_acl (
+	oid OID,
+	parname STRING,
+	paracl STRING[]
+)`
+
+// PgCatalogStatProgressCopy is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatProgressCopy = `
+CREATE TABLE pg_catalog.pg_stat_progress_copy (
+	pid INT4,
+	datid OID,
+	datname NAME,
+	relid OID,
+	command STRING,
+	type STRING,
+	bytes_processed INT,
+	bytes_total INT,
+	tuples_processed INT,
+	tuples_excluded INT,
+	tuples_skipped INT
+)`
+
+// PgCatalogShmemAllocationsNuma is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogShmemAllocationsNuma = `
+CREATE TABLE pg_catalog.pg_shmem_allocations_numa (
+	name STRING,
+	numa_node INT4,
+	size INT
+)`
+
+// PgCatalogStatsExtExprs is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogStatsExtExprs = `
+CREATE TABLE pg_catalog.pg_stats_ext_exprs (
+	schemaname NAME,
+	tablename NAME,
+	statistics_schemaname NAME,
+	statistics_name NAME,
+	statistics_owner NAME,
+	expr STRING,
+	inherited BOOL,
+	null_frac FLOAT4,
+	avg_width INT4,
+	n_distinct FLOAT4,
+	most_common_vals STRING[],
+	most_common_freqs FLOAT4[],
+	histogram_bounds STRING[],
+	correlation FLOAT4,
+	most_common_elems STRING[],
+	most_common_elem_freqs FLOAT4[],
+	elem_count_histogram FLOAT4[]
+)`
+
+// PgCatalogPublicationNamespace is an empty table in the pg_catalog that is not implemented yet
+const PgCatalogPublicationNamespace = `
+CREATE TABLE pg_catalog.pg_publication_namespace (
+	oid OID,
+	pnpubid OID,
+	pnnspid OID
 )`

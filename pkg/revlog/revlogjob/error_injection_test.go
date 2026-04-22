@@ -102,7 +102,7 @@ func TestProducerSurfacesStorageErrors(t *testing.T) {
 	es.failNextWriteUnder("log/data/", errors.New("injected disk full"))
 
 	d, err := revlogjob.NewDriver(es, []roachpb.Span{allSpan}, ts(100),
-		testTickWidth, &seqFileIDs{}, revlogjob.ResumeState{})
+		testTickWidth, &seqFileIDs{}, revlogjob.ResumeState{}, 0 /* forwardThreshold */)
 	require.NoError(t, err)
 
 	d.OnValue(ctx, roachpb.Key("a"), ts(105), []byte("v"), nil)

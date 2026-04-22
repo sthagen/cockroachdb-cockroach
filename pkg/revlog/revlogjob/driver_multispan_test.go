@@ -31,7 +31,7 @@ func newMultiSpanDriver(
 	t.Cleanup(func() { _ = es.Close() })
 	left, right := twoSpans()
 	d, err := revlogjob.NewDriver(es, []roachpb.Span{left, right}, ts(100),
-		testTickWidth, &seqFileIDs{}, revlogjob.ResumeState{})
+		testTickWidth, &seqFileIDs{}, revlogjob.ResumeState{}, 0 /* forwardThreshold */)
 	require.NoError(t, err)
 	return d, es.(*inmemstorage.Storage), left, right
 }

@@ -33,7 +33,7 @@ func writeFixtureLog(t *testing.T, dir string) {
 
 	ctx := context.Background()
 	d, err := revlogjob.NewDriver(es, []roachpb.Span{allSpan},
-		ts(100), testTickWidth, &seqFileIDs{}, revlogjob.ResumeState{})
+		ts(100), testTickWidth, &seqFileIDs{}, revlogjob.ResumeState{}, 0 /* forwardThreshold */)
 	require.NoError(t, err)
 
 	d.OnValue(ctx, roachpb.Key("a"), ts(105), []byte("v_a"), nil)

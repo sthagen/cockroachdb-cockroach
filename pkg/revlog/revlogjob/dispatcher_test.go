@@ -66,7 +66,7 @@ func newDispatcherTestProducer(t *testing.T) (*Producer, *counterSink) {
 	t.Cleanup(func() { _ = es.Close() })
 	sink := &counterSink{}
 	p, err := NewProducer(es, []roachpb.Span{allKeyspace}, ts(100),
-		10*time.Second, &seqIDs{}, sink, ResumeState{})
+		10*time.Second, &seqIDs{}, sink, ResumeState{}, 0 /* forwardThreshold */)
 	require.NoError(t, err)
 	return p, sink
 }
@@ -142,7 +142,7 @@ func TestSetAfterFrontierAdvanceFires(t *testing.T) {
 	es := inmemstorage.New()
 	t.Cleanup(func() { _ = es.Close() })
 	mgr, err := NewTickManager(es, []roachpb.Span{allKeyspace}, ts(100),
-		10*time.Second)
+		10*time.Second, &seqIDs{})
 	require.NoError(t, err)
 	mgr.DisableDescFrontier()
 
@@ -157,7 +157,7 @@ func TestSetAfterFrontierAdvanceFires(t *testing.T) {
 	})
 
 	prod, err := NewProducer(es, []roachpb.Span{allKeyspace}, ts(100),
-		10*time.Second, &seqIDs{}, mgr, ResumeState{})
+		10*time.Second, &seqIDs{}, mgr, ResumeState{}, 0 /* forwardThreshold */)
 	require.NoError(t, err)
 
 	prod.OnValue(ctx, roachpb.Key("a"), ts(105), []byte("v"), nil)

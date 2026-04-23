@@ -74,6 +74,8 @@ go_library(
         "//pkg/kv/kvserver/protectedts",
         "//pkg/kv/kvserver/protectedts/ptpb",
         "//pkg/multitenant/mtinfopb",
+        "//pkg/revlog",
+        "//pkg/revlog/restorerevlog",
         "//pkg/revlog/revlogjob",
         "//pkg/roachpb",
         "//pkg/scheduledjobs",

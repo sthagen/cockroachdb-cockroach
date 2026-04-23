@@ -1876,6 +1876,7 @@ GO_TARGETS = [
     "//pkg/repstream:repstream",
     "//pkg/revert:revert",
     "//pkg/revert:revert_test",
+    "//pkg/revlog/restorerevlog:restorerevlog",
     "//pkg/revlog/revlogjob:revlogjob",
     "//pkg/revlog/revlogjob:revlogjob_test",
     "//pkg/revlog/revlogpb:revlogpb",

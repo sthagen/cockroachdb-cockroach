@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "restorerevlog",
+    srcs = ["restore.go"],
+    importpath = "github.com/cockroachdb/cockroach/pkg/revlog/restorerevlog",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/backup/backupinfo",
+        "//pkg/build",
+        "//pkg/cloud",
+        "//pkg/revlog",
+        "//pkg/util/hlc",
+        "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
+    ],
+)

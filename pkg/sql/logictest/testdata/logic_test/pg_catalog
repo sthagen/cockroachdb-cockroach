@@ -1135,7 +1135,7 @@ crdb_oid    tablename  indexname          indexdef
 5181036     t1_n_seq   primary            CREATE INDEX "primary" ON public.t1_n_seq USING btree (value ASC)
 2955071325  t2         t2_pkey            CREATE UNIQUE INDEX t2_pkey ON public.t2 USING btree (rowid ASC)
 2955071326  t2         t2_t1_id_idx       CREATE INDEX t2_t1_id_idx ON public.t2 USING btree (t1_id ASC)
-2695335053  t3         t3_a_b_idx         CREATE INDEX t3_a_b_idx ON public.t3 USING btree (a ASC, b DESC) STORING (c)
+2695335053  t3         t3_a_b_idx         CREATE INDEX t3_a_b_idx ON public.t3 USING btree (a ASC, b DESC) INCLUDE (c)
 2695335054  t3         t3_pkey            CREATE UNIQUE INDEX t3_pkey ON public.t3 USING btree (rowid ASC)
 3214807592  t4         t4_pkey            CREATE UNIQUE INDEX t4_pkey ON public.t4 USING btree (rowid ASC)
 1869730585  t5         t5_pkey            CREATE UNIQUE INDEX t5_pkey ON public.t5 USING btree (rowid ASC)
@@ -3444,8 +3444,8 @@ row_security                                                     on             
 search_path                                                      "$user", public     NULL      NULL        NULL        string
 serial_normalization                                             rowid               NULL      NULL        NULL        string
 server_encoding                                                  UTF8                NULL      NULL        NULL        string
-server_version                                                   13.0.0              NULL      NULL        NULL        string
-server_version_num                                               130000              NULL      NULL        NULL        string
+server_version                                                   18.0.0              NULL      NULL        NULL        string
+server_version_num                                               180000              NULL      NULL        NULL        string
 show_primary_key_constraint_on_not_visible_columns               on                  NULL      NULL        NULL        string
 sql_safe_updates                                                 off                 NULL      NULL        NULL        string
 ssl                                                              on                  NULL      NULL        NULL        string
@@ -3704,8 +3704,8 @@ row_security                                                     on             
 search_path                                                      "$user", public     NULL  user     NULL      "$user", public     "$user", public
 serial_normalization                                             rowid               NULL  user     NULL      rowid               rowid
 server_encoding                                                  UTF8                NULL  user     NULL      UTF8                UTF8
-server_version                                                   13.0.0              NULL  user     NULL      13.0.0              13.0.0
-server_version_num                                               130000              NULL  user     NULL      130000              130000
+server_version                                                   18.0.0              NULL  user     NULL      18.0.0              18.0.0
+server_version_num                                               180000              NULL  user     NULL      180000              180000
 show_primary_key_constraint_on_not_visible_columns               on                  NULL  user     NULL      on                  on
 sql_safe_updates                                                 off                 NULL  user     NULL      off                 off
 ssl                                                              on                  NULL  user     NULL      on                  on

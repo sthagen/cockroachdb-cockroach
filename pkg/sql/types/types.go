@@ -349,6 +349,12 @@ type DomainMetadata struct {
 	BaseType *T
 	// NotNull is true if the domain has a NOT NULL constraint.
 	NotNull bool
+	// NotNullConstraintName is the name of the NOT NULL constraint.
+	// Empty if the domain has no NOT NULL constraint.
+	NotNullConstraintName string
+	// NotNullConstraintID uniquely identifies the NOT NULL constraint.
+	// Zero if the domain has no NOT NULL constraint.
+	NotNullConstraintID catid.ConstraintID
 	// DefaultExpr is the default expression for the domain, serialized as
 	// a string. Empty if no default is specified.
 	DefaultExpr string
@@ -362,6 +368,8 @@ type DomainCheckConstraint struct {
 	Name string
 	// Expr is the CHECK expression, serialized as a string.
 	Expr string
+	// ConstraintID uniquely identifies this constraint within the domain.
+	ConstraintID catid.ConstraintID
 	// ParsedExpr is the cached parsed expression tree from hydration.
 	// Typed as any to avoid an import cycle with tree. At runtime this
 	// holds a tree.Expr obtained via parserutils.ParseExpr. It may be nil
@@ -1612,6 +1620,13 @@ func (t *T) WithoutTypeModifiers() *T {
 		return MakeTuple(newContents)
 	case EnumFamily:
 		// Enums have no type modifiers.
+		return t
+	}
+	// Domain types share their base type's Family, so check for them before
+	// looking up the OID in OidToType. Domain OIDs are user defined and do not
+	// exist in OidToType, and domains do not have independent type modifiers to
+	// strip beyond the base type information already baked into the type.
+	if t.UserDefined() && t.TypeMeta.DomainData != nil {
 		return t
 	}
 

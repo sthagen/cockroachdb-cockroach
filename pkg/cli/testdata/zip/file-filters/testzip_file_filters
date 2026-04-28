@@ -77,6 +77,7 @@ debug/nodes/1/gossip.json
 debug/nodes/1/heap.pprof
 deterministic.log
 debug/nodes/1/lsm.txt
+debug/nodes/1/mma_state.json
 debug/nodes/1/ranges.json
 debug/nodes/1/stacks.pprof
 debug/nodes/1/stacks.txt
@@ -147,6 +148,7 @@ debug/liveness.json
 debug/nodes.json
 debug/nodes/1/details.json
 debug/nodes/1/gossip.json
+debug/nodes/1/mma_state.json
 debug/nodes/1/ranges.json
 debug/nodes/1/status.json
 debug/pprof-summary.sh
@@ -303,6 +305,7 @@ debug/nodes.json
 debug/nodes/1/details.json
 debug/nodes/1/gossip.json
 deterministic.log
+debug/nodes/1/mma_state.json
 debug/nodes/1/ranges.json
 debug/nodes/1/status.json
 debug/pprof-summary.sh
@@ -398,6 +401,7 @@ debug/nodes/1/details.json
 debug/nodes/1/gossip.json
 debug/nodes/1/heap.pprof
 debug/nodes/1/lsm.txt
+debug/nodes/1/mma_state.json
 debug/nodes/1/ranges.json
 debug/nodes/1/stacks.pprof
 debug/nodes/1/stacks.txt
@@ -470,6 +474,7 @@ debug/nodes/1/details.json
 debug/nodes/1/gossip.json
 debug/nodes/1/heap.pprof
 deterministic.log
+debug/nodes/1/mma_state.json
 debug/nodes/1/ranges.json
 debug/nodes/1/stacks.pprof
 debug/nodes/1/status.json
@@ -692,6 +697,7 @@ debug/hot-ranges-tenant.sh
 debug/hot-ranges.sh
 debug/nodes/1/details.json
 debug/nodes/1/gossip.json
+debug/nodes/1/mma_state.json
 debug/nodes/1/ranges.json
 debug/nodes/1/status.json
 debug/pprof-summary.sh
@@ -708,6 +714,7 @@ debug/liveness.json
 debug/nodes.json
 debug/nodes/1/details.json
 debug/nodes/1/gossip.json
+debug/nodes/1/mma_state.json
 debug/nodes/1/status.json
 debug/pprof-summary.sh
 debug/rangelog.json

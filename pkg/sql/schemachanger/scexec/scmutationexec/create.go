@@ -52,6 +52,9 @@ func (i *immediateVisitor) AddDescriptorName(ctx context.Context, op scop.AddDes
 		Name:           op.Namespace.Name,
 	}
 	i.AddName(op.Namespace.DescriptorID, nameDetails)
+
+	// TODO(bghal): This complementary operation to update the descriptor should
+	// be its own op.
 	if strings.HasPrefix(nameDetails.Name, catconstants.PgTempSchemaName) {
 		return nil
 	}
@@ -59,12 +62,11 @@ func (i *immediateVisitor) AddDescriptorName(ctx context.Context, op scop.AddDes
 	if err != nil {
 		return err
 	}
-
 	switch t := desc.(type) {
 	case *tabledesc.Mutable:
 		t.ParentID = op.Namespace.DatabaseID
-		t.UnexposedParentSchemaID = op.Namespace.SchemaID
 	}
+
 	return nil
 }
 

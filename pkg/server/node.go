@@ -1720,14 +1720,25 @@ func (n *Node) batchInternal(
 	// for replication flow control.
 	admissionInfo := handle.AdmissionInfo()
 
-	// NB: we allocate a single instance of StoreWorkStats across retries since
-	// we want to accumulate those statistics to better account for all the work
-	// done at this store.
+	// Allocate a StoreWorkStats object that is used to track various statistics
+	// about the work done during the course of processing this request.
 	stats := kvserver.NewStoreWorkStats()
 	defer func() {
 		n.storeCfg.KVAdmissionController.AdmittedKVWorkDone(handle, stats.StoreWorkDoneInfo)
 		stats.Release()
 	}()
+
+	// Record the scan stats if tracing is enabled.
+	if sp := tracing.SpanFromContext(ctx); sp.RecordingType() != tracingpb.RecordingOff {
+		defer func() {
+			if ss := stats.ScanStats(); ss.NumGets != 0 || ss.NumScans != 0 || ss.NumReverseScans != 0 {
+				// Only record non-empty ScanStats.
+				ss.NodeID = n.Descriptor.NodeID
+				ss.Region, _ = n.Descriptor.Locality.Find("region")
+				sp.RecordStructured(ss)
+			}
+		}()
+	}
 
 	// If a proxy attempt is requested, we copy the request to prevent evaluation
 	// from modifying the request. There are places on the server that can modify

@@ -25,11 +25,12 @@ import (
 	"github.com/cockroachdb/tokenbucket"
 )
 
-// StoreWorkStats embeds admission.StoreWorkDoneInfo, since the notion of
-// "work is done" is specific to admission control and doesn't need to leak
-// everywhere.
+// StoreWorkStats embeds admission.StoreWorkDoneInfo to record information
+// relevant to admission control. It also contains an instance of kvpb.ScanStats
+// to keep track of low-level pebble statistics.
 type StoreWorkStats struct {
 	admission.StoreWorkDoneInfo
+	scanStats kvpb.ScanStats
 }
 
 var storeWorkStatsPool = sync.Pool{
@@ -48,6 +49,14 @@ func (ws *StoreWorkStats) Release() {
 	}
 	*ws = StoreWorkStats{}
 	storeWorkStatsPool.Put(ws)
+}
+
+// ScanStats returns a pointer to the underlying kvpb.ScanStats.
+func (ws *StoreWorkStats) ScanStats() *kvpb.ScanStats {
+	if ws == nil {
+		return nil
+	}
+	return &ws.scanStats
 }
 
 // SenderWithWorkStats is implemented by Store, Stores, and Replica. It extends

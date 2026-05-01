@@ -48,12 +48,12 @@ type githubIssues struct {
 // worker / test
 // separate from githubIssues because githubIssues is shared amongst all workers
 type githubIssueInfo struct {
-	cluster      *clusterImpl
+	cluster      testCluster
 	vmCreateOpts *vm.CreateOpts
 }
 
 // newGithubIssueInfo constructor for newGithubIssueInfo
-func newGithubIssueInfo(cluster *clusterImpl, vmCreateOpts *vm.CreateOpts) *githubIssueInfo {
+func newGithubIssueInfo(cluster testCluster, vmCreateOpts *vm.CreateOpts) *githubIssueInfo {
 	return &githubIssueInfo{
 		cluster:      cluster,
 		vmCreateOpts: vmCreateOpts,
@@ -302,7 +302,7 @@ func (g *githubIssues) createPostRequest(
 	artifacts := fmt.Sprintf("/%s", testName)
 
 	if issueInfo.cluster != nil {
-		issueClusterName = issueInfo.cluster.name
+		issueClusterName = issueInfo.cluster.Name()
 	}
 
 	issueMessage := messagePrefix + message

@@ -77,6 +77,11 @@ func NoopMMARebalanceAdvisor() *MMARebalanceAdvisor {
 func (a *allocatorState) BuildMMARebalanceAdvisor(
 	existing roachpb.StoreID, cands []roachpb.StoreID,
 ) *MMARebalanceAdvisor {
+	// a.cs is mutated by gossip-driven callbacks (e.g. ProcessStoreLoadMsg) and
+	// must only be accessed under a.mu. The other public methods on
+	// allocatorState follow this discipline.
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	// TODO(wenyihu6): for simplicity, we create a new scratchNodes every call.
 	// We should reuse the scratchNodes instead.
 	scratchNodes := map[roachpb.NodeID]*NodeLoad{}
@@ -105,6 +110,11 @@ func (a *allocatorState) IsInConflictWithMMA(
 	if advisor.disabled {
 		return false
 	}
+	// a.cs is mutated by gossip-driven callbacks (e.g. ProcessStoreLoadMsg) and
+	// must only be accessed under a.mu. The other public methods on
+	// allocatorState follow this discipline.
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	// Lazily compute and cache the load summary for the existing store.
 	if advisor.existingStoreSLS == nil {
 		summary := a.cs.computeLoadSummary(ctx, advisor.existingStoreID, &advisor.means.storeLoad, &advisor.means.nodeLoad, makeMMALogger(false /* verboseToInfof */))

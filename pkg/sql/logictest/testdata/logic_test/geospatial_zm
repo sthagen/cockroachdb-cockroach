@@ -586,3 +586,87 @@ SELECT _ST_3DDWithin('POINT Z(0 0 0)'::geometry, 'POINT Z(0 0 1)'::geometry, 1)
 true
 
 subtest end
+
+# Regression test for #127265: st_dwithin with distance=0 should use
+# inverted index (equivalent to st_intersects).
+subtest st_dwithin_zero_distance
+
+statement ok
+CREATE TABLE geo_dwithin_zero (
+  id INT PRIMARY KEY,
+  geom GEOMETRY,
+  geog GEOGRAPHY,
+  INVERTED INDEX (geom),
+  INVERTED INDEX (geog)
+);
+
+statement ok
+INSERT INTO geo_dwithin_zero VALUES
+  (1, 'POINT(1 1)', 'POINT(1 1)'),
+  (2, 'POINT(2 2)', 'POINT(2 2)'),
+  (3, 'LINESTRING(0 0, 1 1)', 'LINESTRING(0 0, 1 1)'),
+  (4, 'POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))', 'SRID=4326;POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))');
+
+# st_dwithin with distance=0 should match the same rows as st_intersects. The
+# corresponding plan-shape assertion (that the inverted index is used) lives in
+# pkg/sql/opt/exec/execbuilder/testdata/inverted_index_geospatial, which runs
+# only under the local config and has stable EXPLAIN output.
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geom, 'POINT(1 1)'::geometry, 0) ORDER BY id
+----
+1
+3
+4
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geog, 'POINT(1 1)'::geography, 0) ORDER BY id
+----
+1
+3
+4
+
+# NULL arguments to st_dwithin should yield NULL (and thus no rows from
+# WHERE). The inverted index path short-circuits on NULL args via
+# extractInfoFromExpr, so these queries fall through to a regular filter;
+# the assertions confirm the distance=0 optimization does not change
+# observable behavior for NULL inputs.
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geom, NULL::geometry, 0) ORDER BY id
+----
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geog, NULL::geography, 0) ORDER BY id
+----
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geom, 'POINT(1 1)'::geometry, NULL) ORDER BY id
+----
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geog, 'POINT(1 1)'::geography, NULL) ORDER BY id
+----
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geog, 'POINT(1 1)'::geography, 0, NULL) ORDER BY id
+----
+
+# NULL values in the indexed column should not match.
+statement ok
+INSERT INTO geo_dwithin_zero VALUES (5, NULL, NULL)
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geom, 'POINT(1 1)'::geometry, 0) ORDER BY id
+----
+1
+3
+4
+
+query I
+SELECT id FROM geo_dwithin_zero WHERE st_dwithin(geog, 'POINT(1 1)'::geography, 0) ORDER BY id
+----
+1
+3
+4
+
+subtest end

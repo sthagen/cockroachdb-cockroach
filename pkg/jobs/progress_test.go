@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -42,14 +43,14 @@ func TestChunkProgressLogger(t *testing.T) {
 	_, err := s.JobRegistry().(*Registry).CreateJobWithTxn(ctx, defaultRecord, jobID, nil /* txn */)
 	require.NoError(t, err)
 
+	loggerGroup := ctxgroup.WithContext(ctx)
+
 	requestFinishedCh := make(chan struct{}, 100)
-	go func() {
-		require.NoError(t,
-			NewChunkProgressLoggerForJob(
-				jobID, s.InternalDB().(isql.DB), 100 /* expectedChunks */, 0, /* startFraction */
-			).Loop(ctx, requestFinishedCh),
-		)
-	}()
+	loggerGroup.GoCtx(func(ctx context.Context) error {
+		return NewChunkProgressLoggerForJob(
+			jobID, s.InternalDB().(isql.DB), 100 /* expectedChunks */, 0, /* startFraction */
+		).Loop(ctx, requestFinishedCh)
+	})
 
 	db := sqlutils.MakeSQLRunner(s.SQLConn(t))
 	validateFrac := func(expected float64) {
@@ -79,14 +80,11 @@ func TestChunkProgressLogger(t *testing.T) {
 	// Reset to a new logger, mimicing a job pause then resume.
 	close(requestFinishedCh) // Closing this chanel will cancel the previous loop.
 	requestFinishedCh2 := make(chan struct{}, 100)
-	defer close(requestFinishedCh2)
-	go func() {
-		require.NoError(t,
-			NewChunkProgressLoggerForJob(
-				jobID, s.InternalDB().(isql.DB), 40 /* expectedChunks */, 0.6, /* startFraction */
-			).Loop(ctx, requestFinishedCh2),
-		)
-	}()
+	loggerGroup.GoCtx(func(ctx context.Context) error {
+		return NewChunkProgressLoggerForJob(
+			jobID, s.InternalDB().(isql.DB), 40 /* expectedChunks */, 0.6, /* startFraction */
+		).Loop(ctx, requestFinishedCh2)
+	})
 
 	// Verify that we pick up where we left off.
 	for range 39 {
@@ -95,6 +93,11 @@ func TestChunkProgressLogger(t *testing.T) {
 	validateFrac(0.99)
 	requestFinishedCh2 <- struct{}{}
 	validateFrac(1)
+
+	// Wait for loggers to finish so that the TestingSetProgressThresholds defer doesn't race with
+	// their reads of progressTimeThreshold and progressFractionThreshold.
+	close(requestFinishedCh2)
+	require.NoError(t, loggerGroup.Wait())
 }
 
 func TestChunkProgressLoggerLimitsFloatingPointError(t *testing.T) {

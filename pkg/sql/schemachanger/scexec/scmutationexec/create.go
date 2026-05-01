@@ -65,6 +65,10 @@ func (i *immediateVisitor) AddDescriptorName(ctx context.Context, op scop.AddDes
 	switch t := desc.(type) {
 	case *tabledesc.Mutable:
 		t.ParentID = op.Namespace.DatabaseID
+	case *dbdesc.Mutable, *schemadesc.Mutable, *typedesc.Mutable:
+		// These descriptor types have their parent IDs set through other ops.
+	default:
+		return errors.AssertionFailedf("unexpected descriptor type %T for AddDescriptorName", desc)
 	}
 
 	return nil
@@ -90,6 +94,8 @@ func (i *immediateVisitor) SetNameInDescriptor(
 		// functions do not have a namespace entry and their name field is handled
 		// by FunctionName element.
 		return errors.AssertionFailedf("Incorrect descriptor type %v", mut.DescriptorType())
+	default:
+		return errors.AssertionFailedf("unexpected descriptor type %v for SetNameInDescriptor", mut.DescriptorType())
 	}
 	return nil
 }

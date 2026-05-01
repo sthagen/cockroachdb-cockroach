@@ -1146,7 +1146,7 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) (r
 		}
 
 		return nil
-	}, isql.WithPriority(admissionpb.BulkNormalPri)); err != nil {
+	}, isql.WithPriority(admissionpb.BulkLowPri)); err != nil {
 		return err
 	}
 

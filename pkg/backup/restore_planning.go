@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/revlog/restorerevlog"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -2010,6 +2011,11 @@ func doRestorePlan(
 			"revision log detected; restoring to backup end %s, will replay log through %s",
 			endTime, revisionLogTimestamp,
 		)
+		if err := restorerevlog.ValidateResolved(
+			ctx, collectionStore, endTime, revisionLogTimestamp,
+		); err != nil {
+			return err
+		}
 	}
 
 	mem := p.ExecCfg().RootMemoryMonitor.MakeBoundAccount()
@@ -2069,9 +2075,29 @@ func doRestorePlan(
 		return err
 	}
 
-	sqlDescs, restoreDBs, descsByTablePattern, tenants, setupTempDB, err := selectTargets(
-		ctx, p, mainBackupManifests, layerToIterFactory, restoreStmt.Targets, restoreStmt.DescriptorCoverage, endTime,
-	)
+	var sqlDescs []catalog.Descriptor
+	var restoreDBs []catalog.DatabaseDescriptor
+	var descsByTablePattern map[tree.TablePattern]catalog.Descriptor
+	var tenants []mtinfopb.TenantInfoWithUsage
+	var setupTempDB bool
+
+	if !revisionLogTimestamp.IsEmpty() {
+		sqlDescs, restoreDBs, descsByTablePattern, tenants, setupTempDB, err =
+			selectTargetsWithRevlog(
+				ctx, p, collectionStore,
+				mainBackupManifests, layerToIterFactory,
+				restoreStmt.Targets,
+				restoreStmt.DescriptorCoverage,
+				endTime, revisionLogTimestamp,
+			)
+	} else {
+		sqlDescs, restoreDBs, descsByTablePattern, tenants, setupTempDB, err =
+			selectTargets(
+				ctx, p, mainBackupManifests, layerToIterFactory,
+				restoreStmt.Targets,
+				restoreStmt.DescriptorCoverage, endTime,
+			)
+	}
 	if err != nil {
 		return errors.Wrap(err,
 			"failed to resolve targets in the BACKUP location specified by the RESTORE statement, "+
@@ -2328,6 +2354,17 @@ func doRestorePlan(
 		TempSystemID:                     tempSysDBID,
 		Grants:                           restoreStmt.Options.Grants,
 		RevisionLogTimestamp:             revisionLogTimestamp,
+	}
+
+	// Validate that revision log rekeys can be built from the
+	// restore details. This catches errors during planning rather
+	// than during job execution.
+	if !revisionLogTimestamp.IsEmpty() {
+		if _, _, err := restorerevlog.BuildRekeys(
+			restoreDetails, p.ExecCfg(),
+		); err != nil {
+			return errors.Wrap(err, "validating revision log rekeys")
+		}
 	}
 
 	jr := jobs.Record{

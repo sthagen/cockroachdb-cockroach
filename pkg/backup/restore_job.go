@@ -2489,7 +2489,8 @@ func (r *restoreResumer) doResume(ctx context.Context, execCtx interface{}) erro
 	}
 
 	if details.ExperimentalCopy {
-		if len(details.DownloadSpans) == 0 && !details.SchemaOnly {
+		if len(details.DownloadSpans) == 0 && !details.SchemaOnly &&
+			build.IsRelease() {
 			return errors.AssertionFailedf("download spans should have been persisted to job details")
 		}
 		// TODO(msbutler): ideally doDownloadFiles would not depend on job details

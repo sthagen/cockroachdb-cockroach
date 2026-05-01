@@ -6,17 +6,26 @@
 package backup
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/nodelocal"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/revlog"
+	"github.com/cockroachdb/cockroach/pkg/revlog/restorerevlog"
+	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -267,4 +276,129 @@ func TestRevlogDescriptorResolution(t *testing.T) {
 
 		sqlDB.Exec(t, `DROP DATABASE tbl_drop CASCADE`)
 	})
+}
+
+// TestMergeTickEventsFromBackup exercises the merge algorithm against
+// real revision log data produced by BACKUP ... WITH REVISION STREAM.
+//
+//  1. Start a single-node cluster and create a table.
+//  2. Run INSERT, UPDATE, and DELETE to generate MVCC history.
+//  3. BACKUP INTO ... WITH REVISION STREAM to create a backup with a
+//     sibling revision log job.
+//  4. Wait for the revlog job to produce at least one closed tick.
+//  5. Read all ticks from the revlog and run MergeTickEvents.
+//  6. Validate: output is non-empty, keys are sorted, each key
+//     appears exactly once, and values are properly encoded.
+func TestMergeTickEventsFromBackup(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	// System tenant is required because kv.rangefeed.enabled is
+	// operator-only, and the revlog producer needs rangefeeds.
+	params := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
+	}
+	_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(
+		t, singleNode, 0 /* numAccounts */, InitManualReplication, params,
+	)
+	defer cleanup()
+
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	sqlDB.Exec(t, `CREATE TABLE data.kv (k INT PRIMARY KEY, v STRING)`)
+
+	// Run backup with revision stream to start the sibling revlog
+	// job. The revlog producer watches via rangefeed from this
+	// point forward.
+	const destSubdir = "revlog-merge-test"
+	dest := "nodelocal://1/" + destSubdir
+	sqlDB.Exec(t, `BACKUP INTO $1 WITH REVISION STREAM`, dest)
+
+	collectionDir := filepath.Join(dir, destSubdir)
+	siblingID := readSiblingJobID(t, collectionDir)
+	jobutils.WaitForJobToRun(t, sqlDB, siblingID)
+
+	// Mutations happen after the revlog job starts so the rangefeed
+	// captures them.
+	sqlDB.Exec(t, `INSERT INTO data.kv VALUES (1, 'a'), (2, 'b'), (3, 'c')`)
+	sqlDB.Exec(t, `UPDATE data.kv SET v = 'a2' WHERE k = 1`)
+	sqlDB.Exec(t, `DELETE FROM data.kv WHERE k = 2`)
+
+	// Wait for the revlog job to resolve past the mutations by
+	// polling its high_water_timestamp via SHOW JOBS.
+	require.NoError(t, testutils.SucceedsWithinError(func() error {
+		var resolvedTS *string
+		sqlDB.QueryRow(t,
+			`SELECT resolved_timestamp::STRING `+
+				`FROM [SHOW JOBS WITH RESOLVED TIMESTAMP] WHERE job_id = $1`,
+			siblingID,
+		).Scan(&resolvedTS)
+		if resolvedTS == nil {
+			return errors.New("revlog job has no resolved timestamp yet")
+		}
+		return nil
+	}, 90*time.Second))
+
+	// Open the collection storage and discover ticks.
+	es := nodelocal.TestingMakeNodelocalStorage(
+		collectionDir,
+		cluster.MakeTestingClusterSettings(),
+		cloudpb.ExternalStorage{},
+	)
+	defer es.Close()
+
+	lr := revlog.NewLogReader(es)
+	var manifests []revlogpb.Manifest
+	for tick, tickErr := range lr.Ticks(
+		ctx, hlc.Timestamp{WallTime: 1}, hlc.MaxTimestamp,
+	) {
+		require.NoError(t, tickErr)
+		manifests = append(manifests, tick.Manifest)
+	}
+	require.NotEmpty(t, manifests, "expected at least one tick manifest")
+	t.Logf("discovered %d tick(s)", len(manifests))
+
+	// Run the merge algorithm.
+	spec := execinfrapb.RevlogLocalMergeSpec{
+		Ticks: manifests,
+	}
+	var merged []restorerevlog.MergedEntry
+	for entry, err := range restorerevlog.MergeTickEvents(ctx, es, spec) {
+		require.NoError(t, err)
+		merged = append(merged, entry)
+	}
+	require.NotEmpty(t, merged, "expected non-empty merge output")
+
+	// Validate: keys must be in ascending order and unique.
+	seen := make(map[string]bool)
+	for i, e := range merged {
+		keyStr := string(e.Key.Key)
+		require.False(t, seen[keyStr],
+			"duplicate key %s in merge output", e.Key.Key)
+		seen[keyStr] = true
+
+		if i > 0 {
+			require.True(t,
+				merged[i-1].Key.Key.Compare(e.Key.Key) < 0,
+				"keys not sorted: %s >= %s",
+				merged[i-1].Key.Key, e.Key.Key,
+			)
+		}
+
+		// Non-tombstone values must be valid roachpb.Value
+		// encoding (4-byte checksum + 1-byte tag + data).
+		if len(e.Value) > 0 {
+			require.GreaterOrEqual(t, len(e.Value), 5,
+				"value for key %s too short to be a roachpb.Value",
+				e.Key.Key)
+		}
+	}
+
+	t.Logf("merge produced %d deduplicated entries", len(merged))
+
+	// Cancel the sibling job so cleanup doesn't hang.
+	sqlDB.Exec(t, `CANCEL JOB $1`, siblingID)
+	jobutils.WaitForJobToCancel(t, sqlDB, siblingID)
 }

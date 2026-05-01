@@ -182,6 +182,13 @@ func RestoreFromRevisionLog(
 	// Shuffle and distribute ticks across nodes.
 	assignments := AssignTicksToNodes(manifests, len(sqlInstanceIDs))
 
+	// Build table rekeys from the restore details, matching the
+	// pattern in createRestoreFlows (restore_job.go).
+	tableRekeys, tenantRekeys, err := BuildRekeys(details, execCfg)
+	if err != nil {
+		return errors.Wrap(err, "building rekeys for revlog restore")
+	}
+
 	corePlacements := make(
 		[]physicalplan.ProcessorCorePlacement, len(sqlInstanceIDs),
 	)
@@ -190,10 +197,13 @@ func RestoreFromRevisionLog(
 			SQLInstanceID: id,
 			Core: execinfrapb.ProcessorCoreUnion{
 				RevlogLocalMerge: &execinfrapb.RevlogLocalMergeSpec{
-					CollectionURI: details.DefaultCollectionURI,
-					Ticks:         assignments[i],
-					JobID:         int64(job.ID()),
-					UserProto:     execCtx.User().EncodeProto(),
+					CollectionURI:    details.DefaultCollectionURI,
+					Ticks:            assignments[i],
+					JobID:            int64(job.ID()),
+					UserProto:        execCtx.User().EncodeProto(),
+					RestoreTimestamp: details.RevisionLogTimestamp,
+					TableRekeys:      tableRekeys,
+					TenantRekeys:     tenantRekeys,
 				},
 			},
 		}

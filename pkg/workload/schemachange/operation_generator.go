@@ -5887,25 +5887,43 @@ type triggerInfo struct {
 	triggerName string
 }
 
-// collectEnumMembers returns all enum members in the current database. Each
-// result row is a map with keys "name" (qualified enum type name), "value"
-// (quoted member literal), and "non_public" (bool indicating a DROPPING member).
+// collectEnumMembers returns all public enum members in the current database.
+// Each result row is a map with keys "name" (qualified enum type name), "value"
+// (quoted member literal), and "non_public" (always false).
+//
+// This uses enum_range(NULL::type) which goes through the lease-based type
+// resolution and filters out read-only members. This ensures the results are
+// consistent with what DML statements see, avoiding TOCTOU races where the
+// previous system.descriptor-based query could see a member as public while a
+// concurrent schema change has already marked it as READ_ONLY in the leased
+// descriptor.
 func (og *operationGenerator) collectEnumMembers(
 	ctx context.Context, tx pgx.Tx,
 ) ([]map[string]any, error) {
-	q := With([]CTE{
-		{"descriptors", descJSONQuery},
-		{"enums", enumDescsQuery},
-		{"enum_members", enumMemberDescsQuery},
-	}, `SELECT
-			quote_ident(schema_id::REGNAMESPACE::TEXT) || '.' || quote_ident(name) AS name,
-			quote_literal(member->>'logicalRepresentation') AS value,
-			(
-				COALESCE(member->>'direction' = 'REMOVE', false) OR
-				COALESCE(member->>'capability' = 'READ_ONLY', false)
-			) AS non_public
-		FROM enum_members
+	// First, collect all user-defined enum type names via pg_type (lease-based).
+	enumTypeNames, err := Collect(ctx, og, tx, pgx.RowTo[string], `
+		SELECT quote_ident(n.nspname) || '.' || quote_ident(t.typname)
+		FROM pg_catalog.pg_type t
+		JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid
+		WHERE t.typtype = 'e'
+		  AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_extension', 'crdb_internal')
 	`)
+	if err != nil {
+		return nil, err
+	}
+	if len(enumTypeNames) == 0 {
+		return nil, nil
+	}
+
+	// For each enum type, use enum_range to get only public members. Build a
+	// UNION ALL query so we make a single round-trip.
+	var parts []string
+	for _, name := range enumTypeNames {
+		parts = append(parts, fmt.Sprintf(
+			`SELECT '%[1]s' AS name, quote_literal(v) AS value, false AS non_public
+			FROM unnest(enum_range(NULL::%[1]s)) v`, name))
+	}
+	q := strings.Join(parts, " UNION ALL ")
 	return Collect(ctx, og, tx, pgx.RowToMap, q)
 }
 

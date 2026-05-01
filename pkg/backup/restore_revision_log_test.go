@@ -8,6 +8,7 @@ package backup
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -401,4 +402,96 @@ func TestMergeTickEventsFromBackup(t *testing.T) {
 	// Cancel the sibling job so cleanup doesn't hang.
 	sqlDB.Exec(t, `CANCEL JOB $1`, siblingID)
 	jobutils.WaitForJobToCancel(t, sqlDB, siblingID)
+}
+
+// TestRestoreFromRevlog runs a full restore through the revlog path
+// and verifies that the restored data in KV reflects the mutations
+// captured by the revision log. The database has two tables but the
+// restore targets only one, exercising the rekey skip logic for
+// unscoped revlog events.
+func TestRestoreFromRevlog(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// System tenant is required because kv.rangefeed.enabled is
+	// operator-only, and the revlog producer needs rangefeeds.
+	params := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		},
+	}
+	_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(
+		t, singleNode, 0 /* numAccounts */, InitManualReplication, params,
+	)
+	defer cleanup()
+
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
+	sqlDB.Exec(t, `CREATE DATABASE src`)
+	sqlDB.Exec(t, `CREATE TABLE src.foo (k INT PRIMARY KEY, v STRING)`)
+	sqlDB.Exec(t, `INSERT INTO src.foo VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')`)
+	// A second table in the same database ensures the revlog
+	// contains events for tables outside the restore scope.
+	sqlDB.Exec(t, `CREATE TABLE src.bar (k INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO src.bar VALUES (1), (2)`)
+
+	// Run backup with revision stream to start the sibling revlog
+	// job. The revlog producer watches via rangefeed from this
+	// point forward.
+	const destSubdir = "revlog-merge-test"
+	dest := "nodelocal://1/" + destSubdir
+	sqlDB.Exec(t, `BACKUP INTO $1 WITH REVISION STREAM`, dest)
+
+	collectionDir := filepath.Join(dir, destSubdir)
+	siblingID := readSiblingJobID(t, collectionDir)
+	jobutils.WaitForJobToRun(t, sqlDB, siblingID)
+
+	// Mutations happen after the revlog job starts so the rangefeed
+	// captures them.
+	sqlDB.Exec(t, `UPDATE src.foo SET v = 'updated' WHERE k = 1`)
+	sqlDB.Exec(t, `DELETE FROM src.foo WHERE k = 2`)
+	sqlDB.Exec(t, `INSERT INTO src.foo VALUES (100, 'new')`)
+
+	aost := clusterTimestamp(t, sqlDB)
+	waitForRevlogPastTimestamp(t, sqlDB, siblingID, aost)
+
+	sqlDB.Exec(t, `CANCEL JOB $1`, siblingID)
+	jobutils.WaitForJobToCancel(t, sqlDB, siblingID)
+
+	// Restore only src.foo — the revlog data contains events for
+	// both foo and bar, but only foo has rekeys.
+	sqlDB.Exec(t, `CREATE DATABASE restored`)
+	sqlDB.Exec(t, fmt.Sprintf(
+		`RESTORE TABLE src.foo FROM LATEST IN '%s' AS OF SYSTEM TIME '%s' WITH into_db = 'restored'`,
+		dest, aost,
+	))
+
+	// Verify the restored data matches the expected state at the
+	// AOST: k=1 updated, k=2 deleted, k=3 unchanged, k=100 inserted.
+	rows := sqlDB.QueryStr(t,
+		`SELECT k, v FROM restored.foo ORDER BY k`,
+	)
+	expected := [][]string{
+		{"1", "updated"},
+		{"3", "gamma"},
+		{"100", "new"},
+	}
+	require.Equal(t, expected, rows)
+
+	// Verify that intermediate SSTs were cleaned up after restore.
+	// The local merge writes to nodelocal://{id}/job/{jobID}/map/,
+	// which maps to {dir}/job/{jobID}/ on disk.
+	jobDir := filepath.Join(dir, "job")
+	var leftoverSSTs []string
+	_ = filepath.WalkDir(jobDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && filepath.Ext(path) == ".sst" {
+			leftoverSSTs = append(leftoverSSTs, path)
+		}
+		return nil
+	})
+	require.Empty(t, leftoverSSTs,
+		"expected no leftover SSTs under %s", jobDir,
+	)
 }

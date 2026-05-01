@@ -2080,9 +2080,11 @@ func doRestorePlan(
 	var descsByTablePattern map[tree.TablePattern]catalog.Descriptor
 	var tenants []mtinfopb.TenantInfoWithUsage
 	var setupTempDB bool
+	var newDescIDs map[descpb.ID]struct{}
 
 	if !revisionLogTimestamp.IsEmpty() {
-		sqlDescs, restoreDBs, descsByTablePattern, tenants, setupTempDB, err =
+		sqlDescs, restoreDBs, descsByTablePattern, tenants,
+			setupTempDB, newDescIDs, err =
 			selectTargetsWithRevlog(
 				ctx, p, collectionStore,
 				mainBackupManifests, layerToIterFactory,
@@ -2250,6 +2252,19 @@ func doRestorePlan(
 		return err
 	}
 
+	// Compute RevlogNewTableIDs: post-rewrite IDs for tables that
+	// were added by revision log schema changes (not in the backup).
+	var revlogNewTableIDs []descpb.ID
+	for oldID := range newDescIDs {
+		if rw, ok := descriptorRewrites[oldID]; ok {
+			if _, isTable := filteredTablesByID[oldID]; isTable {
+				revlogNewTableIDs = append(
+					revlogNewTableIDs, rw.ID,
+				)
+			}
+		}
+	}
+
 	if restoreStmt.Options.OnlineImpl() {
 		if err := checkBackupElidedPrefixForOnlineCompat(ctx, mainBackupManifests, descriptorRewrites); err != nil {
 			return err
@@ -2355,6 +2370,7 @@ func doRestorePlan(
 		Grants:                           restoreStmt.Options.Grants,
 		RevisionLogTimestamp:             revisionLogTimestamp,
 		DefaultCollectionURI:             defaultCollectionURI,
+		RevlogNewTableIDs:                revlogNewTableIDs,
 	}
 
 	// Validate that revision log rekeys can be built from the

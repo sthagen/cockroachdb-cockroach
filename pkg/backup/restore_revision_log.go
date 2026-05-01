@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/revlog/restorerevlog"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
@@ -39,23 +40,27 @@ func selectTargetsWithRevlog(
 	map[tree.TablePattern]catalog.Descriptor,
 	[]mtinfopb.TenantInfoWithUsage,
 	bool,
+	map[descpb.ID]struct{},
 	error,
 ) {
 	allBackupDescs, lastManifest, err := backupinfo.LoadSQLDescsFromBackupsAtTime(
 		ctx, backupManifests, layerToIterFactory, endTime,
 	)
 	if err != nil {
-		return nil, nil, nil, nil, false,
+		return nil, nil, nil, nil, false, nil,
 			errors.Wrap(err, "loading backup descriptors for revlog merge")
 	}
-	mergedDescs, err := restorerevlog.ApplyDescriptorChanges(
+	mergedDescs, newDescIDs, err := restorerevlog.ApplyDescriptorChanges(
 		ctx, es, allBackupDescs, endTime, revlogTimestamp,
 	)
 	if err != nil {
-		return nil, nil, nil, nil, false, err
+		return nil, nil, nil, nil, false, nil, err
 	}
-	return selectTargetsFromDescs(
-		ctx, p, mergedDescs, lastManifest,
-		targets, descriptorCoverage, endTime,
-	)
+	descs, dbs, byPattern, tenants, setupTempDB, selectErr :=
+		selectTargetsFromDescs(
+			ctx, p, mergedDescs, lastManifest,
+			targets, descriptorCoverage, endTime,
+		)
+	return descs, dbs, byPattern, tenants, setupTempDB,
+		newDescIDs, selectErr
 }

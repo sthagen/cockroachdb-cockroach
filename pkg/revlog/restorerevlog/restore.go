@@ -7,18 +7,26 @@ package restorerevlog
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
+	"slices"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/backup/backupinfo"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/revlog"
 	"github.com/cockroachdb/cockroach/pkg/revlog/revlogpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkmerge"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulksst"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -29,8 +37,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	gogotypes "github.com/gogo/protobuf/types"
 )
 
 // MaybeAdjustEndTime checks whether the collection has a revision log
@@ -127,9 +137,17 @@ func AssignTicksToNodes(ticks []revlogpb.Manifest, numNodes int) [][]revlogpb.Ma
 // backup's end time through the target AOST timestamp, ingesting the
 // mutations on top of the already-restored backup data.
 //
-// It discovers closed ticks in the revision log, shuffles and
-// distributes them across SQL instances, and runs a DistSQL flow with
-// one RevlogLocalMerge processor per node.
+// The pipeline has three phases:
+//  1. Distribute tick work across SQL instances via DistSQL. Each
+//     processor merges its ticks, rewrites keys, writes SSTs, and
+//     sends manifests back via BulkProcessorProgress.
+//  2. Split/scatter new table spans (tables created during the
+//     revlog window that have no backup data).
+//  3. Ingest SSTs into KV via bulkmerge.Merge.
+//
+// TODO(kev-cao): implement checkpointing so that the revlog merge
+// can resume after a transient failure without replaying all ticks
+// from scratch.
 func RestoreFromRevisionLog(
 	ctx context.Context, execCtx sql.JobExecContext, job *jobs.Job, execCfg *sql.ExecutorConfig,
 ) error {
@@ -182,8 +200,7 @@ func RestoreFromRevisionLog(
 	// Shuffle and distribute ticks across nodes.
 	assignments := AssignTicksToNodes(manifests, len(sqlInstanceIDs))
 
-	// Build table rekeys from the restore details, matching the
-	// pattern in createRestoreFlows (restore_job.go).
+	// Build table rekeys from the restore details.
 	tableRekeys, tenantRekeys, err := BuildRekeys(details, execCfg)
 	if err != nil {
 		return errors.Wrap(err, "building rekeys for revlog restore")
@@ -219,10 +236,32 @@ func RestoreFromRevisionLog(
 	)
 	sql.FinalizePlan(ctx, planCtx, plan)
 
-	rowResultWriter := sql.NewRowResultWriter(nil)
+	// Collect SST manifests from the local merge processors.
+	var allManifests []jobspb.BulkSSTManifest
+	metaWriter := sql.NewMetadataOnlyMetadataCallbackWriter(
+		func(
+			ctx context.Context,
+			meta *execinfrapb.ProducerMetadata,
+		) error {
+			if meta.BulkProcessorProgress == nil {
+				return nil
+			}
+			var mapProgress execinfrapb.BulkMapProgress
+			if err := gogotypes.UnmarshalAny(
+				&meta.BulkProcessorProgress.ProgressDetails,
+				&mapProgress,
+			); err != nil {
+				return errors.Wrap(err, "decoding map progress")
+			}
+			allManifests = append(
+				allManifests, mapProgress.SSTManifests...,
+			)
+			return nil
+		},
+	)
 	recv := sql.MakeDistSQLReceiver(
 		ctx,
-		rowResultWriter,
+		metaWriter,
 		tree.Rows,
 		nil, /* rangeCache */
 		nil, /* txn */
@@ -233,10 +272,46 @@ func RestoreFromRevisionLog(
 
 	evalCtxCopy := evalCtx.Copy()
 	dsp.Run(
-		ctx, planCtx, nil /* txn */, plan, recv, evalCtxCopy,
-		nil, /* finishedSetupFn */
+		ctx, planCtx, nil, /* txn */
+		plan, recv, evalCtxCopy, nil, /* finishedSetupFn */
 	)
-	return errors.Wrap(rowResultWriter.Err(), "running revlog restore flow")
+	if err := metaWriter.Err(); err != nil {
+		return errors.Wrap(err, "running revlog local merge flow")
+	}
+
+	if len(allManifests) == 0 {
+		log.Dev.Infof(
+			ctx,
+			"no SSTs produced by revlog local merge (all events filtered)",
+		)
+		return nil
+	}
+	log.Dev.Infof(
+		ctx,
+		"revlog local merge produced %d SST manifests",
+		len(allManifests),
+	)
+
+	// Split/scatter spans for new tables.
+	if err := SplitAndScatterRevlogSpans(
+		ctx, execCtx, details, allManifests,
+	); err != nil {
+		return errors.Wrap(err, "split/scatter for revlog new tables")
+	}
+
+	jobID := job.ID()
+
+	// Ingest via bulkmerge.Merge.
+	if err := RunRevlogFinalMerge(
+		ctx, execCtx, jobID, details, allManifests,
+	); err != nil {
+		return errors.Wrap(err, "revlog final merge")
+	}
+
+	// Best-effort cleanup of intermediate SSTs.
+	CleanupSSTs(ctx, execCtx, jobID, sqlInstanceIDs)
+
+	return nil
 }
 
 // ValidateResolved checks that the revision log has sealed ticks
@@ -284,12 +359,16 @@ func ValidateResolved(
 // and revlogTimestamp are applied on top of the backup's descriptors:
 // new descriptors are added, modified descriptors are updated, and
 // dropped/tombstoned descriptors are removed.
+//
+// The returned newDescIDs set contains descriptor IDs that were
+// ADDED by the revision log (not present in the backup). These
+// represent schema objects created between the backup and the AOST.
 func ApplyDescriptorChanges(
 	ctx context.Context,
 	es cloud.ExternalStorage,
 	backupDescs []catalog.Descriptor,
 	backupEndTime, revlogTimestamp hlc.Timestamp,
-) ([]catalog.Descriptor, error) {
+) ([]catalog.Descriptor, map[descpb.ID]struct{}, error) {
 	// Index backup descriptors by ID.
 	byID := make(map[descpb.ID]catalog.Descriptor, len(backupDescs))
 	for _, d := range backupDescs {
@@ -302,17 +381,21 @@ func ApplyDescriptorChanges(
 	type changeState struct {
 		desc *descpb.Descriptor // nil = tombstone
 	}
+	newDescIDs := make(map[descpb.ID]struct{})
 	latestByID := make(map[descpb.ID]changeState)
 	for sc, err := range revlog.IterSchemaChanges(
 		ctx, es, backupEndTime, revlogTimestamp,
 	) {
 		if err != nil {
-			return nil, errors.Wrap(err, "reading revlog schema changes")
+			return nil, nil, errors.Wrap(err, "reading revlog schema changes")
 		}
 		log.Dev.Infof(ctx,
 			"revlog schema change: desc %d at %s (tombstone=%t)",
 			sc.DescID, sc.ChangedAt, sc.Descriptor == nil,
 		)
+		if _, existed := byID[sc.DescID]; !existed {
+			newDescIDs[sc.DescID] = struct{}{}
+		}
 		latestByID[sc.DescID] = changeState{desc: sc.Descriptor}
 	}
 	log.Dev.Infof(ctx,
@@ -346,7 +429,7 @@ func ApplyDescriptorChanges(
 	for _, desc := range byID {
 		result = append(result, desc)
 	}
-	return result, nil
+	return result, newDescIDs, nil
 }
 
 // BuildRekeys constructs table and tenant rekeys from the restore
@@ -387,4 +470,252 @@ func BuildRekeys(
 	}
 
 	return tableRekeys, tenantRekeys, nil
+}
+
+// SplitAndScatterRevlogSpans splits and scatters ranges for tables
+// that were created during the revlog window (new tables with no
+// backup data). Only tables listed in details.RevlogNewTableIDs are
+// processed.
+func SplitAndScatterRevlogSpans(
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	details jobspb.RestoreDetails,
+	allManifests []jobspb.BulkSSTManifest,
+) error {
+	if len(details.RevlogNewTableIDs) == 0 {
+		return nil
+	}
+
+	newIDSet := make(map[descpb.ID]struct{}, len(details.RevlogNewTableIDs))
+	for _, id := range details.RevlogNewTableIDs {
+		newIDSet[id] = struct{}{}
+	}
+
+	codec := execCtx.ExecCfg().Codec
+	db := execCtx.ExecCfg().DB
+
+	// Compute spans for new tables.
+	var newSpans []roachpb.Span
+	for i := range details.TableDescs {
+		td := tabledesc.NewBuilder(details.TableDescs[i]).
+			BuildImmutableTable()
+		if _, ok := newIDSet[td.GetID()]; !ok {
+			continue
+		}
+		newSpans = append(newSpans, td.TableSpan(codec))
+	}
+	if len(newSpans) == 0 {
+		return nil
+	}
+
+	// Collect row samples within new table spans.
+	var splitKeys []roachpb.Key
+	for _, span := range newSpans {
+		splitKeys = append(splitKeys, span.Key)
+		for _, m := range allManifests {
+			if len(m.RowSample) > 0 && span.ContainsKey(m.RowSample) {
+				splitKeys = append(splitKeys, m.RowSample)
+			}
+		}
+	}
+
+	expirationTime := db.Clock().Now().Add(time.Hour.Nanoseconds(), 0)
+	retryOpts := retry.Options{
+		InitialBackoff: 100 * time.Millisecond,
+		MaxBackoff:     5 * time.Second,
+		Multiplier:     2,
+		MaxRetries:     5,
+	}
+
+	for _, splitKey := range splitKeys {
+		var splitErr error
+		for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+			if splitErr = db.AdminSplit(
+				ctx, splitKey, expirationTime,
+			); splitErr != nil {
+				log.Dev.VInfof(
+					ctx, 1,
+					"attempt %d to split revlog span at %s: %v",
+					r.CurrentAttempt(), splitKey, splitErr,
+				)
+				continue
+			}
+			break
+		}
+		if splitErr != nil {
+			return errors.Wrapf(
+				splitErr, "splitting revlog span at %s", splitKey,
+			)
+		}
+
+		// Scatter the range.
+		req := &kvpb.AdminScatterRequest{
+			RequestHeader: kvpb.RequestHeaderFromSpan(roachpb.Span{
+				Key:    splitKey,
+				EndKey: splitKey.Next(),
+			}),
+			RandomizeLeases: true,
+			MaxSize:         1, // don't scatter non-empty ranges
+		}
+		if _, pErr := kv.SendWrapped(
+			ctx, db.NonTransactionalSender(), req,
+		); pErr != nil {
+			log.Dev.Infof(
+				ctx,
+				"scatter at %s: %v (continuing)",
+				splitKey, pErr,
+			)
+		}
+	}
+
+	log.Dev.Infof(
+		ctx,
+		"split/scattered %d keys for %d new revlog table spans",
+		len(splitKeys), len(newSpans),
+	)
+	return nil
+}
+
+// RunRevlogFinalMerge converts collected manifests to bulkmerge
+// inputs and runs a single final merge iteration that writes
+// directly to KV.
+func RunRevlogFinalMerge(
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	jobID jobspb.JobID,
+	details jobspb.RestoreDetails,
+	allManifests []jobspb.BulkSSTManifest,
+) error {
+	codec := execCtx.ExecCfg().Codec
+
+	// Build SSTFiles from manifests.
+	sstFiles := bulksst.ManifestsToSSTFiles(allManifests)
+
+	// Compute sorted, non-overlapping schema spans from all table
+	// descriptors in the restore.
+	var schemaSpans []roachpb.Span
+	for i := range details.TableDescs {
+		td := tabledesc.NewBuilder(details.TableDescs[i]).
+			BuildImmutableTable()
+		schemaSpans = append(schemaSpans, td.TableSpan(codec))
+	}
+	slices.SortFunc(schemaSpans, func(a, b roachpb.Span) int {
+		return a.Key.Compare(b.Key)
+	})
+
+	inputSSTs, mergeSpans, err := bulksst.CombineFileInfo(
+		[]bulksst.SSTFiles{sstFiles}, schemaSpans,
+	)
+	if err != nil {
+		return errors.Wrap(err, "combining revlog SST info")
+	}
+
+	// Write timestamp must be later than the main restore's to
+	// ensure revlog data wins over any backup data for the same key.
+	writeTS := execCtx.ExecCfg().DB.Clock().Now()
+
+	// genOutputURI is unused for the final iteration (which writes
+	// directly to KV) but is required by the Merge API.
+	paths := bulkutil.NewDistMergePaths(jobID)
+	genOutputURI := func(inst base.SQLInstanceID) (string, error) {
+		return fmt.Sprintf(
+			"nodelocal://%d/%s", inst, paths.MergePath(1),
+		), nil
+	}
+
+	// TODO(kev-cao): bulkmerge.Merge distributes tasks across nodes
+	// using a static round-robin router, not based on range
+	// ownership. This means a node may AddSSTable data for ranges it
+	// doesn't own, causing cross-node RPCs. Regular restore avoids
+	// this by scattering first and routing each entry to the
+	// leaseholder node. We could improve performance here by
+	// ensuring the node that owns the range (as determined by the
+	// split/scatter performed during the main restore and by
+	// SplitAndScatterRevlogSpans above) is the one to ingest the
+	// data.
+	_, err = bulkmerge.Merge(
+		ctx,
+		execCtx,
+		inputSSTs,
+		mergeSpans,
+		genOutputURI,
+		bulkmerge.MergeOptions{
+			Iteration:         1,
+			MaxIterations:     1,
+			WriteTimestamp:    &writeTS,
+			EnforceUniqueness: false,
+			MemoryMonitor:     execinfrapb.BulkMergeSpec_BULK_MONITOR,
+		},
+	)
+	return err
+}
+
+// CleanupMergeSSTs is called from OnFailOrCancel to best-effort
+// delete intermediate revlog merge SSTs on the local node. SSTs on
+// other nodes are cleaned up by the background CleanupOrphanedFiles
+// sweeper, which scans nodelocal://self/job/ for terminal jobs.
+func CleanupMergeSSTs(ctx context.Context, execCtx sql.JobExecContext, job *jobs.Job) {
+	details := job.Details().(jobspb.RestoreDetails)
+	if details.RevisionLogTimestamp.IsEmpty() {
+		return
+	}
+	cleaner := bulkutil.NewBulkJobCleaner(
+		execCtx.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
+		execCtx.User(),
+	)
+	defer func() {
+		if err := cleaner.Close(); err != nil {
+			log.Dev.Warningf(
+				ctx,
+				"error closing cleaner after revlog SST cleanup: %v",
+				err,
+			)
+		}
+	}()
+	if err := cleaner.CleanupJobDirectories(
+		ctx, job.ID(), []string{"nodelocal://self/"},
+	); err != nil {
+		log.Dev.Warningf(
+			ctx,
+			"failed to clean up revlog SSTs for job %d: %v",
+			job.ID(), err,
+		)
+	}
+}
+
+// CleanupSSTs performs best-effort deletion of intermediate SSTs
+// written by the local merge processors using BulkJobCleaner,
+// matching the cleanup pattern used by import and index backfill.
+func CleanupSSTs(
+	ctx context.Context,
+	execCtx sql.JobExecContext,
+	jobID jobspb.JobID,
+	sqlInstanceIDs []base.SQLInstanceID,
+) {
+	storagePrefixes := make([]string, len(sqlInstanceIDs))
+	for i, id := range sqlInstanceIDs {
+		storagePrefixes[i] = fmt.Sprintf("nodelocal://%d/", id)
+	}
+	cleaner := bulkutil.NewBulkJobCleaner(
+		execCtx.ExecCfg().DistSQLSrv.ExternalStorageFromURI,
+		execCtx.User(),
+	)
+	defer func() {
+		if err := cleaner.Close(); err != nil {
+			log.Dev.Warningf(
+				ctx,
+				"error closing cleaner after revlog SST cleanup: %v",
+				err,
+			)
+		}
+	}()
+	if err := cleaner.CleanupJobDirectories(
+		ctx, jobID, storagePrefixes,
+	); err != nil {
+		log.Dev.Warningf(
+			ctx,
+			"failed to clean up revlog SSTs for job %d: %v",
+			jobID, err,
+		)
+	}
 }

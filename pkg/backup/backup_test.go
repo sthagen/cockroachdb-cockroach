@@ -2479,7 +2479,10 @@ RESTORE DATABASE d FROM LATEST IN 'nodelocal://1/rev-history-backup'
 
 	// Test backup/restore of a single table.
 	t.Run("table", func(t *testing.T) {
-		_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, 0, InitManualReplication)
+		_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode,
+			0, InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{DefaultDRPCOption: base.TestDRPCDisabled},
+			})
 		defer cleanupFn()
 		sqlDB.Exec(t, `
 CREATE DATABASE d;
@@ -3964,7 +3967,11 @@ func TestRestoreAsOfSystemTimeGCBounds(t *testing.T) {
 
 	const numAccounts = 10
 	ctx := context.Background()
-	args := base.TestClusterArgs{}
+	args := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultDRPCOption: base.TestDRPCDisabled,
+		},
+	}
 	tc, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, args)
 	defer cleanupFn()
 	const dir = "nodelocal://1/"
@@ -10867,7 +10874,9 @@ func TestBackupRestoreForeignKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params := base.TestServerArgs{}
+	params := base.TestServerArgs{
+		DefaultDRPCOption: base.TestDRPCDisabled,
+	}
 	const numAccounts = 1000
 	_, sqlDB, _, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
 		InitManualReplication, base.TestClusterArgs{ServerArgs: params})

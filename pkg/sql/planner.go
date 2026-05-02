@@ -123,7 +123,7 @@ type extendedEvalContext struct {
 	validateDbZoneConfig *bool
 
 	// advisoryLockManager is the manager for advisory locks.
-	advisoryLockManager *advisorylock.Manager
+	advisoryLockManager *atomic.Pointer[advisorylock.Manager]
 }
 
 // copyFromExecCfg copies relevant fields from an ExecutorConfig.
@@ -297,6 +297,13 @@ type planner struct {
 	// Do not use this object directly; use the BufferClientNotice() method
 	// instead.
 	noticeSender noticeSender
+
+	// stmtResultBuffering exposes the current statement's result writer so a
+	// side-effecting builtin can flush its results immediately and prevent
+	// transparent connExecutor rewind across the side effect. Set in
+	// execStmtInOpenState after resetPlanner; nil between statements and for
+	// the internal executor.
+	stmtResultBuffering resultBufferingDisabler
 
 	queryCacheSession querycache.Session
 
@@ -738,10 +745,11 @@ func (p *planner) InternalSQLTxn() descs.Txn {
 		ie := MakeInternalExecutor(ief.server, ief.memMetrics, ief.monitor)
 		ie.SetSessionData(p.SessionData())
 		ie.extraTxnState = &extraTxnState{
-			txn:                p.Txn(),
-			descCollection:     p.Descriptors(),
-			jobs:               p.extendedEvalCtx.jobs,
-			schemaChangerState: p.extendedEvalCtx.SchemaChangerState,
+			txn:                 p.Txn(),
+			descCollection:      p.Descriptors(),
+			jobs:                p.extendedEvalCtx.jobs,
+			schemaChangerState:  p.extendedEvalCtx.SchemaChangerState,
+			advisoryLockManager: p.extendedEvalCtx.advisoryLockManager,
 		}
 		p.internalSQLTxn.init(p.txn, ie)
 	}
@@ -1327,7 +1335,7 @@ func (p *planner) advisoryXactLockImpl(
 		return false, pgerror.New(pgcode.NoActiveSQLTransaction,
 			"advisory locks are only available in a transaction")
 	}
-	mgr := p.extendedEvalCtx.advisoryLockManager
+	mgr := p.extendedEvalCtx.advisoryLockManager.Load()
 	if mgr == nil {
 		return false, errors.AssertionFailedf("advisory lock manager not initialized")
 	}
@@ -1350,6 +1358,13 @@ func (p *planner) advisoryXactLockImpl(
 			return false, nil
 		}
 		return false, err
+	}
+	// The acquire is a visible side effect; flush the statement's result so
+	// the connExecutor cannot transparently rewind past it on a subsequent
+	// serializable push (e.g. a deadlock break would otherwise be masked by
+	// auto-retry and the losing client would see no error).
+	if w := p.stmtResultBuffering; w != nil {
+		w.DisableBuffering()
 	}
 	return true, nil
 }

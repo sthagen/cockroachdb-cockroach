@@ -4535,20 +4535,6 @@ func (og *operationGenerator) createFunction(ctx context.Context, tx pgx.Tx) (*o
 		{"descriptors", descJSONQuery},
 	}, `SELECT quote_ident(name) FROM descriptors WHERE descriptor ? 'schema'`)
 
-	functionsQuery := With([]CTE{
-		{"descriptors", descJSONQuery},
-		{"functions", functionDescsQuery},
-	}, `SELECT
-	quote_ident(schema_id::REGNAMESPACE::STRING) AS schema,
-	quote_ident(name) AS name,
-	array_to_string(proargnames, ',') AS args,
-	proargtypes AS argtypes,
-	pronargdefaults as numdefaults
-FROM
-	functions
-	INNER JOIN pg_catalog.pg_proc ON oid = (id + 100000)
-	WHERE COALESCE((descriptor->'state')::STRING, 'PUBLIC') = 'PUBLIC'::STRING
-	AND prorettype != 'trigger'::REGTYPE;`)
 	enums, err := Collect(ctx, og, tx, pgx.RowToMap, enumQuery)
 	if err != nil {
 		return nil, err
@@ -4561,7 +4547,7 @@ FROM
 	if err != nil {
 		return nil, err
 	}
-	functions, err := Collect(ctx, og, tx, pgx.RowToMap, functionsQuery)
+	functions, err := og.findNonTriggerFunctions(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -4643,50 +4629,12 @@ FROM
 		possibleBodyReferences = append(possibleBodyReferences, fmt.Sprintf(`((SELECT count(*) FROM %s LIMIT 0) = 0)`, table))
 	}
 
-	// For each function generate a possible invocation passing in null arguments.
 	for _, function := range functions {
-		args := ""
-		if function["args"] != nil {
-			args = function["args"].(string)
-			argTypesStr := strings.Split(function["argtypes"].(string), " ")
-			argTypes := make([]int, 0, len(argTypesStr))
-			// Determine how many default arguemnts should be used.
-			numDefaultArgs := int(function["numdefaults"].(int16))
-			if numDefaultArgs > 0 {
-				numDefaultArgs = rand.Intn(numDefaultArgs)
-			}
-			// Populate the arguments for this signature, and select some number
-			// of default arguments.
-			for _, oidStr := range argTypesStr {
-				oid, err := strconv.Atoi(oidStr)
-				if err != nil {
-					return nil, err
-				}
-				argTypes = append(argTypes, oid)
-			}
-			argIn := strings.Builder{}
-			for idx := range strings.Split(args, ",") {
-				// We have hit the default arguments that we want to not populate.
-				if idx > len(argTypesStr)-numDefaultArgs {
-					break
-				}
-				if argIn.Len() > 0 {
-					argIn.WriteString(",")
-				}
-				// Resolve the type for each column and if possible generate a random
-				// value via randgen.
-				oidValue := oid.Oid(argTypes[idx])
-				typ, ok := types.OidToType[oidValue]
-				if !ok {
-					argIn.WriteString("NULL")
-				} else {
-					randomDatum := randgen.RandDatum(og.params.rng, typ, true)
-					argIn.WriteString(tree.AsStringWithFlags(randomDatum, tree.FmtParsable))
-				}
-			}
-			args = argIn.String()
+		invocation, err := og.buildFuncInvocation(function)
+		if err != nil {
+			return nil, err
 		}
-		possibleBodyFuncReferences = append(possibleBodyFuncReferences, fmt.Sprintf("(SELECT %s.%s(%s) IS NOT NULL)", function["schema"].(string), function["name"].(string), args))
+		possibleBodyFuncReferences = append(possibleBodyFuncReferences, invocation)
 	}
 
 	hasFuncRefs := false
@@ -4930,12 +4878,23 @@ func (og *operationGenerator) alterFunctionRename(ctx context.Context, tx pgx.Tx
 		return nil, err
 	}
 
+	// The server only blocks ALTER FUNCTION RENAME on trigger/policy back-refs
+	// starting in v26.3. In a mixed-version cluster the rename succeeds against
+	// older servers, so don't classify those functions as "with deps" or the
+	// workload will incorrectly expect a feature_not_supported error.
+	skipTriggerPolicyDeps, err := isClusterVersionLessThan(ctx, tx, clusterversion.V26_3.Version())
+	if err != nil {
+		return nil, err
+	}
+
 	functionDepsMap := make(map[int64]struct{})
 	for _, f := range functionDeps {
 		functionDepsMap[f["to_oid"].(int64)] = struct{}{}
 	}
-	for _, f := range triggerPolicyDeps {
-		functionDepsMap[f["func_oid"].(int64)] = struct{}{}
+	if !skipTriggerPolicyDeps {
+		for _, f := range triggerPolicyDeps {
+			functionDepsMap[f["func_oid"].(int64)] = struct{}{}
+		}
 	}
 
 	functionWithDeps := make([]map[string]any, 0, len(functions))
@@ -5040,12 +4999,24 @@ func (og *operationGenerator) alterFunctionSetSchema(
 		return nil, err
 	}
 
+	// The server only blocks ALTER FUNCTION SET SCHEMA on trigger/policy
+	// back-refs starting in v26.3. In a mixed-version cluster the statement
+	// succeeds against older servers, so don't classify those functions as
+	// "with deps" or the workload will incorrectly expect a
+	// feature_not_supported error.
+	skipTriggerPolicyDeps, err := isClusterVersionLessThan(ctx, tx, clusterversion.V26_3.Version())
+	if err != nil {
+		return nil, err
+	}
+
 	functionDepsMap := make(map[int64]struct{})
 	for _, f := range functionDeps {
 		functionDepsMap[f["to_oid"].(int64)] = struct{}{}
 	}
-	for _, f := range triggerPolicyDeps {
-		functionDepsMap[f["func_oid"].(int64)] = struct{}{}
+	if !skipTriggerPolicyDeps {
+		for _, f := range triggerPolicyDeps {
+			functionDepsMap[f["func_oid"].(int64)] = struct{}{}
+		}
 	}
 
 	functionWithDeps := make([]map[string]any, 0, len(functions))
@@ -5766,11 +5737,32 @@ func (og *operationGenerator) createTriggerFunction(
 		}
 	}
 
+	// Sometimes include a UDF call expression to exercise trigger-UDF
+	// dependency tracking (TriggerDeps.uses_routine_ids).
+	udfSelectStmt := ""
+	if og.randIntn(2) == 0 {
+		udfFunctions, err := og.findNonTriggerFunctions(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		if len(udfFunctions) > 0 {
+			picked, err := PickOne(og.params.rng, udfFunctions)
+			if err != nil {
+				return nil, err
+			}
+			invocation, err := og.buildFuncInvocation(picked)
+			if err != nil {
+				return nil, err
+			}
+			udfSelectStmt = fmt.Sprintf("SELECT %s;", invocation)
+		}
+	}
+
 	// The trigger function always returns NEW to avoid breaking inserts.
 	opStmt := makeOpStmt(OpStmtDDL)
 	opStmt.sql = fmt.Sprintf(
-		`CREATE FUNCTION %s() RETURNS TRIGGER AS $FUNC_BODY$ BEGIN %s%s%s;RETURN NEW;END; $FUNC_BODY$ LANGUAGE PLpgSQL`,
-		resolvedName, seqSelectStmt, enumSelectStmt, selectStmt.sql,
+		`CREATE FUNCTION %s() RETURNS TRIGGER AS $FUNC_BODY$ BEGIN %s%s%s%s;RETURN NEW;END; $FUNC_BODY$ LANGUAGE PLpgSQL`,
+		resolvedName, seqSelectStmt, enumSelectStmt, udfSelectStmt, selectStmt.sql,
 	)
 	og.LogMessage(fmt.Sprintf("createTriggerFunction: %s", opStmt.sql))
 
@@ -5783,7 +5775,6 @@ func (og *operationGenerator) createTriggerFunction(
 		{code: pgcode.FeatureNotSupported, condition: !og.useDeclarativeSchemaChanger},
 		{code: pgcode.DuplicateFunction, condition: routineAlreadyExists},
 	})
-
 	return opStmt, nil
 }
 
@@ -5896,26 +5887,111 @@ type triggerInfo struct {
 	triggerName string
 }
 
-// collectEnumMembers returns all enum members in the current database. Each
-// result row is a map with keys "name" (qualified enum type name), "value"
-// (quoted member literal), and "non_public" (bool indicating a DROPPING member).
+// collectEnumMembers returns all public enum members in the current database.
+// Each result row is a map with keys "name" (qualified enum type name), "value"
+// (quoted member literal), and "non_public" (always false).
+//
+// This uses enum_range(NULL::type) which goes through the lease-based type
+// resolution and filters out read-only members. This ensures the results are
+// consistent with what DML statements see, avoiding TOCTOU races where the
+// previous system.descriptor-based query could see a member as public while a
+// concurrent schema change has already marked it as READ_ONLY in the leased
+// descriptor.
 func (og *operationGenerator) collectEnumMembers(
+	ctx context.Context, tx pgx.Tx,
+) ([]map[string]any, error) {
+	// First, collect all user-defined enum type names via pg_type (lease-based).
+	enumTypeNames, err := Collect(ctx, og, tx, pgx.RowTo[string], `
+		SELECT quote_ident(n.nspname) || '.' || quote_ident(t.typname)
+		FROM pg_catalog.pg_type t
+		JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid
+		WHERE t.typtype = 'e'
+		  AND n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_extension', 'crdb_internal')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	if len(enumTypeNames) == 0 {
+		return nil, nil
+	}
+
+	// For each enum type, use enum_range to get only public members. Build a
+	// UNION ALL query so we make a single round-trip.
+	var parts []string
+	for _, name := range enumTypeNames {
+		parts = append(parts, fmt.Sprintf(
+			`SELECT '%[1]s' AS name, quote_literal(v) AS value, false AS non_public
+			FROM unnest(enum_range(NULL::%[1]s)) v`, name))
+	}
+	q := strings.Join(parts, " UNION ALL ")
+	return Collect(ctx, og, tx, pgx.RowToMap, q)
+}
+
+// findNonTriggerFunctions returns public, non-trigger UDFs with argument
+// metadata (schema, name, args, argtypes, numdefaults) for building
+// invocations.
+func (og *operationGenerator) findNonTriggerFunctions(
 	ctx context.Context, tx pgx.Tx,
 ) ([]map[string]any, error) {
 	q := With([]CTE{
 		{"descriptors", descJSONQuery},
-		{"enums", enumDescsQuery},
-		{"enum_members", enumMemberDescsQuery},
+		{"functions", functionDescsQuery},
 	}, `SELECT
-			quote_ident(schema_id::REGNAMESPACE::TEXT) || '.' || quote_ident(name) AS name,
-			quote_literal(member->>'logicalRepresentation') AS value,
-			(
-				COALESCE(member->>'direction' = 'REMOVE', false) OR
-				COALESCE(member->>'capability' = 'READ_ONLY', false)
-			) AS non_public
-		FROM enum_members
-	`)
+	quote_ident(schema_id::REGNAMESPACE::STRING) AS schema,
+	quote_ident(name) AS name,
+	array_to_string(proargnames, ',') AS args,
+	proargtypes AS argtypes,
+	pronargdefaults as numdefaults
+FROM
+	functions
+	INNER JOIN pg_catalog.pg_proc ON oid = (id + 100000)
+	WHERE COALESCE((descriptor->'state')::STRING, 'PUBLIC') = 'PUBLIC'::STRING
+	AND prorettype != 'trigger'::REGTYPE;`)
 	return Collect(ctx, og, tx, pgx.RowToMap, q)
+}
+
+// buildFuncInvocation constructs a SQL expression that invokes the given UDF
+// with random arguments: (SELECT schema.func(args) IS NOT NULL).
+func (og *operationGenerator) buildFuncInvocation(function map[string]any) (string, error) {
+	args := ""
+	if function["args"] != nil {
+		args = function["args"].(string)
+		argTypesStr := strings.Split(function["argtypes"].(string), " ")
+		argTypes := make([]int, 0, len(argTypesStr))
+		numDefaultArgs := int(function["numdefaults"].(int16))
+		if numDefaultArgs > 0 {
+			numDefaultArgs = og.randIntn(numDefaultArgs)
+		}
+		for _, oidStr := range argTypesStr {
+			oidVal, err := strconv.Atoi(oidStr)
+			if err != nil {
+				return "", err
+			}
+			argTypes = append(argTypes, oidVal)
+		}
+		argIn := strings.Builder{}
+		for idx := range strings.Split(args, ",") {
+			if idx > len(argTypesStr)-numDefaultArgs {
+				break
+			}
+			if argIn.Len() > 0 {
+				argIn.WriteString(",")
+			}
+			oidValue := oid.Oid(argTypes[idx])
+			typ, ok := types.OidToType[oidValue]
+			if !ok {
+				argIn.WriteString("NULL")
+			} else {
+				randomDatum := randgen.RandDatum(og.params.rng, typ, true)
+				argIn.WriteString(tree.AsStringWithFlags(randomDatum, tree.FmtParsable))
+			}
+		}
+		args = argIn.String()
+	}
+	return fmt.Sprintf(
+		"(SELECT %s.%s(%s) IS NOT NULL)",
+		function["schema"].(string), function["name"].(string), args,
+	), nil
 }
 
 // findExistingTriggerFunctions returns existing trigger functions (RETURNS

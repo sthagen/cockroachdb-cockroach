@@ -234,6 +234,14 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"goroutine_id",
 		},
 	},
+	"crdb_internal.cluster_held_advisory_locks": {
+		nonSensitiveCols: NonSensitiveColumns{
+			"session_id",
+			"database_id",
+			"is_single_value",
+			"lock_id",
+		},
+	},
 	"crdb_internal.cluster_settings": {
 		customQueryUnredacted: `SELECT
 			variable,
@@ -1043,7 +1051,6 @@ var zipInternalTablesPerNode = DebugZipTableRegistry{
 			"mvcc_range_key_contained_points_var",
 			"mvcc_range_key_skipped_points_avg",
 			"mvcc_range_key_skipped_points_var",
-			"implicit_txn",
 			"full_scan",
 			"sample_plan",
 			"database_name",

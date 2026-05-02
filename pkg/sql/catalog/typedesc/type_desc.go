@@ -1207,6 +1207,11 @@ func (desc *immutable) GetCheckConstraintID(idx int) descpb.ConstraintID {
 	return desc.Domain.CheckConstraints[idx].ConstraintID
 }
 
+// GetCheckConstraintValidity implements the catalog.DomainTypeDescriptor interface.
+func (desc *immutable) GetCheckConstraintValidity(idx int) descpb.ConstraintValidity {
+	return desc.Domain.CheckConstraints[idx].Validity
+}
+
 // Aliased implements the catalog.AliasTypeDescriptor interface.
 func (desc *immutable) Aliased() *types.T {
 	return desc.Alias
@@ -1278,6 +1283,11 @@ func (desc *immutable) GetSuperRegionSurvivalGoal(superRegion string) (string, b
 		}
 	}
 	return "", false, nil
+}
+
+// Rewrite implements the catalog.MutableDescriptor interface.
+func (desc *Mutable) Rewrite(_ catalog.DescriptorRewriteFn) error {
+	return errors.AssertionFailedf("Rewrite is not implemented for type descriptors")
 }
 
 // SetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor

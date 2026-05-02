@@ -1207,6 +1207,11 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
 	}
+	if node.StorageParams != nil {
+		ctx.WriteString(" WITH (")
+		ctx.FormatNode(&node.StorageParams)
+		ctx.WriteString(")")
+	}
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
 		ctx.FormatNode(node.Predicate)
@@ -1216,11 +1221,6 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 		ctx.WriteString(" VISIBILITY " + fmt.Sprintf("%.2f", 1-node.Invisibility.Value))
 	case node.Invisibility.Value == 1.0:
 		ctx.WriteString(" NOT VISIBLE")
-	}
-	if node.StorageParams != nil {
-		ctx.WriteString(" WITH (")
-		ctx.FormatNode(&node.StorageParams)
-		ctx.WriteString(")")
 	}
 }
 
@@ -2276,6 +2276,30 @@ func (node *CreateExtension) Format(ctx *FmtCtx) {
 	ctx.WithFlags(ctx.flags&^FmtAnonymize, func() {
 		ctx.FormatNode(&node.Name)
 	})
+}
+
+// CreateLanguage represents a parameterless CREATE LANGUAGE statement (i.e.
+// without HANDLER/INLINE/VALIDATOR clauses). Only plpgsql is accepted; other
+// languages are rejected at parse time. Since CockroachDB has built-in
+// PL/pgSQL, the statement is a no-op and exists for compatibility with
+// PostgreSQL clients that issue CREATE LANGUAGE plpgsql defensively before
+// creating functions.
+type CreateLanguage struct {
+	Name    Name
+	Replace bool
+}
+
+// Format implements the NodeFormatter interface. The parser swallows the
+// optional TRUSTED/PROCEDURAL modifiers and legacy HANDLER/INLINE/VALIDATOR
+// clauses without recording them, so this does not round-trip the original
+// SQL. That's fine because the statement is a no-op.
+func (node *CreateLanguage) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE ")
+	if node.Replace {
+		ctx.WriteString("OR REPLACE ")
+	}
+	ctx.WriteString("LANGUAGE ")
+	ctx.FormatNode(&node.Name)
 }
 
 // CreateExternalConnection represents a CREATE EXTERNAL CONNECTION statement.

@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/walkutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
@@ -216,7 +217,7 @@ func (b *builderState) checkForConcurrentSchemaChanges(
 // This provides us with all of the ID -> name mappings required to
 // comprehensively decorate any EXPLAIN (DDL) output.
 func (b *builderState) ensureDescriptors(e scpb.Element) {
-	_ = screl.WalkDescIDs(e, func(id *catid.DescID) error {
+	_ = walkutil.Walk(e, func(id *catid.DescID) error {
 		b.ensureDescriptor(*id)
 		return nil
 	})
@@ -1213,6 +1214,12 @@ func (b *builderState) ResolveUserDefinedTypeType(
 	if typ == nil {
 		if p.IsExistenceOptional {
 			return nil
+		}
+		// Check if the name refers to a built-in type that couldn't be resolved
+		// because the qualifying schema/database doesn't exist (see #64663).
+		if _, ok := types.PublicSchemaAliases[name.Object()]; ok {
+			panic(pgerror.Newf(pgcode.WrongObjectType,
+				"type %q is a built-in type", name.Object()))
 		}
 		panic(sqlerrors.NewUndefinedTypeError(name))
 	}

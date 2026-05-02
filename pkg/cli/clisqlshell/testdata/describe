@@ -574,8 +574,8 @@ pg_catalog,pg_language,table,node,permanent,prefix,"available languages
 https://www.postgresql.org/docs/9.5/catalog-pg-language.html"
 pg_catalog,pg_largeobject,table,node,permanent,prefix,pg_largeobject was created for compatibility and is currently unimplemented
 pg_catalog,pg_largeobject_metadata,table,node,permanent,prefix,pg_largeobject_metadata was created for compatibility and is currently unimplemented
-pg_catalog,pg_locks,table,node,permanent,prefix,"locks held by active processes (empty - feature does not exist)
-https://www.postgresql.org/docs/9.6/view-pg-locks.html"
+pg_catalog,pg_locks,table,node,permanent,prefix,"advisory locks: granted and waiting advisory locks
+https://www.postgresql.org/docs/18/view-pg-locks.html"
 pg_catalog,pg_matviews,table,node,permanent,prefix,"available materialized views
 https://www.postgresql.org/docs/9.6/view-pg-matviews.html"
 pg_catalog,pg_namespace,table,node,permanent,prefix,"available namespaces

@@ -2479,7 +2479,10 @@ RESTORE DATABASE d FROM LATEST IN 'nodelocal://1/rev-history-backup'
 
 	// Test backup/restore of a single table.
 	t.Run("table", func(t *testing.T) {
-		_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, 0, InitManualReplication)
+		_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode,
+			0, InitManualReplication, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{DefaultDRPCOption: base.TestDRPCDisabled},
+			})
 		defer cleanupFn()
 		sqlDB.Exec(t, `
 CREATE DATABASE d;
@@ -3964,7 +3967,11 @@ func TestRestoreAsOfSystemTimeGCBounds(t *testing.T) {
 
 	const numAccounts = 10
 	ctx := context.Background()
-	args := base.TestClusterArgs{}
+	args := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultDRPCOption: base.TestDRPCDisabled,
+		},
+	}
 	tc, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, numAccounts, InitManualReplication, args)
 	defer cleanupFn()
 	const dir = "nodelocal://1/"
@@ -5998,7 +6005,8 @@ func TestBatchedInsertStats(t *testing.T) {
 			// Reset the job state, for the next iteration of the test.
 			details := job.Details().(jobspb.RestoreDetails)
 			details.StatsInserted = false
-			require.NoError(t, job.NoTxn().SetDetails(ctx, details))
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			require.NoError(t, job.DeprecatedNoTxn().SetDetails(ctx, details))
 			var err error
 			job, err = registry.LoadJob(ctx, job.ID())
 			require.NoError(t, err)
@@ -10866,7 +10874,9 @@ func TestBackupRestoreForeignKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params := base.TestServerArgs{}
+	params := base.TestServerArgs{
+		DefaultDRPCOption: base.TestDRPCDisabled,
+	}
 	const numAccounts = 1000
 	_, sqlDB, _, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
 		InitManualReplication, base.TestClusterArgs{ServerArgs: params})

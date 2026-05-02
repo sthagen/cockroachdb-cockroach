@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/besteffort"
@@ -211,8 +212,9 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	format := details.Format
 
 	updateDetails := func(txn isql.Txn, details jobspb.ImportDetails) error {
-		return r.job.WithTxn(txn).Update(ctx, func(
-			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		return r.job.DeprecatedWithTxn(txn).Update(ctx, func(
+			txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater,
 		) error {
 			pl := md.Payload
 			*pl.GetImport() = details
@@ -362,7 +364,8 @@ func (r *importResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			); err != nil {
 				return err
 			}
-			return r.job.WithTxn(txn).SetDetails(ctx, details)
+			//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+			return r.job.DeprecatedWithTxn(txn).SetDetails(ctx, details)
 		}); err != nil {
 			return err
 		}
@@ -724,7 +727,8 @@ func (r *importResumer) publishTable(
 
 		// Update job record to mark table published state as complete.
 		details.TablePublished = true
-		err = r.job.WithTxn(txn).SetDetails(ctx, details)
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		err = r.job.DeprecatedWithTxn(txn).SetDetails(ctx, details)
 		if err != nil {
 			return errors.Wrap(err, "updating job details after publishing the table")
 		}
@@ -765,7 +769,8 @@ func (r *importResumer) checkVirtualConstraints(
 
 	if sql.HasVirtualUniqueConstraints(desc) {
 		status := jobs.StatusMessage(fmt.Sprintf("re-validating %s", desc.GetName()))
-		if err := job.NoTxn().UpdateStatusMessage(ctx, status); err != nil {
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		if err := job.DeprecatedNoTxn().UpdateStatusMessage(ctx, status); err != nil {
 			return errors.Wrapf(err, "failed to update running status of job %d", errors.Safe(job.ID()))
 		}
 	}
@@ -1157,8 +1162,9 @@ func truncateTable(ctx context.Context, execCfg *sql.ExecutorConfig, id catid.De
 		return err
 	}
 
+	unsafeAlways := sessiondatapb.UseNewSchemaChangerUnsafeAlways
 	override := sessiondata.NodeUserSessionDataOverride
-	override.MultiOverride = "use_declarative_schema_changer=unsafe_always"
+	override.NewSchemaChangerMode = &unsafeAlways
 	_, err = execCfg.InternalDB.Executor().ExecParsed(
 		ctx,
 		redact.RedactableString("import-truncate-table"),
@@ -1216,8 +1222,9 @@ func (r *importResumer) markOnline(
 			return errors.Wrap(err, "bringing IMPORT INTO table back online")
 		}
 
-		err = r.job.WithTxn(txn).Update(ctx, func(
-			txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		err = r.job.DeprecatedWithTxn(txn).Update(ctx, func(
+			txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater,
 		) error {
 			// Mark the table as published to avoid running cleanup again.
 			details := md.Payload.GetImport()

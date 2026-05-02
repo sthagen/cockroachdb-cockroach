@@ -518,6 +518,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
 	p.sessionDataMutatorIterator.ParamStatusUpdater = res
 	p.noticeSender = res
+	p.stmtResultBuffering = res
 	ih := &p.instrumentation
 
 	if ex.executorType != executorTypeInternal {
@@ -1455,6 +1456,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
 	p.sessionDataMutatorIterator.ParamStatusUpdater = res
 	p.noticeSender = res
+	p.stmtResultBuffering = res
 	ih := &p.instrumentation
 
 	if ex.executorType != executorTypeInternal {
@@ -4742,7 +4744,7 @@ func (ex *connExecutor) execWithProfiling(
 		}
 		// Compute fingerprint ID here since ih.Setup hasn't been called yet.
 		fingerprintID := appstatspb.ConstructStatementFingerprintID(
-			stmtNoConstants, ex.implicitTxn(), ex.sessionData().Database,
+			stmtNoConstants, ex.sessionData().Database,
 		)
 		labels := make([]string, 0, 12)
 		labels = append(labels,

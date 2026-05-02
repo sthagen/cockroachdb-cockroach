@@ -684,6 +684,7 @@ func TestBackupCompactionExecLocality(t *testing.T) {
 	args := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			DefaultTestTenant: base.TestDoesNotWorkWithSecondaryTenantsButWeDontKnowWhyYet(142798),
+			DefaultDRPCOption: base.TestDRPCDisabled,
 		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {

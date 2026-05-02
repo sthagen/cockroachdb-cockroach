@@ -58,6 +58,16 @@ ALTER TABLE temp1 SET SCHEMA public
 statement ok
 INSERT INTO t VALUES (1)
 
+let $t_id
+SELECT 't'::regclass::oid::int
+
+# Verify the table's descriptor has the public schema as its parent.
+query B
+SELECT parent_schema_id = (SELECT id FROM system.namespace WHERE name = 'public' AND "parentID" = (SELECT id FROM system.namespace WHERE name = 'test' AND "parentID" = 0))
+  FROM crdb_internal.tables WHERE table_id = $t_id
+----
+true
+
 statement ok
 ALTER TABLE t SET SCHEMA s1
 
@@ -66,6 +76,13 @@ query I rowsort
 SELECT * FROM s1.t
 ----
 1
+
+# Verify the descriptor's parent_schema_id was updated to s1.
+query B
+SELECT parent_schema_id = (SELECT id FROM system.namespace WHERE name = 's1')
+  FROM crdb_internal.tables WHERE table_id = $t_id
+----
+true
 
 # Check that we can insert into the table.
 statement ok
@@ -90,6 +107,13 @@ SELECT * FROM public.t
 1
 2
 
+# Verify the descriptor's parent_schema_id was updated back to public.
+query B
+SELECT parent_schema_id = (SELECT id FROM system.namespace WHERE name = 'public' AND "parentID" = (SELECT id FROM system.namespace WHERE name = 'test' AND "parentID" = 0))
+  FROM crdb_internal.tables WHERE table_id = $t_id
+----
+true
+
 # Check that we can insert into the table.
 statement ok
 INSERT INTO public.t VALUES (2)
@@ -105,6 +129,9 @@ CREATE TABLE s1.t2(x INT)
 statement ok
 INSERT INTO s1.t2 VALUES (1)
 
+let $t2_id
+SELECT 's1.t2'::regclass::oid::int
+
 statement ok
 ALTER TABLE s1.t2 SET SCHEMA s2
 
@@ -112,6 +139,13 @@ query I rowsort
 SELECT * FROM s2.t2
 ----
 1
+
+# Verify the descriptor's parent_schema_id was updated from s1 to s2.
+query B
+SELECT parent_schema_id = (SELECT id FROM system.namespace WHERE name = 's2')
+  FROM crdb_internal.tables WHERE table_id = $t2_id
+----
+true
 
 # Ensure we cannot select from the old table.
 statement error pq: relation "s1.t2" does not exist
@@ -516,6 +550,42 @@ CREATE TABLE "Another-Schema"."DuplicateTable"(x INT)
 
 statement error pq: relation "test\.\\"Another-Schema\\"\.\\"DuplicateTable\\"" already exists
 ALTER TABLE "MixedCase"."DuplicateTable" SET SCHEMA "Another-Schema"
+
+user testuser
+
+subtest end
+
+# Verify that the table descriptor's parent_schema_id field is updated
+# correctly after `ALTER TABLE SET SCHEMA`.
+subtest regression_168255
+
+user root
+
+statement ok
+CREATE SCHEMA s_168255
+
+statement ok
+CREATE TABLE t_168255(x INT)
+
+statement ok
+ALTER TABLE t_168255 SET SCHEMA s_168255
+
+query B
+SELECT parent_schema_id = (SELECT id FROM system.namespace WHERE name = 's_168255')
+  FROM crdb_internal.tables
+ WHERE database_name = 'test' AND name = 't_168255'
+----
+true
+
+statement ok
+ALTER TABLE s_168255.t_168255 SET SCHEMA public
+
+query B
+SELECT parent_schema_id = (SELECT id FROM system.namespace WHERE name = 'public' AND "parentID" = (SELECT id FROM system.namespace WHERE name = 'test' AND "parentID" = 0))
+  FROM crdb_internal.tables
+ WHERE database_name = 'test' AND name = 't_168255'
+----
+true
 
 user testuser
 

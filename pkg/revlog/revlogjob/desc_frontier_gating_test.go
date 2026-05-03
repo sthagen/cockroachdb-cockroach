@@ -27,12 +27,13 @@ func newTickManagerWithDescGating(
 	t.Helper()
 	es := inmemstorage.New()
 	t.Cleanup(func() { _ = es.Close() })
+	fileIDs := &seqFileIDs{}
 	mgr, err := revlogjob.NewTickManager(es, []roachpb.Span{allSpan},
-		ts(100), testTickWidth)
+		ts(100), testTickWidth, fileIDs)
 	require.NoError(t, err)
 	// Intentionally NOT disabling desc gating.
 	prod, err := revlogjob.NewProducer(es, []roachpb.Span{allSpan},
-		ts(100), testTickWidth, &seqFileIDs{}, mgr, revlogjob.ResumeState{})
+		ts(100), testTickWidth, fileIDs, mgr, revlogjob.ResumeState{}, 0 /* forwardThreshold */)
 	require.NoError(t, err)
 	return mgr, prod, es.(*inmemstorage.Storage)
 }

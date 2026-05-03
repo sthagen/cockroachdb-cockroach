@@ -143,7 +143,7 @@ func startRunDescFeed(
 	es := inmemstorage.New()
 	t.Cleanup(func() { _ = es.Close() })
 
-	manager, err := NewTickManager(es, initialSpans, startHLC, 10*time.Second)
+	manager, err := NewTickManager(es, initialSpans, startHLC, 10*time.Second, &seqIDs{})
 	require.NoError(t, err)
 	manager.DisableDescFrontier()
 

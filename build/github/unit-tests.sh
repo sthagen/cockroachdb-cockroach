@@ -15,14 +15,16 @@ if [[ "$GITHUB_ACTIONS_BRANCH" == "staging" || "$GITHUB_ACTIONS_BRANCH" == trunk
   EXTRA_PARAMS=" --flaky_test_attempts=2"
 fi
 
-# Determine test targets: use affected targets if a base SHA is provided,
-# otherwise fall back to the full test suite.
+# Determine Go test targets: use affected targets if a base SHA is provided,
+# otherwise fall back to the full test suite. JS tests (//pkg/ui:lint and
+# //pkg/ui:test) are always run regardless; we may want to gate those on
+# front-end file changes in the future using a similar mechanism.
 TEST_TARGETS="//pkg:all_tests"
 if [ -n "${BASE_SHA:-}" ]; then
   AFFECTED=$(./build/github/affected-targets.sh "$BASE_SHA")
   if [ -z "$AFFECTED" ]; then
-    echo "No test-relevant files changed, skipping unit tests."
-    exit 0
+    echo "No test-relevant Go files changed, skipping Go unit tests."
+    TEST_TARGETS=""
   elif [ "$AFFECTED" != "FULL" ]; then
     TEST_TARGETS="$AFFECTED"
   fi

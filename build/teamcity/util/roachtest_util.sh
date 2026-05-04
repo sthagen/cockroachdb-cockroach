@@ -26,13 +26,15 @@ source  $root/build/teamcity/util/roachtest_arch_util.sh
 # date at the time of the start of the run (which identifies the version of the
 # code run best).
 stats_dir="$(date +"%Y%m%d")-${TC_BUILD_ID}"
-stats_file_names=("stats.json" "summary_stats.json" "aggregated_stats.json")
+# NOTE: when adding entries here, also extend the `find` invocation in
+# upload_stats below; it indexes this array explicitly.
+stats_file_names=("stats.json" "summary_stats.json" "aggregated_stats.json" "phases.json")
 
 # Provide a default value for EXPORT_OPENMETRICS if it is not set
 EXPORT_OPENMETRICS="${EXPORT_OPENMETRICS:-false}"
 
 if [[ "${EXPORT_OPENMETRICS}" == "true" ]]; then
-  stats_file_names=("stats.om" "summary_stats.om" "aggregated_stats.om")
+  stats_file_names=("stats.om" "summary_stats.om" "aggregated_stats.om" "phases.om")
 fi
 
 COMMIT_SHA=$(git rev-parse --short HEAD)
@@ -85,7 +87,7 @@ function upload_stats {
           fi
           gsutil cp "${f}" "gs://${bucket}/${artifacts_dir}/${stats_dir}/${f}"
         fi
-      done <<< "$(find . \( -name "${stats_file_names[0]}" -o -name "${stats_file_names[1]}" -o -name "${stats_file_names[2]}" \) | sed 's/^\.\///')")
+      done <<< "$(find . \( -name "${stats_file_names[0]}" -o -name "${stats_file_names[1]}" -o -name "${stats_file_names[2]}" -o -name "${stats_file_names[3]}" \) | sed 's/^\.\///')")
   fi
 }
 

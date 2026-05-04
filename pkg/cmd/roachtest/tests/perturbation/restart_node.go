@@ -25,7 +25,7 @@ var _ perturbation = restart{}
 
 func (r restart) setup() variations {
 	r.cleanRestart = true
-	v := setup(r, noImpactThresholds())
+	v := setup(r, defaultThresholds())
 
 	// TODO(baptist): Remove this setting once #120073 is fixed.
 	v.clusterSettings["kv.lease.reject_on_leader_unknown.enabled"] = "true"

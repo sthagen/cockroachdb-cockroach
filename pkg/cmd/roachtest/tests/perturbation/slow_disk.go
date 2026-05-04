@@ -32,7 +32,7 @@ var _ perturbation = &slowDisk{}
 func (s *slowDisk) setup() variations {
 	s.slowLiveness = true
 	s.walFailover = true
-	return setup(s, noImpactThresholds())
+	return setup(s, defaultThresholds())
 }
 
 func (s *slowDisk) setupMetamorphic(rng *rand.Rand) variations {

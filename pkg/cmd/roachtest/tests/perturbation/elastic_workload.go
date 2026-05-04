@@ -30,7 +30,7 @@ var _ perturbation = elasticWorkload{}
 func (e elasticWorkload) setup() variations {
 	// TODO(#137835): Determine why the impact is so high and reduce this once
 	// it is addressed.
-	return setup(e, noImpactThresholds())
+	return setup(e, defaultThresholds())
 }
 
 func (e elasticWorkload) setupMetamorphic(rng *rand.Rand) variations {

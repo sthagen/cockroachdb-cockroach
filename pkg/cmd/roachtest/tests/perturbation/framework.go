@@ -268,6 +268,19 @@ func noImpactThresholds() acceptableImpact {
 	}
 }
 
+// defaultThresholds returns the conservative pass/fail criteria applied to
+// production perturbation tests. Latency gates are disabled (p99 in particular
+// is too noisy with current sample sizes), but a throughput floor is enforced:
+// the test fails if measured throughput drops below 80% of baseline (i.e. the
+// throughput impact ratio exceeds 1.25).
+func defaultThresholds() acceptableImpact {
+	return acceptableImpact{
+		maxP99Impact:        math.Inf(1),
+		maxP50Impact:        math.Inf(1),
+		maxThroughputImpact: 1.25,
+	}
+}
+
 // aggregatedStat holds summary statistics for per-tick metrics over a
 // measurement interval. Used for display/logging and pass/fail validation.
 type aggregatedStat struct {

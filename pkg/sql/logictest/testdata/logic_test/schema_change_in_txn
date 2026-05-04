@@ -1859,11 +1859,17 @@ ALTER TABLE t_52501_valid ALTER COLUMN a SET NOT NULL
 statement ok
 COMMIT
 
+# The column should end up NOT NULL with no residual synthetic check
+# constraint. Regression test for #166612.
 query TTTTB
 SELECT * FROM [SHOW CONSTRAINTS FROM t_52501_valid] ORDER BY constraint_name
 ----
-t_52501_valid  a_auto_not_null     CHECK        CHECK ((a IS NOT NULL))  true
 t_52501_valid  t_52501_valid_pkey  PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+
+query TB
+SELECT column_name, is_nullable FROM [SHOW COLUMNS FROM t_52501_valid] WHERE column_name = 'a'
+----
+a  false
 
 statement ok
 DROP TABLE t_52501_valid

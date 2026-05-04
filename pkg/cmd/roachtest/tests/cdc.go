@@ -3429,7 +3429,7 @@ CONFIGURE ZONE USING
 		Leases:           registry.MetamorphicLeases,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          15 * time.Minute,
-		CompatibleClouds: registry.AllExceptIBM,
+		CompatibleClouds: registry.AllClouds.NoIBM().NoAzure(),
 		Run:              runMessageTooLarge,
 	})
 	for _, perTablePTS := range []bool{false} {

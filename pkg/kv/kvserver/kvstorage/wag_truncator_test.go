@@ -719,6 +719,8 @@ func BenchmarkWAGTruncation(b *testing.B) {
 			b.StopTimer()
 			st := cluster.MakeTestingClusterSettings()
 			wagTruncatorBatchSize.Override(ctx, &st.SV, batchSize)
+			// Disable WAG retention to allow full WAG truncation.
+			wagSuffixRetentionCount.Override(ctx, &st.SV, 0)
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
 			engines := MakeEngines(eng)

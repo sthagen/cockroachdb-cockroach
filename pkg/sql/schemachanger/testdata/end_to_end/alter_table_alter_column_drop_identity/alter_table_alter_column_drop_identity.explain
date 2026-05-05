@@ -32,7 +32,7 @@ Schema change plan for ALTER TABLE ‹defaultdb›.‹public›.‹t› ALTER CO
  │              ├── RemoveSequenceOwner {"ColumnID":2,"OwnedSequenceID":105,"TableID":104}
  │              ├── RemoveOwnerBackReferenceInSequence {"SequenceID":105}
  │              ├── DrainDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":105,"Name":"t_j_seq","SchemaID":101}}
- │              ├── NotImplementedForPublicObjects {"DescID":105,"ElementType":"scpb.Owner"}
+ │              ├── RemoveOwner {"DescriptorID":105}
  │              ├── RemoveUserPrivileges {"DescriptorID":105,"User":"admin"}
  │              └── RemoveUserPrivileges {"DescriptorID":105,"User":"root"}
  ├── PreCommitPhase
@@ -74,7 +74,7 @@ Schema change plan for ALTER TABLE ‹defaultdb›.‹public›.‹t› ALTER CO
  │              ├── RemoveSequenceOwner {"ColumnID":2,"OwnedSequenceID":105,"TableID":104}
  │              ├── RemoveOwnerBackReferenceInSequence {"SequenceID":105}
  │              ├── DrainDescriptorName {"Namespace":{"DatabaseID":100,"DescriptorID":105,"Name":"t_j_seq","SchemaID":101}}
- │              ├── NotImplementedForPublicObjects {"DescID":105,"ElementType":"scpb.Owner"}
+ │              ├── RemoveOwner {"DescriptorID":105}
  │              ├── RemoveUserPrivileges {"DescriptorID":105,"User":"admin"}
  │              ├── RemoveUserPrivileges {"DescriptorID":105,"User":"root"}
  │              ├── SetJobStateOnDescriptor {"DescriptorID":104,"Initialize":true}

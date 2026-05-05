@@ -79,14 +79,17 @@ var MinLeaseTransferStatsDuration = 30 * time.Second
 // EnableLoadBasedLeaseRebalancing controls whether lease rebalancing is done
 // via the new heuristic based on request load and latency or via the simpler
 // approach that purely seeks to balance the number of leases per node evenly.
+//
+// This setting is retired and can be removed once the multi-metric allocator
+// cannot be disabled (as having the multi-metric allocator enabled already
+// implicitly disables this setting).
 var EnableLoadBasedLeaseRebalancing = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"kv.allocator.load_based_lease_rebalancing.enabled",
 	"set to enable rebalancing of range leases based on load and latency;"+
 		" has no effect when kv.allocator.load_based_rebalancing is set"+
-		" to 'multi-metric only' or 'multi-metric and count'",
-	true,
-	settings.WithPublic)
+		" to 'multi-metric only', 'multi-metric and count', or 'auto'",
+	false, settings.Retired)
 
 // leaseRebalancingAggressiveness enables users to tweak how aggressive their
 // cluster is at moving leases towards the localities where the most requests

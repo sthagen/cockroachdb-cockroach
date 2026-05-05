@@ -11716,6 +11716,17 @@ layers:
       how_to_use: This metric indicates when elastic CPU tokens are exhausted. Extended periods of elastic CPU token exhaustion may indicate high CPU utilization affecting elastic workloads.
       visibility: ESSENTIAL
       owner: cockroachdb/admission-control
+    - name: admission.granter.disk_write_byte_tokens_exhausted_duration.kv
+      exported_name: admission_granter_disk_write_byte_tokens_exhausted_duration_kv
+      description: Total duration (in nanos) when disk write byte tokens were exhausted, as observed by the token granter (not waiters)
+      y_axis_label: Nanoseconds
+      type: COUNTER
+      unit: NANOSECONDS
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
+      how_to_use: This metric indicates when disk write byte tokens are exhausted, meaning disk bandwidth admission control is actively throttling elastic writes. Extended periods of exhaustion may indicate the provisioned disk bandwidth is insufficient for the workload.
+      visibility: ESSENTIAL
+      owner: cockroachdb/admission-control
     - name: admission.granter.elastic_io_tokens_exhausted_duration.kv
       exported_name: admission_granter_elastic_io_tokens_exhausted_duration_kv
       description: Total duration when Elastic IO tokens were exhausted, as observed by the token granter (not waiters). This is reported in nanoseconds from 26.1 onwards, and was microseconds before that.
@@ -14471,12 +14482,33 @@ layers:
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
       owner: cockroachdb/admission-control
-    - name: admission.granter.disk_write_byte_tokens_exhausted_duration.kv
-      exported_name: admission_granter_disk_write_byte_tokens_exhausted_duration_kv
-      description: Total duration (in nanos) when disk write byte tokens were exhausted, as observed by the token granter (not waiters)
-      y_axis_label: Nanoseconds
+    - name: admission.granter.disk_write_byte_tokens_used.elastic.kv
+      exported_name: admission_granter_disk_write_byte_tokens_used_elastic_kv
+      labeled_name: 'admission.granter.disk_write_byte_tokens_used.kv{work_type: elastic}'
+      description: Total disk write byte tokens consumed by elastic work
+      y_axis_label: Tokens
       type: COUNTER
-      unit: NANOSECONDS
+      unit: COUNT
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
+      owner: cockroachdb/admission-control
+    - name: admission.granter.disk_write_byte_tokens_used.regular.kv
+      exported_name: admission_granter_disk_write_byte_tokens_used_regular_kv
+      labeled_name: 'admission.granter.disk_write_byte_tokens_used.kv{work_type: regular}'
+      description: Total disk write byte tokens consumed by regular work
+      y_axis_label: Tokens
+      type: COUNTER
+      unit: COUNT
+      aggregation: AVG
+      derivative: NON_NEGATIVE_DERIVATIVE
+      owner: cockroachdb/admission-control
+    - name: admission.granter.disk_write_byte_tokens_used.snapshot.kv
+      exported_name: admission_granter_disk_write_byte_tokens_used_snapshot_kv
+      labeled_name: 'admission.granter.disk_write_byte_tokens_used.kv{work_type: snapshot}'
+      description: Total disk write byte tokens consumed by snapshot ingest work
+      y_axis_label: Tokens
+      type: COUNTER
+      unit: COUNT
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
       owner: cockroachdb/admission-control
@@ -17830,6 +17862,16 @@ layers:
       aggregation: AVG
       derivative: NONE
       owner: cockroachdb/kv
+    - name: mma.overloaded_store.lease_grace.skipped
+      exported_name: mma_overloaded_store_lease_grace_skipped
+      labeled_name: 'mma.overloaded_store{type: lease_grace, result: skipped}'
+      description: Number of overloaded stores in the lease shedding grace period (first 2 min of overload) that MMA recognized as overloaded but did not shed from this pass. Common reasons include pending work on the store (pending-decrease saturated above the configured fraction threshold, or pending-increase >= epsilon, indicating the load arithmetic is unreliable), no top-K ranges available to evaluate, or the per-pass range-move budget already exhausted. For each duration bucket, success + failure + skipped equals the total overloaded stores observed in that bucket this pass.
+      y_axis_label: Stores
+      type: GAUGE
+      unit: COUNT
+      aggregation: AVG
+      derivative: NONE
+      owner: cockroachdb/kv
     - name: mma.overloaded_store.lease_grace.success
       exported_name: mma_overloaded_store_lease_grace_success
       labeled_name: 'mma.overloaded_store{type: lease_grace, result: success}'
@@ -17844,6 +17886,16 @@ layers:
       exported_name: mma_overloaded_store_long_dur_failure
       labeled_name: 'mma.overloaded_store{type: long_dur, result: failure}'
       description: Number of stores overloaded for a long duration (8+ min) where all shedding attempts failed during this store's MMA rebalancing pass. Even with the most aggressive target selection, no suitable store was found. This may indicate cluster-wide capacity issues or overly restrictive constraints.
+      y_axis_label: Stores
+      type: GAUGE
+      unit: COUNT
+      aggregation: AVG
+      derivative: NONE
+      owner: cockroachdb/kv
+    - name: mma.overloaded_store.long_dur.skipped
+      exported_name: mma_overloaded_store_long_dur_skipped
+      labeled_name: 'mma.overloaded_store{type: long_dur, result: skipped}'
+      description: Number of stores overloaded for a long duration (8+ min) that MMA recognized as overloaded but did not shed from this pass. Common reasons include pending work on the store (pending-decrease saturated above the configured fraction threshold, or pending-increase >= epsilon), no top-K ranges available to evaluate, or the per-pass range-move budget already exhausted. A persistently non-zero value here indicates an overloaded store that is repeatedly being deferred and may not be receiving relief. For each duration bucket, success + failure + skipped equals the total overloaded stores observed in that bucket this pass.
       y_axis_label: Stores
       type: GAUGE
       unit: COUNT
@@ -17870,6 +17922,16 @@ layers:
       aggregation: AVG
       derivative: NONE
       owner: cockroachdb/kv
+    - name: mma.overloaded_store.medium_dur.skipped
+      exported_name: mma_overloaded_store_medium_dur_skipped
+      labeled_name: 'mma.overloaded_store{type: medium_dur, result: skipped}'
+      description: Number of stores overloaded for a medium duration (5-8 min) that MMA recognized as overloaded but did not shed from this pass. Common reasons include pending work on the store (pending-decrease saturated above the configured fraction threshold, or pending-increase >= epsilon), no top-K ranges available to evaluate, or the per-pass range-move budget already exhausted. For each duration bucket, success + failure + skipped equals the total overloaded stores observed in that bucket this pass.
+      y_axis_label: Stores
+      type: GAUGE
+      unit: COUNT
+      aggregation: AVG
+      derivative: NONE
+      owner: cockroachdb/kv
     - name: mma.overloaded_store.medium_dur.success
       exported_name: mma_overloaded_store_medium_dur_success
       labeled_name: 'mma.overloaded_store{type: medium_dur, result: success}'
@@ -17884,6 +17946,16 @@ layers:
       exported_name: mma_overloaded_store_short_dur_failure
       labeled_name: 'mma.overloaded_store{type: short_dur, result: failure}'
       description: Number of stores overloaded for a short duration (2-5 min) where all shedding attempts failed during this store's MMA rebalancing pass. Failures occur when no suitable target store is found (e.g., all targets are too loaded, constraints cannot be satisfied). At this stage, MMA only considers lightly-loaded targets.
+      y_axis_label: Stores
+      type: GAUGE
+      unit: COUNT
+      aggregation: AVG
+      derivative: NONE
+      owner: cockroachdb/kv
+    - name: mma.overloaded_store.short_dur.skipped
+      exported_name: mma_overloaded_store_short_dur_skipped
+      labeled_name: 'mma.overloaded_store{type: short_dur, result: skipped}'
+      description: Number of stores overloaded for a short duration (2-5 min) that MMA recognized as overloaded but did not shed from this pass. Common reasons include pending work on the store (pending-decrease saturated above the configured fraction threshold, or pending-increase >= epsilon), no top-K ranges available to evaluate, or the per-pass range-move budget already exhausted. For each duration bucket, success + failure + skipped equals the total overloaded stores observed in that bucket this pass.
       y_axis_label: Stores
       type: GAUGE
       unit: COUNT

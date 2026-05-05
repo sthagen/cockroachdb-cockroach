@@ -127,7 +127,10 @@ export interface StatementDetailsState {
   formattedQuery: string;
 }
 
-export interface StatementDetailsDispatchProps {
+export interface StatementDetailsOwnProps {
+  statementFingerprintID: string;
+  timeScale: TimeScale;
+  requestTime: moment.Moment;
   dismissStatementDiagnosticsAlertMessage?: () => void;
   onTabChanged?: (tabName: string) => void;
   onTimeScaleChange: (ts: TimeScale) => void;
@@ -147,15 +150,6 @@ export interface StatementDetailsDispatchProps {
   onBackToStatementsClick?: () => void;
   onRequestTimeChange: (t: moment.Moment) => void;
 }
-
-export interface StatementDetailsStateProps {
-  statementFingerprintID: string;
-  timeScale: TimeScale;
-  requestTime: moment.Moment;
-}
-
-export type StatementDetailsOwnProps = StatementDetailsDispatchProps &
-  StatementDetailsStateProps;
 
 const cx = classNames.bind(styles);
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);

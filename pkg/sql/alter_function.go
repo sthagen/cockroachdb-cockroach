@@ -8,7 +8,6 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -531,11 +530,7 @@ func newAlterFunctionDependentObjectsError(
 	operation, detail string, fnDesc *funcdesc.Mutable, dependentObjects []redact.RedactableString,
 ) error {
 	joined := redact.Join(", ", dependentObjects)
-	err := errors.UnimplementedErrorf(
-		errors.IssueLink{
-			IssueURL: build.MakeIssueURL(83233),
-			Detail:   detail,
-		},
+	err := unimplemented.NewWithIssueDetailf(83233, detail,
 		"cannot %s function %q because other objects ([%s]) still depend on it",
 		operation, fnDesc.Name, joined.StripMarkers())
 	return errors.WithSafeDetails(err, "dependents: %s", joined)

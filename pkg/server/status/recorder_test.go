@@ -1350,12 +1350,15 @@ func TestRecordChangefeedChildMetrics(t *testing.T) {
 		require.Equal(t, len(expectedSuffixes), len(foundSuffixes), "Expected to find histogram metric suffixes")
 	})
 
-	// Regression test: the childMetricNameCache must not return one metric's
-	// name when serving another metric that happens to have an identical label
-	// set. In production, most allowlisted changefeed agg-metrics are built
-	// via aggmetric.MakeBuilder("scope") and share the same single-label
-	// structure, so this collision is reachable for any non-trivial cluster.
-	t.Run("cache does not collide across different metrics with identical labels", func(t *testing.T) {
+	// Regression test: two metrics that share an identical label set must each
+	// be recorded under their own (distinct) names. The childMetricNameCache
+	// is keyed by labels alone — only the encoded label suffix is shared
+	// across metrics; the metric-name prefix must come from the caller on
+	// every lookup. In production, most allowlisted changefeed agg-metrics
+	// are built via aggmetric.MakeBuilder("scope") and share the same
+	// single-label shape, so this code path is exercised on any non-trivial
+	// cluster.
+	t.Run("cache shares label suffix without confusing metric names", func(t *testing.T) {
 		reg := metric.NewRegistry()
 
 		counter := aggmetric.NewCounter(metric.Metadata{

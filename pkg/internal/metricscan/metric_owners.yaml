@@ -47,6 +47,10 @@ owners:
   admission_granter_cpu_load_long_period_duration_kv: cockroachdb/admission-control
   admission_granter_cpu_load_short_period_duration_kv: cockroachdb/admission-control
   admission_granter_disk_write_byte_tokens_exhausted_duration_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_elastic_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_regular_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_snapshot_kv: cockroachdb/admission-control
   admission_granter_elastic_io_tokens_available_kv: cockroachdb/admission-control
   admission_granter_elastic_io_tokens_exhausted_duration_kv: cockroachdb/admission-control
   admission_granter_io_tokens_available_kv: cockroachdb/admission-control
@@ -476,12 +480,16 @@ owners:
   mma_external_registration_success: cockroachdb/kv
   mma_overloaded_store: cockroachdb/kv
   mma_overloaded_store_lease_grace_failure: cockroachdb/kv
+  mma_overloaded_store_lease_grace_skipped: cockroachdb/kv
   mma_overloaded_store_lease_grace_success: cockroachdb/kv
   mma_overloaded_store_long_dur_failure: cockroachdb/kv
+  mma_overloaded_store_long_dur_skipped: cockroachdb/kv
   mma_overloaded_store_long_dur_success: cockroachdb/kv
   mma_overloaded_store_medium_dur_failure: cockroachdb/kv
+  mma_overloaded_store_medium_dur_skipped: cockroachdb/kv
   mma_overloaded_store_medium_dur_success: cockroachdb/kv
   mma_overloaded_store_short_dur_failure: cockroachdb/kv
+  mma_overloaded_store_short_dur_skipped: cockroachdb/kv
   mma_overloaded_store_short_dur_success: cockroachdb/kv
   mma_span_config_normalization: cockroachdb/kv
   mma_span_config_normalization_error: cockroachdb/kv

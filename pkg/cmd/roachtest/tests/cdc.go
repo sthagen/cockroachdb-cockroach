@@ -2632,7 +2632,6 @@ CONFIGURE ZONE USING
 	})
 	r.Add(registry.TestSpec{
 		Name:             "cdc/initial-scan-only/parquet/metamorphic",
-		Skip:             "#119295",
 		Owner:            registry.OwnerCDC,
 		Benchmark:        true,
 		Cluster:          r.MakeClusterSpec(4, spec.CPU(16), spec.WorkloadNode(), spec.Arch(spec.OnlyAMD64)),
@@ -3429,7 +3428,7 @@ CONFIGURE ZONE USING
 		Leases:           registry.MetamorphicLeases,
 		Suites:           registry.Suites(registry.Nightly),
 		Timeout:          15 * time.Minute,
-		CompatibleClouds: registry.AllExceptIBM,
+		CompatibleClouds: registry.AllClouds.NoIBM().NoAzure(),
 		Run:              runMessageTooLarge,
 	})
 	for _, perTablePTS := range []bool{false} {

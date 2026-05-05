@@ -11,6 +11,7 @@ import {
   DatabaseDetailsPageV2,
   TableDetailsPageV2,
   ScheduleDetails,
+  util,
 } from "@cockroachlabs/cluster-ui";
 import { ConfigProvider } from "antd";
 import { ConnectedRouter } from "connected-react-router";
@@ -23,6 +24,8 @@ import { Action, Store } from "redux";
 import { SWRConfig } from "swr";
 
 import { TimezoneProvider } from "src/contexts/timezoneProvider";
+import { clearTenantCookie } from "src/redux/cookies";
+import { getLoginPage } from "src/redux/login";
 import { AdminUIState } from "src/redux/state";
 import { createLoginRoute, createLogoutRoute } from "src/routes/login";
 import { RedirectToStatementDetails } from "src/routes/RedirectToStatementDetails";
@@ -49,6 +52,7 @@ import {
   tableIdAttr,
 } from "src/util/constants";
 import NotFound from "src/views/app/components/errorMessage/notFound";
+import { AlertDataProvider } from "src/views/app/containers/alertDataProvider";
 import Layout from "src/views/app/containers/layout";
 import DataDistributionPage from "src/views/cluster/containers/dataDistribution";
 import { EventPage } from "src/views/cluster/containers/events";
@@ -113,9 +117,37 @@ export interface AppProps {
 export const App: React.FC<AppProps> = (props: AppProps) => {
   const { store, history } = props;
 
+  const swrConfig = {
+    errorRetryCount: 3,
+    onError: (error: Error) => {
+      if (util.isRequestError(error) && error.status === 401) {
+        // Avoid a redirect loop if a request from the login or JWT auth
+        // page itself returns 401.
+        const { pathname } = history.location;
+        if (pathname.startsWith("/login") || pathname.startsWith("/jwt")) {
+          return;
+        }
+        clearTenantCookie();
+        history.push(getLoginPage(history.location));
+      }
+    },
+    onErrorRetry: (
+      error: Error,
+      _key: string,
+      _config: unknown,
+      revalidate: (opts: { retryCount: number }) => void,
+      { retryCount }: { retryCount: number },
+    ) => {
+      if (util.isRequestError(error) && error.status === 403) return;
+      if (retryCount >= 3) return;
+      setTimeout(() => revalidate({ retryCount }), 5000 * (retryCount + 1));
+    },
+  };
+
   return (
     <Provider store={store} context={ReactReduxContext}>
-      <SWRConfig value={{ errorRetryCount: 3 }}>
+      <SWRConfig value={swrConfig}>
+        <AlertDataProvider />
         <ConnectedRouter history={history} context={ReactReduxContext}>
           <CockroachCloudContext.Provider value={false}>
             <TimezoneProvider>

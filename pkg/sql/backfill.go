@@ -2735,16 +2735,20 @@ func runSchemaChangesInTxn(
 	for _, c := range constraintAdditionMutations {
 		if ck := c.AsCheck(); ck != nil {
 			if ck.IsNotNullColumnConstraint() {
-				// Remove the  check constraint we added.
+				// The synthetic IS NOT NULL check was added earlier to drive
+				// backfill validation. Validation succeeded, so flip the
+				// column descriptor's Nullable bit and drop the synthetic
+				// check rather than persisting it on the table.
+				colID := ck.GetReferencedColumnID(0)
+				col := catalog.FindColumnByID(tableDesc, colID)
+				col.ColumnDesc().Nullable = false
 				for i := range tableDesc.Checks {
 					if tableDesc.Checks[i].ConstraintID == ck.GetConstraintID() {
 						tableDesc.Checks = append(tableDesc.Checks[:i], tableDesc.Checks[i+1:]...)
+						break
 					}
-					colID := ck.GetReferencedColumnID(0)
-					col := catalog.FindColumnByID(tableDesc, colID)
-					col.ColumnDesc().Nullable = false
-					continue
 				}
+				continue
 			}
 			tableDesc.Checks = append(tableDesc.Checks, ck.CheckDesc())
 		} else if fk := c.AsForeignKey(); fk != nil {

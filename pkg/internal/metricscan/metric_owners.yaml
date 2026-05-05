@@ -47,6 +47,10 @@ owners:
   admission_granter_cpu_load_long_period_duration_kv: cockroachdb/admission-control
   admission_granter_cpu_load_short_period_duration_kv: cockroachdb/admission-control
   admission_granter_disk_write_byte_tokens_exhausted_duration_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_elastic_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_regular_kv: cockroachdb/admission-control
+  admission_granter_disk_write_byte_tokens_used_snapshot_kv: cockroachdb/admission-control
   admission_granter_elastic_io_tokens_available_kv: cockroachdb/admission-control
   admission_granter_elastic_io_tokens_exhausted_duration_kv: cockroachdb/admission-control
   admission_granter_io_tokens_available_kv: cockroachdb/admission-control

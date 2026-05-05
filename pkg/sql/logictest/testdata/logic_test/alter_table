@@ -5332,7 +5332,7 @@ subtest validate_not_null_during_sc
 statement ok
 SET create_table_with_schema_locked=false
 
-statement error pgcode 23514 pq: failed to satisfy CHECK constraint \(n IS NOT NULL\)
+statement error pgcode 23502 null value in column "n" violates not-null constraint
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 SET LOCAL autocommit_before_ddl = false;
 create table t1_135692(n int);

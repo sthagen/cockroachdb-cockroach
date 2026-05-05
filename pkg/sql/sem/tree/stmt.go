@@ -88,6 +88,7 @@ const (
 )
 
 const (
+	AlterDomainTag         = "ALTER DOMAIN"
 	AlterSequenceTag       = "ALTER SEQUENCE"
 	AlterTableTag          = "ALTER TABLE"
 	AlterTypeTag           = "ALTER TYPE"
@@ -487,6 +488,17 @@ func (*AlterDefaultPrivileges) StatementType() StatementType { return TypeDCL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*AlterDefaultPrivileges) StatementTag() string { return "ALTER DEFAULT PRIVILEGES" }
+
+// StatementReturnType implements the Statement interface.
+func (*AlterDomain) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*AlterDomain) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterDomain) StatementTag() string { return AlterDomainTag }
+
+func (*AlterDomain) hiddenFromShowQueries() {}
 
 // StatementReturnType implements the Statement interface.
 func (*AlterIndex) StatementReturnType() StatementReturnType { return DDL }
@@ -2650,6 +2662,7 @@ func (n *AlterDatabaseSecondaryRegion) String() string        { return AsString(
 func (n *AlterDatabaseDropSecondaryRegion) String() string    { return AsString(n) }
 func (n *AlterDatabaseSetZoneConfigExtension) String() string { return AsString(n) }
 func (n *AlterDefaultPrivileges) String() string              { return AsString(n) }
+func (n *AlterDomain) String() string                         { return AsString(n) }
 func (n *AlterFunctionOptions) String() string                { return AsString(n) }
 func (n *AlterPolicy) String() string                         { return AsString(n) }
 func (n *AlterRoutineRename) String() string                  { return AsString(n) }

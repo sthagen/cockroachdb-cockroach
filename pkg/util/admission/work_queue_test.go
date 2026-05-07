@@ -8,12 +8,10 @@ package admission
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-	"unicode"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -320,26 +318,6 @@ func TestWorkQueueBasic(t *testing.T) {
 				wrkMap.delete(id)
 				return buf.stringAndReset()
 
-			case "set-tenant-weights":
-				var weights string
-				d.ScanArgs(t, "weights", &weights)
-				fields := strings.FieldsFunc(weights, func(r rune) bool {
-					return r == ':' || r == ',' || unicode.IsSpace(r)
-				})
-				if len(fields)%2 != 0 {
-					return "tenant and weight are not paired"
-				}
-				weightMap := make(map[uint64]uint32)
-				for i := 0; i < len(fields); i += 2 {
-					tenantID, err := strconv.Atoi(fields[i])
-					require.NoError(t, err)
-					weight, err := strconv.Atoi(fields[i+1])
-					require.NoError(t, err)
-					weightMap[uint64(tenantID)] = uint32(weight)
-				}
-				q.SetTenantWeights(weightMap)
-				return q.String()
-
 			case "print":
 				// Need deterministic output, and this is racing with the goroutine
 				// whose work is canceled. Retry to let it get scheduled.
@@ -571,12 +549,12 @@ func runCPUTimeTokenWorkQueueTest(t *testing.T, path string) {
 				// Build the full map from current state plus the new entry,
 				// then call the production SetMaxCPUGroups method.
 				q.mu.Lock()
-				m := make(map[uint64]bool, len(q.mu.maxCPUGroups))
+				m := make(map[groupKey]bool, len(q.mu.maxCPUGroups))
 				for k, val := range q.mu.maxCPUGroups {
 					m[k] = val
 				}
 				q.mu.Unlock()
-				m[uint64(group)] = v
+				m[rgGroupKey(uint64(group))] = v
 				q.SetMaxCPUGroups(m)
 				return ""
 

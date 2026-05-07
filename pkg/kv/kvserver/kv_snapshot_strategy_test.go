@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/pebble"
@@ -68,11 +67,6 @@ func (m *mockKVAdmissionController) AdmitRangefeedRequest(
 	_ roachpb.TenantID, _ *kvpb.RangeFeedRequest,
 ) *admission.Pacer {
 	return nil
-}
-
-func (m *mockKVAdmissionController) SetTenantWeightProvider(
-	kvadmission.TenantWeightProvider, *stop.Stopper,
-) {
 }
 
 func (m *mockKVAdmissionController) SnapshotIngestedOrWritten(

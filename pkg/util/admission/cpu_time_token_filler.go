@@ -52,34 +52,19 @@ var KVCPUTimeUtilTarget = settings.RegisterFloatSetting(
 	0.75,
 	settings.FloatInRange(minTargetUtilFrac, 1.0))
 
-// KVCPUTimeUtilBurstDeltaRM is the delta added to KVCPUTimeUtilTarget
-// to compute the burstable utilization ceiling in resource manager
-// mode. For example, with target_util=0.75 and burst_delta_rm=0.25,
-// the burstable ceiling is 1.0. Resource groups configured with
-// MAX_CPU are always allowed to burst up to this ceiling.
+// KVCPUTimeUtilBurstDelta is the delta added to the non-burstable CPU
+// utilization target to compute the burstable utilization ceiling. In
+// Serverless mode this delta is added to both the system and app tenant
+// targets; in Resource Manager mode it is added to KVCPUTimeUtilTarget to
+// produce the ceiling for resource groups that have qualified for burst
+// (e.g. MAX_CPU groups).
 //
-// If target + delta exceeds 1.0, the burstable token bucket refill
-// rate will exceed the machine's CPU capacity. In practice this means
-// burstable work is never throttled by the token bucket (tokens
-// accumulate faster than they can be consumed). No other invariant
-// breaks because the token bucket simply acts as if it were infinite.
+// If target + delta exceeds 1.0, the burstable token bucket refill rate
+// will exceed the machine's CPU capacity. In practice this means burstable
+// work is never throttled by the token bucket (tokens accumulate faster
+// than they can be consumed). No other invariant breaks because the token
+// bucket simply acts as if it were infinite.
 // TODO(wenyihu): Confirm this ^.
-//
-// TODO(wenyihu): This setting is not yet consumed; it will be wired
-// into the filler when resourceManagerMode is implemented.
-var KVCPUTimeUtilBurstDeltaRM = settings.RegisterFloatSetting(
-	settings.SystemOnly,
-	"admission.cpu_time_tokens.target_util.burst_delta_rm",
-	"the delta added to admission.cpu_time_tokens.target_util to compute "+
-		"the burstable utilization ceiling in resource manager mode "+
-		"(not yet active; reserved for future use), "+
-		"value is in the interval (0,1]",
-	0.25,
-	settings.FloatInRange(0, 1.0),
-	settings.PositiveFloat)
-
-// Burstable work is given this much CPU headroom above non-burstable. See
-// resetInterval for more.
 var KVCPUTimeUtilBurstDelta = settings.RegisterFloatSetting(
 	settings.SystemOnly,
 	"admission.cpu_time_tokens.target_util.burst_delta",
@@ -362,8 +347,8 @@ func (s *serverlessStrategy) refillBurst(tokens tokenCounts, refillRates rates) 
 // single WorkQueue with N resource groups and a single utilization target.
 type rmStrategy struct {
 	queue workQueueIForAllocator
-	// canBurstTarget is the canBurst utilization target (e.g. 1.0 when
-	// KVCPUTimeUtilTarget=0.75 + KVCPUTimeUtilBurstDeltaRM=0.25). Set by
+	// canBurstTarget is the canBurst utilization target (e.g. 0.80 when
+	// KVCPUTimeUtilTarget=0.75 + KVCPUTimeUtilBurstDelta=0.05). Set by
 	// computeTargets each interval; used by refillBurst to recover the 100% CPU
 	// rate by dividing the cycle's canBurst allocation by canBurstTarget and
 	// forwards to WorkQueue.refillRMGroupBurstBuckets.
@@ -384,7 +369,7 @@ func (s *rmStrategy) computeTargets(sv *settings.Values) targetUtilizations {
 	}
 	var targets targetUtilizations
 	noBurstTarget := KVCPUTimeUtilTarget.Get(sv)
-	burstDelta := KVCPUTimeUtilBurstDeltaRM.Get(sv)
+	burstDelta := KVCPUTimeUtilBurstDelta.Get(sv)
 	targets[0][noBurst] = noBurstTarget
 	targets[0][canBurst] = noBurstTarget + burstDelta
 	s.canBurstTarget = targets[0][canBurst]

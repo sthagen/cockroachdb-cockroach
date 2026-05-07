@@ -967,13 +967,14 @@ ALTER TYPE eventlog RENAME TO eventlog_renamed
 query ITT
 SELECT "reportingID", "eventType", info::JSONB - 'Timestamp' - 'DescriptorID' - 'TxnReadTimestamp'
   FROM system.eventlog
- WHERE ("eventType" = 'alter_type' OR "eventType" = 'rename_type') AND info::JSONB->>'TypeName' LIKE '%eventlog%'
+ WHERE "eventType" IN ('alter_type', 'rename_type', 'set_schema')
+   AND (info::JSONB->>'TypeName' LIKE '%eventlog%' OR info::JSONB->>'DescriptorName' LIKE '%eventlog%')
 ORDER BY "timestamp", info
 ----
 1  alter_type   {"EventType": "alter_type", "Statement": "ALTER TYPE defaultdb.public.eventlog ADD VALUE 'test'", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root"}
 1  alter_type   {"EventType": "alter_type", "Statement": "ALTER TYPE defaultdb.public.eventlog RENAME VALUE 'test' TO 'testing'", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root"}
-1  alter_type   {"EventType": "alter_type", "Statement": "ALTER TYPE defaultdb.public.eventlog SET SCHEMA testing", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root"}
-1  alter_type   {"EventType": "alter_type", "Statement": "ALTER TYPE defaultdb.testing.eventlog SET SCHEMA public", "Tag": "ALTER TYPE", "TypeName": "defaultdb.testing.eventlog", "User": "root"}
+1  set_schema   {"DescriptorName": "defaultdb.public.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.testing.eventlog", "Statement": "ALTER TYPE defaultdb.public.eventlog SET SCHEMA testing", "Tag": "ALTER TYPE", "User": "root"}
+1  set_schema   {"DescriptorName": "defaultdb.testing.eventlog", "DescriptorType": "type", "EventType": "set_schema", "NewDescriptorName": "defaultdb.public.eventlog", "Statement": "ALTER TYPE defaultdb.testing.eventlog SET SCHEMA public", "Tag": "ALTER TYPE", "User": "root"}
 1  rename_type  {"EventType": "rename_type", "NewTypeName": "eventlog_renamed", "Statement": "ALTER TYPE defaultdb.public.eventlog RENAME TO eventlog_renamed", "Tag": "ALTER TYPE", "TypeName": "defaultdb.public.eventlog", "User": "root"}
 
 statement ok

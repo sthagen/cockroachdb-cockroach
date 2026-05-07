@@ -666,7 +666,7 @@ func TestRMStrategyComputeTargets(t *testing.T) {
 	st := cluster.MakeClusterSettings()
 	ctx := context.Background()
 	KVCPUTimeUtilTarget.Override(ctx, &st.SV, 0.75)
-	KVCPUTimeUtilBurstDeltaRM.Override(ctx, &st.SV, 0.25)
+	KVCPUTimeUtilBurstDelta.Override(ctx, &st.SV, 0.25)
 
 	s := &rmStrategy{}
 	targets := s.computeTargets(&st.SV)

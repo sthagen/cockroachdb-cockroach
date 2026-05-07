@@ -163,10 +163,6 @@ func (t *testElasticCPUInternalWorkQueue) Admit(
 	return AdmitResponse{Enabled: !t.disabled}, nil
 }
 
-func (t *testElasticCPUInternalWorkQueue) SetTenantWeights(tenantWeights map[uint64]uint32) {
-	panic("unimplemented")
-}
-
 func (t *testElasticCPUInternalWorkQueue) adjustGroupUsed(gKey groupKey, additionalUsed int64) {
 	if !t.disabled {
 		fmt.Fprintf(&t.buf, "adjust-group-used: group=%s additional-used=%s",

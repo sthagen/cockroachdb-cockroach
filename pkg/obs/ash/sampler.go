@@ -228,7 +228,6 @@ func (s *Sampler) run(ctx context.Context) {
 	for {
 		select {
 		case <-timer.C:
-			timer.Read = true
 			timer.Reset(time.Duration(s.interval.Load()))
 			if Enabled.Get(&s.st.SV) {
 				s.takeSample(ctx)

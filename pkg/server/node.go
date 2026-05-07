@@ -779,8 +779,6 @@ func (n *Node) start(
 	}
 
 	n.startComputePeriodicMetrics(n.stopper, base.DefaultMetricsSampleInterval)
-	// Stores have been created, so can start providing tenant weights.
-	n.storeCfg.KVAdmissionController.SetTenantWeightProvider(n, n.stopper)
 
 	// Be careful about moving this line above where we start stores; store
 	// upgrades rely on the fact that the cluster version has not been updated
@@ -1470,30 +1468,6 @@ func (mrp *storeMetricsRegistryProvider) GetMetricsRegistry(
 	storeID roachpb.StoreID,
 ) *metric.Registry {
 	return mrp.n.stores.GetStoreMetricRegistry(storeID)
-}
-
-// GetTenantWeights implements kvserver.TenantWeightProvider.
-func (n *Node) GetTenantWeights() kvadmission.TenantWeights {
-	weights := kvadmission.TenantWeights{
-		Node: make(map[uint64]uint32),
-	}
-	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
-		sw := make(map[uint64]uint32)
-		weights.Stores = append(weights.Stores, kvadmission.TenantWeightsForStore{
-			StoreID: store.StoreID(),
-			Weights: sw,
-		})
-		store.VisitReplicas(func(r *kvserver.Replica) bool {
-			tid, valid := r.TenantID()
-			if valid {
-				weights.Node[tid.ToUint64()]++
-				sw[tid.ToUint64()]++
-			}
-			return true
-		})
-		return nil
-	})
-	return weights
 }
 
 func startGraphiteStatsExporter(

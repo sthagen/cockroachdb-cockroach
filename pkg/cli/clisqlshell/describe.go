@@ -278,14 +278,11 @@ func describeFunctions(
 		// TODO(sql-sessions): Column "Language" omitted.
 		// (pg_language is not supported)
 		//
-		// TODO(sql-sessions): pg_get_function_sqlbody is not called here
-		// because it is not supported.
-		//
 		// TODO(sql-sessions): The "Description" column is currently
 		// ineffective for UDFs because of
 		// https://github.com/cockroachdb/cockroach/issues/44135
 		buf.WriteString(`,
-       p.prosrc AS "Source code",
+       COALESCE(p.prosrc, pg_catalog.pg_get_function_sqlbody(p.oid)) AS "Source code",
        pg_catalog.obj_description(p.oid, 'pg_proc') AS "Description"`)
 	}
 	buf.WriteString(`

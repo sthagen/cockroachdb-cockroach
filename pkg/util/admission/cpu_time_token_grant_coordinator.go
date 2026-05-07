@@ -188,15 +188,6 @@ func (coord *CPUGrantCoordinators) GetSQLWorkQueue(workKind WorkKind) *WorkQueue
 	return coord.slotsCoord.queues[workKind].(*WorkQueue)
 }
 
-// SetTenantWeights sets the weight of tenants, using the provided tenant ID
-// => weight map. A nil map will result in all tenants having the same weight.
-// SetTenantWeights adjusts the weights on all WorkQueues that
-// CPUGrantCoordinators manages.
-func (coord *CPUGrantCoordinators) SetTenantWeights(weights map[uint64]uint32) {
-	coord.slotsCoord.GetWorkQueue(KVWork).SetTenantWeights(weights)
-	coord.cpuTimeCoord.setGroupWeights(weights)
-}
-
 // GetRunnableCountCallback returns a callback of type
 // goschedstats.RunnableCountCallback.
 func (coord *CPUGrantCoordinators) GetRunnableCountCallback() goschedstats.RunnableCountCallback {
@@ -336,12 +327,6 @@ func (coord *cpuTimeTokenGrantCoordinator) getWorkQueue(tier resourceTier) *Work
 		}
 	}
 	return coord.queues[tier].(*WorkQueue)
-}
-
-func (coord *cpuTimeTokenGrantCoordinator) setGroupWeights(weights map[uint64]uint32) {
-	for tier := range coord.queues {
-		coord.queues[tier].(*WorkQueue).SetTenantWeights(weights)
-	}
 }
 
 func (coord *cpuTimeTokenGrantCoordinator) close() {

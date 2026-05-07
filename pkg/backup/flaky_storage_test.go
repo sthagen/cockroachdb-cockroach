@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/cockroachdb/cockroach/pkg/backup/backuptestutils"
@@ -84,6 +85,13 @@ func TestCloudBackupRestore_FlakyStorage(t *testing.T) {
 			backupURI := uri.String()
 			t.Logf("using backup store URI: %s", backupURI)
 
+			// Cloud storage operations are slower due to network latency,
+			// so use a longer timeout than the default SucceedsSoon duration.
+			successTimeout := testutils.DefaultSucceedsSoonDuration
+			if store.Cloud() != "nodelocal" {
+				successTimeout = 90 * time.Second
+			}
+
 			nextRow := 1
 			writeRows := func(t *testing.T, sql *sqlutils.SQLRunner) {
 				for i := 0; i < 10; i++ {
@@ -97,31 +105,31 @@ func TestCloudBackupRestore_FlakyStorage(t *testing.T) {
 			sql.Exec(t, `CREATE TABLE testdb.test_table (id INT PRIMARY KEY, name STRING, value INT)`)
 
 			writeRows(t, sql)
-			testutils.SucceedsSoon(t, func() error {
+			testutils.SucceedsWithin(t, func() error {
 				_, err := sqlDB.DB.ExecContext(ctx, `BACKUP TABLE testdb.test_table INTO $1`, backupURI)
 				return err
-			})
+			}, successTimeout)
 
 			for i := 0; i < 10; i++ {
 				writeRows(t, sql)
-				testutils.SucceedsSoon(t, func() error {
+				testutils.SucceedsWithin(t, func() error {
 					_, err := sqlDB.DB.ExecContext(
 						ctx, `BACKUP TABLE testdb.test_table INTO LATEST IN $1`, backupURI,
 					)
 					return err
-				})
+				}, successTimeout)
 			}
 
 			originalFingerprint := sql.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE testdb.test_table`)
 
 			sqlDB.Exec(t, `DROP TABLE testdb.test_table`)
 
-			testutils.SucceedsSoon(t, func() error {
+			testutils.SucceedsWithin(t, func() error {
 				_, err := sqlDB.DB.ExecContext(
 					ctx, `RESTORE TABLE testdb.test_table FROM LATEST IN $1`, backupURI,
 				)
 				return err
-			})
+			}, successTimeout)
 
 			restoredFingerprint := sqlDB.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE testdb.test_table`)
 			require.Equal(t, originalFingerprint, restoredFingerprint, "fingerprints should match")

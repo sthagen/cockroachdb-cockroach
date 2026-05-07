@@ -150,9 +150,11 @@ func (sm *replicaStateMachine) NewBatch() apply.Batch {
 	// it is more efficient. If there are exceptions, sparingly use NewReader or
 	// NewBatch (if it needs to read its own writes, which is unlikely).
 	b.batch = r.store.batchFactory.NewBatch()
+	b.sl = r.raftMu.stateLoader
 
 	r.mu.RLock()
 	b.state = r.shMu.state
+	b.initialForceFlushIndex = r.shMu.state.ForceFlushIndex
 	b.truncState = r.asLogStorage().shMu.trunc
 	b.state.Stats = &sm.stats
 	*b.state.Stats = *r.shMu.state.Stats

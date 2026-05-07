@@ -207,7 +207,7 @@ pg_subscription                  true
 pg_subscription_rel              true
 pg_tables                        false
 pg_tablespace                    false
-pg_timezone_abbrevs              true
+pg_timezone_abbrevs              false
 pg_timezone_names                false
 pg_transform                     true
 pg_trigger                       false

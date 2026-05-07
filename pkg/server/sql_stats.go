@@ -28,6 +28,7 @@ import (
 // different aggregation windows are not combined.
 type DrainSqlStatsRespBuilder struct {
 	stmtFingerprintCount map[appstatspb.StmtFingerprintID]struct{}
+	txnFingerprintCount  map[appstatspb.TransactionFingerprintID]struct{}
 	stmtMap              map[stmtDrainKey]*appstatspb.CollectedStatementStatistics
 	txnMap               map[txnDrainKey]*appstatspb.CollectedTransactionStatistics
 }
@@ -49,6 +50,7 @@ type txnDrainKey struct {
 func NewDrainSqlStatsRespBuilder() *DrainSqlStatsRespBuilder {
 	return &DrainSqlStatsRespBuilder{
 		stmtFingerprintCount: make(map[appstatspb.StmtFingerprintID]struct{}),
+		txnFingerprintCount:  make(map[appstatspb.TransactionFingerprintID]struct{}),
 		stmtMap:              make(map[stmtDrainKey]*appstatspb.CollectedStatementStatistics),
 		txnMap:               make(map[txnDrainKey]*appstatspb.CollectedTransactionStatistics),
 	}
@@ -84,11 +86,15 @@ func (b *DrainSqlStatsRespBuilder) AddTxnStats(
 		} else {
 			existingTx.Stats.Add(&txn.Stats)
 		}
+
+		if _, ok := b.txnFingerprintCount[txn.TransactionFingerprintID]; !ok {
+			b.txnFingerprintCount[txn.TransactionFingerprintID] = struct{}{}
+		}
 	}
 }
 
 func (b *DrainSqlStatsRespBuilder) Build() *serverpb.DrainStatsResponse {
-	fingerprintCount := len(b.stmtFingerprintCount) + len(b.txnMap)
+	fingerprintCount := len(b.stmtFingerprintCount) + len(b.txnFingerprintCount)
 	response := &serverpb.DrainStatsResponse{
 		Statements:       make([]*appstatspb.CollectedStatementStatistics, 0, len(b.stmtMap)),
 		Transactions:     make([]*appstatspb.CollectedTransactionStatistics, 0, len(b.txnMap)),

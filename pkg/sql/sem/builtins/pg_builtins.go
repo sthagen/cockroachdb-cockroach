@@ -909,6 +909,30 @@ FROM defaults_parsed
 		},
 	),
 
+	// pg_get_function_sqlbody returns the deparsed SQL body of a function defined
+	// with the SQL-standard inline body syntax (RETURN expr or BEGIN ATOMIC ...
+	// END), and NULL otherwise. CockroachDB does not yet support that syntax (see
+	// issue #85144), so pg_proc.prosqlbody is always NULL today and this builtin
+	// returns NULL for every input. It exists for compatibility with tools that
+	// probe pg_catalog (e.g. psql's \df+).
+	// https://www.postgresql.org/docs/14/functions-info.html
+	"pg_get_function_sqlbody": makeBuiltin(
+		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "func_oid", Typ: types.Oid}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Body: `SELECT prosqlbody
+             FROM pg_catalog.pg_proc
+             WHERE oid=$1
+             LIMIT 1`,
+			Info: "Returns the SQL-standard body of the specified function, or NULL " +
+				"if the function was not defined with the SQL-standard inline body syntax.",
+			Volatility:        volatility.Stable,
+			CalledOnNullInput: true,
+			Language:          tree.RoutineLangSQL,
+		},
+	),
+
 	// pg_get_indexdef functions like SHOW CREATE INDEX would if we supported that
 	// statement.
 	"pg_get_indexdef": makeBuiltin(

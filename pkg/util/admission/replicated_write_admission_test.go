@@ -53,12 +53,9 @@ import (
 //     requests waiting. If no class is specified, we grant admission across
 //     both classes.
 //
-//   - "tenant-weights" [t<int>=<int>]...
-//     Set weights for each tenant.
-//
 //   - "print"
 //     Pretty-print work queue internal state (waiting requests, consumed tokens
-//     per-tenant, physical admission statistics, tenant weights, etc).
+//     per-tenant, physical admission statistics).
 func TestReplicatedWriteAdmission(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -212,18 +209,6 @@ func TestReplicatedWriteAdmission(t *testing.T) {
 					tg[wc].tokens += delta
 				}
 				return printTestGranterTokens(tg)
-
-			case "tenant-weights":
-				weightMap := make(map[uint64]uint32)
-				for _, cmdArg := range d.CmdArgs {
-					tenantID, err := strconv.Atoi(strings.TrimPrefix(cmdArg.Key, "t"))
-					require.NoError(t, err)
-					weight, err := strconv.Atoi(cmdArg.Vals[0])
-					require.NoError(t, err)
-					weightMap[uint64(tenantID)] = uint32(weight)
-				}
-				storeWorkQueue.SetTenantWeights(weightMap)
-				return ""
 
 			case "grant":
 				var wcs []admissionpb.WorkClass

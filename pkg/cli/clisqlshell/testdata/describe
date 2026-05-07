@@ -689,7 +689,7 @@ pg_catalog,pg_tables,table,node,permanent,prefix,"tables summary (see also infor
 https://www.postgresql.org/docs/9.5/view-pg-tables.html"
 pg_catalog,pg_tablespace,table,node,permanent,prefix,"available tablespaces (incomplete; concept inapplicable to CockroachDB)
 https://www.postgresql.org/docs/9.5/catalog-pg-tablespace.html"
-pg_catalog,pg_timezone_abbrevs,table,node,permanent,prefix,pg_timezone_abbrevs was created for compatibility and is currently unimplemented
+pg_catalog,pg_timezone_abbrevs,table,node,permanent,prefix,pg_timezone_abbrevs lists the timezone abbreviations recognized by date/time literal parsing
 pg_catalog,pg_timezone_names,table,node,permanent,prefix,pg_timezone_names lists all the timezones that are supported by SET timezone
 pg_catalog,pg_transform,table,node,permanent,prefix,pg_transform was created for compatibility and is currently unimplemented
 pg_catalog,pg_trigger,table,node,permanent,prefix,"trigger definitions
@@ -2200,7 +2200,7 @@ List of functions:
         pg_catalog.pg_get_userbyid(p.proowner) AS "Owner",
         CASE WHEN p.prosecdef THEN 'definer' ELSE 'invoker' END AS "Security",
        COALESCE(pg_catalog.array_to_string(p.proacl, e'\n'), '') AS "Access privileges",
-       p.prosrc AS "Source code",
+       COALESCE(p.prosrc, pg_catalog.pg_get_function_sqlbody(p.oid)) AS "Source code",
        pg_catalog.obj_description(p.oid, 'pg_proc') AS "Description"
      FROM pg_catalog.pg_proc p
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
@@ -2256,7 +2256,7 @@ List of functions:
         pg_catalog.pg_get_userbyid(p.proowner) AS "Owner",
         CASE WHEN p.prosecdef THEN 'definer' ELSE 'invoker' END AS "Security",
        COALESCE(pg_catalog.array_to_string(p.proacl, e'\n'), '') AS "Access privileges",
-       p.prosrc AS "Source code",
+       COALESCE(p.prosrc, pg_catalog.pg_get_function_sqlbody(p.oid)) AS "Source code",
        pg_catalog.obj_description(p.oid, 'pg_proc') AS "Description"
      FROM pg_catalog.pg_proc p
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
@@ -2311,7 +2311,7 @@ List of functions:
         pg_catalog.pg_get_userbyid(p.proowner) AS "Owner",
         CASE WHEN p.prosecdef THEN 'definer' ELSE 'invoker' END AS "Security",
        COALESCE(pg_catalog.array_to_string(p.proacl, e'\n'), '') AS "Access privileges",
-       p.prosrc AS "Source code",
+       COALESCE(p.prosrc, pg_catalog.pg_get_function_sqlbody(p.oid)) AS "Source code",
        pg_catalog.obj_description(p.oid, 'pg_proc') AS "Description"
      FROM pg_catalog.pg_proc p
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
@@ -2368,7 +2368,7 @@ List of functions:
         pg_catalog.pg_get_userbyid(p.proowner) AS "Owner",
         CASE WHEN p.prosecdef THEN 'definer' ELSE 'invoker' END AS "Security",
        COALESCE(pg_catalog.array_to_string(p.proacl, e'\n'), '') AS "Access privileges",
-       p.prosrc AS "Source code",
+       COALESCE(p.prosrc, pg_catalog.pg_get_function_sqlbody(p.oid)) AS "Source code",
        pg_catalog.obj_description(p.oid, 'pg_proc') AS "Description"
      FROM pg_catalog.pg_proc p
 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace

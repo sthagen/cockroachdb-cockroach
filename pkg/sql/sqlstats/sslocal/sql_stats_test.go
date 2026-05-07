@@ -444,6 +444,11 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		Settings: st,
 	})
 
+	// Stub the time so all events fall in the same aggregation window.
+	// Without this, a test run that crosses an aggregation boundary
+	// produces duplicate (fingerprint, aggregatedTs) keys and inflates
+	// the fingerprint count. See #169386.
+	stubNow := time.Date(2026, 3, 15, 10, 30, 45, 0, time.UTC)
 	sqlStats := sslocal.NewSQLStats(
 		st,
 		sqlstats.MaxMemSQLStatsStmtFingerprints,
@@ -453,7 +458,9 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 		nil, /* discardedStatsCount */
 		monitor,
 		nil, /* reportingSink */
-		nil, /* knobs */
+		&sqlstats.TestingKnobs{
+			StubTimeNow: func() time.Time { return stubNow },
+		},
 	)
 
 	ingester := sslocal.NewSQLStatsIngester(

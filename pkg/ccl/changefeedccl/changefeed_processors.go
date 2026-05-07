@@ -721,7 +721,6 @@ func (ca *changeAggregator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMet
 
 		select {
 		case <-ca.aggTimer.C:
-			ca.aggTimer.Read = true
 			ca.aggTimer.Reset(tracingAggTimerInterval)
 			return nil, bulkutil.ConstructTracingAggregatorProducerMeta(ca.Ctx(),
 				ca.FlowCtx.NodeID.SQLInstanceID(), ca.FlowCtx.ID, ca.agg)
@@ -1591,7 +1590,6 @@ func (cf *changeFrontier) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetad
 
 		select {
 		case <-cf.aggTimer.C:
-			cf.aggTimer.Read = true
 			cf.aggTimer.Reset(1 * time.Second)
 			return nil, bulkutil.ConstructTracingAggregatorProducerMeta(cf.Ctx(),
 				cf.FlowCtx.NodeID.SQLInstanceID(), cf.FlowCtx.ID, cf.agg)

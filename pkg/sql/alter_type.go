@@ -110,9 +110,8 @@ func (n *alterTypeNode) startExec(params runParams) error {
 		})
 		eventLogDone = true
 	case *tree.AlterTypeSetSchema:
-		// TODO(knz): this is missing dedicated logging,
-		// See https://github.com/cockroachdb/cockroach/issues/57741
 		err = params.p.setTypeSchema(params.ctx, n, string(t.Schema))
+		eventLogDone = true // done inside setTypeSchema().
 	case *tree.AlterTypeOwner:
 		owner, err := decodeusername.FromRoleSpec(
 			params.SessionData(), username.PurposeValidation, t.Owner,

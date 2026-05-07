@@ -101,7 +101,12 @@ func TestTelemetryLoggingDataDriven(t *testing.T) {
 			getTimeNow:       st.TimeNow,
 			getTracingStatus: sts.TracingStatus,
 		}
-		tc := serverutils.StartCluster(t, 3, base.TestClusterArgs{
+		// NB: use a single-node cluster so that the leaseholder for any
+		// user table is always the gateway. With multiple nodes, the
+		// leaseholder can land on a non-gateway node and the physical
+		// planner will distribute the flow, making the Distribution field
+		// in telemetry log events nondeterministic. See #169735.
+		tc := serverutils.StartCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					SQLExecutor: &ExecutorTestingKnobs{

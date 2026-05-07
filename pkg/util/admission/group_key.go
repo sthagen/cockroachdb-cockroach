@@ -59,12 +59,6 @@ type groupKey struct {
 	kind groupKind
 }
 
-// isTenant reports whether k identifies a tenant container.
-func (k groupKey) isTenant() bool { return k.kind == tenantKind }
-
-// isRg reports whether k identifies a resource group container.
-func (k groupKey) isRg() bool { return k.kind == rgKind }
-
 // SafeFormat implements redact.SafeFormatter. Formats as e.g.
 // "t1" / "rg2"; useful in SafeFormat output so callers don't have
 // to switch on kind themselves.

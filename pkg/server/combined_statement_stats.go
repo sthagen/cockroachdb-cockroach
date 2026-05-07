@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
@@ -657,52 +658,6 @@ func (r *statementStatsRunner) collectCombinedStatements(
 ) ([]serverpb.StatementsResponse_CollectedStatementStatistics, error) {
 	aostClause := r.testingKnobs.GetAOSTClause()
 	const expectedNumDatums = 9
-	const queryFormat = `
-SELECT 
-    fingerprint_id,
-    app_name,
-    aggregated_ts,
-    COALESCE(CAST(metadata -> 'distSQLCount' AS INT), 0)  AS distSQLCount,
-    COALESCE(CAST(metadata -> 'fullScanCount' AS INT), 0) AS fullScanCount,
-    metadata ->> 'query'                                  AS query,
-    metadata ->> 'querySummary'                           AS querySummary,
-    (SELECT string_agg(elem::text, ',') 
-    FROM json_array_elements_text(metadata->'db') AS elem) AS databases,
-    statistics
-FROM (SELECT fingerprint_id,
-             app_name,
-             max(aggregated_ts)                           AS aggregated_ts,
-             merge_stats_metadata(metadata)               AS metadata,
-             merge_statement_stats(statistics)            AS statistics
-      FROM %s %s
-      GROUP BY
-          fingerprint_id,
-          app_name) %s
-%s`
-	metadataAggFn := mergeAggStmtMetadataColumnLatest
-	activityQuery := strings.Join([]string{`
-SELECT 
-    fingerprint_id,
-    app_name,
-    aggregated_ts,
-    COALESCE(CAST(metadata -> 'distSQLCount' AS INT), 0)  AS distSQLCount,
-    COALESCE(CAST(metadata -> 'fullScanCount' AS INT), 0) AS fullScanCount,
-    metadata ->> 'query'                                  AS query,
-    metadata ->> 'querySummary'                           AS querySummary,
-    (SELECT string_agg(elem::text, ',') 
-    FROM json_array_elements_text(metadata->'db') AS elem) AS databases,
-    statistics
-FROM (SELECT fingerprint_id,
-             app_name,
-             max(aggregated_ts)                                     AS aggregated_ts,
-             `, metadataAggFn, ` AS metadata,
-             merge_statement_stats(statistics)                      AS statistics
-      FROM %s %s
-      GROUP BY
-          fingerprint_id,
-          app_name) %s
-%s`}, "")
-
 	var it isql.Rows
 	var err error
 	defer func() {
@@ -715,7 +670,7 @@ FROM (SELECT fingerprint_id,
 			ctx,
 			r.ie,
 			// The statement activity table has aggregated metadata.
-			activityQuery,
+			getQuery(ctx, settings, mergeAggStmtMetadataColumnLatest),
 			CrdbInternalStmtStatsCached,
 			"activity-by-interval",
 			whereClause,
@@ -726,7 +681,7 @@ FROM (SELECT fingerprint_id,
 		it, err = getIterator(
 			ctx,
 			r.ie,
-			queryFormat,
+			getQuery(ctx, settings, mergeStatsMetadataColumn),
 			r.stmtSourceTable,
 			"by-interval",
 			whereClause,
@@ -765,7 +720,7 @@ FROM (SELECT fingerprint_id,
 		fullScanCount := int64(*row[4].(*tree.DInt))
 		query := string(tree.MustBeDString(row[5]))
 		querySummary := string(tree.MustBeDString(row[6]))
-		databases := string(tree.MustBeDString(row[7]))
+		database := string(tree.MustBeDString(row[7]))
 
 		metadata := appstatspb.CollectedStatementStatistics{
 			Key: appstatspb.StatementStatisticsKey{
@@ -774,7 +729,7 @@ FROM (SELECT fingerprint_id,
 				FullScan:     fullScanCount > 0,
 				Query:        query,
 				QuerySummary: querySummary,
-				Database:     databases,
+				Database:     database,
 			},
 		}
 
@@ -802,6 +757,60 @@ FROM (SELECT fingerprint_id,
 	}
 
 	return statements, nil
+}
+
+func getQuery(ctx context.Context, settings *cluster.Settings, mergeMetadataFn string) string {
+	if settings.Version.IsActive(ctx, clusterversion.V26_3) {
+		return `
+SELECT 
+    fingerprint_id,
+    app_name,
+    aggregated_ts,
+    COALESCE(CAST(metadata -> 'distSQLCount' AS INT), 0)  AS distSQLCount,
+    COALESCE(CAST(metadata -> 'fullScanCount' AS INT), 0) AS fullScanCount,
+    query,
+    querySummary,
+    database,
+    statistics
+FROM (SELECT fingerprint_id,
+             app_name,
+             query,
+             query_summary                                AS querySummary,
+             database                                     AS database,
+             max(aggregated_ts)                           AS aggregated_ts,
+             ` + mergeMetadataFn + `                      AS metadata,
+             merge_statement_stats(statistics)            AS statistics
+      FROM %s %s
+      GROUP BY
+          fingerprint_id,
+          app_name,
+          query,
+          query_summary,
+          database) %s
+%s`
+	}
+
+	return `
+SELECT 
+    fingerprint_id,
+    app_name,
+    aggregated_ts,
+    COALESCE(CAST(metadata -> 'distSQLCount' AS INT), 0)  AS distSQLCount,
+    COALESCE(CAST(metadata -> 'fullScanCount' AS INT), 0) AS fullScanCount,
+    metadata ->> 'query'                                  AS query,
+    metadata ->> 'querySummary'                           AS querySummary,
+    metadata -> 'db' ->> 0                                AS database,
+    statistics
+FROM (SELECT fingerprint_id,
+             app_name,
+             max(aggregated_ts)                           AS aggregated_ts,
+             ` + mergeMetadataFn + `                      AS metadata,
+             merge_statement_stats(statistics)            AS statistics
+      FROM %s %s
+      GROUP BY
+          fingerprint_id,
+          app_name) %s
+%s`
 }
 
 func getIterator(

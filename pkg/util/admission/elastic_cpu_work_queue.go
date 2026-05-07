@@ -46,7 +46,6 @@ type ElasticCPUWorkQueue struct {
 type elasticCPUInternalWorkQueue interface {
 	requester
 	Admit(ctx context.Context, info WorkInfo) (AdmitResponse, error)
-	SetTenantWeights(tenantWeights map[uint64]uint32)
 	adjustGroupUsed(gKey groupKey, additionalUsed int64)
 }
 
@@ -121,11 +120,6 @@ func (e *ElasticCPUWorkQueue) AdmittedWorkDone(h *ElasticCPUWorkHandle) {
 
 	e.granter.returnGrant(-difference.Nanoseconds())
 	e.metrics.ReturnedNanos.Inc(-difference.Nanoseconds())
-}
-
-// SetTenantWeights passes through to WorkQueue.SetTenantWeights.
-func (e *ElasticCPUWorkQueue) SetTenantWeights(tenantWeights map[uint64]uint32) {
-	e.workQueue.SetTenantWeights(tenantWeights)
 }
 
 func (e *ElasticCPUWorkQueue) enabled() bool {

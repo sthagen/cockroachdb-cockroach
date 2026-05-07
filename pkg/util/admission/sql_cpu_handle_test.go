@@ -605,9 +605,9 @@ func TestSQLCPUHandleSecondDeductionAfterTurn(t *testing.T) {
 // are interpreted as resource group IDs (rgKind) only. A
 // numerically equal tenant-keyed container must not inherit the
 // flag — that's the cross-namespace collision the kind discriminator
-// in q.mu.groups is meant to prevent. The lookup-time guard in
-// getMaxCPULocked enforces this even though q.mu.maxCPUGroups
-// itself is uint64-keyed.
+// in q.mu.groups is meant to prevent. SetMaxCPUGroups stores its
+// entries under rgGroupKey, so a tenant-keyed lookup naturally
+// misses.
 func TestSetMaxCPUGroupsRGOnly(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -645,7 +645,7 @@ func TestSetMaxCPUGroupsRGOnly(t *testing.T) {
 		"tenant 1 and rg 1 must be distinct *groupInfo entries")
 
 	// Set maxCPU on group 1. It should affect the rg container only.
-	q.SetMaxCPUGroups(map[uint64]bool{1: true})
+	q.SetMaxCPUGroups(map[groupKey]bool{rgGroupKey(1): true})
 
 	q.mu.Lock()
 	tenantMaxCPU := tenantContainer.cpuTimeBurstBucket.maxCPU
@@ -654,7 +654,7 @@ func TestSetMaxCPUGroupsRGOnly(t *testing.T) {
 
 	require.False(t, tenantMaxCPU,
 		"tenant container must not inherit the rg-keyed maxCPU flag "+
-			"(getMaxCPULocked's isRg guard is the enforcement)")
+			"(maxCPUGroups is keyed by rgGroupKey)")
 	require.True(t, rgMaxCPU,
 		"rg container should pick up the maxCPU flag")
 

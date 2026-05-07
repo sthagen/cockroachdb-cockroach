@@ -9,7 +9,6 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -96,24 +95,28 @@ var admissionControlEnabledSettings = [numWorkKinds]*settings.BoolSetting{
 	SQLSQLResponseWork: SQLSQLResponseAdmissionControlEnabled,
 }
 
-// KVTenantWeightsEnabled controls whether tenant weights are enabled for KV
-// admission control. This setting has no effect if admission.kv.enabled is
-// false.
+// KVTenantWeightsEnabled is retired. The underlying tenant-weight
+// propagation mechanism for KV admission control was never enabled in
+// production and has been removed; the setting is kept registered as a
+// no-op for compatibility with automation that may still try to set it.
 var KVTenantWeightsEnabled = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"admission.kv.tenant_weights.enabled",
-	"when true, tenant weights are enabled for KV admission control",
+	"retired no-op",
 	false,
+	settings.Retired,
 )
 
-// KVStoresTenantWeightsEnabled controls whether tenant weights are enabled
-// for KV-stores admission control. This setting has no effect if
-// admission.kv.enabled is false.
+// KVStoresTenantWeightsEnabled is retired. The underlying tenant-weight
+// propagation mechanism for KV-stores admission control was never enabled
+// in production and has been removed; the setting is kept registered as a
+// no-op for compatibility with automation that may still try to set it.
 var KVStoresTenantWeightsEnabled = settings.RegisterBoolSetting(
 	settings.SystemOnly,
 	"admission.kv.stores.tenant_weights.enabled",
-	"when true, tenant weights are enabled for KV-stores admission control",
+	"retired no-op",
 	false,
+	settings.Retired,
 )
 
 // EpochLIFOEnabled controls whether the adaptive epoch-LIFO scheme is enabled
@@ -317,26 +320,14 @@ type WorkQueue struct {
 		// representing different semantic kinds (e.g., system tenant
 		// 1 vs rg 1) does not collide on a single container.
 		// Periodically GC'd by gcGroupsResetUsedAndUpdateEstimators.
-		groups       map[groupKey]*groupInfo
-		groupWeights struct {
-			mu syncutil.Mutex
-			// active refers to the currently active weights. mu is held for updates
-			// to the inactive weights, to prevent concurrent updates. After
-			// updating the inactive weights, it is made active by swapping with
-			// active, while also holding WorkQueue.mu. Therefore, reading
-			// groupWeights.active does not require groupWeights.mu. For lock
-			// ordering, groupWeights.mu precedes WorkQueue.mu.
-			//
-			// The maps are lazily allocated.
-			active, inactive map[groupKey]uint32
-		}
-		// maxCPUGroups maps resource group ID to whether that group always
-		// qualifies for burst (MAX_CPU). IDs are interpreted as resource group
-		// IDs (rgKind); the lookup in getMaxCPULocked short-circuits for
-		// tenant-keyed containers so a numerically equal tenant ID can never
-		// inherit the flag. Only used if mode == usesCPUTimeTokens and
-		// admission.cpu_time_tokens.mode == "resource_manager".
-		maxCPUGroups map[uint64]bool
+		groups map[groupKey]*groupInfo
+		// maxCPUGroups maps a resource-group container key to whether that
+		// group always qualifies for burst (MAX_CPU). Keys are constructed
+		// via rgGroupKey when SetMaxCPUGroups runs, so a numerically equal
+		// tenant-keyed container can never collide on a lookup. Only used
+		// if mode == usesCPUTimeTokens and admission.cpu_time_tokens.mode
+		// == "resource_manager".
+		maxCPUGroups map[groupKey]bool
 
 		// useResourceGroup, when true, derives the resource group ID from
 		// WorkInfo.Priority instead of WorkInfo.TenantID. Used in Resource
@@ -1545,53 +1536,38 @@ func (q *WorkQueue) SafeFormat(s redact.SafePrinter, _ rune) {
 	}
 }
 
-// Weight for groups that are not assigned a weight. This typically applies
-// to groups which weren't on this node in the prior call to
-// SetTenantWeights. Additionally, it is also the minimum group weight.
+// defaultGroupWeight is the weight assigned to every group. Weighted fair
+// sharing across tenants/groups is not currently configurable; all groups
+// share equal weight.
 const defaultGroupWeight = 1
 
-// The current cap on the weight of a group. We don't allow a single group
-// to use more than cap times the number of resources of the smallest group.
-// For KV slots, we have seen a range of slot counts from 50-200 for 16 cpu
-// nodes, for a KV50 workload, depending on how we set
-// admission.kv_slot_adjuster.overload_threshold. We don't want to starve
-// small groups, so the cap is currently set to 20. A more sophisticated fair
-// sharing scheme would not need such a cap.
-const groupWeightCap = 20
-
-func (q *WorkQueue) getGroupWeightLocked(gKey groupKey) uint32 {
-	weight, ok := q.mu.groupWeights.active[gKey]
-	if !ok {
-		weight = defaultGroupWeight
-	}
-	return weight
+func (q *WorkQueue) getGroupWeightLocked(_ groupKey) uint32 {
+	return defaultGroupWeight
 }
 
 // getMaxCPULocked returns the maxCPU flag for the given group.
-// Returns false if the ID is not in maxCPUGroups, or if gKey is
-// tenant-keyed: maxCPUGroups is populated with RG IDs, so the
-// kind guard prevents a numerically equal tenant ID from inheriting
-// the flag. See cpuTimeBurstBucket for how this flag affects burst
-// qualification.
+// Returns false if gKey is not in maxCPUGroups. Tenant-keyed
+// containers are naturally excluded because maxCPUGroups is keyed
+// by rgGroupKey (see SetMaxCPUGroups). See cpuTimeBurstBucket for
+// how this flag affects burst qualification.
 //
 // REQUIRES: q.mu is held.
 func (q *WorkQueue) getMaxCPULocked(gKey groupKey) bool {
 	q.mu.AssertHeld()
-	if !gKey.isRg() {
-		return false
-	}
-	return q.mu.maxCPUGroups[gKey.id]
+	return q.mu.maxCPUGroups[gKey]
 }
 
-// SetMaxCPUGroups replaces all per-resource-group maxCPU flags with
-// the provided map. Input IDs are interpreted as resource group IDs
-// (rgKind); only rg-keyed containers consult this map (see
-// getMaxCPULocked), so a numerically equal tenant ID can never
-// inherit the flag. Groups absent from the map revert to the default
+// SetMaxCPUGroups replaces all per-group maxCPU flags with the
+// provided map. Callers should construct keys via rgGroupKey: only
+// resource groups are intended to carry the MAX_CPU flag, and
+// getMaxCPULocked looks up containers by their groupKey, so a
+// tenant-keyed lookup naturally misses an rg-keyed map and returns
+// false. Groups absent from the map revert to the default
 // (maxCPU=false). Existing groups have their burst buckets updated;
 // new groups will pick up their flag when created. The map is
-// captured by reference; the caller must not modify it after calling.
-func (q *WorkQueue) SetMaxCPUGroups(groups map[uint64]bool) {
+// captured by reference; the caller must not modify it after
+// calling.
+func (q *WorkQueue) SetMaxCPUGroups(groups map[groupKey]bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.mu.maxCPUGroups = groups
@@ -1614,106 +1590,6 @@ func (q *WorkQueue) SetOverrideAllToBypassAdmission(override bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.mu.overrideAllToBypassAdmission = override
-}
-
-// SetTenantWeights sets the weight of tenants, using the provided tenant ID
-// => weight map. A nil map will result in all tenants having the same weight.
-// Only tenantKind entries in groupWeights.active are written; any non-tenant
-// entries already in active are preserved across the swap.
-//
-// TODO(wenyihu): rename to SetGroupWeights.
-func (q *WorkQueue) SetTenantWeights(groupWeights map[uint64]uint32) {
-	q.mu.groupWeights.mu.Lock()
-	defer q.mu.groupWeights.mu.Unlock()
-	if q.mu.groupWeights.inactive == nil {
-		q.mu.groupWeights.inactive = make(map[groupKey]uint32)
-	}
-	// Remove all elements from the inactive map.
-	for k := range q.mu.groupWeights.inactive {
-		delete(q.mu.groupWeights.inactive, k)
-	}
-	// Compute the max weight in the new map, for enforcing the groupWeightCap.
-	maxWeight := uint32(1)
-	for _, v := range groupWeights {
-		if v > maxWeight {
-			maxWeight = v
-		}
-	}
-	scaling := float64(1)
-	if maxWeight > groupWeightCap {
-		scaling = groupWeightCap / float64(maxWeight)
-	}
-	// Populate the weights in the inactive map. SetTenantWeights only
-	// governs tenant containers, so wrap with tenantGroupKey.
-	for k, v := range groupWeights {
-		w := uint32(math.Ceil(float64(v) * scaling))
-		if w < defaultGroupWeight {
-			w = defaultGroupWeight
-		}
-		q.mu.groupWeights.inactive[tenantGroupKey(k)] = w
-	}
-	// Establish the new active map. Before swapping, copy any
-	// non-tenant entries from active into inactive so that the swap
-	// does not lose them.
-	func() {
-		q.mu.Lock()
-		defer q.mu.Unlock()
-		for k, v := range q.mu.groupWeights.active {
-			if k.kind != tenantKind {
-				q.mu.groupWeights.inactive[k] = v
-			}
-		}
-		q.mu.groupWeights.active, q.mu.groupWeights.inactive =
-			q.mu.groupWeights.inactive, q.mu.groupWeights.active
-	}()
-	// Create a slice for storing all tenant-keyed group keys. We use
-	// this to split the update to the data-structures that require
-	// holding q.mu, in case there are 1000s of groups (we don't want to
-	// hold q.mu for long durations). Only tenant-kind containers are
-	// updated here: SetTenantWeights only governs tenant containers.
-	keys := func() []groupKey {
-		q.mu.Lock()
-		defer q.mu.Unlock()
-		ks := make([]groupKey, 0, len(q.mu.groups))
-		for k := range q.mu.groups {
-			if k.isTenant() {
-				ks = append(ks, k)
-			}
-		}
-		return ks
-	}()
-	// Any groups not in keys will see the latest weight when their
-	// groupInfo is created. The existing ones need their weights to be
-	// updated.
-
-	// keys[index] represents the next groupKey that needs to be updated.
-	var index int
-	n := len(keys)
-	// updateNextBatch acquires q.mu and updates a batch of groups.
-	updateNextBatch := func() (repeat bool) {
-		q.mu.Lock()
-		defer q.mu.Unlock()
-		// Arbitrary batch size of 5.
-		const batchSize = 5
-		for i := 0; i < batchSize; i++ {
-			if index >= n {
-				return false
-			}
-			key := keys[index]
-			gi := q.mu.groups[key]
-			weight := q.getGroupWeightLocked(key)
-			if gi != nil && gi.weight != weight {
-				gi.weight = weight
-				if isInGroupHeap(gi) {
-					q.mu.groupHeap.fix(gi)
-				}
-			}
-			index++
-		}
-		return true
-	}
-	for updateNextBatch() {
-	}
 }
 
 // close tells the gc goroutine to stop.
@@ -2849,13 +2725,6 @@ func (q *StoreWorkQueue) updateStoreStatsAfterWorkDone(
 		q.mu.stats.aboveRaftStats.workCount += workCount
 		q.mu.stats.aboveRaftStats.writeAccountedBytes += uint64(doneInfo.WriteBytes)
 		q.mu.stats.aboveRaftStats.ingestedAccountedBytes += uint64(doneInfo.IngestedBytes)
-	}
-}
-
-// SetTenantWeights passes through to WorkQueue.SetTenantWeights.
-func (q *StoreWorkQueue) SetTenantWeights(groupWeights map[uint64]uint32) {
-	for i := range q.q {
-		q.q[i].SetTenantWeights(groupWeights)
 	}
 }
 

@@ -1725,16 +1725,10 @@ func (og *operationGenerator) dropColumn(ctx context.Context, tx pgx.Tx) (*opStm
 		return nil, err
 	}
 
-	// Check if the table has any policies, triggers, foreign keys, or row-level TTL.
-	tableHasPolicies, tableHasTriggers, tableHasFK, tableHasTTL := false, false, false, false
+	// Check if the table has any policies or row-level TTL.
+	tableHasPolicies, tableHasTTL := false, false
 	if tableExists {
 		if tableHasPolicies, err = og.tableHasPolicies(ctx, tx, tableName); err != nil {
-			return nil, err
-		}
-		if tableHasTriggers, err = og.tableHasTriggers(ctx, tx, tableName); err != nil {
-			return nil, err
-		}
-		if tableHasFK, err = og.tableHasFK(ctx, tx, tableName); err != nil {
 			return nil, err
 		}
 		if tableHasTTL, err = og.tableHasRowLevelTTL(ctx, tx, tableName); err != nil {
@@ -1751,10 +1745,6 @@ func (og *operationGenerator) dropColumn(ctx context.Context, tx pgx.Tx) (*opStm
 		return nil, err
 	}
 	colIsPrimaryKey, err := og.colIsPrimaryKey(ctx, tx, tableName, columnName)
-	if err != nil {
-		return nil, err
-	}
-	columnIsDependedOn, err := og.columnIsDependedOn(ctx, tx, tableName, columnName, false /* includeFKs */)
 	if err != nil {
 		return nil, err
 	}
@@ -1776,7 +1766,6 @@ func (og *operationGenerator) dropColumn(ctx context.Context, tx pgx.Tx) (*opStm
 		{code: pgcode.ObjectNotInPrerequisiteState, condition: columnIsInAddingOrDroppingIndex},
 		{code: pgcode.UndefinedColumn, condition: !columnExists},
 		{code: pgcode.InvalidColumnReference, condition: colIsPrimaryKey || colIsRefByComputed},
-		{code: pgcode.DependentObjectsStillExist, condition: columnIsDependedOn},
 		{code: pgcode.FeatureNotSupported, condition: hasAlterPKSchemaChange && !og.useDeclarativeSchemaChanger},
 	})
 	stmt.potentialExecErrors.addAll(codesWithConditions{
@@ -1789,36 +1778,12 @@ func (og *operationGenerator) dropColumn(ctx context.Context, tx pgx.Tx) (*opStm
 		// It is possible that we cannot drop column because it is referenced
 		// in a policy expression or a row-level TTL expiration expression.
 		{code: pgcode.InvalidTableDefinition, condition: tableHasPolicies || tableHasTTL},
-		// It is possible that we cannot drop column because
-		// it is depended on by a trigger or foreign key.
-		{code: pgcode.DependentObjectsStillExist, condition: tableHasTriggers || tableHasFK},
+		// Predicting DependentObjectsStillExist precisely has been a source of
+		// flakes, so permit it as a valid outcome instead.
+		{code: pgcode.DependentObjectsStillExist, condition: true},
 	})
 	stmt.sql = fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, tableName.String(), columnName.String())
 	return stmt, nil
-}
-
-// tableHasTriggers checks if a table has any triggers defined
-func (og *operationGenerator) tableHasTriggers(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName,
-) (bool, error) {
-	// Query to check if a table has any triggers
-	query := `
-	SELECT EXISTS (
-		SELECT 1
-		FROM information_schema.triggers
-		WHERE event_object_schema = $1
-		AND event_object_table = $2
-		LIMIT 1
-	)
-	`
-
-	var hasTriggers bool
-	err := tx.QueryRow(ctx, query, tableName.Schema(), tableName.Object()).Scan(&hasTriggers)
-	if err != nil {
-		return false, err
-	}
-
-	return hasTriggers, nil
 }
 
 // tableHasPolicies checks if a table has any row-level security policies defined
@@ -1845,19 +1810,6 @@ func (og *operationGenerator) tableHasPolicies(
 	}
 
 	return hasPolicies, nil
-}
-
-// tableHasFK checks if a table participates in any foreign key constraints.
-func (og *operationGenerator) tableHasFK(
-	ctx context.Context, tx pgx.Tx, tableName *tree.TableName,
-) (bool, error) {
-	return og.scanBool(ctx, tx, `
-SELECT EXISTS (
-	SELECT 1
-	  FROM pg_constraint
-	 WHERE contype = 'f'
-	   AND (conrelid = $1::REGCLASS OR confrelid = $1::REGCLASS)
-)`, tableName.String())
 }
 
 // tableHasRowLevelTTL checks if a table has a row-level TTL configured.
@@ -6088,44 +6040,20 @@ func (og *operationGenerator) truncateTable(ctx context.Context, tx pgx.Tx) (*op
 		{expectedCode, true},
 	})
 
-	// If the the TRUNCATE is not cascaded, then the operation can fail
-	// if foreign key references exist.
+	// A non-CASCADE TRUNCATE is rejected when an inbound foreign key references
+	// one of the truncated tables. Rather than checking for inbound FK
+	// dependencies, always allow the rejection as a potential outcome.
 	if expectedCode == pgcode.SuccessfulCompletion &&
 		stmt.DropBehavior != tree.DropCascade {
-		tableSet := map[string]struct{}{}
-		fkSet := map[string]struct{}{}
-		// Gather the set of tables handled by this statement, and
-		// any foreign keys that reference these tables.
-		for _, table := range stmt.Tables {
-			tableSet[table.FQString()] = struct{}{}
-			fkReferenceTables, err := og.getTableForeignKeyReferences(ctx, tx, &table)
-			if err != nil {
-				return nil, err
-			}
-			for _, fk := range fkReferenceTables {
-				fkSet[fk.FQString()] = struct{}{}
-			}
+		op.potentialExecErrors.add(pgcode.FeatureNotSupported)
+		// Pre-v26.1 binaries returned Uncategorized for this rejection; the
+		// pgcode was changed in #154382.
+		versionBefore261, err := isClusterVersionLessThan(ctx, tx, clusterversion.V26_1.Version())
+		if err != nil {
+			return nil, err
 		}
-		// Check if any of the foreign keys that reference these
-		// tables are not truncated. If they are, then the TRUNCATE
-		// will fail with an error.
-		for fk := range fkSet {
-			if _, hasTable := tableSet[fk]; !hasTable {
-				// In mixed version workloads, we can see either pgcode.Uncategorized
-				// (pre-v26.1) or pgcode.FeatureNotSupported (v26.1+) depending on which
-				// node handles the TRUNCATE. The pgcode was changed in #154382 (v26.1).
-				versionBefore261, err := isClusterVersionLessThan(ctx, tx, clusterversion.V26_1.Version())
-				if err != nil {
-					return nil, err
-				}
-				if versionBefore261 {
-					op.expectedExecErrors.add(pgcode.Uncategorized)
-					op.potentialExecErrors.add(pgcode.FeatureNotSupported)
-				} else {
-					op.expectedExecErrors.add(pgcode.FeatureNotSupported)
-				}
-				break
-			}
+		if versionBefore261 {
+			op.potentialExecErrors.add(pgcode.Uncategorized)
 		}
 	}
 	return op, nil

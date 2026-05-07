@@ -437,7 +437,6 @@ func (s *Store) maybeThrottleBatch(
 				res.Release()
 				return batchThrottleCallback{}, errors.Wrap(ctx.Err(), "context ended while throttling bulk read request")
 			case <-timer.C:
-				timer.Read = true
 				ok, delay = obtainTokens()
 			}
 		}

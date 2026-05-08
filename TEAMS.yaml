@@ -20,6 +20,10 @@ cockroachdb/sql-queries:
   # See .github/workflows/add-issues-to-project.yml.
   label: T-sql-queries
   silence_mentions: true
+cockroachdb/specialized-indexing:
+  aliases:
+    cockroachdb/specialized-indexing-prs: other
+  label: T-specialized-indexing
 cockroachdb/kv:
   aliases:
     cockroachdb/kv-triage: roachtest
@@ -36,8 +40,6 @@ cockroachdb/spatial:
   label: T-spatial
 cockroachdb/dev-inf:
   label: T-dev-inf
-cockroachdb/drp-eng:
-  label: T-drpeng
 cockroachdb/multiregion:
   label: T-multiregion
 cockroachdb/storage:

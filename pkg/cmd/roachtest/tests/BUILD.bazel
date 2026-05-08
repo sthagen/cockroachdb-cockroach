@@ -35,6 +35,7 @@ go_library(
         "asyncpg_blocklist.go",
         "awsdms.go",
         "backup.go",
+        "backup_chaining.go",
         "backup_fixtures.go",
         "backup_restore_driver.go",
         "backup_restore_roundtrip.go",

@@ -272,6 +272,9 @@ func runAnalyzer(pass *analysis.Pass) (interface{}, error) {
 						"WorkKind":  {},
 						"QueueKind": {},
 					},
+					"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb": {
+						"ResourceGroupID": {},
+					},
 					"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb": {
 						"TraceID": {},
 						"SpanID":  {},

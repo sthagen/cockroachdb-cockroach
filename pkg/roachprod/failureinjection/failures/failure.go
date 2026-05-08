@@ -317,6 +317,27 @@ func (f *GenericFailure) StartNodes(
 	return f.Run(ctx, l, nodes, "./cockroach.sh")
 }
 
+// restartCrashedNodes pings each node and restarts any that are unreachable.
+// It uses systemctl stop to clear systemd's "active" state before restarting,
+// since the PID-based kill in Stop() is a no-op when the process has already
+// crashed.
+func (f *GenericFailure) restartCrashedNodes(
+	ctx context.Context, l *logger.Logger, nodes install.Nodes,
+) error {
+	label := install.VirtualClusterLabel(install.SystemInterfaceName, 0)
+	return forEachNode(nodes, func(n install.Nodes) error {
+		if err := f.PingNode(ctx, l, n); err != nil {
+			l.Printf("failed to connect to n%d, assuming node exited and restarting: %v", n, err)
+			stopCmd := fmt.Sprintf("sudo systemctl stop %s 2>/dev/null || true", label)
+			if err := f.Run(ctx, l, n, stopCmd); err != nil {
+				l.Printf("warning: failed to stop service on n%d: %v", n[0], err)
+			}
+			return f.StartNodes(ctx, l, n)
+		}
+		return nil
+	})
+}
+
 // forEachNode is a helper function that calls fn for each node in nodes.
 func forEachNode(nodes install.Nodes, fn func(install.Nodes) error) error {
 	// TODO (darryl): Consider parallelizing this, for now all usages

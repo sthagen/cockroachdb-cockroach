@@ -2445,14 +2445,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES ('x1', NULL, NULL)
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES (NULL, 'y1', NULL)
@@ -2460,14 +2454,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES (NULL, 'y1', NULL)
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES (NULL, NULL, 'z1')
@@ -2475,14 +2463,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES (NULL, NULL, 'z1')
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES ('x1', 'y1', NULL)
@@ -2490,14 +2472,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES ('x1', 'y1', NULL)
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES ('x1', NULL, 'z1')
@@ -2505,14 +2481,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES ('x1', NULL, 'z1')
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES (NULL, 'y1', 'z1')
@@ -2520,14 +2490,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES (NULL, 'y1', 'z1')
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES ('x2', 'y1', 'z1')
@@ -2535,14 +2499,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES ('x2', 'y1', 'z1')
 statement error foreign key violation: "b" row a_z='z1', a_y='y1', a_x='x2', rowid=[0-9]* has no match in "a"
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES ('x2', 'y2', 'z1')
@@ -2550,14 +2508,8 @@ INSERT INTO b (a_x, a_y, a_z) VALUES ('x2', 'y2', 'z1')
 statement error foreign key violation: "b" row a_z='z1', a_y='y2', a_x='x2', rowid=[0-9]* has no match in "a"
 ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z, y, x) MATCH FULL
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 INSERT INTO b (a_x, a_y, a_z) VALUES ('x2', 'y2', 'z2')
@@ -2734,14 +2686,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2755,14 +2701,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2776,14 +2716,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2797,14 +2731,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2818,14 +2746,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2839,14 +2761,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error foreign key violation: MATCH FULL does not allow mixing of null and nonnull values
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2860,14 +2776,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error pq: foreign key violation: "b" row a_z='z1', a_y='y1', a_x='x2', rowid=[0-9]* has no match in "a"
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -2881,14 +2791,8 @@ ALTER TABLE b ADD CONSTRAINT fk_ref FOREIGN KEY (a_z, a_y, a_x) REFERENCES a (z,
 statement error pq: foreign key violation: "b" row a_z='z1', a_y='y2', a_x='x2', rowid=[0-9]* has no match in "a"
 ALTER TABLE b VALIDATE CONSTRAINT fk_ref
 
-statement ok
-ALTER TABLE b SET (schema_locked=false);
-
-statement ok
-TRUNCATE b
-
-statement ok
-ALTER TABLE b RESET (schema_locked);
+statement count 1
+DELETE FROM b
 
 statement ok
 ALTER TABLE b DROP CONSTRAINT fk_ref
@@ -3488,23 +3392,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 # 'ON DELETE NO ACTION', followed by 'ON DELETE CASCADE'
 statement ok
@@ -3529,23 +3421,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 0
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 # 'ON DELETE RESTRICT', followed by 'ON DELETE SET NULL'
 statement ok
@@ -3571,23 +3451,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 # 'ON DELETE RESTRICT', followed by 'ON DELETE CASCADE'
 statement ok
@@ -3612,23 +3480,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 0
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 # 'ON DELETE CASCADE', followed by 'ON DELETE SET DEFAULT'
 statement ok
@@ -3653,23 +3509,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 0
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 # 'ON DELETE CASCADE', followed by 'ON DELETE SET NULL'
 statement ok
@@ -3694,23 +3538,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 0
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE CASCADE'
 statement ok
@@ -3735,23 +3567,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON DELETE SET DEFAULT', followed by 'ON DELETE SET NULL'
 statement ok
@@ -3776,23 +3596,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON DELETE SET NULL', followed by 'ON DELETE SET DEFAULT'
 statement ok
@@ -3818,23 +3626,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 0
+DELETE FROM t1
 
 statement ok
 DROP TABLE t2 CASCADE;
@@ -3879,23 +3675,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE NO ACTION', followed by 'ON UPDATE CASCADE'
 statement ok
@@ -3921,23 +3705,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE RESTRICT', followed by 'ON UPDATE SET NULL'
 statement ok
@@ -3963,23 +3735,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE RESTRICT', followed by 'ON UPDATE CASCADE'
 statement ok
@@ -4005,23 +3765,11 @@ ALTER TABLE t2 DROP CONSTRAINT fk1;
 statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE CASCADE', followed by 'ON UPDATE SET DEFAULT'
 statement ok
@@ -4048,23 +3796,11 @@ statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE CASCADE', followed by 'ON UPDATE SET NULL'
 statement ok
@@ -4091,23 +3827,11 @@ statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE SET DEFAULT', followed by 'ON UPDATE CASCADE'
 statement ok
@@ -4134,23 +3858,11 @@ statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE SET DEFAULT', followed by 'ON UPDATE SET NULL'
 statement ok
@@ -4177,23 +3889,11 @@ statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 # 'ON UPDATE SET NULL', followed by 'ON UPDATE SET DEFAULT'
 statement ok
@@ -4220,23 +3920,11 @@ statement ok
 ALTER TABLE t2 DROP CONSTRAINT fk2;
 
 
-statement ok
-ALTER TABLE t2 SET (schema_locked=false);
+statement count 1
+DELETE FROM t2;
 
-statement ok
-ALTER TABLE t1 SET (schema_locked=false);
-
-statement ok
-TRUNCATE TABLE t2;
-
-statement ok
-TRUNCATE TABLE t1
-
-statement ok
-ALTER TABLE t2 RESET (schema_locked)
-
-statement ok
-ALTER TABLE t1 RESET (schema_locked)
+statement count 1
+DELETE FROM t1
 
 statement ok
 DROP TABLE t2 CASCADE;

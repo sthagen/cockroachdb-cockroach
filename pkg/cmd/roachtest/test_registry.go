@@ -192,8 +192,9 @@ func (r testRegistryImpl) AllOperations() []registry.OperationSpec {
 
 // FilteredOperations returns operations filtered by the given regex.
 // If skipRegex is non-nil, operations matching it are excluded.
+// If cloud is set, operations incompatible with that cloud are excluded.
 func (r testRegistryImpl) FilteredOperations(
-	regex *regexp.Regexp, skipRegex *regexp.Regexp,
+	regex *regexp.Regexp, skipRegex *regexp.Regexp, cloud spec.Cloud,
 ) []registry.OperationSpec {
 	var filteredOps []registry.OperationSpec
 	for _, opSpec := range r.AllOperations() {
@@ -201,6 +202,9 @@ func (r testRegistryImpl) FilteredOperations(
 			continue
 		}
 		if skipRegex != nil && skipRegex.MatchString(opSpec.Name) {
+			continue
+		}
+		if cloud.IsSet() && !opSpec.CompatibleClouds.Contains(cloud) {
 			continue
 		}
 		filteredOps = append(filteredOps, opSpec)

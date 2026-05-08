@@ -1122,8 +1122,8 @@ owners:
   sql_txns_open: cockroachdb/sql-queries
   sql_update_count: cockroachdb/sql-queries
   sql_update_started_count: cockroachdb/sql-queries
-  sql_vecindex_pending_splits_merges: cockroachdb/sql-queries
-  sql_vecindex_successful_splits: cockroachdb/sql-queries
+  sql_vecindex_pending_splits_merges: cockroachdb/specialized-indexing
+  sql_vecindex_successful_splits: cockroachdb/specialized-indexing
   sqlliveness_is_alive_cache_hits: cockroachdb/server
   sqlliveness_is_alive_cache_misses: cockroachdb/server
   sqlliveness_sessions_deleted: cockroachdb/server

@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -29,10 +30,18 @@ import (
 // next KV has a different timestamp or a checkpoint/end-of-stream is
 // encountered). This guarantees that a transaction is never split across
 // batches.
+//
+// The merge feed only emits events with timestamp strictly less than endTime.
+// After exhausting all events below the cutoff, it flushes any buffered KVs
+// and emits a synthetic checkpoint at endTime.Prev(). It then blocks on ctx.Done
+// rather than returning, keeping the events channel open so downstream
+// consumers can advance their frontier on the synthetic checkpoint before
+// the parent context cancellation closes the pipeline.
 type MergeFeed struct {
 	subs           []streamclient.Subscription
 	events         chan crosscluster.Event
 	targetBatchKVs int
+	endTime        hlc.Timestamp
 
 	// loop holds state owned exclusively by mergeLoop while it is running.
 	// After Subscribe returns, err may be read via Err().
@@ -60,12 +69,16 @@ var _ streamclient.Subscription = (*MergeFeed)(nil)
 // flushing a batch (actual batches may be larger to avoid splitting a
 // transaction).
 func NewMergeFeed(
-	subs []streamclient.Subscription, coveringSpan roachpb.Span, targetBatchKVs int,
+	subs []streamclient.Subscription,
+	coveringSpan roachpb.Span,
+	targetBatchKVs int,
+	endTime hlc.Timestamp,
 ) *MergeFeed {
 	m := &MergeFeed{
 		subs:           subs,
 		events:         make(chan crosscluster.Event),
 		targetBatchKVs: targetBatchKVs,
+		endTime:        endTime,
 	}
 	m.loop.coveringSpan = coveringSpan
 	return m
@@ -100,6 +113,10 @@ func (m *MergeFeed) mergeLoop(ctx context.Context) error {
 
 	for h.len() != 0 {
 		entry := h.pop()
+
+		if m.endTime.LessEq(entry.peekTS) {
+			return m.shutdown(ctx)
+		}
 
 		if !entry.isKV() {
 			if err := m.flushScratch(ctx); err != nil {
@@ -208,4 +225,16 @@ func (m *MergeFeed) maybeEmitCheckpoint(ctx context.Context, ts hlc.Timestamp) e
 	case m.events <- cpEvent:
 	}
 	return nil
+}
+
+func (m *MergeFeed) shutdown(ctx context.Context) error {
+	if err := m.flushScratch(ctx); err != nil {
+		return err
+	}
+	if err := m.maybeEmitCheckpoint(ctx, m.endTime.Prev()); err != nil {
+		return err
+	}
+	log.Dev.Infof(ctx, "merge feed waiting for context to finish")
+	<-ctx.Done()
+	return ctx.Err()
 }

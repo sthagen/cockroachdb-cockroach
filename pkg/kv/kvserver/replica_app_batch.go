@@ -655,7 +655,7 @@ func (b *replicaAppBatch) ApplyToStateMachine(ctx context.Context) error {
 			existingClosed.String(), newClosed.String())
 		logcrash.ReportOrPanic(ctx, &b.r.ClusterSettings().SV, "%v", err)
 	}
-	r.mu.closedTimestampSetter = b.closedTimestampSetter
+	r.raftMu.closedTimestampSetter = b.closedTimestampSetter
 	closedTimestampUpdated := r.shMu.state.RaftClosedTimestamp.Forward(b.state.RaftClosedTimestamp)
 
 	if b.state.ForceFlushIndex != r.shMu.state.ForceFlushIndex {

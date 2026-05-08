@@ -79,7 +79,7 @@
 /pkg/sql/control_job*        @cockroachdb/sql-queries-prs @cockroachdb/jobs-prs
 /pkg/sql/job_exec_context*   @cockroachdb/sql-queries-prs @cockroachdb/jobs-prs
 /pkg/sql/delegate/*job*.go   @cockroachdb/jobs-prs @cockroachdb/disaster-recovery
-/pkg/sql/vecindex/           @cockroachdb/sql-queries-prs
+/pkg/sql/vecindex/           @cockroachdb/specialized-indexing-prs
 /pkg/sql/partition*.go       @cockroachdb/sql-queries-prs
 /pkg/sql/temporary_schema*   @cockroachdb/sql-queries-prs
 #!/pkg/sql/BUILD.bazel       @cockroachdb/sql-queries-noreview
@@ -432,7 +432,7 @@
 /pkg/cmd/cr2pg/              @cockroachdb/sql-foundations
 /pkg/cmd/dev/                @cockroachdb/dev-inf
 #!/pkg/cmd/docgen/             @cockroachdb/docs-infra-prs
-/pkg/cmd/drt*                @cockroachdb/drp-eng
+/pkg/cmd/drt*                @cockroachdb/test-eng
 /pkg/cmd/fuzz/               @cockroachdb/test-eng
 /pkg/cmd/generate-binary/    @cockroachdb/sql-foundations
 /pkg/cmd/generate-distdir/ @cockroachdb/dev-inf
@@ -464,8 +464,8 @@
 /pkg/cmd/roachtest/datadog/           @cockroachdb/test-eng
 /pkg/cmd/roachtest/grafana/           @cockroachdb/test-eng
 /pkg/cmd/roachtest/fixtures/          @cockroachdb/test-eng
-/pkg/cmd/roachtest/operation/         @cockroachdb/drp-eng
-/pkg/cmd/roachtest/operations/        @cockroachdb/drp-eng
+/pkg/cmd/roachtest/operation/         @cockroachdb/test-eng
+/pkg/cmd/roachtest/operations/        @cockroachdb/test-eng
 /pkg/cmd/roachtest/option/            @cockroachdb/test-eng
 /pkg/cmd/roachtest/registry/          @cockroachdb/test-eng
 /pkg/cmd/roachtest/roachtestflags     @cockroachdb/test-eng

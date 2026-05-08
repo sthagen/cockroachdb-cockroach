@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
@@ -103,20 +102,15 @@ func TestGenerateHelpCommand(t *testing.T) {
 	end := time.Date(2023, time.July, 21, 16, 42, 13, 137, time.UTC)
 
 	r := &issues.Renderer{}
-	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", spec.GCE, start, end)(r)
+	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", start, end)(r)
 
 	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command.txt"))
-
-	r = &issues.Renderer{}
-	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", spec.AWS, start, end)(r)
-
-	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command_non_gce.txt"))
 
 	// With TC_BUILD_BRANCH=master, Datadog log upload is enabled and the
 	// help command should include a Datadog Logs link.
 	t.Setenv("TC_BUILD_BRANCH", "master")
 	r = &issues.Renderer{}
-	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", spec.GCE, start, end)(r)
+	generateHelpCommand("acceptance/gossip/locality-address", "foo-cluster", start, end)(r)
 
 	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command_with_dd.txt"))
 }

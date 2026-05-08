@@ -467,6 +467,9 @@ type Replica struct {
 		// decoder is used to decode committed raft entries.
 		decoder replicaDecoder
 
+		// Historical information about the command that set the closed timestamp.
+		closedTimestampSetter closedTimestampSetterInfo
+
 		// Scratch for populating rac2.RaftEvent.MsgApps for flowControlV2.
 		msgAppScratchForFlowControl map[roachpb.ReplicaID][]raftpb.Message
 		// Scratch for populating rac2.RaftEvent.ReplicaSateInfo for flowControlV2.
@@ -990,9 +993,6 @@ type Replica struct {
 		failureToGossipSystemConfig bool
 
 		tenantID roachpb.TenantID // Set when first initialized, not modified after
-
-		// Historical information about the command that set the closed timestamp.
-		closedTimestampSetter closedTimestampSetterInfo
 
 		// Followers to which replication traffic is currently dropped.
 		//

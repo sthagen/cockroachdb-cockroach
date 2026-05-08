@@ -279,17 +279,7 @@ func (s *CGroupDiskStaller) Recover(ctx context.Context, l *logger.Logger, args 
 		return err
 	}
 
-	// If we are restarting nodes, then we assume the failure above is because
-	// the disk stall was injected too long, and it was an expected death. Restart
-	// any dead nodes.
-	return forEachNode(diskStallArgs.Nodes, func(n install.Nodes) error {
-		err = s.Run(ctx, l, n, "cat", cockroachIOController)
-		if err != nil && diskStallArgs.RestartNodes {
-			l.Printf("failed to log cgroup bandwidth limits, assuming n%d exited and restarting: %v", n, err)
-			return s.StartNodes(ctx, l, n)
-		}
-		return nil
-	})
+	return s.restartCrashedNodes(ctx, l, diskStallArgs.Nodes)
 }
 
 func (s *CGroupDiskStaller) WaitForFailureToPropagate(
@@ -578,15 +568,7 @@ func (s *DmsetupDiskStaller) Recover(
 	}
 
 	if diskStallArgs.RestartNodes {
-		// If the disk stall was injected for long enough that the cockroach process
-		// detected it and shut down the node, then restart it.
-		return forEachNode(nodes, func(n install.Nodes) error {
-			if err := s.PingNode(ctx, l, n); err != nil {
-				l.Printf("failed to connect to n%d, assuming node exited and restarting: %v", n, err)
-				return s.StartNodes(ctx, l, n)
-			}
-			return nil
-		})
+		return s.restartCrashedNodes(ctx, l, nodes)
 	}
 
 	return nil

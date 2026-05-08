@@ -10455,7 +10455,7 @@ layers:
       unit: COUNT
       aggregation: AVG
       derivative: NONE
-      owner: cockroachdb/sql-queries
+      owner: cockroachdb/specialized-indexing
     - name: sql.vecindex.successful_splits
       exported_name: sql_vecindex_successful_splits
       description: Total number of vector index partitions split without error
@@ -10464,7 +10464,7 @@ layers:
       unit: COUNT
       aggregation: AVG
       derivative: NON_NEGATIVE_DERIVATIVE
-      owner: cockroachdb/sql-queries
+      owner: cockroachdb/specialized-indexing
     - name: sqlliveness.is_alive.cache_hits
       exported_name: sqlliveness_is_alive_cache_hits
       description: Number of calls to IsAlive that return from the cache

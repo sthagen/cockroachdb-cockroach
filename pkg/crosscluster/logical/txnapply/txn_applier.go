@@ -14,11 +14,33 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/container/heap"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/ring"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
+
+// ReplicationError is returned by a writer goroutine when a source transaction
+// cannot be applied to the destination (e.g. a constraint violation).
+type ReplicationError struct {
+	// The underlying error that prevented the transaction from being applied.
+	Err error
+	// The MVCC timestamp of the source transaction that could not be applied.
+	Timestamp hlc.Timestamp
+}
+
+// Error implements the error interface.
+func (e *ReplicationError) Error() string {
+	return redact.StringWithoutMarkers(e)
+}
+
+// SafeFormat implements redact.SafeFormatter.
+func (e *ReplicationError) SafeFormat(p redact.SafePrinter, _ rune) {
+	p.Printf("replication error at %s: %v", e.Timestamp, e.Err)
+}
+
+// Unwrap implements the errors.Wrapper interface.
+func (e *ReplicationError) Unwrap() error { return e.Err }
 
 type appliedTransaction struct {
 	ldrdecoder.Transaction
@@ -358,8 +380,10 @@ func (a *Applier) writer(
 				applyResult: results[0],
 			}
 			if txn.applyResult.DlqReason != nil {
-				// TODO(msbutler): actually write to the DLQ.
-				log.Dev.Errorf(ctx, "transaction %s should be sent to DLQ with reason: %v", transaction.TxnID.Timestamp, txn.applyResult.DlqReason)
+				return &ReplicationError{
+					Err:       txn.applyResult.DlqReason,
+					Timestamp: transaction.TxnID.Timestamp,
+				}
 			}
 			select {
 			case <-ctx.Done():

@@ -171,6 +171,11 @@ type WorkInfo struct {
 	// TenantID is the id of the tenant. For single-tenant clusters, this will
 	// always be the SystemTenantID.
 	TenantID roachpb.TenantID
+	// ResourceGroupID identifies the resource group to which this work
+	// belongs. When the resource manager is enabled, admission decisions
+	// use the resource group rather than the tenant to distribute
+	// capacity. Zero means the resource group is unset.
+	ResourceGroupID admissionpb.ResourceGroupID
 	// Priority is utilized within a tenant.
 	Priority admissionpb.WorkPriority
 	// CreateTime is equivalent to Time.UnixNano() at the creation time of this

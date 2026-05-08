@@ -1670,7 +1670,7 @@ func (u *sqlSymUnion) filterType() tree.FilterType {
 %type <tree.Expr> overlay_placing
 %type <*tree.TenantSpec> virtual_cluster_spec virtual_cluster_spec_opt_all
 
-%type <bool> opt_unique opt_concurrently opt_cluster opt_without_index
+%type <bool> opt_unique opt_concurrently opt_cluster opt_without_index opt_virtual_or_stored
 
 %type <*tree.Limit> limit_clause offset_clause opt_limit_clause
 %type <tree.Expr> select_fetch_first_value
@@ -12010,17 +12010,13 @@ col_qualification_elem:
       Match: $4.compositeKeyMatchMethod(),
     }
   }
-| generated_as '(' a_expr ')' STORED
+| generated_as '(' a_expr ')' opt_virtual_or_stored
   {
-    $$.val = &tree.ColumnComputedDef{Expr: $3.expr(), Virtual: false}
-  }
-| generated_as '(' a_expr ')' VIRTUAL
-  {
-    $$.val = &tree.ColumnComputedDef{Expr: $3.expr(), Virtual: true}
+    $$.val = &tree.ColumnComputedDef{Expr: $3.expr(), Virtual: $5.bool()}
   }
 | generated_as error
   {
-    sqllex.Error("use AS ( <expr> ) STORED or AS ( <expr> ) VIRTUAL")
+    sqllex.Error("use AS ( <expr> ), AS ( <expr> ) STORED, or AS ( <expr> ) VIRTUAL")
     return 1
   }
 | generated_always_as IDENTITY '(' opt_sequence_option_list ')'
@@ -12053,6 +12049,23 @@ opt_without_index:
 | /* EMPTY */
   {
     $$.val = false
+  }
+
+// opt_virtual_or_stored optionally specifies whether a generated column is
+// VIRTUAL or STORED. When neither keyword is given, the column is VIRTUAL,
+// matching PostgreSQL.
+opt_virtual_or_stored:
+  STORED
+  {
+    $$.val = false
+  }
+| VIRTUAL
+  {
+    $$.val = true
+  }
+| /* EMPTY */
+  {
+    $$.val = true
   }
 
 generated_as:

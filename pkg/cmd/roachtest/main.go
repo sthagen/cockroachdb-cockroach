@@ -265,7 +265,7 @@ Example:
 					return err
 				}
 			}
-			ops := r.FilteredOperations(registry.MergeRegEx(args), skipRegex)
+			ops := r.FilteredOperations(registry.MergeRegEx(args), skipRegex, roachtestflags.Cloud)
 			for _, op := range ops {
 				fmt.Printf("%s\n", op.Name)
 			}
@@ -514,7 +514,7 @@ func opsToRun(r testRegistryImpl, filter string, skip string) ([]registry.Operat
 			return nil, err
 		}
 	}
-	filteredOps := r.FilteredOperations(regex, skipRegex)
+	filteredOps := r.FilteredOperations(regex, skipRegex, roachtestflags.Cloud)
 	if len(filteredOps) == 0 {
 		return nil, errors.New("no matching operations to run")
 	}

@@ -1257,7 +1257,7 @@ ALTER TABLE a ADD COLUMN b INT GENERATED ALWAYS AS (1 + 1) STORED GENERATED ALWA
 error
 ALTER TABLE a ADD COLUMN b INT GENERATED ALWAYS AS (1+1) IDENTITY
 ----
-at or near "identity": syntax error: use AS ( <expr> ) STORED or AS ( <expr> ) VIRTUAL
+at or near "identity": syntax error
 DETAIL: source SQL:
 ALTER TABLE a ADD COLUMN b INT GENERATED ALWAYS AS (1+1) IDENTITY
                                                          ^

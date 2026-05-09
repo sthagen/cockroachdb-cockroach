@@ -529,7 +529,10 @@ func TestPGPreparedQuery(t *testing.T) {
 		}},
 		{"SHOW CONSTRAINTS FROM system.users", []preparedQueryTest{
 			baseTest.Results("users", "primary", "PRIMARY KEY", "PRIMARY KEY (username ASC)", true).
-				Results("users", "users_user_id_idx", "UNIQUE", "UNIQUE (user_id ASC)", true),
+				Results("users", "users_isRole_not_null", "NOT NULL", "NOT NULL", true).
+				Results("users", "users_user_id_idx", "UNIQUE", "UNIQUE (user_id ASC)", true).
+				Results("users", "users_user_id_not_null", "NOT NULL", "NOT NULL", true).
+				Results("users", "users_username_not_null", "NOT NULL", "NOT NULL", true),
 		}},
 		{"SHOW TIME ZONE", []preparedQueryTest{
 			baseTest.Results("UTC"),

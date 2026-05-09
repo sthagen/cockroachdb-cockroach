@@ -344,11 +344,12 @@ table_name  index_name  non_unique  seq_in_index  column_name  definition  direc
 descriptor  primary     false       1             id           id          ASC        false    false     true     1
 descriptor  primary     false       2             descriptor   descriptor  N/A        true     false     true     1
 
-query TTTTB colnames
+query TTTTB colnames,nosort
 SELECT * FROM [SHOW CONSTRAINT FROM system.descriptor]
 ----
-table_name  constraint_name  constraint_type  details               validated
-descriptor  primary          PRIMARY KEY      PRIMARY KEY (id ASC)  true
+table_name  constraint_name         constraint_type  details               validated
+descriptor  primary                 PRIMARY KEY      PRIMARY KEY (id ASC)  true
+descriptor  descriptor_id_not_null  NOT NULL         NOT NULL              true
 
 query TTBITTTBBBF colnames,rowsort
 SELECT * FROM [SHOW KEYS FROM system.descriptor]

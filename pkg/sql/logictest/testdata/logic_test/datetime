@@ -2222,6 +2222,7 @@ SELECT details FROM [SHOW CONSTRAINTS FROM t97643];
 ----
 PRIMARY KEY (rowid ASC)
 CHECK ((parse_time('abc'::text) = parse_time('abc'::text)))
+NOT NULL
 
 subtest experimental_strftime_year_padding
 

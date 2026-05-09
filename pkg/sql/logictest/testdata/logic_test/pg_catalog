@@ -363,7 +363,8 @@ table_name  index_name  non_unique  seq_in_index  column_name  definition  direc
 query TTTTB colnames
 SHOW CONSTRAINTS FROM pg_catalog.pg_namespace
 ----
-table_name  constraint_name  constraint_type  details  validated
+table_name    constraint_name                constraint_type  details   validated
+pg_namespace  pg_namespace_nspname_not_null  NOT NULL         NOT NULL  true
 
 query TTTTTB colnames
 SHOW GRANTS ON pg_catalog.pg_namespace
@@ -1738,28 +1739,39 @@ FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-conname        connamespace  contype  condef
-t1_pkey        109           p        PRIMARY_KEY_(p_ASC)
-t1_a_key       109           u        UNIQUE_(a_ASC)
-index_key      109           u        UNIQUE_(b_ASC,_c_ASC)
-primary        109           p        PRIMARY_KEY_(value_ASC)
-primary        109           p        PRIMARY_KEY_(value_ASC)
-t2_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-fk             109           f        FOREIGN_KEY_(t1_id)_REFERENCES_t1(a)
-t3_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-check_b        109           c        CHECK_((b_>_11))
-check_c        109           c        CHECK_((c_!=_''::text))
-fk             109           f        FOREIGN_KEY_(a,_b)_REFERENCES_t1(b,_c)
-t4_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-unique_a       109           u        UNIQUE_WITHOUT_INDEX_(a)
-uwi_b_c        109           u        UNIQUE_WITHOUT_INDEX_(b,_c)
-uwi_b_partial  109           u        UNIQUE_WITHOUT_INDEX_(b)_WHERE_(c_=_'foo'::text)
-t5_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-fk_b_c         109           f        FOREIGN_KEY_(b,_c)_REFERENCES_t4(b,_c)_MATCH_FULL_ON_UPDATE_RESTRICT
-t5_a_fkey      109           f        FOREIGN_KEY_(a)_REFERENCES_t4(a)_ON_DELETE_CASCADE
-t6_pkey        109           p        PRIMARY_KEY_(rowid_ASC)
-t6_expr_key    109           u        UNIQUE_(lower(c)_ASC)
-mv1_pkey       109           p        PRIMARY_KEY_(rowid_ASC)
+conname                  connamespace  contype  condef
+t1_pkey                  109           p        PRIMARY_KEY_(p_ASC)
+t1_a_key                 109           u        UNIQUE_(a_ASC)
+index_key                109           u        UNIQUE_(b_ASC,_c_ASC)
+t1_p_not_null            109           n        NOT_NULL
+t1_m_not_null            109           n        NOT_NULL
+t1_n_not_null            109           n        NOT_NULL
+primary                  109           p        PRIMARY_KEY_(value_ASC)
+t1_m_seq_value_not_null  109           n        NOT_NULL
+primary                  109           p        PRIMARY_KEY_(value_ASC)
+t1_n_seq_value_not_null  109           n        NOT_NULL
+t2_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+fk                       109           f        FOREIGN_KEY_(t1_id)_REFERENCES_t1(a)
+t2_rowid_not_null        109           n        NOT_NULL
+t3_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+check_b                  109           c        CHECK_((b_>_11))
+check_c                  109           c        CHECK_((c_!=_''::text))
+fk                       109           f        FOREIGN_KEY_(a,_b)_REFERENCES_t1(b,_c)
+t3_rowid_not_null        109           n        NOT_NULL
+t4_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+unique_a                 109           u        UNIQUE_WITHOUT_INDEX_(a)
+uwi_b_c                  109           u        UNIQUE_WITHOUT_INDEX_(b,_c)
+uwi_b_partial            109           u        UNIQUE_WITHOUT_INDEX_(b)_WHERE_(c_=_'foo'::text)
+t4_rowid_not_null        109           n        NOT_NULL
+t5_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+fk_b_c                   109           f        FOREIGN_KEY_(b,_c)_REFERENCES_t4(b,_c)_MATCH_FULL_ON_UPDATE_RESTRICT
+t5_a_fkey                109           f        FOREIGN_KEY_(a)_REFERENCES_t4(a)_ON_DELETE_CASCADE
+t5_rowid_not_null        109           n        NOT_NULL
+t6_pkey                  109           p        PRIMARY_KEY_(rowid_ASC)
+t6_expr_key              109           u        UNIQUE_(lower(c)_ASC)
+t6_rowid_not_null        109           n        NOT_NULL
+mv1_pkey                 109           p        PRIMARY_KEY_(rowid_ASC)
+mv1_rowid_not_null       109           n        NOT_NULL
 
 query TTBBBOOOB colnames,rowsort
 SELECT conname, contype, condeferrable, condeferred, convalidated, conrelid, contypid, conindid, conenforced
@@ -1767,34 +1779,45 @@ FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-conname        contype  condeferrable  condeferred  convalidated  conrelid  contypid  conindid    conenforced
-t1_pkey        p        false          false        true          110       0         3687884466  true
-t1_a_key       u        false          false        true          110       0         3687884465  true
-index_key      u        false          false        true          110       0         3687884464  true
-primary        p        false          false        true          111       0         2342807459  true
-primary        p        false          false        true          112       0         5181036     true
-t2_pkey        p        false          false        true          113       0         2955071325  true
-fk             f        false          false        true          113       0         3687884465  true
-t3_pkey        p        false          false        true          114       0         2695335054  true
-check_b        c        false          false        true          114       0         0           true
-check_c        c        false          false        true          114       0         0           true
-fk             f        false          false        true          114       0         3687884464  true
-t4_pkey        p        false          false        true          116       0         3214807592  true
-unique_a       u        false          false        true          116       0         0           true
-uwi_b_c        u        false          false        true          116       0         0           true
-uwi_b_partial  u        false          false        true          116       0         0           true
-t5_pkey        p        false          false        true          117       0         1869730585  true
-fk_b_c         f        false          false        true          117       0         0           true
-t5_a_fkey      f        false          false        true          117       0         0           true
-t6_pkey        p        false          false        true          120       0         2129466852  true
-t6_expr_key    u        false          false        true          120       0         2129466848  true
-mv1_pkey       p        false          false        true          121       0         784389845   true
+conname                  contype  condeferrable  condeferred  convalidated  conrelid  contypid  conindid    conenforced
+t1_pkey                  p        false          false        true          110       0         3687884466  true
+t1_a_key                 u        false          false        true          110       0         3687884465  true
+index_key                u        false          false        true          110       0         3687884464  true
+t1_p_not_null            n        false          false        true          110       0         0           true
+t1_m_not_null            n        false          false        true          110       0         0           true
+t1_n_not_null            n        false          false        true          110       0         0           true
+primary                  p        false          false        true          111       0         2342807459  true
+t1_m_seq_value_not_null  n        false          false        true          111       0         0           true
+primary                  p        false          false        true          112       0         5181036     true
+t1_n_seq_value_not_null  n        false          false        true          112       0         0           true
+t2_pkey                  p        false          false        true          113       0         2955071325  true
+fk                       f        false          false        true          113       0         3687884465  true
+t2_rowid_not_null        n        false          false        true          113       0         0           true
+t3_pkey                  p        false          false        true          114       0         2695335054  true
+check_b                  c        false          false        true          114       0         0           true
+check_c                  c        false          false        true          114       0         0           true
+fk                       f        false          false        true          114       0         3687884464  true
+t3_rowid_not_null        n        false          false        true          114       0         0           true
+t4_pkey                  p        false          false        true          116       0         3214807592  true
+unique_a                 u        false          false        true          116       0         0           true
+uwi_b_c                  u        false          false        true          116       0         0           true
+uwi_b_partial            u        false          false        true          116       0         0           true
+t4_rowid_not_null        n        false          false        true          116       0         0           true
+t5_pkey                  p        false          false        true          117       0         1869730585  true
+fk_b_c                   f        false          false        true          117       0         0           true
+t5_a_fkey                f        false          false        true          117       0         0           true
+t5_rowid_not_null        n        false          false        true          117       0         0           true
+t6_pkey                  p        false          false        true          120       0         2129466852  true
+t6_expr_key              u        false          false        true          120       0         2129466848  true
+t6_rowid_not_null        n        false          false        true          120       0         0           true
+mv1_pkey                 p        false          false        true          121       0         784389845   true
+mv1_rowid_not_null       n        false          false        true          121       0         0           true
 
 query T
 SELECT conname
 FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
-WHERE n.nspname = 'public' AND contype NOT IN ('c', 'f', 'p', 'u')
+WHERE n.nspname = 'public' AND contype NOT IN ('c', 'f', 'n', 'p', 'u')
 ORDER BY con.oid
 ----
 
@@ -1842,28 +1865,39 @@ FROM pg_catalog.pg_constraint con
 JOIN pg_catalog.pg_namespace n ON con.connamespace = n.oid
 WHERE n.nspname = 'public'
 ----
-conname        conislocal  coninhcount  connoinherit  conkey
-t1_pkey        true        0            true          {1}
-t1_a_key       true        0            true          {2}
-index_key      true        0            true          {3,4}
-primary        true        0            true          {1}
-primary        true        0            true          {1}
-t2_pkey        true        0            true          {2}
-fk             true        0            true          {1}
-t3_pkey        true        0            true          {4}
-check_b        true        0            true          {2}
-check_c        true        0            true          {3}
-fk             true        0            true          {1,2}
-t4_pkey        true        0            true          {4}
-unique_a       true        0            true          NULL
-uwi_b_c        true        0            true          NULL
-uwi_b_partial  true        0            true          NULL
-t5_pkey        true        0            true          {4}
-fk_b_c         true        0            true          {2,3}
-t5_a_fkey      true        0            true          {1}
-t6_pkey        true        0            true          {6}
-t6_expr_key    true        0            true          {7}
-mv1_pkey       true        0            true          {2}
+conname                  conislocal  coninhcount  connoinherit  conkey
+t1_pkey                  true        0            true          {1}
+t1_a_key                 true        0            true          {2}
+index_key                true        0            true          {3,4}
+t1_p_not_null            true        0            false         {1}
+t1_m_not_null            true        0            false         {14}
+t1_n_not_null            true        0            false         {15}
+primary                  true        0            true          {1}
+t1_m_seq_value_not_null  true        0            false         {1}
+primary                  true        0            true          {1}
+t1_n_seq_value_not_null  true        0            false         {1}
+t2_pkey                  true        0            true          {2}
+fk                       true        0            true          {1}
+t2_rowid_not_null        true        0            false         {2}
+t3_pkey                  true        0            true          {4}
+check_b                  true        0            true          {2}
+check_c                  true        0            true          {3}
+fk                       true        0            true          {1,2}
+t3_rowid_not_null        true        0            false         {4}
+t4_pkey                  true        0            true          {4}
+unique_a                 true        0            true          NULL
+uwi_b_c                  true        0            true          NULL
+uwi_b_partial            true        0            true          NULL
+t4_rowid_not_null        true        0            false         {4}
+t5_pkey                  true        0            true          {4}
+fk_b_c                   true        0            true          {2,3}
+t5_a_fkey                true        0            true          {1}
+t5_rowid_not_null        true        0            false         {4}
+t6_pkey                  true        0            true          {6}
+t6_expr_key              true        0            true          {7}
+t6_rowid_not_null        true        0            false         {6}
+mv1_pkey                 true        0            true          {2}
+mv1_rowid_not_null       true        0            false         {2}
 
 query TTTTTTTTT colnames
 SELECT conname, confkey, conpfeqop, conppeqop, conffeqop, conexclop, conbin, consrc, pg_get_constraintdef(con.oid) as condef
@@ -4461,20 +4495,22 @@ CREATE TABLE t(x INT UNIQUE);
 query TTT
 SELECT conname, confupdtype, confdeltype FROM pg_constraint ORDER BY conname
 ----
-t_pkey    NULL  NULL
-t_x_key   NULL  NULL
-u_a_fkey  a     a
-u_b_fkey  a     r
-u_c_fkey  a     n
-u_d_fkey  a     d
-u_e_fkey  a     c
-u_f_fkey  a     a
-u_g_fkey  r     a
-u_h_fkey  n     a
-u_i_fkey  d     a
-u_j_fkey  c     a
-u_k_fkey  n     r
-u_pkey    NULL  NULL
+t_pkey            NULL  NULL
+t_rowid_not_null  NULL  NULL
+t_x_key           NULL  NULL
+u_a_fkey          a     a
+u_b_fkey          a     r
+u_c_fkey          a     n
+u_d_fkey          a     d
+u_e_fkey          a     c
+u_f_fkey          a     a
+u_g_fkey          r     a
+u_h_fkey          n     a
+u_i_fkey          d     a
+u_j_fkey          c     a
+u_k_fkey          n     r
+u_pkey            NULL  NULL
+u_rowid_not_null  NULL  NULL
 
 statement ok
 DROP TABLE u; DROP TABLE t
@@ -4492,11 +4528,13 @@ CREATE TABLE w(
 query TT
 SELECT conname, confmatchtype FROM pg_constraint ORDER BY conname
 ----
-v_pkey      NULL
-v_x_y_key   NULL
-w_a_b_fkey  f
-w_c_d_fkey  s
-w_pkey      NULL
+v_pkey            NULL
+v_rowid_not_null  NULL
+v_x_y_key         NULL
+w_a_b_fkey        f
+w_c_d_fkey        s
+w_pkey            NULL
+w_rowid_not_null  NULL
 
 statement ok
 DROP DATABASE d34862 CASCADE; SET database=test
@@ -4638,10 +4676,11 @@ ON c.conrelid = t.oid
 WHERE t.relname = 'partial_index_table'
 ORDER BY conname
 ----
-conname                     condef
-partial_index_table_a_key   UNIQUE (a ASC) WHERE (a > 0)
-partial_index_table_a_key1  UNIQUE (a ASC) WHERE (b IN ('foo'::public.testenum, 'bar'::public.testenum))
-partial_index_table_pkey    PRIMARY KEY (rowid ASC)
+conname                             condef
+partial_index_table_a_key           UNIQUE (a ASC) WHERE (a > 0)
+partial_index_table_a_key1          UNIQUE (a ASC) WHERE (b IN ('foo'::public.testenum, 'bar'::public.testenum))
+partial_index_table_pkey            PRIMARY KEY (rowid ASC)
+partial_index_table_rowid_not_null  NOT NULL
 
 subtest regression_46799
 statement ok
@@ -6298,5 +6337,62 @@ statement ok
 DROP TABLE pg_attrdef_alter_identity
 
 subtest end
+
+subtest pg_constraint_not_null
+
+# Match PostgreSQL: every NOT NULL column gets a synthetic pg_constraint row of
+# type 'n', regardless of whether the column became non-nullable via an explicit
+# modifier, a primary key, or ALTER TABLE ... SET NOT NULL. The constraint
+# name must follow PG's default ("<table>_<column>_not_null") so pg_dump
+# suppresses the explicit CONSTRAINT clause and emits a bare NOT NULL.
+
+statement ok
+CREATE TABLE notnull_test (
+  id INT PRIMARY KEY,
+  explicit_nn TEXT NOT NULL,
+  nullable TEXT,
+  later_nn TEXT,
+  pk_explicit_nn INT NOT NULL
+);
+ALTER TABLE notnull_test ALTER COLUMN later_nn SET NOT NULL;
+
+query TTT rowsort
+SELECT conname, contype::text, conkey::text
+FROM pg_catalog.pg_constraint
+WHERE conrelid = 'notnull_test'::regclass AND contype = 'n'
+----
+notnull_test_id_not_null              n  {1}
+notnull_test_explicit_nn_not_null     n  {2}
+notnull_test_later_nn_not_null        n  {4}
+notnull_test_pk_explicit_nn_not_null  n  {5}
+
+# The PK column also has its dedicated pg_constraint row of type 'p' — both
+# rows coexist, matching PG.
+query TTT rowsort
+SELECT conname, contype::text, conkey::text
+FROM pg_catalog.pg_constraint
+WHERE conrelid = 'notnull_test'::regclass AND contype IN ('p', 'n') AND conkey = '{1}'
+----
+notnull_test_pkey         p  {1}
+notnull_test_id_not_null  n  {1}
+
+# pg_dump 18 joins on (a.attrelid = co.conrelid AND co.contype = 'n'
+# AND co.conkey = array[a.attnum]). Confirm that join finds exactly the
+# non-nullable columns and nothing else.
+query TT rowsort
+SELECT a.attname, co.conname
+FROM pg_catalog.pg_attribute a
+LEFT JOIN pg_catalog.pg_constraint co
+  ON a.attrelid = co.conrelid AND co.contype = 'n' AND co.conkey = array[a.attnum]
+WHERE a.attrelid = 'notnull_test'::regclass AND a.attnum > 0
+----
+id              notnull_test_id_not_null
+explicit_nn     notnull_test_explicit_nn_not_null
+nullable        NULL
+later_nn        notnull_test_later_nn_not_null
+pk_explicit_nn  notnull_test_pk_explicit_nn_not_null
+
+statement ok
+DROP TABLE notnull_test
 
 subtest end

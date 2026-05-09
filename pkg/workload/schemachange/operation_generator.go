@@ -3989,9 +3989,13 @@ func (og *operationGenerator) randConstraint(
 	if err := og.setSeedInDB(ctx, tx); err != nil {
 		return "", err
 	}
+	// NOT NULL rows in pg_constraint are synthesized from non-nullable column
+	// metadata, so they cannot be dropped via ALTER TABLE ... DROP CONSTRAINT.
+	// Skip them when picking a random constraint for drop.
 	q := fmt.Sprintf(`
   SELECT constraint_name
     FROM [SHOW CONSTRAINTS FROM %s]
+   WHERE constraint_type <> 'NOT NULL'
 ORDER BY random()
    LIMIT 1;
 `, tableName)

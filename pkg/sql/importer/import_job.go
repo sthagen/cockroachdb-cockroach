@@ -920,7 +920,8 @@ func ingestWithRetry(
 	var res kvpb.BulkOpSummary
 	var err error
 	// State to decide when to exit the retry loop.
-	lastProgressChange, lastProgress := timeutil.Now(), getFractionCompleted(job)
+	var lastProgressChange time.Time
+	lastProgress := getFractionCompleted(job)
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		for {
 			res, err = distImport(
@@ -977,7 +978,10 @@ func ingestWithRetry(
 		}
 
 		maxRetryDuration := retryDuration.Get(&execCtx.ExecCfg().Settings.SV)
-		if timeutil.Since(lastProgressChange) > maxRetryDuration {
+		if lastProgressChange.IsZero() {
+			lastProgressChange = timeutil.Now()
+			log.Dev.Warningf(ctx, "encountered retryable error, starting retry duration timer: %+v", err)
+		} else if timeutil.Since(lastProgressChange) > maxRetryDuration {
 			log.Dev.Warningf(ctx, "encountered retryable error but exceeded retry duration, stopping: %+v", err)
 			break
 		} else {

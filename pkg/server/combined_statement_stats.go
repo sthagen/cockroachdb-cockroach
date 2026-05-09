@@ -65,14 +65,11 @@ func getTimeFromSeconds(seconds int64) *time.Time {
 	return nil
 }
 
-func closeIterator(it isql.Rows, err error) error {
-	if it != nil {
-		closeErr := it.Close()
-		if closeErr != nil {
-			err = errors.CombineErrors(err, closeErr)
-		}
+func closeIterator(it isql.Rows, retErr *error) {
+	closeErr := it.Close()
+	if closeErr != nil {
+		*retErr = errors.CombineErrors(*retErr, closeErr)
 	}
-	return err
 }
 
 func (s *statusServer) CombinedStatementStats(
@@ -213,7 +210,7 @@ func activityTablesHaveFullData(
 	reqStartTime *time.Time,
 	limit int64,
 	order serverpb.StatsSortOptions,
-) (result bool, err error) {
+) (result bool, retErr error) {
 
 	if !StatsActivityUIEnabled.Get(&settings.SV) {
 		return false, nil
@@ -253,6 +250,7 @@ FROM crdb_internal.statement_activity
 	if err != nil {
 		return false, err
 	}
+	defer closeIterator(it, &retErr)
 	ok, err := it.Next(ctx)
 	if err != nil {
 		return false, err
@@ -265,10 +263,6 @@ FROM crdb_internal.statement_activity
 	if row = it.Cur(); row == nil {
 		return false, errors.New("unexpected null row on activityTablesHaveFullData")
 	}
-
-	defer func() {
-		err = closeIterator(it, err)
-	}()
 
 	minAggregatedTs := tree.MustBeDTimestampTZ(row[0]).Time
 
@@ -326,7 +320,7 @@ func getSourceStatsInfo(
 	}
 	whereClauseOldestDate := buffer.String()
 
-	getRuntime := func(table string, createQuery func(tableName string) string) (float32, error) {
+	getRuntime := func(table string, createQuery func(tableName string) string) (_ float32, retErr error) {
 
 		queryToGetClusterTotalRunTime := createQuery(table)
 		it, err := ie.QueryIteratorEx(
@@ -335,14 +329,10 @@ func getSourceStatsInfo(
 			nil,
 			sessiondata.NodeUserSessionDataOverride,
 			queryToGetClusterTotalRunTime, args...)
-
 		if err != nil {
 			return 0, err
 		}
-
-		defer func() {
-			err = closeIterator(it, err)
-		}()
+		defer closeIterator(it, &retErr)
 
 		ok, err := it.Next(ctx)
 		if err != nil {
@@ -362,7 +352,7 @@ func getSourceStatsInfo(
 		return float32(tree.MustBeDFloat(row[0])), nil
 	}
 
-	getOldestDate := func(table string) (*time.Time, error) {
+	getOldestDate := func(table string) (_ *time.Time, retErr error) {
 		it, err := ie.QueryIteratorEx(
 			ctx,
 			redact.Sprintf(`console-combined-stmts-%s-oldest_date`, table),
@@ -375,6 +365,7 @@ FROM %s %s`, table, whereClauseOldestDate), args...)
 		if err != nil {
 			return nil, err
 		}
+		defer closeIterator(it, &retErr)
 		ok, err := it.Next(ctx)
 		if err != nil {
 			return nil, err
@@ -387,9 +378,6 @@ FROM %s %s`, table, whereClauseOldestDate), args...)
 		if row = it.Cur(); row == nil {
 			return nil, nil
 		}
-		defer func() {
-			err = closeIterator(it, err)
-		}()
 
 		if row[0] == tree.DNull {
 			return nil, nil
@@ -655,14 +643,11 @@ func (r *statementStatsRunner) collectCombinedStatements(
 	args []interface{},
 	orderAndLimit string,
 	settings *cluster.Settings,
-) ([]serverpb.StatementsResponse_CollectedStatementStatistics, error) {
+) (_ []serverpb.StatementsResponse_CollectedStatementStatistics, retErr error) {
 	aostClause := r.testingKnobs.GetAOSTClause()
 	const expectedNumDatums = 9
 	var it isql.Rows
 	var err error
-	defer func() {
-		err = closeIterator(it, err)
-	}()
 
 	switch r.stmtSourceTable {
 	case CrdbInternalStmtStatsCached:
@@ -695,6 +680,7 @@ func (r *statementStatsRunner) collectCombinedStatements(
 	if err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
+	defer closeIterator(it, &retErr)
 
 	var statements []serverpb.StatementsResponse_CollectedStatementStatistics
 	var ok bool
@@ -844,7 +830,7 @@ func getIterator(
 
 func (r *statementStatsRunner) collectCombinedTransactions(
 	ctx context.Context, whereClause string, args []interface{}, orderAndLimit string,
-) ([]serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics, error) {
+) (_ []serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics, retErr error) {
 	aostClause := r.testingKnobs.GetAOSTClause()
 	const expectedNumDatums = 5
 	const queryFormat = `
@@ -860,10 +846,7 @@ FROM (SELECT app_name,
           fingerprint_id) %s
 %s`
 
-	var it isql.Rows
-	var err error
-
-	it, err = getIterator(
+	it, err := getIterator(
 		ctx,
 		r.ie,
 		queryFormat,
@@ -877,9 +860,7 @@ FROM (SELECT app_name,
 	if err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
-	defer func() {
-		err = closeIterator(it, err)
-	}()
+	defer closeIterator(it, &retErr)
 
 	var transactions []serverpb.StatementsResponse_ExtendedCollectedTransactionStatistics
 	var ok bool

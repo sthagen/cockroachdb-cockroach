@@ -6389,7 +6389,10 @@ CREATE TABLE t (
 			{"1", "1"}, {"2", "2"}, {"3", "3"},
 		})
 		sqlDB.CheckQueryResults(t, `SELECT constraint_name, validated from [SHOW CONSTRAINTS FROM t] ORDER BY 1;`, [][]string{
-			{"check_crdb_internal_x_shard_16", "true"}, {"t_pkey", "true"},
+			{"check_crdb_internal_x_shard_16", "true"},
+			{"t_crdb_internal_x_shard_16_not_null", "true"},
+			{"t_pkey", "true"},
+			{"t_rowid_not_null", "true"},
 		})
 	})
 }

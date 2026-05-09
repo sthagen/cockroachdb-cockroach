@@ -1397,6 +1397,58 @@ func populateTableConstraints(
 			return err
 		}
 	}
+
+	// Synthesize a NOT NULL constraint row for each non-nullable column.
+	// PostgreSQL exposes one of these for every NOT NULL column (whether it
+	// became non-nullable via an explicit modifier, a primary key, or
+	// ALTER TABLE ... SET NOT NULL); CockroachDB doesn't model NOT NULL as a
+	// separate constraint object, so we materialize the rows on the fly to
+	// match. Naming the synthetic constraint "<table>_<column>_not_null" lines
+	// up with PostgreSQL's default name.
+	for _, col := range table.AccessibleColumns() {
+		if col.IsNullable() {
+			continue
+		}
+		conkey, err := colIDArrayToDatum([]descpb.ColumnID{col.GetID()})
+		if err != nil {
+			return err
+		}
+		conname := fmt.Sprintf("%s_%s_not_null", table.GetName(), col.GetName())
+		if err := addRow(
+			h.NotNullConstraintOid(db.GetID(), sc.GetID(), table.GetID(), col.GetID()), // oid
+			tree.NewDName(conname),      // conname
+			namespaceOid,                // connamespace
+			conTypeNotNull,              // contype
+			tree.DBoolFalse,             // condeferrable
+			tree.DBoolFalse,             // condeferred
+			tree.DBoolTrue,              // convalidated
+			tblOid,                      // conrelid
+			oidZero,                     // contypid
+			oidZero,                     // conindid
+			oidZero,                     // conparentid
+			oidZero,                     // confrelid
+			tree.DNull,                  // confupdtype
+			tree.DNull,                  // confdeltype
+			tree.DNull,                  // confmatchtype
+			tree.DBoolTrue,              // conislocal
+			zeroVal,                     // coninhcount
+			tree.DBoolFalse,             // connoinherit
+			conkey,                      // conkey
+			tree.DNull,                  // confkey
+			tree.DNull,                  // conpfeqop
+			tree.DNull,                  // conppeqop
+			tree.DNull,                  // conffeqop
+			tree.DNull,                  // confdelsetcols
+			tree.DNull,                  // conexclop
+			tree.DNull,                  // conbin
+			tree.DNull,                  // consrc
+			tree.NewDString("NOT NULL"), // condef
+			tree.DBoolTrue,              // conenforced
+			tree.DBoolFalse,             // conperiod
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -6312,6 +6364,7 @@ const (
 	policyTypeTag
 	roleMembershipTypeTag
 	domainConstraintTypeTag
+	notNullConstraintTypeTag
 )
 
 func (h oidHasher) writeTypeTag(tag oidTypeTag) {
@@ -6434,6 +6487,22 @@ func (h oidHasher) DomainConstraintOid(
 	h.writeTypeTag(domainConstraintTypeTag)
 	h.writeUInt32(uint32(typeOid))
 	h.writeUInt32(uint32(constraintID))
+	return h.getOid()
+}
+
+// NotNullConstraintOid returns a stable OID for the synthetic NOT NULL
+// constraint that pg_catalog.pg_constraint exposes for a non-nullable column.
+// CockroachDB does not model NOT NULL as a separate constraint object, so the
+// constraint is materialized on the fly and keyed by the (db, schema, table,
+// column) tuple to keep the OID stable across catalog reads.
+func (h oidHasher) NotNullConstraintOid(
+	dbID descpb.ID, scID descpb.ID, tableID descpb.ID, columnID descpb.ColumnID,
+) *tree.DOid {
+	h.writeTypeTag(notNullConstraintTypeTag)
+	h.writeDB(dbID)
+	h.writeSchema(scID)
+	h.writeTable(tableID)
+	h.writeUInt32(uint32(columnID))
 	return h.getOid()
 }
 

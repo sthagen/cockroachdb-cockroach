@@ -326,13 +326,6 @@ type WorkQueue struct {
 		// 1 vs rg 1) does not collide on a single container.
 		// Periodically GC'd by gcGroupsResetUsedAndUpdateEstimators.
 		groups map[groupKey]*groupInfo
-		// maxCPUGroups maps a resource-group container key to whether that
-		// group always qualifies for burst (MAX_CPU). Keys are constructed
-		// via rgGroupKey when SetMaxCPUGroups runs, so a numerically equal
-		// tenant-keyed container can never collide on a lookup. Only used
-		// if mode == usesCPUTimeTokens and admission.cpu_time_tokens.mode
-		// == "resource_manager".
-		maxCPUGroups map[groupKey]bool
 
 		// useResourceGroup, when true, derives the resource group ID from
 		// WorkInfo.Priority instead of WorkInfo.TenantID. Used in Resource
@@ -355,21 +348,37 @@ type WorkQueue struct {
 		maxQueueDelayToSwitchToLifo time.Duration
 		// Only used if mode == usesCPUTimeTokens.
 		defaultCPUTimeTokenEstimator cpuTimeTokenEstimator
-		// burstBucketCapacity is the capacity for newly created group burst
-		// buckets. Note that buckets init full, so burstBucketCapacity is also
-		// the starting token count. Updated by refillBurstBuckets. Only used
-		// if mode == usesCPUTimeTokens.
+		// burstBucketCapacity is the (tokens, capacity) seed used when a
+		// new groupInfo is created via Admit lazy-create or
+		// applyConfigLocked pre-create. Both fields take this value, so
+		// new groups start full and can burst immediately.
 		//
-		// TODO(wenyihu6): For RM, a group that appears between refills will use
-		// burstBucketCapacity (which may be stale or zero) until the next refill
-		// delivers its correct per-group capacity within 1ms. We should plumb the
-		// per-group capacity to newGroupInfo at creation time so new groups don't
-		// wait for the next refill cycle.
+		// Serverless mode: refreshed every 1ms by refillBurstBuckets to
+		// match the uniform per-tenant capacity.
+		//
+		// RM mode: left at zero. RM capacities scale by per-group weight,
+		// so no queue-wide value is correct. Seeding with the unscaled
+		// 100% value would briefly grant unearned burst budget to
+		// non-MAX_CPU groups; seeding with zero only throttles a brand-
+		// new group for at most one refill tick (1ms), which is the safer
+		// failure mode. refillRMGroupBurstBuckets installs the correct
+		// per-group capacity on the next tick.
 		burstBucketCapacity int64
 		// overrideAllToBypassAdmission, when true, causes all work to bypass
 		// admission control. Used by CPU time token AC.
 		overrideAllToBypassAdmission bool
 	}
+
+	// configHolder owns the per-resource-group config for RM mode. Always
+	// non-nil; non-CTT WorkQueues hold their own holder but never read it
+	// because useResourceGroup stays false. See
+	// resource_group_config_holder.go for the type's lifecycle contract.
+	//
+	// Lock ordering: q.mu is acquired first, holder.mu second. Never the
+	// reverse. All current readers (Snapshot) are called from sites that
+	// already hold q.mu.
+	configHolder *ResourceGroupConfigHolder
+
 	logThreshold log.EveryN
 	metrics      *WorkQueueMetrics
 	stopCh       chan struct{}
@@ -401,6 +410,12 @@ type workQueueOptions struct {
 	// metrics. Only set when mode == usesCPUTimeTokens. See
 	// cpuTimeTokenMetrics for details.
 	perGroupAggMetrics *groupAggMetrics
+	// configHolder is the per-resource-group config for RM mode. The CTT
+	// grant coordinator passes a shared holder across both per-tier
+	// WorkQueues; other call sites leave this nil and initWorkQueue
+	// allocates a fresh holder. See WorkQueue.configHolder for the full
+	// contract.
+	configHolder *ResourceGroupConfigHolder
 
 	// timeSource can be set to non-nil for tests. If nil,
 	// the timeutil.DefaultTimeSource will be used.
@@ -481,6 +496,10 @@ func initWorkQueue(
 	q.logThreshold = log.Every(5 * time.Minute)
 	q.metrics = metrics
 	q.stopCh = stopCh
+	q.configHolder = opts.configHolder
+	if q.configHolder == nil {
+		q.configHolder = newResourceGroupConfigHolder()
+	}
 	q.perGroupAggMetrics = opts.perGroupAggMetrics
 	q.timeSource = timeSource
 	q.knobs = knobs
@@ -736,10 +755,16 @@ func priorityToResourceGroupKey(pri admissionpb.WorkPriority) groupKey {
 // setUseResourceGroup enables or disables priority-based resource
 // group derivation. When enabled, the resource group ID is derived
 // from WorkInfo.Priority instead of WorkInfo.TenantID.
+//
+// When enabled is true, the current holder snapshot is also applied
+// to q.mu.groups via applyConfigLocked.
 func (q *WorkQueue) setUseResourceGroup(enabled bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.mu.useResourceGroup = enabled
+	if enabled {
+		q.applyConfigLocked(q.configHolder.Snapshot())
+	}
 }
 
 // groupKeyForWorkLocked returns the composite groupKey for the given
@@ -816,8 +841,8 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (AdmitResponse, er
 		// dedicated to that group yet. When we create the groupInfo struct
 		// here, we also create the estimator. We init the estimator using a
 		// global estimator that sees workload across all groups.
-		maxCPU := q.getMaxCPULocked(gKey)
-		group = newGroupInfo(gKey, q.getGroupWeightLocked(gKey),
+		weights, maxCPU := q.getGroupWeightLocked(gKey)
+		group = newGroupInfo(gKey, weights,
 			q.mode, q.mu.defaultCPUTimeTokenEstimator.estimateTokensToBeUsed(), q.mu.burstBucketCapacity,
 			maxCPU, q.perGroupAggMetrics)
 		q.mu.groups[gKey] = group
@@ -963,8 +988,8 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (AdmitResponse, er
 		// groupInfo struct is declared.
 		group, ok = q.mu.groups[gKey]
 		if !ok {
-			maxCPU := q.getMaxCPULocked(gKey)
-			group = newGroupInfo(gKey, q.getGroupWeightLocked(gKey),
+			weights, maxCPU := q.getGroupWeightLocked(gKey)
+			group = newGroupInfo(gKey, weights,
 				q.mode, q.mu.defaultCPUTimeTokenEstimator.estimateTokensToBeUsed(), q.mu.burstBucketCapacity,
 				maxCPU, q.perGroupAggMetrics)
 			q.mu.groups[gKey] = group
@@ -1419,21 +1444,15 @@ func (q *WorkQueue) refillBurstBuckets(toAdd int64, capacity int64) {
 	}
 }
 
-// refillBurstBucketForGroup adds tokens to a specific resource group's
-// burst bucket and updates its capacity. This is called by
-// rmStrategy.refillBurst with pre-scaled per-group amounts. For example,
-// a group with WEIGHT_CPU=10% gets toAdd and capacity equal to 10% of the
-// 100% CPU rate, so its burst bucket stays at steady state when the
-// group uses ~10% of node CPU.
-// TODO(wenyihu6): actually finish the plumbing from ^
+// refillBurstBucketForGroup refills a single rgKind group's burst
+// bucket. Test-only: production refills go through
+// refillRMGroupBurstBuckets, which iterates all rgKind groups under one
+// q.mu critical section. This entry point exists for datadriven tests
+// that need to drive one group's bucket to a specific (toAdd, capacity)
+// without running the full filler.
 //
-// If the group's burst qualification changes, its position in the
-// groupHeap is updated.
-//
-// TODO(wenyihu6): investigate whether refill rates need a pre-warming
-// period after RM config changes. A sudden config swap (e.g. changing
-// which groups have maxCPU) could interact poorly with the filler's
-// model if it hasn't had time to stabilize at the new rates.
+// If the refill flips the group's burst qualification, its groupHeap
+// position is fixed.
 func (q *WorkQueue) refillBurstBucketForGroup(gKey groupKey, toAdd int64, capacity int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -1441,22 +1460,34 @@ func (q *WorkQueue) refillBurstBucketForGroup(gKey groupKey, toAdd int64, capaci
 	if !ok {
 		return
 	}
-	q.mu.burstBucketCapacity = capacity
 	q.refillBurstBucketLocked(group, toAdd, capacity)
 }
 
-// refillRMGroupBurstBuckets is the per-group RM-mode refill entry point
-// called by rmStrategy.refillBurst. rate100 may be negative when
-// resetInterval forwards a delta; cap100 is the current rate and should
-// be non-negative.
+// refillRMGroupBurstBuckets refills every rgKind group's burst bucket
+// in a single q.mu critical section. rate100 and cap100 are the 100%
+// CPU per-tick refill rate and bucket capacity; per-group amounts are
+// scaled by group.weight/100. Called by rmStrategy.refillBurst on every
+// tick.
 //
-// No-op stub today; RM mode is off by default, so the stub has no production
-// effect. Per-group refill cannot be implemented yet because per-resource-group
-// configuration (weight, MaxCPU, burstFrac) is not yet plumbed onto groupInfo.
+// Iterating q.mu.groups directly (rather than snapshotting the holder)
+// avoids a per-tick allocation. The kind filter skips any tenantKind
+// orphans left over from a prior serverless mode.
 //
-// TODO(wenyihu6): once that storage lands, wire this to iterate groupInfos
-// and refill each bucket scaled by burstFrac.
+// Holding q.mu once (instead of acquiring per group) costs one lock
+// acquire instead of N+1 and makes the refill atomic across groups: no
+// observer can see a partial-refill state.
 func (q *WorkQueue) refillRMGroupBurstBuckets(rate100, cap100 float64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for k, group := range q.mu.groups {
+		if k.kind != rgKind {
+			continue
+		}
+		burstFrac := float64(group.weight) / 100.0
+		toAdd := int64(rate100 * burstFrac)
+		capacity := int64(cap100 * burstFrac)
+		q.refillBurstBucketLocked(group, toAdd, capacity)
+	}
 }
 
 // refillBurstBucketLocked refills a group's burst bucket and fixes its
@@ -1546,47 +1577,12 @@ func (q *WorkQueue) SafeFormat(s redact.SafePrinter, _ rune) {
 // share equal weight.
 const defaultGroupWeight = 1
 
-func (q *WorkQueue) getGroupWeightLocked(_ groupKey) uint32 {
-	return defaultGroupWeight
-}
-
-// getMaxCPULocked returns the maxCPU flag for the given group.
-// Returns false if gKey is not in maxCPUGroups. Tenant-keyed
-// containers are naturally excluded because maxCPUGroups is keyed
-// by rgGroupKey (see SetMaxCPUGroups). See cpuTimeBurstBucket for
-// how this flag affects burst qualification.
-//
-// REQUIRES: q.mu is held.
-func (q *WorkQueue) getMaxCPULocked(gKey groupKey) bool {
-	q.mu.AssertHeld()
-	return q.mu.maxCPUGroups[gKey]
-}
-
-// SetMaxCPUGroups replaces all per-group maxCPU flags with the
-// provided map. Callers should construct keys via rgGroupKey: only
-// resource groups are intended to carry the MAX_CPU flag, and
-// getMaxCPULocked looks up containers by their groupKey, so a
-// tenant-keyed lookup naturally misses an rg-keyed map and returns
-// false. Groups absent from the map revert to the default
-// (maxCPU=false). Existing groups have their burst buckets updated;
-// new groups will pick up their flag when created. The map is
-// captured by reference; the caller must not modify it after
-// calling.
-func (q *WorkQueue) SetMaxCPUGroups(groups map[groupKey]bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.mu.maxCPUGroups = groups
-	for gKey, group := range q.mu.groups {
-		maxCPU := q.getMaxCPULocked(gKey)
-		if group.cpuTimeBurstBucket.maxCPU != maxCPU {
-			prevQual := group.cpuTimeBurstBucket.burstQualification()
-			group.cpuTimeBurstBucket.maxCPU = maxCPU
-			curQual := group.cpuTimeBurstBucket.burstQualification()
-			if prevQual != curQual && isInGroupHeap(group) {
-				q.mu.groupHeap.fix(group)
-			}
-		}
-	}
+// getGroupWeightLocked returns the heap weight and maxCPU flag for gKey from
+// the configHolder, which falls back to a kind-appropriate default for
+// unconfigured keys. q.mu must be held.
+func (q *WorkQueue) getGroupWeightLocked(gKey groupKey) (weight uint32, maxCPU bool) {
+	cfg := q.configHolder.Snapshot().GetOrDefault(gKey)
+	return cfg.Weight, cfg.MaxCPU
 }
 
 // SetOverrideAllToBypassAdmission sets whether all work should bypass
@@ -1595,6 +1591,72 @@ func (q *WorkQueue) SetOverrideAllToBypassAdmission(override bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.mu.overrideAllToBypassAdmission = override
+}
+
+// refreshResourceGroupConfig pushes the current holder snapshot onto
+// q.mu.groups via applyConfigLocked. Call this after configHolder.Set
+// to make a config change visible to in-flight admits. No-op when the
+// queue is not in RM mode; setUseResourceGroup(true) replays the
+// holder snapshot on the next mode entry.
+func (q *WorkQueue) refreshResourceGroupConfig() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.mu.useResourceGroup {
+		q.applyConfigLocked(q.configHolder.Snapshot())
+	}
+}
+
+// applyConfigLocked upserts each entry in the holder snapshot into
+// q.mu.groups: existing groups have their weight and maxCPU updated
+// (with a heap fix if either changes the heap order), and missing
+// rgKind groups are pre-created so the very first Admit for the ID
+// hits the fast path with the configured values already in place.
+// Entries absent from the snapshot are left in q.mu.groups and drain
+// via the GC path.
+//
+// q.mu must be held. Callers: setUseResourceGroup at RM-mode entry,
+// and refreshResourceGroupConfig on a config change.
+//
+// New-vs-existing asymmetry: a freshly pre-created groupInfo seeds
+// cpuTimeTokenEstimator and cpuTimeBurstBucket.capacity from package
+// state (defaultCPUTimeTokenEstimator, q.mu.burstBucketCapacity)
+// rather than the snapshot, so the estimator seed and bucket
+// capacity stick at their first-creation values. The bucket capacity
+// catches up on the next refillRMGroupBurstBuckets tick (within 1ms);
+// a Set that changes MaxCPU lands instantly while the implied bucket
+// capacity trails briefly.
+func (q *WorkQueue) applyConfigLocked(config ResourceGroupConfigSet) {
+	for k, d := range config {
+		group, ok := q.mu.groups[k]
+		if !ok {
+			group = newGroupInfo(k, d.Weight, q.mode,
+				q.mu.defaultCPUTimeTokenEstimator.estimateTokensToBeUsed(),
+				q.mu.burstBucketCapacity, d.MaxCPU, q.perGroupAggMetrics)
+			q.mu.groups[k] = group
+			continue
+		}
+		// Track whether anything that affects groupHeap.Less changed
+		// so we can fix the heap once at the end. Less orders by
+		// burstQualification then by used/weight, so both a weight
+		// change and a maxCPU-driven qualification flip can invalidate
+		// the heap invariant.
+		needsHeapFix := false
+		if group.weight != d.Weight {
+			group.weight = d.Weight
+			needsHeapFix = true
+		}
+		if group.cpuTimeBurstBucket.maxCPU != d.MaxCPU {
+			prevQual := group.cpuTimeBurstBucket.burstQualification()
+			group.cpuTimeBurstBucket.maxCPU = d.MaxCPU
+			curQual := group.cpuTimeBurstBucket.burstQualification()
+			if prevQual != curQual {
+				needsHeapFix = true
+			}
+		}
+		if needsHeapFix && isInGroupHeap(group) {
+			q.mu.groupHeap.fix(group)
+		}
+	}
 }
 
 // close tells the gc goroutine to stop.

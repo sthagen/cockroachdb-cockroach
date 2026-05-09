@@ -67,6 +67,7 @@ true
 statement ok
 COMMIT
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(1::INT4, 2::INT4)
 ----
@@ -169,6 +170,7 @@ user testuser
 statement ok
 BEGIN
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(1::INT4, 2::INT4)
 ----
@@ -588,6 +590,7 @@ user testuser
 statement ok
 BEGIN
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(950001)
 ----
@@ -649,6 +652,7 @@ user root
 statement ok
 BEGIN
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(950101)
 ----
@@ -731,16 +735,19 @@ SET database = defaultdb
 statement ok
 BEGIN
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(960001)
 ----
 true
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock_shared(960002)
 ----
 true
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(960003::INT4, 960004::INT4)
 ----
@@ -920,6 +927,7 @@ user testuser
 statement ok
 BEGIN
 
+retry
 query B
 SELECT pg_try_advisory_xact_lock(990001)
 ----

@@ -4398,8 +4398,10 @@ func TestProxyTracing(t *testing.T) {
 
 		checkLeaseCount := func(node, expectedLeaseCount int) error {
 			if count := leaseCount(node); count != expectedLeaseCount {
-				require.NoError(t, tc.GetFirstStoreFromServer(t, 0).
-					ForceLeaseQueueProcess())
+				for i := 0; i < tc.NumServers(); i++ {
+					require.NoError(t, tc.GetFirstStoreFromServer(t, i).
+						ForceLeaseQueueProcess())
+				}
 				return errors.Errorf("expected %d leases on node %d, found %d",
 					expectedLeaseCount, node, count)
 			}

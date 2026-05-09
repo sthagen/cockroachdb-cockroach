@@ -288,16 +288,22 @@ func makeSendFunc(
 			ext, txn.DB(), batchRequestsIssued, kvCPUTime, localKVCPUTime,
 		)
 	}
-	var w timeutil.CPUStopWatch
 	return func(
 		ctx context.Context,
 		ba *kvpb.BatchRequest,
 	) (*kvpb.BatchResponse, error) {
 		log.VEventf(ctx, 2, "kv fetcher: sending a batch with %d requests", len(ba.Requests))
-		w.Start()
+		// NOTE: the streamer invokes Send concurrently on its worker goroutines,
+		// but passes in a nil localKVCPUTime.
+		var w timeutil.CPUStopWatch
+		if localKVCPUTime != nil {
+			w.Start()
+		}
 		res, err := txn.Send(ctx, ba)
-		if delta := w.Stop(); delta > 0 && localKVCPUTime != nil {
-			atomic.AddInt64(localKVCPUTime, int64(delta))
+		if localKVCPUTime != nil {
+			if delta := w.Stop(); delta > 0 {
+				atomic.AddInt64(localKVCPUTime, int64(delta))
+			}
 		}
 		if err != nil {
 			return nil, err.GoError()

@@ -333,7 +333,7 @@ LIMIT 1`, rb.mergeAggStmtMetadataColExpr, rb.whereClause), rb.qargs...)
 // part of the key on the grouping.
 func (rb *statementDetailsRespBuilder) getStatementDetailsPerAggregatedTs(
 	ctx context.Context,
-) ([]serverpb.StatementDetailsResponse_CollectedStatementGroupedByAggregatedTs, error) {
+) (_ []serverpb.StatementDetailsResponse_CollectedStatementGroupedByAggregatedTs, retErr error) {
 	const expectedNumDatums = 3
 	const queryFormat = `
 SELECT aggregated_ts,
@@ -345,15 +345,11 @@ GROUP BY
 ORDER BY aggregated_ts ASC
 LIMIT $%d`
 	var it isql.Rows
-	var err error
-	defer func() {
-		err = closeIterator(it, err)
-	}()
 	args := rb.qargs[:]
 	args = append(args, rb.limit)
 
 	if rb.activityHasData {
-		it, err = rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-activity-details-by-aggregated-timestamp", nil,
+		it1, err := rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-activity-details-by-aggregated-timestamp", nil,
 			sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf(`
 SELECT aggregated_ts,
@@ -369,42 +365,49 @@ LIMIT $%d`, rb.mergeAggStmtMetadataColExpr, rb.whereClause, len(args)),
 		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
 		}
+		defer closeIterator(it1, &retErr)
+		if it1.HasResults() {
+			it = it1
+		}
 	}
 
 	// If there are no results from the activity table, retrieve the data from the persisted table.
 	var query string
-	if it == nil || !it.HasResults() {
-		if it != nil {
-			err = closeIterator(it, err)
-		}
+	if it == nil {
 		query = fmt.Sprintf(
 			queryFormat,
 			CrdbInternalStmtStatsPersisted,
 			rb.whereClause,
 			len(args))
 
-		it, err = rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-persisted-details-by-aggregated-timestamp", nil,
+		it2, err := rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-persisted-details-by-aggregated-timestamp", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
 
 		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
+		}
+		defer closeIterator(it2, &retErr)
+		if it2.HasResults() {
+			it = it2
 		}
 	}
 
 	// If there are no results from the persisted table, retrieve the data from the combined view
 	// with data in-memory.
-	if !it.HasResults() {
-		err = closeIterator(it, err)
+	if it == nil {
 		query = fmt.Sprintf(queryFormat, CrdbInternalStmtStatsCombined, rb.whereClause, len(args))
-		it, err = rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-details-by-aggregated-timestamp-with-memory", nil,
+		it3, err := rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-details-by-aggregated-timestamp-with-memory", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
 		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
 		}
+		defer closeIterator(it3, &retErr)
+		it = it3
 	}
 
 	var statements []serverpb.StatementDetailsResponse_CollectedStatementGroupedByAggregatedTs
 	var ok bool
+	var err error
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		var row tree.Datums
 		if row = it.Cur(); row == nil {
@@ -445,7 +448,9 @@ LIMIT $%d`, rb.mergeAggStmtMetadataColExpr, rb.whereClause, len(args)),
 }
 
 // getExplainPlanFromGist decode the Explain Plan from a Plan Gist.
-func getExplainPlanFromGist(ctx context.Context, ie *sql.InternalExecutor, planGist string) string {
+func getExplainPlanFromGist(
+	ctx context.Context, ie *sql.InternalExecutor, planGist string,
+) (retString string) {
 	planError := "Error collecting Explain Plan."
 	var args []interface{}
 
@@ -460,7 +465,9 @@ func getExplainPlanFromGist(ctx context.Context, ie *sql.InternalExecutor, planG
 	}
 
 	defer func() {
-		err = closeIterator(it, err)
+		if err := it.Close(); err != nil {
+			retString = planError
+		}
 	}()
 
 	var explainPlan []string
@@ -516,7 +523,7 @@ func getIdxAndTableName(ctx context.Context, ie *sql.InternalExecutor, indexInfo
 // part of the key on the grouping.
 func (rb *statementDetailsRespBuilder) getStatementDetailsPerPlanHash(
 	ctx context.Context,
-) ([]serverpb.StatementDetailsResponse_CollectedStatementGroupedByPlanHash, error) {
+) (_ []serverpb.StatementDetailsResponse_CollectedStatementGroupedByPlanHash, retErr error) {
 	expectedNumDatums := 5
 	const queryFormat = `
 SELECT plan_hash,
@@ -533,20 +540,10 @@ LIMIT $%d`
 
 	args := rb.qargs[:]
 	args = append(args, rb.limit)
-	var err error
-	// We will have 1 open iterator at a time. For the deferred close operation, we will
-	// only close the iterator if there were no errors creating the iterator. Closing an
-	// iterator that returned an error on creation will cause a nil pointer deref.
 	var it isql.Rows
-	var iterErr error
-	defer func() {
-		if iterErr == nil {
-			err = closeIterator(it, err)
-		}
-	}()
 
 	if rb.activityHasData {
-		it, iterErr = rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-activity-details-by-plan-hash", nil,
+		it1, err := rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-activity-details-by-plan-hash", nil,
 			sessiondata.NodeUserSessionDataOverride, fmt.Sprintf(`
 SELECT plan_hash,
        (statistics -> 'statistics' -> 'planGists' ->> 0)   AS plan_gist,
@@ -559,43 +556,50 @@ GROUP BY
     plan_gist,
     index_recommendations
 LIMIT $%d`, rb.mergeAggStmtMetadataColExpr, rb.whereClause, len(args)), args...)
-		if iterErr != nil {
+		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
+		}
+		defer closeIterator(it1, &retErr)
+		if it1.HasResults() {
+			it = it1
 		}
 	}
 
 	// If there are no results from the activity table, retrieve the data from the persisted table.
 	var query string
-	if it == nil || !it.HasResults() {
-		if it != nil {
-			err = closeIterator(it, err)
-		}
+	if it == nil {
 		query = fmt.Sprintf(
 			queryFormat,
 			"crdb_internal.statement_statistics_persisted",
 			rb.whereClause,
 			len(args))
-		it, iterErr = rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-persisted-details-by-plan-hash", nil,
+		it2, err := rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-persisted-details-by-plan-hash", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
-		if iterErr != nil {
+		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
+		}
+		defer closeIterator(it2, &retErr)
+		if it2.HasResults() {
+			it = it2
 		}
 	}
 
 	// If there are no results from the persisted table, retrieve the data from the combined view
 	// with data in-memory.
-	if !it.HasResults() {
-		err = closeIterator(it, err)
+	if it == nil {
 		query = fmt.Sprintf(queryFormat, CrdbInternalStmtStatsCombined, rb.whereClause, len(args))
-		it, iterErr = rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-details-by-plan-hash-with-memory", nil,
+		it3, err := rb.ie.QueryIteratorEx(ctx, "console-combined-stmts-details-by-plan-hash-with-memory", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
-		if iterErr != nil {
+		if err != nil {
 			return nil, srverrors.ServerError(ctx, err)
 		}
+		defer closeIterator(it3, &retErr)
+		it = it3
 	}
 
 	var statements []serverpb.StatementDetailsResponse_CollectedStatementGroupedByPlanHash
 	var ok bool
+	var err error
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		var row tree.Datums
 		if row = it.Cur(); row == nil {
@@ -676,7 +680,7 @@ LIMIT $%d`, rb.mergeAggStmtMetadataColExpr, rb.whereClause, len(args)), args...)
 // plan distribution over time in a stacked bar chart.
 func (rb *statementDetailsRespBuilder) getStatementDetailsPerAggregatedTsAndPlanHash(
 	ctx context.Context,
-) ([]serverpb.StatementDetailsResponse_StatementPlanDistribution, error) {
+) (_ []serverpb.StatementDetailsResponse_StatementPlanDistribution, retErr error) {
 	const expectedNumDatums = 6
 	const queryFormat = `
 SELECT
@@ -698,50 +702,50 @@ LIMIT $%d`
 	args = append(args, rb.limit)
 
 	var it isql.Rows
-	var err error
-	var iterErr error
-	defer func() {
-		if iterErr == nil {
-			err = closeIterator(it, err)
-		}
-	}()
 
 	// Try activity table first
 	if rb.activityHasData {
 		query := fmt.Sprintf(queryFormat, "crdb_internal.statement_activity", rb.whereClause, len(args))
-		it, iterErr = rb.ie.QueryIteratorEx(ctx, "console-stmts-activity-details-by-ts-and-plan", nil,
+		it1, err := rb.ie.QueryIteratorEx(ctx, "console-stmts-activity-details-by-ts-and-plan", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
-		if iterErr != nil {
-			return nil, srverrors.ServerError(ctx, iterErr)
+		if err != nil {
+			return nil, srverrors.ServerError(ctx, err)
+		}
+		defer closeIterator(it1, &retErr)
+		if it1.HasResults() {
+			it = it1
 		}
 	}
 
 	// Fallback to persisted table
-	if it == nil || !it.HasResults() {
-		if it != nil {
-			err = closeIterator(it, err)
-		}
+	if it == nil {
 		query := fmt.Sprintf(queryFormat, CrdbInternalStmtStatsPersisted, rb.whereClause, len(args))
-		it, iterErr = rb.ie.QueryIteratorEx(ctx, "console-stmts-persisted-details-by-ts-and-plan", nil,
+		it2, err := rb.ie.QueryIteratorEx(ctx, "console-stmts-persisted-details-by-ts-and-plan", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
-		if iterErr != nil {
-			return nil, srverrors.ServerError(ctx, iterErr)
+		if err != nil {
+			return nil, srverrors.ServerError(ctx, err)
+		}
+		defer closeIterator(it2, &retErr)
+		if it2.HasResults() {
+			it = it2
 		}
 	}
 
 	// Fallback to combined view
-	if !it.HasResults() {
-		err = closeIterator(it, err)
+	if it == nil {
 		query := fmt.Sprintf(queryFormat, CrdbInternalStmtStatsCombined, rb.whereClause, len(args))
-		it, iterErr = rb.ie.QueryIteratorEx(ctx, "console-stmts-details-by-ts-and-plan-with-memory", nil,
+		it3, err := rb.ie.QueryIteratorEx(ctx, "console-stmts-details-by-ts-and-plan-with-memory", nil,
 			sessiondata.NodeUserSessionDataOverride, query, args...)
-		if iterErr != nil {
-			return nil, srverrors.ServerError(ctx, iterErr)
+		if err != nil {
+			return nil, srverrors.ServerError(ctx, err)
 		}
+		defer closeIterator(it3, &retErr)
+		it = it3
 	}
 
 	var statements []serverpb.StatementDetailsResponse_StatementPlanDistribution
 	var ok bool
+	var err error
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		var row tree.Datums
 		if row = it.Cur(); row == nil {

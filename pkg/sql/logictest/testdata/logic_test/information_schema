@@ -354,10 +354,15 @@ SHOW INDEXES FROM information_schema.tables
 ----
 table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible  visibility
 
-query TTTTB colnames
+query TTTTB colnames,nosort
 SHOW CONSTRAINTS FROM information_schema.tables
 ----
-table_name  constraint_name  constraint_type  details  validated
+table_name  constraint_name                     constraint_type  details   validated
+tables      tables_is_insertable_into_not_null  NOT NULL         NOT NULL  true
+tables      tables_table_catalog_not_null       NOT NULL         NOT NULL  true
+tables      tables_table_name_not_null          NOT NULL         NOT NULL  true
+tables      tables_table_schema_not_null        NOT NULL         NOT NULL  true
+tables      tables_table_type_not_null          NOT NULL         NOT NULL  true
 
 query TTTTTB colnames
 SHOW GRANTS ON information_schema.tables

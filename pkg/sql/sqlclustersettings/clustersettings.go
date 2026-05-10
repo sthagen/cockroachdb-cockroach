@@ -209,3 +209,30 @@ var SkipUnderlyingViewPrivilegeChecks = settings.RegisterBoolSetting(
 		"This restores pre-v26.2 behavior.",
 	false,
 	settings.WithPublic)
+
+// AllowSubsetUniqueFKs gates creation of subset-unique foreign keys: a
+// CockroachDB extension that lets an FK be backed by a unique constraint
+// covering only some of the FK's referenced columns (e.g. a parent with
+// UNIQUE(a) can back an FK that references (a, b)). When this setting is
+// false, only exact matches between the FK's referenced columns and a
+// parent unique constraint are accepted at creation time.
+//
+// Mixed-version safety is enforced separately by clusterversion.V26_3.
+// This setting is what operators can flip once V26_3 has been finalized,
+// either as a kill switch if a regression appears or to enforce
+// SQL standard/PostgreSQL-compatible strict matching cluster-wide.
+//
+// The setting governs creation only. Once a subset-unique FK exists in the
+// catalog, lookups that resolve it for validation or back-reference
+// handling continue to honor subset matching regardless of the setting
+// so that flipping the setting off cannot break any existing FKs.
+var AllowSubsetUniqueFKs = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.subset_unique_fks.enabled",
+	"if true, foreign keys may be backed by a unique constraint that covers "+
+		"only a strict subset of the foreign key's referenced columns (e.g. a "+
+		"parent with UNIQUE(a) can back an FK that references (a, b)); set to "+
+		"false to require strict matching, as required by the SQL standard "+
+		"and PostgreSQL",
+	true,
+	settings.WithPublic)

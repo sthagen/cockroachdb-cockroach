@@ -49,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
@@ -1134,8 +1135,28 @@ func ResolveFK(
 		return errors.HandleAsAssertionFailure(err)
 	}
 	// Ensure that there is a unique constraint on the referenced side to use.
-	_, err = catalog.FindFKReferencedUniqueConstraint(target, c.(catalog.ForeignKeyConstraint))
-	return err
+	fkConstraint := c.(catalog.ForeignKeyConstraint)
+	canUseSubset := evalCtx.Settings.Version.IsActive(ctx, clusterversion.V26_3)
+	match, err := catalog.FindFKReferencedUniqueConstraint(target, fkConstraint, canUseSubset)
+	if err != nil {
+		return err
+	}
+	if !match.IsValidReferencedUniqueConstraint(fkConstraint, false /* asSubset */) {
+		// The match was accepted by the catalog lookup only because subset
+		// matching is on. The cluster setting decides whether to allow it.
+		if !sqlclustersettings.AllowSubsetUniqueFKs.Get(&evalCtx.Settings.SV) {
+			return errors.WithHintf(
+				pgerror.Newf(pgcode.ForeignKeyViolation,
+					"there is no unique constraint matching given keys for referenced table %s",
+					target.GetName()),
+				"a unique constraint matching a subset of the referenced columns exists; "+
+					"set cluster setting %q to true to allow this foreign key to be created",
+				sqlclustersettings.AllowSubsetUniqueFKs.Name())
+		}
+		// An exact match would have been preferred had one existed.
+		telemetry.Inc(sqltelemetry.SubsetUniqueForeignKeysUseCounter)
+	}
+	return nil
 }
 
 // CreatePartitioning returns a set of implicit columns and a new partitioning

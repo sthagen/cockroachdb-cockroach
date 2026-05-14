@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/mmaintegration"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -59,11 +60,23 @@ func newMMAStoreRebalancer(
 	// Initialize disk utilization thresholds from cluster settings.
 	opts := allocatorimpl.MakeDiskCapacityOptions(&st.SV)
 	mma.SetDiskUtilThresholds(opts.RebalanceToThreshold, opts.ShedAndBlockAllThreshold)
+	as := s.cfg.AllocatorSync
+	if as == nil {
+		// Production code (server.go) is expected to populate AllocatorSync on
+		// the StoreConfig. A handful of test entry points (TestStoreConfig and
+		// the assorted store_rebalancer_test setups) populate StorePool but not
+		// AllocatorSync; fall back to constructing one here so those tests don't
+		// trip a nil-receiver panic from the background rebalancer goroutine.
+		if !buildutil.CrdbTestBuild {
+			panic(errors.AssertionFailedf("AllocatorSync must be set on StoreConfig outside of test builds"))
+		}
+		as = mmaintegration.NewAllocatorSync(s.cfg.StorePool, mma, st, nil /* knobs */)
+	}
 	return &mmaStoreRebalancer{
 		store:              (*mmaStore)(s),
 		mma:                mma,
 		st:                 st,
-		as:                 s.cfg.AllocatorSync,
+		as:                 as,
 		processTimeoutFunc: makeRateLimitedTimeoutFunc(rebalanceSnapshotRate),
 	}
 }

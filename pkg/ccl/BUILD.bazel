@@ -10,8 +10,6 @@ go_library(
         "//pkg/ccl/changefeedccl",
         "//pkg/ccl/multiregionccl",
         "//pkg/ccl/multitenantccl",
-        "//pkg/ccl/workloadccl",
-        "//pkg/ccl/workloadccl/cliccl",
         "//pkg/cloud/impl:cloudimpl",
         "//pkg/crosscluster/logical",
         "//pkg/crosscluster/physical",

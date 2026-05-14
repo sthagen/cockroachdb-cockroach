@@ -589,6 +589,13 @@ func TestBackupRollbacks_base_alter_type_rename_value(t *testing.T) {
 	sctest.BackupRollbacks(t, path, sctest.SingleNodeTestClusterFactory{})
 }
 
+func TestBackupRollbacks_base_alter_type_set_schema(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	const path = "pkg/sql/schemachanger/testdata/end_to_end/alter_type_set_schema"
+	sctest.BackupRollbacks(t, path, sctest.SingleNodeTestClusterFactory{})
+}
+
 func TestBackupRollbacks_base_comment_on_type_composite(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1489,6 +1496,13 @@ func TestBackupRollbacksMixedVersion_base_alter_type_rename_value(t *testing.T) 
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	const path = "pkg/sql/schemachanger/testdata/end_to_end/alter_type_rename_value"
+	sctest.BackupRollbacksMixedVersion(t, path, sctest.SingleNodeTestClusterFactory{})
+}
+
+func TestBackupRollbacksMixedVersion_base_alter_type_set_schema(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	const path = "pkg/sql/schemachanger/testdata/end_to_end/alter_type_set_schema"
 	sctest.BackupRollbacksMixedVersion(t, path, sctest.SingleNodeTestClusterFactory{})
 }
 
@@ -2395,6 +2409,13 @@ func TestBackupSuccess_base_alter_type_rename_value(t *testing.T) {
 	sctest.BackupSuccess(t, path, sctest.SingleNodeTestClusterFactory{})
 }
 
+func TestBackupSuccess_base_alter_type_set_schema(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	const path = "pkg/sql/schemachanger/testdata/end_to_end/alter_type_set_schema"
+	sctest.BackupSuccess(t, path, sctest.SingleNodeTestClusterFactory{})
+}
+
 func TestBackupSuccess_base_comment_on_type_composite(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -3295,6 +3316,13 @@ func TestBackupSuccessMixedVersion_base_alter_type_rename_value(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	const path = "pkg/sql/schemachanger/testdata/end_to_end/alter_type_rename_value"
+	sctest.BackupSuccessMixedVersion(t, path, sctest.SingleNodeTestClusterFactory{})
+}
+
+func TestBackupSuccessMixedVersion_base_alter_type_set_schema(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	const path = "pkg/sql/schemachanger/testdata/end_to_end/alter_type_set_schema"
 	sctest.BackupSuccessMixedVersion(t, path, sctest.SingleNodeTestClusterFactory{})
 }
 

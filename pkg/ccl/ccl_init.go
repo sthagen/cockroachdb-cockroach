@@ -13,8 +13,6 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/workloadccl/cliccl" // registers fixtures command
 	// TODO(ssd): Many test packages require this implicitly but have failed to
 	// import it, instead depending on the implicit dependency tree of pkg/ccl to
 	// include it.

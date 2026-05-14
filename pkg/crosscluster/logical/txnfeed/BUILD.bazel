@@ -17,7 +17,6 @@ go_library(
         "//pkg/roachpb",
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
-        "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
     ],
@@ -42,7 +41,6 @@ go_test(
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/timeutil",
-        "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
     ],
 )

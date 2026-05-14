@@ -368,8 +368,9 @@ func TestReplicaLifecycleDataDriven(t *testing.T) {
 				in := splitPreApplyInput{
 					lhsID:               lhsRangeState.replica.FullReplicaID,
 					raftIndex:           ps.raftIndex,
+					rhsID:               roachpb.FullReplicaID{RangeID: split.RightDesc.RangeID, ReplicaID: rhsReplDesc.ReplicaID},
+					rhsSpan:             split.RightDesc.RSpan(),
 					rhsDestroyed:        rhsDestroyed,
-					rhsDesc:             split.RightDesc,
 					initClosedTimestamp: hlc.Timestamp{WallTime: 100}, // dummy timestamp
 					lhsLastReplicaGC:    hlc.Timestamp{},              // dummy timestamp
 				}

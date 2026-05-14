@@ -38,7 +38,7 @@ SELECT * FROM f();
 3
 
 query II nosort
-SELECT * FROM f(), f();
+SELECT * FROM f() AS foo, f() AS bar;
 ----
 1  1
 1  2

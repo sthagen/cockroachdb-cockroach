@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -319,7 +318,6 @@ func TestMergeFeedEndTime(t *testing.T) {
 					"checkpoints at or beyond endTime must not be emitted")
 				if cp.Equal(endTime.Prev()) {
 					sawSyntheticCP = true
-					cancel()
 				}
 			}
 		}
@@ -335,13 +333,11 @@ func TestMergeFeedEndTime(t *testing.T) {
 		require.Equal(t, expectedKVTimes, receivedKVTimes)
 
 		err := <-subscribeErr
+		require.NoError(t, err)
 		if endTime == hlc.MaxTimestamp {
 			require.False(t, sawSyntheticCP, "no cutoff expected for unbounded endTime")
-			require.NoError(t, err)
 		} else {
 			require.True(t, sawSyntheticCP, "expected synthetic checkpoint at endTime")
-			require.True(t, errors.Is(err, context.Canceled),
-				"expected context.Canceled, got %v", err)
 		}
 	})
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -32,11 +31,11 @@ import (
 // batches.
 //
 // The merge feed only emits events with timestamp strictly less than endTime.
-// After exhausting all events below the cutoff, it flushes any buffered KVs
-// and emits a synthetic checkpoint at endTime.Prev(). It then blocks on ctx.Done
-// rather than returning, keeping the events channel open so downstream
-// consumers can advance their frontier on the synthetic checkpoint before
-// the parent context cancellation closes the pipeline.
+// After encountering the first event at or beyond endTime, it flushes any
+// buffered KVs and emits a synthetic checkpoint at endTime.Prev(). For all
+// remaining events, it continues normal heap processing but only ever emits
+// the synthetic checkpoint (deduplicated by maybeEmitCheckpoint) until every
+// subscription is exhausted and the loop exits naturally.
 type MergeFeed struct {
 	subs           []streamclient.Subscription
 	events         chan crosscluster.Event
@@ -115,7 +114,10 @@ func (m *MergeFeed) mergeLoop(ctx context.Context) error {
 		entry := h.pop()
 
 		if m.endTime.LessEq(entry.peekTS) {
-			return m.shutdown(ctx)
+			if err := m.processPastEndTime(ctx, entry, h); err != nil {
+				return err
+			}
+			continue
 		}
 
 		if !entry.isKV() {
@@ -202,12 +204,44 @@ func (m *MergeFeed) initHeap(ctx context.Context) (*mergeHeap, error) {
 	return h, nil
 }
 
+// processPastEndTime drains an entry whose timestamp is at or beyond endTime.
+// It flushes any buffered KVs, emits a synthetic checkpoint at endTime.Prev(),
+// and advances the entry without processing it.
+func (m *MergeFeed) processPastEndTime(ctx context.Context, entry *mergeEntry, h *mergeHeap) error {
+	if err := m.flushScratch(ctx); err != nil {
+		return err
+	}
+	if err := m.emitCheckpoint(ctx, m.endTime.Prev()); err != nil {
+		return err
+	}
+	var closed bool
+	var err error
+	if entry.isKV() {
+		closed, err = entry.advanceKV(ctx)
+	} else {
+		closed, err = entry.advanceFromChannel(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if !closed {
+		h.push(entry)
+	}
+	return nil
+}
+
 // maybeEmitCheckpoint emits a merged checkpoint if ts advances the global
 // frontier.
 func (m *MergeFeed) maybeEmitCheckpoint(ctx context.Context, ts hlc.Timestamp) error {
-	if !m.loop.resolvedTime.Less(ts) {
+	if ts.LessEq(m.loop.resolvedTime) {
 		return nil
 	}
+	return m.emitCheckpoint(ctx, ts)
+}
+
+// emitCheckpoint unconditionally emits a checkpoint event at ts and updates
+// the resolved timestamp.
+func (m *MergeFeed) emitCheckpoint(ctx context.Context, ts hlc.Timestamp) error {
 	m.loop.resolvedTime = ts
 
 	cpEvent := crosscluster.MakeCheckpointEvent(
@@ -225,16 +259,4 @@ func (m *MergeFeed) maybeEmitCheckpoint(ctx context.Context, ts hlc.Timestamp) e
 	case m.events <- cpEvent:
 	}
 	return nil
-}
-
-func (m *MergeFeed) shutdown(ctx context.Context) error {
-	if err := m.flushScratch(ctx); err != nil {
-		return err
-	}
-	if err := m.maybeEmitCheckpoint(ctx, m.endTime.Prev()); err != nil {
-		return err
-	}
-	log.Dev.Infof(ctx, "merge feed waiting for context to finish")
-	<-ctx.Done()
-	return ctx.Err()
 }

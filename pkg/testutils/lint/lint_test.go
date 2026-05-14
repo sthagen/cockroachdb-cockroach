@@ -680,7 +680,7 @@ func TestLint(t *testing.T) {
 					":!backup/backup_test.go",
 					":!ccl/changefeedccl/helpers_test.go",
 					":!cloud",
-					":!ccl/workloadccl/fixture_test.go",
+					":!workload/fixture/fixture_test.go",
 					":!internal/reporoot/reporoot.go",
 					":!cmd",
 					":!util/cgroups/cgroups.go",

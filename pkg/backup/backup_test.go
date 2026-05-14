@@ -1091,7 +1091,15 @@ func TestBackupRestoreSystemTables(t *testing.T) {
 
 	const numAccounts = 0
 	ctx := context.Background()
-	_, sqlDB, _, cleanupFn := backupRestoreTestSetup(t, multiNode, numAccounts, InitManualReplication)
+	// Note (kev-cao): DRPC is currently flaky on this test, disabling while it is
+	// investigated.
+	_, sqlDB, _, cleanupFn := backupRestoreTestSetupWithParams(
+		t, multiNode, numAccounts, InitManualReplication, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultDRPCOption: base.TestDRPCDisabled,
+			},
+		},
+	)
 	conn := sqlDB.DB.(*gosql.DB)
 	defer cleanupFn()
 

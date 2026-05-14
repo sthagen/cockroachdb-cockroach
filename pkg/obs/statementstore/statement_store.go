@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
@@ -150,6 +151,14 @@ func (ss *StatementStore) PutStatement(ctx context.Context, info StatementInfo) 
 	if !StatementStoreEnabled.Get(&ss.settings.SV) {
 		return
 	}
+	// Stay dormant until the V26_3_AlterStatementsTablePK migration has run on
+	// the whole cluster. Writing during the ALTER PRIMARY KEY window can race
+	// with the schema change and produce transient INSERT errors that the
+	// writer handles by evicting from cache (and logging at ERROR level), but
+	// the data is non-essential, so it is cleaner to simply not write.
+	if !ss.settings.Version.IsActive(ctx, clusterversion.V26_3_AlterStatementsTablePK) {
+		return
+	}
 	if !ss.addToCacheIfAbsent(ctx, info.FingerprintID) {
 		return
 	}
@@ -235,6 +244,12 @@ func (ss *StatementStore) Start(ctx context.Context, stopper *stop.Stopper) {
 
 	if err := stopper.RunAsyncTask(ctx,
 		"statement-store-writer", func(ctx context.Context) {
+			// Tie ctx to the stopper's quiesce signal so that an in-flight
+			// flush is interrupted at shutdown. Without this, drainAndFlush
+			// can block indefinitely inside the internal executor (e.g. on
+			// RAC2 flow control) and prevent the stopper from quiescing.
+			ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+			defer cancel()
 			ticker := time.NewTicker(flushInterval.Get(&ss.settings.SV))
 			defer ticker.Stop()
 			for {

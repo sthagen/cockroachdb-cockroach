@@ -178,8 +178,8 @@ importers:
         specifier: 2.2.5
         version: 2.2.5(react@16.12.0)
       uplot:
-        specifier: ^1.6.19
-        version: 1.6.19
+        specifier: ^1.6.31
+        version: 1.6.32
     devDependencies:
       '@babel/cli':
         specifier: ^7.8.3
@@ -636,8 +636,8 @@ importers:
         specifier: 2.2.5
         version: 2.2.5(react@16.12.0)
       uplot:
-        specifier: ^1.6.19
-        version: 1.6.19
+        specifier: ^1.6.31
+        version: 1.6.32
       util:
         specifier: ^0.12.5
         version: 0.12.5
@@ -11076,8 +11076,8 @@ packages:
     peerDependencies:
       browserslist: '>= 4.21.0'
 
-  uplot@1.6.19:
-    resolution: {integrity: sha512-s5Oab13s8zUzuZ/KiSV0GRhEvuKptAg2831fkt2PFsginIP1NSsiNrcozlc+tTPuUEAt+4rAXqX521I1DrZwEg==}
+  uplot@1.6.32:
+    resolution: {integrity: sha512-KIMVnG68zvu5XXUbC4LQEPnhwOxBuLyW1AHtpm6IKTXImkbLgkMy+jabjLgSLMasNuGGzQm/ep3tOkyTxpiQIw==}
 
   uri-js@4.4.1:
     resolution: {integrity: sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg==}
@@ -25996,7 +25996,7 @@ snapshots:
       escalade: 3.2.0
       picocolors: 1.1.1
 
-  uplot@1.6.19: {}
+  uplot@1.6.32: {}
 
   uri-js@4.4.1:
     dependencies:

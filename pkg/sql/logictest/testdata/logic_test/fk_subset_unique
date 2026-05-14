@@ -718,7 +718,8 @@ ALTER TABLE drop_ref_parent DROP COLUMN b CASCADE
 query TTTTB nosort
 SHOW CONSTRAINTS FROM drop_ref_child
 ----
-drop_ref_child  drop_ref_child_pkey  PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+drop_ref_child  drop_ref_child_pkey            PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+drop_ref_child  drop_ref_child_rowid_not_null  NOT NULL     NOT NULL                 true
 
 statement ok
 DROP TABLE drop_ref_child, drop_ref_parent
@@ -761,7 +762,8 @@ ALTER TABLE uwi_inbound_parent DROP COLUMN d CASCADE
 query TTTTB nosort
 SHOW CONSTRAINTS FROM uwi_inbound_child
 ----
-uwi_inbound_child  uwi_inbound_child_pkey  PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+uwi_inbound_child  uwi_inbound_child_pkey            PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+uwi_inbound_child  uwi_inbound_child_rowid_not_null  NOT NULL     NOT NULL                 true
 
 statement ok
 DROP TABLE uwi_inbound_child;

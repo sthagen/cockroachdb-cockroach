@@ -357,13 +357,21 @@ func (bd *backupDriver) monitorBackups(ctx context.Context) error {
 			continue
 		}
 
+		// SHOW BACKUPS caps results at 50 (most recent) unless both NEWER THAN
+		// and OLDER THAN are specified, so set explicit bounds that capture
+		// every backup the schedule has produced. Without this, fixtures with
+		// ChainLength > 50 never see the original full backup once enough
+		// incrementals accumulate, and monitorBackups loops forever.
+		showBackups := fmt.Sprintf(
+			"SHOW BACKUPS IN $1 NEWER THAN 1 OLDER THAN %d", timeutil.Now().UnixNano(),
+		)
 		var numChains int
 		sql.QueryRow(bd.t,
-			"SELECT count(*) FROM [SHOW BACKUPS IN $1 WITH DEBUG] WHERE start_time IS NULL",
+			fmt.Sprintf("SELECT count(*) FROM [%s WITH DEBUG] WHERE start_time IS NULL", showBackups),
 			fixtureURI.String()).Scan(&numChains)
 		var totalBackups int
 		sql.QueryRow(bd.t,
-			"SELECT count(*) FROM [SHOW BACKUPS IN $1]",
+			fmt.Sprintf("SELECT count(*) FROM [%s]", showBackups),
 			fixtureURI.String()).Scan(&totalBackups)
 		bd.t.L().Printf(
 			"%d scheduled backups taken (%d fulls + %d incrementals)",

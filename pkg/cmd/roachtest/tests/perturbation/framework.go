@@ -393,6 +393,7 @@ func RegisterTests(r registry.Registry) {
 	const skippedByBankruptcy = "#149662"
 
 	register(r, restart{}, notSkipped)
+	addLong(r, restart{})
 	register(r, backup{}, notSkipped)
 
 	// TODO(ssd): We skipped the majority of these tests so that we can focus on
@@ -560,6 +561,67 @@ func addFull(r registry.Registry, p perturbation, skipReason string) {
 		Cluster:                v.makeClusterSpec(),
 		Leases:                 v.leaseType,
 		Benchmark:              true,
+		PostProcessPerfMetrics: perturbationDefaultProcessFunction,
+		Run:                    v.runTest,
+	})
+}
+
+// addLong registers a heavyweight variant of a perturbation test that runs
+// significantly longer than addFull. It is intended for cases where the
+// perturbation only becomes interesting at scale (e.g. a restart that needs a
+// non-trivial backlog to surface IO-overload behavior on recovery), and
+// belongs to the Weekly suite to keep the nightly footprint small. Individual
+// callers can override variations fields after p.setup() to tune what "long"
+// means for their perturbation; the timeout below is sized for the longest
+// expected fill-plus-perturbation we currently configure.
+//
+// What the long fill buys, and what it does not:
+//
+// The 2h fill duration grows the LSM and range count on the surviving nodes
+// so that ongoing compactions, snapshot generation, and lease bookkeeping at
+// the time of the perturbation reflect a non-trivial steady-state cluster,
+// rather than a freshly-initialized one. It does NOT enlarge the raft gap
+// the perturbed node has to close on recovery -- that gap is set by
+// perturbationDuration (default 10 minutes) and the cluster's write rate
+// during the measurement phase.
+//
+// Napkin math for the restart variant on the default 12-node, 16 vcpu,
+// localSSD spec with 50/50 r/w (50% follower-reads), 4 KiB blocks, and
+// splits=10000: cluster max throughput measures around 80k ops/s, so at
+// ratioOfMax=0.5 the measurement workload sustains ~20k writes/s. A 10
+// minute downtime therefore produces ~12 GiB of cluster-wide raft data
+// destined for the down node's ranges. With ~25% of replicas on a
+// 12-node RF=3 cluster across 10000 splits, the down node owns ~2500
+// ranges, so the average per-range raft log accumulated against it is
+// ~5 MiB. That sits below RaftLogTruncationThreshold (16 MiB; see
+// pkg/base/config.go), so most ranges should recover via log replay
+// rather than raft snapshots; if the per-range write skew, the cluster
+// throughput, or perturbationDuration grow, the average will cross that
+// threshold and the cost mix shifts toward snapshot ingest.
+func addLong(r registry.Registry, p perturbation) {
+	v := p.setup()
+	v.fillDuration = 2 * time.Hour
+	v = v.finishSetup()
+	r.Add(registry.TestSpec{
+		Name:             fmt.Sprintf("perturbation/long/%s", v.perturbationName()),
+		CompatibleClouds: v.cloud,
+		Suites:           registry.Suites(registry.Weekly),
+		Owner:            registry.OwnerKV,
+		Cluster:          v.makeClusterSpec(),
+		Leases:           v.leaseType,
+		Benchmark:        true,
+		// The expected runtime is around 2h45m (2h fill + 10m perturbation +
+		// validation/recovery windows + teardown). The timeout is set well
+		// above that — it is a backstop for pathological cases (everything
+		// seizing up in a way that does not surface as a test failure) and
+		// not a target.
+		Timeout: 6 * time.Hour,
+		// The 2h fill produces enough data that the post-test replica
+		// divergence check exceeds its 20m budget, mirroring the carve-out
+		// for large block sizes in pkg/cmd/roachtest/tests/kv.go (see
+		// #141007). The divergence-check timeout is logged but does not
+		// fail the test; we skip it explicitly to keep the artifact clean.
+		SkipPostValidations:    registry.PostValidationReplicaDivergence,
 		PostProcessPerfMetrics: perturbationDefaultProcessFunction,
 		Run:                    v.runTest,
 	})

@@ -254,7 +254,13 @@ func (p *LogicalReplicationPlanner) planRowReplication(
 				return errors.Wrapf(err, "failed to look up schema descriptor for table %d", pair.DstDescriptorID)
 			}
 
-			if err := tabledesc.CheckLogicalReplicationCompatibility(&srcTableDesc, dstTableDesc.TableDesc(), payload.SkipSchemaCheck || payload.CreateTable, writer == sqlclustersettings.LDRWriterTypeLegacyKV); err != nil {
+			if err := tabledesc.CheckLogicalReplicationCompatibility(
+				&srcTableDesc,
+				dstTableDesc.TableDesc(),
+				payload.SkipSchemaCheck || payload.CreateTable,
+				writer == sqlclustersettings.LDRWriterTypeLegacyKV,
+				false, /* isTxnMode */
+			); err != nil {
 				return err
 			}
 

@@ -11,9 +11,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/txnapply"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/logical/txnmode"
+	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -71,12 +77,69 @@ func (r *logicalReplicationResumer) runTxnCoordinator(
 		return err
 	}
 
+	planner := MakeLogicalReplicationPlanner(jobExecCtx, r.job, client)
+	sourcePlan, err := planner.GetSourcePlan(ctx)
+	if err != nil {
+		return err
+	}
+
 	// TODO(jeffswenson): checkpoint partition URIs via
 	// r.checkpointPartitionURIs once plan generation is added.
 
+	// Build the DistSQL physical plan before starting concurrent work.
+	replicatedTime, err := replicatedTimeFromJob(ctx, jobExecCtx.ExecCfg().InternalDB, r.job)
+	if err != nil {
+		return err
+	}
+	flowPlan, planCtx, applierInstanceIDs, err :=
+		txnmode.PlanTxnReplication(ctx, r.job, jobExecCtx, sourcePlan, replicatedTime, endTime)
+	if err != nil {
+		return errors.Wrap(err, "building DistSQL plan")
+	}
+
+	payload := r.job.Details().(jobspb.LogicalReplicationDetails)
 	heartbeatInterval := func() time.Duration {
 		return heartbeatFrequency.Get(&jobExecCtx.ExecCfg().Settings.SV)
 	}
-	coordinator := txnmode.NewTxnLdrCoordinator(jobExecCtx, r.job, client, heartbeatInterval, endTime)
-	return coordinator.Resume(ctx)
+	heartbeatSender := streamclient.NewHeartbeatSender(
+		ctx,
+		client,
+		streampb.StreamID(payload.StreamID),
+		heartbeatInterval,
+	)
+	defer func() {
+		_ = heartbeatSender.Stop()
+	}()
+
+	runFlow := func(ctx context.Context) error {
+		return txnmode.RunDistSQLFlow(
+			ctx, jobExecCtx, flowPlan, planCtx,
+			r.job, heartbeatSender.FrontierUpdates,
+			applierInstanceIDs, replicatedTime, endTime,
+		)
+	}
+	startHeartbeat := func(ctx context.Context) error {
+		heartbeatSender.Start(ctx, timeutil.DefaultTimeSource{})
+		return heartbeatSender.Wait()
+	}
+
+	return ctxgroup.GoAndWait(ctx, runFlow, startHeartbeat)
+}
+
+// replicatedTimeFromJob returns the replicated time from ProgressStorage,
+// falling back to the replication start time if no checkpoint exists.
+func replicatedTimeFromJob(ctx context.Context, db isql.DB, job *jobs.Job) (hlc.Timestamp, error) {
+	var resolved hlc.Timestamp
+	if err := db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		var err error
+		_, resolved, _, err = job.ProgressStorage().Get(ctx, txn)
+		return err
+	}); err != nil {
+		return hlc.Timestamp{}, err
+	}
+	if !resolved.IsEmpty() {
+		return resolved, nil
+	}
+	payload := job.Payload().Details.(*jobspb.Payload_LogicalReplicationDetails).LogicalReplicationDetails
+	return payload.ReplicationStartTime, nil
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -566,6 +567,7 @@ func (m *Memo) IsStale(
 		m.txnIsoLevel != evalCtx.TxnIsoLevel ||
 		m.useBackupsWithIDs != evalCtx.SessionData().UseBackupsWithIDs ||
 		m.pgDumpCompatibility != evalCtx.SessionData().PgDumpCompatibility {
+		log.VEventf(ctx, 1, "memo is stale: session settings changed")
 		return true, nil
 	}
 
@@ -585,13 +587,15 @@ func (m *Memo) IsStale(
 	// evicting it, avoiding cache thrashing.
 	if (m.builtWithStatsRollout == eval.StatsRolloutStable && evalCtx.StatsRollout == eval.StatsRolloutDefault) ||
 		(m.builtWithStatsRollout == eval.StatsRolloutDefault && evalCtx.StatsRollout == eval.StatsRolloutStable) {
+		log.VEventf(ctx, 1, "memo is stale: stats rollout mode changed")
 		return true, nil
 	}
 
 	// Memo is stale if the fingerprint of any object in the memo's metadata has
 	// changed, or if the current user no longer has sufficient privilege to
 	// access the object.
-	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil || !depsUpToDate {
+	if reason, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil || reason != "" {
+		log.VEventf(ctx, 1, "memo is stale: %s", reason)
 		return true, err
 	}
 	return false, nil

@@ -595,12 +595,6 @@ func (s *scope) removeHiddenCols() {
 	s.cols = s.cols[:n]
 }
 
-// isAnonymousTable returns true if the table name of the first column
-// in this scope is empty.
-func (s *scope) isAnonymousTable() bool {
-	return len(s.cols) > 0 && s.cols[0].table.ObjectName == ""
-}
-
 // setTableAlias qualifies the names of all columns in this scope with the
 // given alias name, as if they were part of a table with that name. If the
 // alias is the empty string, then setTableAlias removes any existing column

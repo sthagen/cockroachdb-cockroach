@@ -2799,6 +2799,7 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '15s'`)
 
 		_ = maybeDisableDeclarativeSchemaChangesForTest(t, sqlDB)
 

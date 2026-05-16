@@ -179,6 +179,7 @@ go_library(
         "replicagc.go",
         "restart.go",
         "restore.go",
+        "revlog_backup_restore.go",
         "roachmart.go",
         "roachtest.go",
         "ruby_pg.go",

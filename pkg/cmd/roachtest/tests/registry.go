@@ -26,6 +26,7 @@ func RegisterTests(r registry.Registry) {
 	registerBackupMixedVersion(r)
 	registerBackupNodeShutdown(r)
 	registerBackupRestoreRoundTrip(r)
+	registerRevlogBackupRestore(r)
 	registerOnlineRestoreRecovery(r)
 	registerBackupFixtures(r)
 	registerBackupScheduleChaining(r)

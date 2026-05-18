@@ -16,7 +16,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/distribution"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/plangram"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
@@ -639,7 +638,7 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 	}
 
 	// Penalize expressions that don't match the PlanGram.
-	if plangram.VisibleToPlanGram(candidate) && !required.PlanGram.Matches(candidate, c.mem.Metadata()) {
+	if physical.VisibleToPlanGram(candidate.Op()) && !required.PlanGram.Matches(candidate, c.mem.Metadata()) {
 		cost.Penalties |= memo.PlanGramMismatchPenalty
 	}
 

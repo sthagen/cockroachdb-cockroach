@@ -1226,10 +1226,21 @@ func (p *planner) InsertStatementHint(
 	statementFingerprint string,
 	hint hintpb.StatementHintUnion,
 	optDatabase string,
-) (int64, error) {
-	return hints.InsertHintIntoDB(
-		ctx, p.execCfg.Settings, p.InternalSQLTxn(), statementFingerprint, hint, optDatabase,
+) (int64, int64, error) {
+	txn := p.InternalSQLTxn()
+	hintID, err := hints.InsertHintIntoDB(
+		ctx, p.execCfg.Settings, txn, statementFingerprint, hint, optDatabase,
 	)
+	if err != nil {
+		return 0, 0, err
+	}
+	numOverridden, err := hints.CountConflictingHintsInDB(
+		ctx, p.execCfg.Settings, txn, statementFingerprint, hint, hintID,
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	return hintID, numOverridden, nil
 }
 
 // DeleteStatementHint is part of the eval.Planner interface.
@@ -1352,7 +1363,11 @@ func (p *planner) advisoryXactLockImpl(
 		mode = advisorylock.LockModeShare
 	}
 	lockKey := mk(db.GetID())
-	err = mgr.AcquireInTxn(ctx, p.txn, lockKey, mode, wait /* wait */)
+	// When wait is true, honor the session's lock_timeout (if set). The non-
+	// waiting (try_*) variants ignore lockTimeout entirely on the KV side
+	// because WaitPolicy_Error short-circuits before any waiting happens.
+	lockTimeout := p.SessionData().LockTimeout
+	err = mgr.AcquireInTxn(ctx, p.txn, lockKey, mode, wait /* wait */, lockTimeout /* lockTimeout */)
 	if err != nil {
 		if !wait && errors.Is(err, advisorylock.LockIsNotAvailableErr) {
 			return false, nil

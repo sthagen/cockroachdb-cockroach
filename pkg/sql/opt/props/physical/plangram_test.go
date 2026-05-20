@@ -91,14 +91,14 @@ func TestPlanGramFormatPretty(t *testing.T) {
 		rules: []planGramTerm{
 			&planGramExpr{
 				op: opt.ScanOp,
-				fields: []planGramExprField{
-					{key: "Index", val: "abc_b_idx"},
+				fields: []PlanGramField{
+					{Key: "Index", Val: "abc_b_idx"},
 				},
 			},
 			&planGramExpr{
 				op: opt.ScanOp,
-				fields: []planGramExprField{
-					{key: "Index", val: "abc_c_idx"},
+				fields: []PlanGramField{
+					{Key: "Index", Val: "abc_c_idx"},
 				},
 			},
 		},
@@ -144,8 +144,8 @@ func TestPlanGramFormatPretty(t *testing.T) {
 			name: "simple terminal",
 			plangram: PlanGram{root: &planGramExpr{
 				op: opt.ScanOp,
-				fields: []planGramExprField{
-					{key: "Index", val: "abc_a_idx"},
+				fields: []PlanGramField{
+					{Key: "Index", Val: "abc_a_idx"},
 				},
 			}},
 			expectedOneLine:  "root: (Scan Index=\"abc_a_idx\");",
@@ -190,6 +190,21 @@ func TestPlanGramFormatPretty(t *testing.T) {
 			expectedNewlines: "root: (Select none);\n",
 		},
 		{
+			name:             "wildcard expression",
+			plangram:         PlanGram{root: &planGramExpr{op: opt.UnknownOp}},
+			expectedOneLine:  "root: (_);",
+			expectedNewlines: "root: (_);\n",
+		},
+		{
+			name: "wildcard child",
+			plangram: PlanGram{root: &planGramExpr{
+				op:       opt.SelectOp,
+				children: []planGramTerm{&planGramExpr{op: opt.UnknownOp}},
+			}},
+			expectedOneLine:  "root: (Select (_));",
+			expectedNewlines: "root: (Select (_));\n",
+		},
+		{
 			name: "with nonterminal production",
 			plangram: PlanGram{root: &planGramExpr{
 				op: opt.SelectOp,
@@ -208,9 +223,9 @@ func TestPlanGramFormatPretty(t *testing.T) {
 			name: "multiple fields",
 			plangram: PlanGram{root: &planGramExpr{
 				op: opt.ScanOp,
-				fields: []planGramExprField{
-					{key: "Table", val: "abc"},
-					{key: "Index", val: "abc_b_idx"},
+				fields: []PlanGramField{
+					{Key: "Table", Val: "abc"},
+					{Key: "Index", Val: "abc_b_idx"},
 				},
 			}},
 			expectedOneLine:  "root: (Scan Table=\"abc\" Index=\"abc_b_idx\");",
@@ -220,8 +235,8 @@ func TestPlanGramFormatPretty(t *testing.T) {
 			name: "field value with special characters",
 			plangram: PlanGram{root: &planGramExpr{
 				op: opt.ScanOp,
-				fields: []planGramExprField{
-					{key: "Index", val: `has "quotes" and spaces`},
+				fields: []PlanGramField{
+					{Key: "Index", Val: `has "quotes" and spaces`},
 				},
 			}},
 			expectedOneLine:  `root: (Scan Index="has \"quotes\" and spaces");`,
@@ -257,6 +272,15 @@ func (m *mockExpr) ChildCount() int        { return len(m.children) }
 func (m *mockExpr) Child(nth int) opt.Expr { return m.children[nth] }
 func (m *mockExpr) Private() interface{}   { return nil }
 
+type mockFieldExpr struct {
+	mockExpr
+	fields []PlanGramField
+}
+
+func (m *mockFieldExpr) PlanGramMatchableFields(*opt.Metadata) []PlanGramField {
+	return m.fields
+}
+
 func TestPlanGramMatches(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -266,6 +290,45 @@ func TestPlanGramMatches(t *testing.T) {
 	twoChildExpr := &mockExpr{
 		op:       opt.InnerJoinOp,
 		children: []opt.Expr{scanExpr, scanExpr},
+	}
+	scanWithFields := &mockFieldExpr{
+		mockExpr: mockExpr{op: opt.ScanOp},
+		fields: []PlanGramField{
+			{Key: "Table", Val: "abc"},
+			{Key: "Index", Val: "abc_b_idx"},
+		},
+	}
+	scanWithConstraint := &mockFieldExpr{
+		mockExpr: mockExpr{op: opt.ScanOp},
+		fields: []PlanGramField{
+			{Key: "Table", Val: "abc"},
+			{Key: "Index", Val: "abc_b_idx"},
+			{Key: "HasConstraint", Val: "true"},
+			{Key: "HasLimit", Val: "false"},
+		},
+	}
+	scanWithLimit := &mockFieldExpr{
+		mockExpr: mockExpr{op: opt.ScanOp},
+		fields: []PlanGramField{
+			{Key: "Table", Val: "abc"},
+			{Key: "Index", Val: "abc_b_idx"},
+			{Key: "HasConstraint", Val: "false"},
+			{Key: "HasLimit", Val: "true"},
+		},
+	}
+	innerJoinWithType := &mockFieldExpr{
+		mockExpr: mockExpr{op: opt.InnerJoinOp, children: []opt.Expr{scanExpr, scanExpr}},
+		fields: []PlanGramField{
+			{Key: "JoinType", Val: "inner"},
+		},
+	}
+	lookupJoinWithType := &mockFieldExpr{
+		mockExpr: mockExpr{op: opt.LookupJoinOp, children: []opt.Expr{scanExpr}},
+		fields: []PlanGramField{
+			{Key: "Table", Val: "abc"},
+			{Key: "Index", Val: "abc_pkey"},
+			{Key: "JoinType", Val: "left"},
+		},
 	}
 
 	tests := []struct {
@@ -299,10 +362,37 @@ func TestPlanGramMatches(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "wildcard op matches any expr",
+			name:     "wildcard op matches scan",
 			pg:       PlanGram{root: &planGramExpr{op: opt.UnknownOp}},
 			expr:     scanExpr,
 			expected: true,
+		},
+		{
+			name:     "wildcard op matches select",
+			pg:       PlanGram{root: &planGramExpr{op: opt.UnknownOp}},
+			expr:     selectExpr,
+			expected: true,
+		},
+		{
+			name: "wildcard op with children",
+			pg: PlanGram{root: &planGramExpr{
+				op:       opt.UnknownOp,
+				children: []planGramTerm{&planGramExpr{op: opt.ScanOp}},
+			}},
+			expr:     selectExpr,
+			expected: true,
+		},
+		{
+			name: "wildcard op with too many children",
+			pg: PlanGram{root: &planGramExpr{
+				op: opt.UnknownOp,
+				children: []planGramTerm{
+					&planGramExpr{op: opt.ScanOp},
+					&planGramExpr{op: opt.ScanOp},
+				},
+			}},
+			expr:     selectExpr,
+			expected: false,
 		},
 		{
 			name: "fewer PG children than expr children",
@@ -338,11 +428,149 @@ func TestPlanGramMatches(t *testing.T) {
 			expr:     twoChildExpr,
 			expected: true,
 		},
+		{
+			name: "field match",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "Index", Val: "abc_b_idx"}},
+			}},
+			expr:     scanWithFields,
+			expected: true,
+		},
+		{
+			name: "field mismatch",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "Index", Val: "abc_c_idx"}},
+			}},
+			expr:     scanWithFields,
+			expected: false,
+		},
+		{
+			name: "field on non-matchable expr",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "Index", Val: "abc_b_idx"}},
+			}},
+			expr:     scanExpr,
+			expected: false,
+		},
+		{
+			name: "subset of fields matches",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "Table", Val: "abc"}},
+			}},
+			expr:     scanWithFields,
+			expected: true,
+		},
+		{
+			name:     "no fields with matchable expr still matches",
+			pg:       PlanGram{root: &planGramExpr{op: opt.ScanOp}},
+			expr:     scanWithFields,
+			expected: true,
+		},
+		{
+			name: "HasConstraint match true",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "HasConstraint", Val: "true"}},
+			}},
+			expr:     scanWithConstraint,
+			expected: true,
+		},
+		{
+			name: "HasConstraint mismatch",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "HasConstraint", Val: "true"}},
+			}},
+			expr:     scanWithLimit,
+			expected: false,
+		},
+		{
+			name: "HasLimit match true",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "HasLimit", Val: "true"}},
+			}},
+			expr:     scanWithLimit,
+			expected: true,
+		},
+		{
+			name: "HasLimit mismatch",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "HasLimit", Val: "true"}},
+			}},
+			expr:     scanWithConstraint,
+			expected: false,
+		},
+		{
+			name: "JoinType match",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.InnerJoinOp,
+				fields: []PlanGramField{{Key: "JoinType", Val: "inner"}},
+			}},
+			expr:     innerJoinWithType,
+			expected: true,
+		},
+		{
+			name: "JoinType mismatch",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.InnerJoinOp,
+				fields: []PlanGramField{{Key: "JoinType", Val: "left"}},
+			}},
+			expr:     innerJoinWithType,
+			expected: false,
+		},
+		{
+			name: "JoinType case-insensitive match",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.InnerJoinOp,
+				fields: []PlanGramField{{Key: "JoinType", Val: "Inner"}},
+			}},
+			expr:     innerJoinWithType,
+			expected: true,
+		},
+		{
+			name: "HasConstraint case-insensitive match",
+			pg: PlanGram{root: &planGramExpr{
+				op:     opt.ScanOp,
+				fields: []PlanGramField{{Key: "HasConstraint", Val: "True"}},
+			}},
+			expr:     scanWithConstraint,
+			expected: true,
+		},
+		{
+			name: "combined Table + JoinType match",
+			pg: PlanGram{root: &planGramExpr{
+				op: opt.LookupJoinOp,
+				fields: []PlanGramField{
+					{Key: "Table", Val: "abc"},
+					{Key: "JoinType", Val: "left"},
+				},
+			}},
+			expr:     lookupJoinWithType,
+			expected: true,
+		},
+		{
+			name: "combined Table match + JoinType mismatch",
+			pg: PlanGram{root: &planGramExpr{
+				op: opt.LookupJoinOp,
+				fields: []PlanGramField{
+					{Key: "Table", Val: "abc"},
+					{Key: "JoinType", Val: "inner"},
+				},
+			}},
+			expr:     lookupJoinWithType,
+			expected: false,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.expected, tc.pg.Matches(tc.expr))
+			require.Equal(t, tc.expected, tc.pg.Matches(tc.expr, nil))
 		})
 	}
 }
@@ -642,6 +870,10 @@ func TestPlanGramParse(t *testing.T) {
 			name:  "nullary expression",
 			input: "root: (Scan);",
 		},
+		{
+			name:  "wildcard expression",
+			input: "root: (_);",
+		},
 		// Expressions with fields.
 		{
 			name:  "one field",
@@ -656,6 +888,14 @@ func TestPlanGramParse(t *testing.T) {
 			input: `root: (Scan Index="has \"quotes\" and spaces");`,
 		},
 		// Expressions with children.
+		{
+			name:  "wildcard child",
+			input: "root: (Select (_));",
+		},
+		{
+			name:  "wildcard with children",
+			input: "root: (_ (Scan));",
+		},
 		{
 			name:  "child referencing any",
 			input: "root: (Select any);",

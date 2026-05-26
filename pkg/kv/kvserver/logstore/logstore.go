@@ -27,11 +27,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
@@ -262,7 +262,7 @@ func (s *LogStore) storeEntriesAndCommitBatch(
 		stats.EntryStats.Add(entryStats) // TODO(pav-kv): just return the stats.
 		state.ByteSize += entryStats.SideloadedBytes
 		if state, err = logAppend(
-			ctx, s.StateLoader.RaftLogPrefix(), batch, state, thinEntries,
+			ctx, s.StateLoader.RangeIDPrefixBuf, s.Engine, batch, state, thinEntries,
 			UseRaftLogSingleDelete(s.Separated),
 		); err != nil {
 			const expl = "during append"
@@ -456,8 +456,9 @@ func storeHardState(
 // on-disk payloads in case the log tail is replaced.
 func logAppend(
 	ctx context.Context,
-	raftLogPrefix roachpb.Key,
-	rw storage.ReadWriter,
+	prefixBuf keys.RangeIDPrefixBuf,
+	eng storage.Engine, // only used to create a read-only batch if needed
+	w storage.Writer,
 	prev RaftState,
 	entries []raftpb.Entry,
 	enginesSeparated bool,
@@ -479,95 +480,96 @@ func logAppend(
 	value.RawBytes = value.RawBytes[:0]
 	diff.Reset()
 
+	newFirst := kvpb.RaftIndex(entries[0].Index)
+	if newFirst == 0 {
+		// No raft entry should have index 0.
+		return RaftState{}, errors.AssertionFailedf("raft entry index must be >= 1")
+	}
+	newLast := kvpb.RaftIndex(entries[len(entries)-1].Index)
 	useSingleDelete := UseRaftLogSingleDelete(enginesSeparated)
+	overlapping := newFirst <= prev.LastIndex
+
+	if util.RaceEnabled {
+		// In race builds, assert that there are no unexpected pre-existing
+		// raft log entries. This is important as we use single-delete for
+		// log truncation, and it relies on not having multiple PUTs for
+		// one key not interleaved by deletes.
+		r := eng.NewReader(storage.StandardDurability)
+		defer r.Close()
+		if hi, err := EmptyLogRange(ctx, r, prefixBuf, prev.LastIndex /* lo */, math.MaxUint64 /* hi */); err != nil {
+			return RaftState{}, err
+		} else if uint64(hi) != math.MaxUint64 {
+			return RaftState{}, errors.AssertionFailedf("unexpected raft log entry at index: %d when appending", hi+1)
+		}
+	}
+
+	// In the common case, the new entries don't overlap the existing log and are
+	// appended to its end. If there is an overlap, the [newFirst, prev.LastIndex]
+	// span is overwritten by the [newFirst, newLast] suffix.
+	//
+	// TODO(ibrahim): both ClearRangeSizeKnown calls below pass MaxInt to force
+	// point deletes (no Pebble range tombstones). Worth investigating whether a
+	// lower threshold is appropriate for large overwrites/tail-drops.
+	if overlapping {
+		// Subtract [newFirst, prev.LastIndex] from the log size stats.
+		startKey, endKey := raftLogBounds(prefixBuf, newFirst-1, prev.LastIndex)
+		reader := eng.NewReader(storage.StandardDurability)
+		defer reader.Close()
+		ms, err := storage.ComputeStats(
+			ctx, reader, fs.ReplicationReadCategory, startKey, endKey, 0, /* nowNanos */
+		)
+		if err != nil {
+			return RaftState{}, err
+		}
+		// Inline raft log entries only contribute to Sys{Bytes,Count}.
+		diff.SysBytes -= ms.SysBytes
+		diff.SysCount -= ms.SysCount
+
+		// When using SingleDelete, explicitly delete the old suffix, because
+		// SingleDelete requires there to be no double PUT of the same key. If not
+		// using SingleDelete, the MVCCBlindPut below will overwrite those entries,
+		// and another ClearRangeSizeKnown will remove the (newLast, prev.LastIndex]
+		// remainder, if any.
+		if useSingleDelete {
+			if err := ClearRangeSizeKnown(
+				w, prefixBuf, newFirst-1, prev.LastIndex, math.MaxInt, true, /* maybeUseSingleDel */
+			); err != nil {
+				return RaftState{}, err
+			}
+		}
+	}
+
 	opts := storage.MVCCWriteOptions{Stats: diff, Category: fs.ReplicationReadCategory}
+	// NB: each iteration consumes its key before the next RaftLogKeyFromPrefix
+	// call rewrites the bytes after raftLogPrefix.
+	raftLogPrefix := prefixBuf.RaftLogPrefix()
 	for i := range entries {
 		ent := &entries[i]
 		key := keys.RaftLogKeyFromPrefix(raftLogPrefix, kvpb.RaftIndex(ent.Index))
-
 		if err := value.SetProto(ent); err != nil {
 			return RaftState{}, err
 		}
 		value.InitChecksum(key)
-		var err error
-		if kvpb.RaftIndex(ent.Index) > prev.LastIndex {
-			_, err = storage.MVCCBlindPut(ctx, rw, key, hlc.Timestamp{}, *value, opts)
-		} else if useSingleDelete {
-			// Overwriting an existing log entry. To make SingleDelete here and in
-			// other places safe, maintain the invariant that there is always a
-			// deletion between two puts.
-			if err := singleClearInline(ctx, rw, key, diff); err != nil {
-				return RaftState{}, err
-			}
-			_, err = storage.MVCCBlindPut(ctx, rw, key, hlc.Timestamp{}, *value, opts)
-		} else {
-			_, err = storage.MVCCPut(ctx, rw, key, hlc.Timestamp{}, *value, opts)
-		}
-		if err != nil {
+		if _, err := storage.MVCCBlindPut(ctx, w, key, hlc.Timestamp{}, *value, opts); err != nil {
 			return RaftState{}, err
 		}
 	}
 
-	newLastIndex := kvpb.RaftIndex(entries[len(entries)-1].Index)
-	// Delete any previously appended log entries which never committed.
-	if prev.LastIndex > 0 {
-		for i := newLastIndex + 1; i <= prev.LastIndex; i++ {
-			// Note that the caller is in charge of deleting any sideloaded payloads
-			// (which they must only do *after* the batch has committed).
-			key := keys.RaftLogKeyFromPrefix(raftLogPrefix, i)
-			var err error
-			if useSingleDelete {
-				// SingleDelete is safe since there is always a deletion between two
-				// puts.
-				err = singleClearInline(ctx, rw, key, diff)
-			} else {
-				_, _, err = storage.MVCCDelete(ctx, rw, key, hlc.Timestamp{}, opts)
-			}
-			if err != nil {
-				return RaftState{}, err
-			}
+	if overlapping && !useSingleDelete {
+		// Truncate the log suffix not covered by the new entries.
+		// No-op if newLast >= prev.LastIndex.
+		if err := ClearRangeSizeKnown(
+			w, prefixBuf, newLast, prev.LastIndex, math.MaxInt, false, /* maybeUseSingleDel */
+		); err != nil {
+			return RaftState{}, err
 		}
 	}
 
 	return RaftState{
-		LastIndex: newLastIndex,
+		LastIndex: newLast,
 		LastTerm:  kvpb.RaftTerm(entries[len(entries)-1].Term),
 		ByteSize:  prev.ByteSize + diff.SysBytes,
 	}, nil
-}
-
-// singleClearInline issues a Pebble SingleDelete for the inline entry at key
-// and subtracts its byte/count contribution from ms. This restores the
-// MVCCStats accounting that SingleClearUnversioned skips, mirroring what
-// MVCCDelete's inline path computes via updateStatsForInline.
-// TODO(ibrahim): Replace this with a new MVCCSingleDelete function that does
-// something similar to MVCCDelete but using SingleDelete.
-func singleClearInline(
-	ctx context.Context, rw storage.ReadWriter, key roachpb.Key, ms *enginepb.MVCCStats,
-) error {
-	// TODO(ibrahim): Instead of creating an iterator for every deleted entry,
-	// create just one iterator and use it to delete the entries.
-	iter, err := rw.NewMVCCIterator(ctx, storage.MVCCKeyIterKind, storage.IterOptions{
-		Prefix: true, ReadCategory: fs.ReplicationReadCategory,
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	iter.SeekGE(storage.MakeMVCCMetadataKey(key))
-	if ok, err := iter.Valid(); err != nil {
-		return err
-	} else if ok && iter.UnsafeKey().Key.Equal(key) {
-		keyBytes := int64(iter.UnsafeKey().EncodedSize())
-		valBytes := int64(iter.ValueLen())
-		ms.SysBytes -= keyBytes + valBytes
-		ms.SysCount--
-		return rw.SingleClearUnversioned(key)
-	}
-	// We don't expect to hit this. However, we can fail-open here because
-	// the entry is already deleted, and there is nothing to do.
-	log.KvExec.Errorf(ctx, "attempted to delete a non-existent raft log entry: %s", key)
-	return nil
 }
 
 // Compact prepares a write that removes entries (prev.Index, next.Index] from
@@ -591,37 +593,17 @@ func Compact(
 	// Truncate the Raft log from the entry after the previous truncation index to
 	// the new truncation index. This is performed atomically with updating the
 	// RaftTruncatedState so that the state of the log is consistent.
-	prefixBuf := &loader.RangeIDPrefixBuf
-	numTruncatedEntries := next.Index - prev.Index
-	if numTruncatedEntries >= raftLogTruncationClearRangeThreshold {
-		start := prefixBuf.RaftLogKey(prev.Index + 1).Clone()
-		end := prefixBuf.RaftLogKey(next.Index + 1).Clone() // end is exclusive
-		if err := writer.ClearRawRange(start, end, true, false); err != nil {
-			return errors.Wrapf(err,
-				"unable to clear truncated Raft entries for %+v after index %d",
-				next, prev.Index)
-		}
-	} else {
-		// NB: RangeIDPrefixBufs have sufficient capacity (32 bytes) to avoid
-		// allocating when constructing Raft log keys (16 bytes).
-		useSingleDelete := UseRaftLogSingleDelete(enginesSeparated)
-		prefix := prefixBuf.RaftLogPrefix()
-		for idx := prev.Index + 1; idx <= next.Index; idx++ {
-			key := keys.RaftLogKeyFromPrefix(prefix, idx)
-			var err error
-			if useSingleDelete {
-				err = writer.SingleClearUnversioned(key)
-			} else {
-				err = writer.ClearUnversioned(key, storage.ClearOptions{})
-			}
-			if err != nil {
-				return errors.Wrapf(err, "unable to clear truncated Raft entries for %+v at index %d",
-					next, idx)
-			}
-		}
+	if err := ClearRangeSizeKnown(
+		writer, loader.RangeIDPrefixBuf,
+		prev.Index, next.Index, int(raftLogTruncationClearRangeThreshold),
+		UseRaftLogSingleDelete(enginesSeparated),
+	); err != nil {
+		return errors.Wrapf(err,
+			"unable to clear truncated Raft entries for %+v after index %d",
+			next, prev.Index)
 	}
 
-	key := prefixBuf.RaftTruncatedStateKey()
+	key := loader.RaftTruncatedStateKey()
 	var value roachpb.Value
 	if _, err := next.MarshalToSizedBuffer(value.AllocBytes(next.Size())); err != nil {
 		return err
@@ -634,6 +616,133 @@ func Compact(
 		return errors.Wrap(err, "unable to write RaftTruncatedState")
 	}
 	return nil
+}
+
+// ClearRange clears raft log entries in the range (lo, hi]. It calls
+// storage.ClearRangeWithHeuristic() which scans up to pointKeyThreshold keys to
+// choose between point deletes and a single Pebble range tombstone.
+// No-op if lo >= hi. Uses point deletes when number of entries < pointKeyThreshold,
+// or a range deletion otherwise.
+func ClearRange(
+	ctx context.Context,
+	r storage.Reader,
+	w storage.Writer,
+	prefixBuf keys.RangeIDPrefixBuf,
+	lo, hi kvpb.RaftIndex,
+	pointKeyThreshold int,
+) error {
+	if lo >= hi {
+		return nil
+	}
+	start, end := raftLogBounds(prefixBuf, lo, hi)
+	return storage.ClearRangeWithHeuristic(ctx, r, w, start, end, pointKeyThreshold)
+}
+
+// ClearRangeSizeKnown clears raft log entries in range (lo, hi] when the caller
+// already knows how many entries the range contains. Uses point deletes
+// when hi-lo < pointKeyThreshold, or a range deletion otherwise.
+// No-op if lo >= hi.
+//
+// If maybeUseSingleDel is true, it uses SingleDelete instead of regular Delete
+// if the size is <= pointKeyThreshold.
+func ClearRangeSizeKnown(
+	w storage.Writer,
+	prefixBuf keys.RangeIDPrefixBuf,
+	lo, hi kvpb.RaftIndex,
+	pointKeyThreshold int,
+	maybeUseSingleDel bool,
+) error {
+	if lo >= hi {
+		return nil
+	}
+	if hi-lo >= kvpb.RaftIndex(pointKeyThreshold) {
+		start, end := raftLogBounds(prefixBuf, lo, hi)
+		return w.ClearRawRange(start, end, true /* pointKeys */, false /* rangeKeys */)
+	}
+	raftLogPrefix := prefixBuf.RaftLogPrefix()
+	// NB: each iteration consumes a key before the next call mutates the bytes
+	// after raftLogPrefix.
+	// NB: avoid overflow in the unlikely case hi == MaxUint64.
+	for idx := lo; idx < hi; idx++ {
+		key := keys.RaftLogKeyFromPrefix(raftLogPrefix, idx+1)
+		var err error
+		if maybeUseSingleDel {
+			err = w.SingleClearUnversioned(key)
+		} else {
+			err = w.ClearUnversioned(key, storage.ClearOptions{})
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// raftLogBounds converts (lo, hi] to their roachpb keys. The sentinels lo == 0
+// and hi == math.MaxUint64 expand to raftLogPrefix and raftLogPrefix.PrefixEnd
+// respectively.
+//
+// The returned keys are independent of prefixBuf's underlying buffer:
+// keys.RaftLogKeyFromPrefix returns a slice that aliases the bytes immediately
+// after the raft log prefix, so building two bounds from the same prefix
+// without cloning would have the second call clobber the first.
+func raftLogBounds(
+	prefixBuf keys.RangeIDPrefixBuf, lo, hi kvpb.RaftIndex,
+) (start, end roachpb.Key) {
+	raftLogPrefix := prefixBuf.RaftLogPrefix()
+	if lo == 0 {
+		start = raftLogPrefix.Clone()
+	} else {
+		start = keys.RaftLogKeyFromPrefix(raftLogPrefix, lo+1).Clone()
+	}
+	if hi == math.MaxUint64 {
+		end = raftLogPrefix.PrefixEnd()
+	} else {
+		end = keys.RaftLogKeyFromPrefix(raftLogPrefix, hi+1).Clone()
+	}
+	return start, end
+}
+
+// EmptyLogRange returns the index preceding the first existing raft log entry
+// between (lo, hi]. Returns hi if the entire span is empty.
+func EmptyLogRange(
+	ctx context.Context,
+	r storage.Reader,
+	prefixBuf keys.RangeIDPrefixBuf,
+	lo kvpb.RaftIndex,
+	hi kvpb.RaftIndex,
+) (kvpb.RaftIndex, error) {
+	if lo >= hi {
+		return hi, nil // no-op
+	}
+	pref := prefixBuf.RaftLogPrefix()
+	end := keys.RaftLogKeyFromPrefix(pref, hi).Next().Clone()
+	start := keys.RaftLogKeyFromPrefix(pref, lo).Next()
+	iter, err := r.NewEngineIterator(ctx, storage.IterOptions{
+		KeyTypes:   storage.IterKeyTypePointsOnly,
+		LowerBound: start,
+		UpperBound: end,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	ok, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: start})
+	if err != nil || !ok {
+		return hi, err // error or not found
+	}
+	key, err := iter.UnsafeEngineKey()
+	if err != nil {
+		return 0, err
+	}
+	firstIndex, err := keys.DecodeRaftLogKeyFromSuffix(key.Key[len(pref):])
+	if err != nil {
+		return 0, err
+	}
+	if firstIndex <= lo || firstIndex > hi {
+		return 0, errors.AssertionFailedf("firstIndex %d not in (%d,%d]", firstIndex, lo, hi)
+	}
+	return firstIndex - 1, nil
 }
 
 // ComputeSize computes the size (in bytes) of the raft log from the storage

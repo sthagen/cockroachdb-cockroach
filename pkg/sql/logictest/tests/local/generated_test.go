@@ -841,6 +841,13 @@ func TestLogic_drop_procedure(
 	runLogicTest(t, "drop_procedure")
 }
 
+func TestLogic_drop_provisioned_roles(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "drop_provisioned_roles")
+}
+
 func TestLogic_drop_role_with_default_privileges(
 	t *testing.T,
 ) {
@@ -2029,6 +2036,13 @@ func TestLogic_procedure_deps(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "procedure_deps")
+}
+
+func TestLogic_procedure_late_binding(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "procedure_late_binding")
 }
 
 func TestLogic_procedure_params(

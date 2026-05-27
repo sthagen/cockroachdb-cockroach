@@ -48,6 +48,8 @@ go_library(
         "//pkg/sql/rowexec",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
+        "//pkg/util/admission",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/log",
@@ -61,7 +63,9 @@ go_library(
 
 go_test(
     name = "txnmode_test",
+    size = "large",
     srcs = [
+        "alter_logical_replication_test.go",
         "main_test.go",
         "node_router_test.go",
         "txnmode_dist_test.go",
@@ -98,6 +102,7 @@ go_test(
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
+        "//pkg/util/admission",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",

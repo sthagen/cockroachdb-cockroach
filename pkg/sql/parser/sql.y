@@ -1333,6 +1333,7 @@ func (u *sqlSymUnion) filterType() tree.FilterType {
 %type <tree.Statement> create_table_as_stmt
 %type <tree.Statement> create_virtual_cluster_stmt
 %type <tree.Statement> create_logical_replication_stream_stmt
+%type <tree.Statement> alter_logical_replication_stream_stmt
 %type <tree.Statement> create_view_stmt
 %type <tree.Statement> create_sequence_stmt
 %type <tree.Statement> create_func_stmt
@@ -2034,6 +2035,7 @@ alter_ddl_stmt:
 | alter_domain_stmt             // EXTEND WITH HELP: ALTER DOMAIN
 | alter_default_privileges_stmt // EXTEND WITH HELP: ALTER DEFAULT PRIVILEGES
 | alter_changefeed_stmt         // EXTEND WITH HELP: ALTER CHANGEFEED
+| alter_logical_replication_stream_stmt /* SKIP DOC */
 | alter_backup_stmt             // EXTEND WITH HELP: ALTER BACKUP
 | alter_func_stmt               // EXTEND WITH HELP: ALTER FUNCTION
 | alter_proc_stmt               // EXTEND WITH HELP: ALTER PROCEDURE
@@ -4287,7 +4289,15 @@ with_resource_group_options:
   {
     $$.val = $2.kvOptions()
   }
+| WITH_LA resource_group_option_list
+  {
+    $$.val = $2.kvOptions()
+  }
 | WITH '(' resource_group_option_list ')'
+  {
+    $$.val = $3.kvOptions()
+  }
+| WITH_LA '(' resource_group_option_list ')'
   {
     $$.val = $3.kvOptions()
   }
@@ -4311,7 +4321,7 @@ resource_group_option:
 // %Help: CREATE RESOURCE GROUP - create a resource group for the resource manager
 // %Category: Misc
 // %Text:
-// CREATE RESOURCE GROUP [IF NOT EXISTS] <name> WITH <option> = <value>, ...
+// CREATE RESOURCE GROUP [IF NOT EXISTS] <name> WITH (<option> = <value>, ...)
 //
 // Options:
 //   cpu_weight = <int>   relative CPU share (must be > 0)
@@ -4337,7 +4347,7 @@ create_resource_group_stmt:
 // %Help: ALTER RESOURCE GROUP - alter an existing resource group
 // %Category: Misc
 // %Text:
-// ALTER RESOURCE GROUP [IF EXISTS] <name> WITH <option> = <value>, ...
+// ALTER RESOURCE GROUP [IF EXISTS] <name> WITH (<option> = <value>, ...)
 //
 // Only the options named are updated; unspecified options are left unchanged.
 alter_resource_group_stmt:
@@ -5101,6 +5111,14 @@ comment_stmt:
   {
     $$.val = &tree.CommentOnTable{Table: $4.unresolvedObjectName(), Comment: $6.strPtr()}
   }
+| COMMENT ON VIEW view_name IS comment_text
+  {
+    $$.val = &tree.CommentOnView{View: $4.unresolvedObjectName(), Comment: $6.strPtr()}
+  }
+| COMMENT ON SEQUENCE sequence_name IS comment_text
+  {
+    $$.val = &tree.CommentOnSequence{Sequence: $4.unresolvedObjectName(), Comment: $6.strPtr()}
+  }
 | COMMENT ON COLUMN column_path IS comment_text
   {
     varName, err := $4.unresolvedName().NormalizeVarName()
@@ -5208,6 +5226,18 @@ create_logical_replication_stream_stmt:
     }
   }
 | CREATE LOGICAL REPLICATION STREAM error // SHOW HELP: CREATE LOGICAL REPLICATION STREAM
+
+alter_logical_replication_stream_stmt:
+  ALTER LOGICAL REPLICATION STREAM a_expr SKIP
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterLogicalReplicationStream{
+      JobID: $5.expr(),
+      Cmds: tree.AlterLogicalReplicationCmds{
+        &tree.SkipConflictCmd{},
+      },
+    }
+  }
 
 logical_replication_resources:
   TABLE db_object_name

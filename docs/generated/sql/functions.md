@@ -3739,11 +3739,11 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(any...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="pg_database_size"></a><code>pg_database_size(database_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of all tables in the named database. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes.</p>
+<tr><td><a name="pg_database_size"></a><code>pg_database_size(database_name: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of all tables in the named database. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Errors if the database does not exist or if the caller lacks CONNECT on it.</p>
 </span></td><td>Volatile</td></tr>
-<tr><td><a name="pg_database_size"></a><code>pg_database_size(database_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of all tables in the database with the given OID. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes.</p>
+<tr><td><a name="pg_database_size"></a><code>pg_database_size(database_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of all tables in the database with the given OID. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Errors if the database does not exist or if the caller lacks CONNECT on it.</p>
 </span></td><td>Volatile</td></tr>
-<tr><td><a name="pg_function_is_visible"></a><code>pg_function_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the function with the given OID belongs to one of the schemas on the search path.</p>
+<tr><td><a name="pg_function_is_visible"></a><code>pg_function_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the function with the given OID is visible in the search path (its schema is on the search path and no function with the same name and signature shadows it from an earlier schema).</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_constraintdef"></a><code>pg_get_constraintdef(constraint_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the definition of the specified constraint.</p>
 </span></td><td>Stable</td></tr>
@@ -3789,13 +3789,15 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_has_role"></a><code>pg_has_role(user: oid, role: oid, privilege: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether or not the user has privileges for role.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="pg_indexes_size"></a><code>pg_indexes_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the total on-disk size, in bytes, of the secondary indexes attached to the relation with the given OID. The primary index is excluded (it is reported by pg_relation_size and pg_table_size, since CockroachDB stores row data in the primary index). The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_is_other_temp_schema"></a><code>pg_is_other_temp_schema(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns true if the given OID is the OID of another session’s temporary schema. (This can be useful, for example, to exclude other sessions’ temporary tables from a catalog display.)</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_my_temp_schema"></a><code>pg_my_temp_schema() &rarr; oid</code></td><td><span class="funcdesc"><p>Returns the OID of the current session’s temporary schema, or zero if it has none (because it has not created any temporary tables).</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_relation_is_updatable"></a><code>pg_relation_is_updatable(reloid: oid, include_triggers: <a href="bool.html">bool</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the update events the relation supports.</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="pg_relation_size"></a><code>pg_relation_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the relation with the given OID. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
+<tr><td><a name="pg_relation_size"></a><code>pg_relation_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the relation with the given OID. For a table-class relation this is the primary index size (matching PG’s “heap only” semantics, since CockroachDB’s primary index is the row data). For an index this is the size of just that index. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_sequence_last_value"></a><code>pg_sequence_last_value(sequence_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the last value generated by a sequence, or NULL if the sequence has not been used yet.</p>
 </span></td><td>Volatile</td></tr>
@@ -3807,11 +3809,11 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="pg_sleep"></a><code>pg_sleep(seconds: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>pg_sleep makes the current session’s process sleep until seconds seconds have elapsed. seconds is a value of type double precision, so fractional-second delays can be specified.</p>
 </span></td><td>Volatile</td></tr>
-<tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID belongs to one of the schemas on the search path.</p>
+<tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID is visible in the search path (its schema is on the search path and no table with the same name shadows it from an earlier schema).</p>
 </span></td><td>Stable</td></tr>
-<tr><td><a name="pg_table_size"></a><code>pg_table_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the table, including TOAST and visibility map (where applicable) with the given OID. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
+<tr><td><a name="pg_table_size"></a><code>pg_table_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the table with the given OID, excluding indexes. In CockroachDB this is the primary index size, since the primary index is the row data. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
 </span></td><td>Volatile</td></tr>
-<tr><td><a name="pg_total_relation_size"></a><code>pg_total_relation_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the relation, including all indexes with the given OID. The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
+<tr><td><a name="pg_total_relation_size"></a><code>pg_total_relation_size(relation_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the on-disk size, in bytes, of the relation with the given OID, including all indexes and any data still occupying the table’s keyspace (such as dropped-index data awaiting garbage collection). The size is read from a periodically-refreshed cache and may lag behind the true value by minutes. Returns NULL if no such relation exists.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_trigger_depth"></a><code>pg_trigger_depth() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the current nesting level of PostgreSQL triggers (0 if not called, directly or indirectly, from inside a trigger).</p>
 </span></td><td>Volatile</td></tr>
@@ -3823,7 +3825,7 @@ may increase either contention or retry errors, or both.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_try_advisory_xact_lock_shared"></a><code>pg_try_advisory_xact_lock_shared(key: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Acquires a shared transaction-level advisory lock if available. Returns true if the lock was acquired, false if it was not. The lock is released automatically at the end of the current transaction.</p>
 </span></td><td>Volatile</td></tr>
-<tr><td><a name="pg_type_is_visible"></a><code>pg_type_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the type with the given OID belongs to one of the schemas on the search path.</p>
+<tr><td><a name="pg_type_is_visible"></a><code>pg_type_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the type with the given OID is visible in the search path (its schema is on the search path and no type with the same name shadows it from an earlier schema).</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="set_config"></a><code>set_config(setting_name: <a href="string.html">string</a>, new_value: <a href="string.html">string</a>, is_local: <a href="bool.html">bool</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>System info</p>
 </span></td><td>Volatile</td></tr>

@@ -294,6 +294,12 @@ const (
 	// the crdb_internal.tsdb_query generator builtin.
 	V26_3_CrdbInternalTSDB
 
+	// V26_3_GrantReferencesToUsersWithCreate grants the REFERENCES privilege
+	// to all users/roles that currently hold CREATE on any table. This ensures
+	// backwards compatibility after FK creation switches from requiring CREATE
+	// to requiring REFERENCES on both the origin and referenced tables.
+	V26_3_GrantReferencesToUsersWithCreate
+
 	// *************************************************
 	// Step (1) Add new versions above this comment.
 	// Do not add new versions to a patch release.
@@ -386,6 +392,8 @@ var versionTable = [numKeys]roachpb.Version{
 	V26_3_AddResourceGroupsTable: {Major: 26, Minor: 2, Internal: 10},
 
 	V26_3_CrdbInternalTSDB: {Major: 26, Minor: 2, Internal: 12},
+
+	V26_3_GrantReferencesToUsersWithCreate: {Major: 26, Minor: 2, Internal: 14},
 	// *************************************************
 	// Step (2): Add new versions above this comment.
 	// *************************************************
@@ -400,7 +408,7 @@ const MinSupported Key = V25_4
 
 // PreviousRelease is the logical cluster version of the previous release (which must
 // have at least an RC build published).
-const PreviousRelease Key = V26_1
+const PreviousRelease Key = V26_2
 
 // V26_3 is a placeholder that will eventually be replaced by the actual 26.3
 // version Key, but in the meantime it points to the latest Key. The placeholder

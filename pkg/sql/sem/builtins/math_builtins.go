@@ -739,6 +739,12 @@ var mathBuiltins = map[string]builtinDefinition{
 						"count must be greater than zero",
 					)
 				}
+				if b1 == b2 {
+					return nil, pgerror.New(
+						pgcode.InvalidArgumentForWidthBucketFunction,
+						"lower bound cannot equal upper bound",
+					)
+				}
 				if math.IsInf(operand, 1) {
 					return tree.NewDInt(tree.DInt(count + 1)), nil
 				}
@@ -764,6 +770,12 @@ var mathBuiltins = map[string]builtinDefinition{
 					return nil, pgerror.New(
 						pgcode.InvalidArgumentForWidthBucketFunction,
 						"count must be greater than zero",
+					)
+				}
+				if b1 == b2 {
+					return nil, pgerror.New(
+						pgcode.InvalidArgumentForWidthBucketFunction,
+						"lower bound cannot equal upper bound",
 					)
 				}
 				return tree.NewDInt(tree.DInt(widthBucket(operand, b1, b2, count))), nil

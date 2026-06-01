@@ -260,8 +260,70 @@ update-hosts)
 	# Step 2: Insert the new line at the end unconditionally
 	echo "${NEW_IP} ${NAME}.local" | sudo tee -a ${HOSTS_FILE} > /dev/null
 	;;
+migrate)
+	# Verify the VM exists.
+	if ! gcloud compute instances describe "${NAME}" --zone="${CLOUDSDK_COMPUTE_ZONE}" --project="${CLOUDSDK_CORE_PROJECT}" > /dev/null 2>&1; then
+		echo "Error: VM ${NAME} does not exist." >&2
+		exit 1
+	fi
+
+	# Check current network.
+	current_network=$(gcloud compute instances describe "${NAME}" \
+		--zone="${CLOUDSDK_COMPUTE_ZONE}" \
+		--project="${CLOUDSDK_CORE_PROJECT}" \
+		--format="value(networkInterfaces[0].network)")
+	if [[ "${current_network}" == *"cockroach-workers-vpc"* ]]; then
+		echo "VM ${NAME} is already on cockroach-workers-vpc. Nothing to do."
+		exit 0
+	fi
+
+	echo "This will migrate ${NAME} to the cockroach-workers-vpc network."
+	echo ""
+	echo "  The following changes will be made:"
+	echo "    - Stop the VM (if running)"
+	echo "    - Update NIC to cockroach-workers-vpc / cockroach-workers-vpc-${REGION}"
+	echo "    - Apply created-with=gceworker-legacy label"
+	echo "    - Grant OS Login admin access"
+	echo "    - Update SSH config for IAP tunneling"
+	echo ""
+	read -r -p "Are you sure? [yes] " response
+	response=$(echo "$response" | tr '[:upper:]' '[:lower:]')
+	if [[ $response != "yes" ]]; then
+		echo Aborting
+		exit 1
+	fi
+
+	# Stop the VM if it's not already stopped.
+	vm_status=$(gcloud compute instances describe "${NAME}" \
+		--zone="${CLOUDSDK_COMPUTE_ZONE}" \
+		--project="${CLOUDSDK_CORE_PROJECT}" \
+		--format="value(status)")
+	if [[ "${vm_status}" == "RUNNING" || "${vm_status}" == "SUSPENDED" ]]; then
+		echo "VM is ${vm_status}, stopping..."
+		gcloud compute instances stop "${NAME}" \
+			--zone="${CLOUDSDK_COMPUTE_ZONE}" \
+			--project="${CLOUDSDK_CORE_PROJECT}"
+	else
+		echo "VM is already ${vm_status}, skipping stop."
+	fi
+
+	echo "Updating network interface to cockroach-workers-vpc..."
+	gcloud compute instances network-interfaces update "${NAME}" \
+		--zone="${CLOUDSDK_COMPUTE_ZONE}" \
+		--project="${CLOUDSDK_CORE_PROJECT}" \
+		--network="cockroach-workers-vpc" \
+		--subnetwork="cockroach-workers-vpc-${REGION}" \
+		--network-interface="nic0"
+
+	ensure_created_with_label
+	grant_ssh_access
+	refresh_ssh_config
+
+	echo ""
+	echo "Migration complete. Run '$0 start' to start the VM on the new network."
+	;;
 *)
-	echo "$0: unknown command: ${cmd}, use one of create, start, stop, resume, suspend, reset, delete, status, ssh, get, put, ip, vscode, update-hosts, or gcloud"
+	echo "$0: unknown command: ${cmd}, use one of create, start, stop, resume, suspend, reset, delete, status, ssh, get, put, ip, vscode, update-hosts, migrate, or gcloud"
 	exit 1
 	;;
 esac

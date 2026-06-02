@@ -288,8 +288,8 @@ func (b *fetchMoveNodeBase) nextInternal(ctx context.Context) (bool, error) {
 		case tree.FetchFirst:
 			switch b.cursor.curRow {
 			case 0:
-				_, err := b.cursor.Next(ctx)
-				return true, err
+				more, err := b.cursor.Next(ctx)
+				return more, err
 			case 1:
 				return true, nil
 			}

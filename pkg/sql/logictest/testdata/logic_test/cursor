@@ -943,3 +943,20 @@ statement ok
 CLOSE foo;
 
 subtest end
+
+# Regression test for FETCH FIRST on a persisted WITH HOLD cursor over an
+# empty result set returning an internal error instead of zero rows (#171238).
+subtest regression_171238
+
+statement ok
+BEGIN;
+DECLARE foo_first CURSOR WITH HOLD FOR SELECT * FROM empty;
+COMMIT;
+
+query empty
+FETCH FIRST FROM foo_first;
+
+statement ok
+CLOSE foo_first;
+
+subtest end

@@ -10,9 +10,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Autosolver fork configuration - update these if the bot account changes
+  # Owner of the bot fork the branch is pushed to. The fork repo name is
+  # derived from CODE_REPO (see the validate step).
   AUTOSOLVER_FORK_OWNER: cockroach-teamcity
-  AUTOSOLVER_FORK_REPO: cockroach
 
 jobs:
   auto-solve-issue:
@@ -24,6 +24,9 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
+    env:
+      # Repository the code and the resulting PR target. Issues stay in github.repository.
+      CODE_REPO: ${{ secrets.CODE_REPO }}
 
     steps:
       - name: Check that labeler is not the issue author
@@ -34,37 +37,34 @@ jobs:
         run: |
           if [ "$LABELER" = "$ISSUE_AUTHOR" ]; then
             echo "::notice::Skipping auto-solver: labeler ($LABELER) is the issue author"
-            gh issue comment ${{ github.event.issue.number }} --body \
+            gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body \
               "Auto-solver skipped: the \`c-autosolve\` label should be applied by someone other than the issue author."
-            gh issue edit ${{ github.event.issue.number }} --remove-label "c-autosolve" || true
+            gh issue edit ${{ github.event.issue.number }} --repo ${{ github.repository }} --remove-label "c-autosolve" || true
             exit 1
           fi
 
-      - name: Validate required secrets and configuration
+      - name: Validate configuration
         env:
           AUTOSOLVER_PUSH_TO_FORK_PAT: ${{ secrets.AUTOSOLVER_PUSH_TO_FORK_PAT }}
           AUTOSOLVER_CREATE_PRS_PAT: ${{ secrets.AUTOSOLVER_CREATE_PRS_PAT }}
         run: |
-          if [ -z "${AUTOSOLVER_PUSH_TO_FORK_PAT:-}" ]; then
-            echo "::error::AUTOSOLVER_PUSH_TO_FORK_PAT secret is not configured"
-            exit 1
-          fi
+          for v in AUTOSOLVER_PUSH_TO_FORK_PAT AUTOSOLVER_CREATE_PRS_PAT CODE_REPO AUTOSOLVER_FORK_OWNER; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::$v is not configured"
+              exit 1
+            fi
+          done
 
-          if [ -z "${AUTOSOLVER_CREATE_PRS_PAT:-}" ]; then
-            echo "::error::AUTOSOLVER_CREATE_PRS_PAT secret is not configured"
-            exit 1
-          fi
+          FORK_REPO="${CODE_REPO#*/}"
+          echo "::add-mask::$FORK_REPO"
+          echo "FORK_REPO=$FORK_REPO" >> "$GITHUB_ENV"
 
-          # Validate that env vars match expected fork (defense against misconfiguration)
-          EXPECTED_FORK="${AUTOSOLVER_FORK_OWNER}/${AUTOSOLVER_FORK_REPO}"
-          if [ "$EXPECTED_FORK" != "cockroach-teamcity/cockroach" ]; then
-            echo "::error::AUTOSOLVER_FORK_OWNER/AUTOSOLVER_FORK_REPO mismatch. Update the env vars or the validation check."
-            exit 1
-          fi
-
+      # Check out CODE_REPO using the autosolver fork PAT (read access).
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
+          repository: ${{ env.CODE_REPO }}
+          token: ${{ secrets.AUTOSOLVER_PUSH_TO_FORK_PAT }}
           fetch-depth: 0
 
       - name: Authenticate to Google Cloud
@@ -89,6 +89,8 @@ jobs:
           # Pass user-controlled content via env vars to prevent prompt injection
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          # The checkout is a different repo; point gh at this repo's issues.
+          GH_REPO: ${{ github.repository }}
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           use_vertex: "true"
@@ -183,6 +185,8 @@ jobs:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           AUTOMATION: "1"
+          # The checkout is a different repo; point gh at this repo's issues.
+          GH_REPO: ${{ github.repository }}
         run: |
           MAX_RETRIES=10
           RETRY_COUNT=0
@@ -234,8 +238,11 @@ jobs:
           **OUTPUT REQUIREMENT**: Before reporting your result, read the commit
           message format guidelines in `.claude/skills/commit-helper/SKILL.md`
           and produce a commit message following that format. The commit message
-          should explain the root cause, what the fix does, and why. Use
-          `Resolves:` (not `Fixes:`) for issue references. Use `Release note: None`
+          should explain the root cause, what the fix does, and why. The PR
+          targets a different repo than the issue, so reference the issue in
+          its fully-qualified form
+          `Resolves: ${{ github.repository }}#${{ github.event.issue.number }}`
+          (not a bare `#N`, and not `Fixes:`). Use `Release note: None`
           unless the fix is user-facing.
 
           Wrap your commit message in markers exactly like this:
@@ -384,7 +391,7 @@ jobs:
           git config --local credential.helper '!f() { echo "username=${AUTOSOLVER_FORK_OWNER}"; echo "password=${AUTOSOLVER_PUSH_TO_FORK_PAT}"; }; f'
 
           # Add the fork as a remote (handle case where it already exists)
-          FORK_URL="https://github.com/${AUTOSOLVER_FORK_OWNER}/${AUTOSOLVER_FORK_REPO}.git"
+          FORK_URL="https://github.com/${AUTOSOLVER_FORK_OWNER}/${FORK_REPO}.git"
           if ! git remote add fork "$FORK_URL" 2>/dev/null; then
             # Remote already exists, update the URL
             if ! git remote set-url fork "$FORK_URL"; then
@@ -450,7 +457,7 @@ jobs:
             printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n' >> "$COMMIT_MSG_FILE"
           else
             # Fallback: construct a minimal commit message
-            ISSUE_TITLE=$(gh issue view ${{ github.event.issue.number }} --json title -q '.title' 2>/dev/null || echo "fix issue #${{ github.event.issue.number }}")
+            ISSUE_TITLE=$(gh issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json title -q '.title' 2>/dev/null || echo "fix issue #${{ github.event.issue.number }}")
             ISSUE_TITLE=$(echo "$ISSUE_TITLE" | tr '\n\r' ' ' | tr '`' "'" | cut -c1-100)
             PREFIX=$(git diff --name-only --cached 2>/dev/null | grep '\.go$' | head -1 | sed 's|pkg/||' | cut -d'/' -f1)
             if [ -z "$PREFIX" ]; then
@@ -459,7 +466,8 @@ jobs:
             ISSUE_NUMBER="${{ github.event.issue.number }}"
             {
               printf '%s: %s\n\n' "$PREFIX" "$ISSUE_TITLE"
-              printf 'Resolves: #%s\n\n' "$ISSUE_NUMBER"
+              # Fully-qualify the issue reference: the PR targets a different repo.
+              printf 'Resolves: %s#%s\n\n' "${{ github.repository }}" "$ISSUE_NUMBER"
               printf 'Release note: None\n\n'
               printf 'Generated by Claude Code Auto-Solver\n'
               printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n'
@@ -471,7 +479,7 @@ jobs:
           # Sync the fork's default branch with upstream so the push doesn't
           # include upstream workflow file changes that the fork hasn't seen yet.
           GH_TOKEN="${AUTOSOLVER_PUSH_TO_FORK_PAT}" gh api \
-            "repos/${AUTOSOLVER_FORK_OWNER}/${AUTOSOLVER_FORK_REPO}/merge-upstream" \
+            "repos/${AUTOSOLVER_FORK_OWNER}/${FORK_REPO}/merge-upstream" \
             --method POST --field branch=master 2>/dev/null \
             || echo "::warning::Failed to sync fork with upstream (may already be in sync)"
 
@@ -511,10 +519,10 @@ jobs:
             echo "*Please review carefully before approving.*"
           )
 
-          # Create the PR from fork to upstream.
+          # Create the PR from the fork to CODE_REPO.
           # Assign and request review from the user who triggered autosolve.
           PR_URL=$(gh pr create \
-            --repo ${{ github.repository }} \
+            --repo "$CODE_REPO" \
             --head "${AUTOSOLVER_FORK_OWNER}:${{ steps.push.outputs.branch_name }}" \
             --base master \
             --draft \
@@ -532,7 +540,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue comment ${{ github.event.issue.number }} --body \
+          gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body \
             "Auto-solver has created a draft PR to address this issue: ${{ steps.create_pr.outputs.pr_url }}
 
           Please review the changes carefully before approving.
@@ -568,7 +576,7 @@ jobs:
             echo ""
             echo "[Workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
           } > "$COMMENT_FILE"
-          gh issue comment ${{ github.event.issue.number }} --body-file "$COMMENT_FILE"
+          gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body-file "$COMMENT_FILE"
 
       - name: Comment on issue - Failed
         if: |
@@ -579,7 +587,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue comment ${{ github.event.issue.number }} --body \
+          gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body \
             "Auto-solver attempted to fix this issue but was unable to complete the implementation.
 
           This issue may require human intervention.

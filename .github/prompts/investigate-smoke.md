@@ -30,8 +30,8 @@ mkdir -p artifacts
     pick one of the older commits from the list, and run `git show <sha> -- pkg/kv/kvserver/replica.go | head -40`.
     This verifies that the blobless clone can transparently fetch old diffs.
 8. **Bash(gh issue view)**: `gh issue view <ISSUE_NUMBER> --json title -q .title`
-   (use the issue number from the variables below)
-9. **Bash(gh search)**: `gh search issues "test" --repo <REPO> --limit 1 --json number`
+   (use the issue number from the variables below; gh defaults to ISSUE_REPO)
+9. **Bash(gh search)**: `gh search issues "test" --repo <ISSUE_REPO> --limit 1 --json number`
 10. **Bash(fetch-url)**: `fetch-url "https://teamcity.cockroachdb.com/guestAuth/app/rest/server" /dev/null`
 11. **Bash(unzip)**: download any small zip and list it, or just run `unzip -l` on a nonexistent file to confirm the command runs
 12. **Read tool**: Read `pkg/BUILD.bazel` (first 10 lines)

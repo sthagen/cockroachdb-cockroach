@@ -7,7 +7,12 @@ and write your findings to `artifacts/findings.md` (a later workflow
 step posts it as a comment on the issue). Create the directory first
 with `mkdir -p artifacts`.
 
-You are inside a blobless clone of the CockroachDB repository with
+The issue and your findings comment live in `ISSUE_REPO` (passed in the
+prompt); `gh` defaults to it, so use plain `gh issue`/`gh pr`/`gh search`
+commands. The working tree is checked out from `CODE_REPO`; use that
+when building source links (blob/permalink URLs).
+
+You are inside a blobless clone of the `CODE_REPO` repository with
 full commit history. `git log`, `git blame`, `git diff`, etc. work
 normally — no need to deepen or unshallow. File contents (blobs) are
 fetched transparently on demand when you check out a commit or read
@@ -339,10 +344,10 @@ top-level error is just "command failed" or similarly uninformative,
 dig into the artifact logs to find the actual underlying failure
 from the command's output.>
 
-<When referencing file:line(s) in code, make it a link specific to this repo and
-SHA. Example:
-[server.go:251](https://github.com/cockroachdb/cockroach/blob/<sha>/pkg/server/server.go#L251).
-For multi-line sections, e.g. [server.go:251-300], use suffix like #L251-L300>
+<When referencing file:line(s) in code, make it a link specific to the
+CODE_REPO repo and SHA. Example (substitute CODE_REPO for the owner/repo):
+[server.go:251](https://github.com/<CODE_REPO>/blob/<sha>/pkg/server/server.go#L251).
+For multi-line sections, e.g. [server.go:251-300], use suffix like #L251-L300.>
 
 ### Analysis
 

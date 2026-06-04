@@ -90,6 +90,8 @@ jobs:
       ISSUE_NUMBER: ${{ inputs.issue_number || github.event.issue.number }}
       COMMENT_BODY: ${{ inputs.comment_body || github.event.comment.body }}
       HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      # Repository to check out the code from. Issues and comments use github.repository.
+      CODE_REPO: ${{ secrets.CODE_REPO }}
     steps:
       - name: Acknowledge trigger
         if: github.event_name == 'issue_comment'
@@ -104,9 +106,15 @@ jobs:
       # contents until they're actually accessed. Much faster than a
       # full clone of the cockroach repo while still giving the agent
       # full history without manual deepening.
+      #
+      # Check out CODE_REPO using the autosolver fork PAT. On a personal
+      # fork (HAS_API_KEY set) CODE_REPO is unset, so fall back to the
+      # fork itself with the default token.
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
+          repository: ${{ env.HAS_API_KEY == 'true' && github.repository || env.CODE_REPO }}
+          token: ${{ env.HAS_API_KEY == 'true' && secrets.GITHUB_TOKEN || secrets.AUTOSOLVER_PUSH_TO_FORK_PAT }}
           filter: blob:none
           fetch-depth: 0
 
@@ -156,6 +164,9 @@ jobs:
         env:
           ANTHROPIC_VERTEX_PROJECT_ID: ${{ env.HAS_API_KEY != 'true' && 'vertex-model-runners' || '' }}
           CLOUD_ML_REGION: ${{ env.HAS_API_KEY != 'true' && 'global' || '' }}
+          # The checkout is a different repo than this one; point the
+          # agent's gh commands at this repo's issue tracker.
+          GH_REPO: ${{ github.repository }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -173,10 +184,14 @@ jobs:
             Read and follow the instructions in the prompt file
             `.github/prompts/${{ inputs.smoke_test == true && 'investigate-smoke' || 'investigate' }}.md`.
 
-            REPO: ${{ github.repository }}
+            ISSUE_REPO: ${{ github.repository }}
+            CODE_REPO: ${{ env.HAS_API_KEY == 'true' && github.repository || env.CODE_REPO }}
             ISSUE NUMBER: ${{ env.ISSUE_NUMBER }}
             TRIGGER COMMENT: ${{ env.COMMENT_BODY }}
             WORKFLOW RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Use ISSUE_REPO for all gh issue/pr/search commands. Use
+            CODE_REPO when building source links (blob/permalink URLs).
 
       - name: Upload findings
         if: always()

@@ -106,15 +106,11 @@ jobs:
       # contents until they're actually accessed. Much faster than a
       # full clone of the cockroach repo while still giving the agent
       # full history without manual deepening.
-      #
-      # Check out CODE_REPO using the autosolver fork PAT. On a personal
-      # fork (HAS_API_KEY set) CODE_REPO is unset, so fall back to the
-      # fork itself with the default token.
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           repository: ${{ env.HAS_API_KEY == 'true' && github.repository || env.CODE_REPO }}
-          token: ${{ env.HAS_API_KEY == 'true' && secrets.GITHUB_TOKEN || secrets.AUTOSOLVER_PUSH_TO_FORK_PAT }}
+          token: ${{ env.HAS_API_KEY == 'true' && secrets.GITHUB_TOKEN || secrets.AUTOSOLVER_CREATE_PRS_PAT }}
           filter: blob:none
           fetch-depth: 0
 

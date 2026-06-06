@@ -59,12 +59,11 @@ jobs:
           echo "::add-mask::$FORK_REPO"
           echo "FORK_REPO=$FORK_REPO" >> "$GITHUB_ENV"
 
-      # Check out CODE_REPO using the autosolver fork PAT (read access).
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           repository: ${{ env.CODE_REPO }}
-          token: ${{ secrets.AUTOSOLVER_PUSH_TO_FORK_PAT }}
+          token: ${{ secrets.AUTOSOLVER_CREATE_PRS_PAT }}
           fetch-depth: 0
 
       - name: Authenticate to Google Cloud
@@ -385,6 +384,8 @@ jobs:
         run: |
           git config user.name "cockroach-teamcity"
           git config user.email "cockroach-teamcity@users.noreply.github.com"
+
+          git config --local --unset-all http.https://github.com/.extraheader || true
 
           # Configure git credential helper to use PAT for the fork
           # Using a script-based helper avoids writing credentials to disk

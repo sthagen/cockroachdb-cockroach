@@ -110,7 +110,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: ${{ env.HAS_API_KEY == 'true' && github.repository || env.CODE_REPO }}
-          token: ${{ env.HAS_API_KEY == 'true' && secrets.GITHUB_TOKEN || secrets.AUTOSOLVER_CREATE_PRS_PAT }}
+          token: ${{ env.HAS_API_KEY == 'true' && secrets.GITHUB_TOKEN || secrets.INVESTIGATE_PAT }}
           filter: blob:none
           fetch-depth: 0
 

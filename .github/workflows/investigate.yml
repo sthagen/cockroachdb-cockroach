@@ -114,7 +114,7 @@ jobs:
           filter: blob:none
           fetch-depth: 0
 
-      - name: Create fetch-url wrapper
+      - name: Create helper scripts
         run: |
           cat > /usr/local/bin/fetch-url <<'WRAPPER'
           #!/bin/bash
@@ -127,6 +127,43 @@ jobs:
           fi
           WRAPPER
           chmod +x /usr/local/bin/fetch-url
+
+          # checkout-sha SHA — check out a commit in the blobless clone.
+          #
+          # A plain `git checkout <sha>` triggers a partial-clone lazy fetch
+          # of the commit's blobs (`want <blob-oid>`). GitHub's on-demand
+          # object serving rejects that with "not our ref" for commits not
+          # reachable from the checked-out repo's default branch (e.g.
+          # release-branch SHAs), which is most failure SHAs we investigate.
+          # To avoid that path, fetch the commit's complete snapshot in an
+          # isolated repo — there the request is `want <commit-sha>` with no
+          # haves, which GitHub serves reliably for any reachable commit —
+          # import those objects into this repo's object store, then check
+          # out locally with no further network access.
+          cat > /usr/local/bin/checkout-sha <<'WRAPPER'
+          #!/bin/bash
+          set -euo pipefail
+          sha="${1:?Usage: checkout-sha SHA}"
+          git_dir=$(git rev-parse --absolute-git-dir)
+          url=$(git config --get remote.origin.url)
+          auth=$(git config --get http.https://github.com/.extraheader || true)
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          git -C "$tmp" init -q
+          if [ -n "$auth" ]; then
+            git -C "$tmp" config http.https://github.com/.extraheader "$auth"
+          fi
+          # fetch.unpackLimit=1 keeps the result as a packfile (instead of
+          # loose objects) regardless of object count, so the copy below has
+          # a stable source.
+          git -C "$tmp" -c fetch.unpackLimit=1 fetch -q --depth=1 "$url" "$sha"
+          cp "$tmp"/.git/objects/pack/pack-*.pack \
+             "$tmp"/.git/objects/pack/pack-*.idx \
+             "$git_dir/objects/pack/"
+          git -c advice.detachedHead=false checkout --force "$sha"
+          WRAPPER
+          chmod +x /usr/local/bin/checkout-sha
 
       # Vertex AI auth for cockroachdb/cockroach. Skipped when an
       # ANTHROPIC_API_KEY secret is set (e.g. on a personal fork).
@@ -175,7 +212,7 @@ jobs:
           # based permissions may work after upgrading the action.
           claude_args: |
             --model ${{ inputs.cheap == true && 'claude-sonnet-4-5' || 'claude-opus-4-6' }}
-            --allowedTools "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
+            --allowedTools "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(checkout-sha:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
           prompt: |
             Read and follow the instructions in the prompt file
             `.github/prompts/${{ inputs.smoke_test == true && 'investigate-smoke' || 'investigate' }}.md`.

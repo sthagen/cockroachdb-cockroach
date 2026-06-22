@@ -13,18 +13,18 @@ commands. The working tree is checked out from `CODE_REPO`; use that
 when building source links (blob/permalink URLs).
 
 You are inside a blobless clone of the `CODE_REPO` repository with
-full commit history. `git log`, `git blame`, `git diff`, etc. work
-normally — no need to deepen or unshallow. File contents (blobs) are
-fetched transparently on demand when you check out a commit or read
-a file at a specific revision.
+full commit history. `git log`, `git diff`, etc. work normally — no
+need to deepen or unshallow.
 
-To inspect a specific commit, just check it out:
+To inspect a specific commit, check it out with the `checkout-sha`
+helper (do not use a plain `git checkout <sha>` — it cannot reliably
+fetch file contents for commits on non-default branches):
 
 ```bash
-git checkout <sha>
+checkout-sha <sha>
 ```
 
-If the checkout fails (SHA not reachable from this remote — rare,
+If `checkout-sha` fails (SHA not reachable from this remote — rare,
 only happens for commits exclusive to a fork), proceed with the
 currently checked-out code instead, but add a prominent warning at
 the very top of `artifacts/findings.md`:
@@ -47,7 +47,8 @@ to check what's available.
 Key tools at your disposal:
 
 - **Code reading**: Read, Grep, Glob, and common shell text tools
-- **Git**: all git commands (log, blame, diff, show, fetch, etc.)
+- **Git**: all git commands (log, diff, show, etc.); use
+  `checkout-sha <sha>` to check out a specific commit
 - **GitHub CLI**: gh issue view/list, gh pr view/list/diff, gh search
 - **Web browsing**: WebFetch tool for reading web pages and JSON APIs
 - **File download**: `fetch-url <url> [output-file]` (GET-only HTTP
@@ -128,10 +129,10 @@ fix is present in the failure SHA's history using `git log`.
 After determining the failure SHA from Step 1, check it out:
 
 ```bash
-git checkout <failure-sha>
+checkout-sha <failure-sha>
 ```
 
-If the checkout fails, fall back to the default branch tip (see the
+If `checkout-sha` fails, fall back to the default branch tip (see the
 warning note in the checkout instructions above).
 
 Then explore the relevant source code:

@@ -18,9 +18,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Autosolver fork configuration - update these if the bot account changes
+  # Owner of the fork - update if the bot account changes.
   AUTOSOLVER_FORK_OWNER: cockroach-teamcity
-  AUTOSOLVER_FORK_REPO: cockroach
 
 jobs:
   fix-ci-failures:
@@ -35,6 +34,8 @@ jobs:
       pull-requests: write
       id-token: write
       actions: read  # needed to read workflow run details
+    env:
+      AUTOSOLVER_FORK_REPO: ${{ secrets.FORK_REPO }}
 
     steps:
       - name: Find autosolver PR

@@ -10,8 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Owner of the bot fork the branch is pushed to. The fork repo name is
-  # derived from CODE_REPO (see the validate step).
+  # Owner of the fork the branch is pushed to.
   AUTOSOLVER_FORK_OWNER: cockroach-teamcity
 
 jobs:
@@ -27,6 +26,7 @@ jobs:
     env:
       # Repository the code and the resulting PR target. Issues stay in github.repository.
       CODE_REPO: ${{ secrets.CODE_REPO }}
+      FORK_REPO: ${{ secrets.FORK_REPO }}
 
     steps:
       - name: Check that labeler is not the issue author
@@ -48,16 +48,12 @@ jobs:
           AUTOSOLVER_PUSH_TO_FORK_PAT: ${{ secrets.AUTOSOLVER_PUSH_TO_FORK_PAT }}
           AUTOSOLVER_CREATE_PRS_PAT: ${{ secrets.AUTOSOLVER_CREATE_PRS_PAT }}
         run: |
-          for v in AUTOSOLVER_PUSH_TO_FORK_PAT AUTOSOLVER_CREATE_PRS_PAT CODE_REPO AUTOSOLVER_FORK_OWNER; do
+          for v in AUTOSOLVER_PUSH_TO_FORK_PAT AUTOSOLVER_CREATE_PRS_PAT CODE_REPO FORK_REPO AUTOSOLVER_FORK_OWNER; do
             if [ -z "${!v:-}" ]; then
               echo "::error::$v is not configured"
               exit 1
             fi
           done
-
-          FORK_REPO="${CODE_REPO#*/}"
-          echo "::add-mask::$FORK_REPO"
-          echo "FORK_REPO=$FORK_REPO" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v5

@@ -19,9 +19,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Autosolver fork configuration - update these if the bot account changes
+  # Owner of the fork - update if the bot account changes.
   AUTOSOLVER_FORK_OWNER: cockroach-teamcity
-  AUTOSOLVER_FORK_REPO: cockroach
 
 jobs:
   address-review-comments:
@@ -33,6 +32,8 @@ jobs:
       pull-requests: write
       id-token: write
       actions: read  # needed to download artifacts from workflow_run
+    env:
+      AUTOSOLVER_FORK_REPO: ${{ secrets.FORK_REPO }}
 
     steps:
       - name: Check if trigger produced an artifact
@@ -117,10 +118,9 @@ jobs:
 
       - name: Validate configuration
         run: |
-          # Validate that env vars match expected fork (defense against misconfiguration)
-          EXPECTED_FORK="${AUTOSOLVER_FORK_OWNER}/${AUTOSOLVER_FORK_REPO}"
-          if [ "$EXPECTED_FORK" != "cockroach-teamcity/cockroach" ]; then
-            echo "::error::AUTOSOLVER_FORK_OWNER/AUTOSOLVER_FORK_REPO mismatch. Update the env vars."
+          # Fail early if the fork repo is not configured.
+          if [ -z "${AUTOSOLVER_FORK_REPO:-}" ]; then
+            echo "::error::AUTOSOLVER_FORK_REPO is not configured"
             exit 1
           fi
 

@@ -128,42 +128,104 @@ jobs:
           WRAPPER
           chmod +x /usr/local/bin/fetch-url
 
-          # checkout-sha SHA — check out a commit in the blobless clone.
+          # snapshot-fetch SHA — import a single commit's complete snapshot
+          # into this repo's object store.
           #
-          # A plain `git checkout <sha>` triggers a partial-clone lazy fetch
-          # of the commit's blobs (`want <blob-oid>`). GitHub's on-demand
-          # object serving rejects that with "not our ref" for commits not
-          # reachable from the checked-out repo's default branch (e.g.
-          # release-branch SHAs), which is most failure SHAs we investigate.
-          # To avoid that path, fetch the commit's complete snapshot in an
+          # A plain `git checkout <sha>` in a blobless clone triggers a
+          # partial-clone lazy fetch of the commit's blobs (`want <blob-oid>`).
+          # GitHub's on-demand object serving rejects that with "not our ref"
+          # for commits not reachable from the checked-out repo's default
+          # branch (e.g. release-branch SHAs), which is most failure SHAs we
+          # investigate. To avoid that path, fetch the commit's snapshot in an
           # isolated repo — there the request is `want <commit-sha>` with no
-          # haves, which GitHub serves reliably for any reachable commit —
-          # import those objects into this repo's object store, then check
-          # out locally with no further network access.
-          cat > /usr/local/bin/checkout-sha <<'WRAPPER'
+          # haves, which GitHub serves reliably for any reachable commit — and
+          # import those objects so later reads need no network access.
+          #
+          # All git invocations here use the real binary (/usr/bin/git), not
+          # the wrapper installed below, to avoid recursion.
+          cat > /usr/local/bin/snapshot-fetch <<'WRAPPER'
           #!/bin/bash
           set -euo pipefail
-          sha="${1:?Usage: checkout-sha SHA}"
-          git_dir=$(git rev-parse --absolute-git-dir)
-          url=$(git config --get remote.origin.url)
-          auth=$(git config --get http.https://github.com/.extraheader || true)
+          sha="${1:?Usage: snapshot-fetch SHA}"
+          git_dir=$(/usr/bin/git rev-parse --absolute-git-dir)
+          url=$(/usr/bin/git config --get remote.origin.url)
+          auth=$(/usr/bin/git config --get http.https://github.com/.extraheader || true)
 
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
-          git -C "$tmp" init -q
+          /usr/bin/git -C "$tmp" init -q
           if [ -n "$auth" ]; then
-            git -C "$tmp" config http.https://github.com/.extraheader "$auth"
+            /usr/bin/git -C "$tmp" config http.https://github.com/.extraheader "$auth"
           fi
           # fetch.unpackLimit=1 keeps the result as a packfile (instead of
           # loose objects) regardless of object count, so the copy below has
           # a stable source.
-          git -C "$tmp" -c fetch.unpackLimit=1 fetch -q --depth=1 "$url" "$sha"
+          /usr/bin/git -C "$tmp" -c fetch.unpackLimit=1 fetch -q --depth=1 "$url" "$sha"
           cp "$tmp"/.git/objects/pack/pack-*.pack \
              "$tmp"/.git/objects/pack/pack-*.idx \
              "$git_dir/objects/pack/"
-          git -c advice.detachedHead=false checkout --force "$sha"
+          WRAPPER
+          chmod +x /usr/local/bin/snapshot-fetch
+
+          # checkout-sha SHA — import the commit's snapshot, then check it out.
+          cat > /usr/local/bin/checkout-sha <<'WRAPPER'
+          #!/bin/bash
+          set -euo pipefail
+          sha="${1:?Usage: checkout-sha SHA}"
+          snapshot-fetch "$sha"
+          /usr/bin/git -c advice.detachedHead=false checkout --force "$sha"
           WRAPPER
           chmod +x /usr/local/bin/checkout-sha
+
+          # git wrapper — make a plain `git checkout <sha>` (the reflex the
+          # agent reaches for) work in the blobless clone. Real git handles
+          # everything; only a checkout/switch that fails because the lazy
+          # blob fetch was rejected ("not our ref" / promisor remote) is
+          # retried after snapshot-fetch imports the target commit. This
+          # removes the dependency on the agent remembering to use
+          # checkout-sha, which it reliably forgets.
+          cat > /usr/local/bin/git <<'WRAPPER'
+          #!/bin/bash
+          set -uo pipefail
+          REAL_GIT=/usr/bin/git
+
+          case "${1:-}" in
+            checkout|switch) ;;
+            *) exec "$REAL_GIT" "$@" ;;
+          esac
+
+          out=$("$REAL_GIT" "$@" 2>&1); rc=$?
+          if [ "$rc" -eq 0 ]; then
+            [ -n "$out" ] && printf '%s\n' "$out" >&2
+            exit 0
+          fi
+          if ! printf '%s' "$out" | grep -qiE 'promisor|not our ref'; then
+            printf '%s\n' "$out" >&2
+            exit "$rc"
+          fi
+
+          # Find the commit-ish among the arguments: the first non-option
+          # token before a `--` path separator that resolves to a commit.
+          # The full commit graph is present (blobless clone), so rev-parse
+          # resolves offline.
+          sha=""
+          for arg in "${@:2}"; do
+            [ "$arg" = "--" ] && break
+            case "$arg" in -*) continue ;; esac
+            if "$REAL_GIT" rev-parse --verify --quiet "${arg}^{commit}" >/dev/null 2>&1; then
+              sha=$("$REAL_GIT" rev-parse "${arg}^{commit}")
+              break
+            fi
+          done
+          if [ -z "$sha" ]; then
+            printf '%s\n' "$out" >&2
+            exit "$rc"
+          fi
+
+          snapshot-fetch "$sha"
+          exec "$REAL_GIT" "$@"
+          WRAPPER
+          chmod +x /usr/local/bin/git
 
       # Vertex AI auth for cockroachdb/cockroach. Skipped when an
       # ANTHROPIC_API_KEY secret is set (e.g. on a personal fork).

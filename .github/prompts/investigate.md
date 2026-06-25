@@ -16,18 +16,18 @@ You are inside a blobless clone of the `CODE_REPO` repository with
 full commit history. `git log`, `git diff`, etc. work normally — no
 need to deepen or unshallow.
 
-To inspect a specific commit, check it out with the `checkout-sha`
-helper (do not use a plain `git checkout <sha>` — it cannot reliably
-fetch file contents for commits on non-default branches):
+To inspect a specific commit, check it out normally:
 
 ```bash
-checkout-sha <sha>
+git checkout <sha>
 ```
 
-If `checkout-sha` fails (SHA not reachable from this remote — rare,
-only happens for commits exclusive to a fork), proceed with the
-currently checked-out code instead, but add a prominent warning at
-the very top of `artifacts/findings.md`:
+File contents for any reachable commit are fetched on demand, so this
+works even for commits on release branches. If the checkout fails
+because the SHA is not reachable from this remote (rare — only for
+commits exclusive to a fork), proceed with the currently checked-out
+code instead, but add a prominent warning at the very top of
+`artifacts/findings.md`:
 
 > **Warning:** Could not check out failure SHA `<sha>`. Analysis is
 > based on the default branch tip, which may differ from the code
@@ -47,8 +47,7 @@ to check what's available.
 Key tools at your disposal:
 
 - **Code reading**: Read, Grep, Glob, and common shell text tools
-- **Git**: all git commands (log, diff, show, etc.); use
-  `checkout-sha <sha>` to check out a specific commit
+- **Git**: all git commands (log, diff, show, checkout, etc.)
 - **GitHub CLI**: gh issue view/list, gh pr view/list/diff, gh search
 - **Web browsing**: WebFetch tool for reading web pages and JSON APIs
 - **File download**: `fetch-url <url> [output-file]` (GET-only HTTP
@@ -129,10 +128,10 @@ fix is present in the failure SHA's history using `git log`.
 After determining the failure SHA from Step 1, check it out:
 
 ```bash
-checkout-sha <failure-sha>
+git checkout <failure-sha>
 ```
 
-If `checkout-sha` fails, fall back to the default branch tip (see the
+If the checkout fails, fall back to the default branch tip (see the
 warning note in the checkout instructions above).
 
 Then explore the relevant source code:

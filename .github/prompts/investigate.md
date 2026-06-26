@@ -12,26 +12,27 @@ prompt); `gh` defaults to it, so use plain `gh issue`/`gh pr`/`gh search`
 commands. The working tree is checked out from `CODE_REPO`; use that
 when building source links (blob/permalink URLs).
 
-You are inside a blobless clone of the `CODE_REPO` repository with
-full commit history. `git log`, `git diff`, etc. work normally — no
-need to deepen or unshallow.
+You are inside a blobless clone of the `CODE_REPO` repository. `git log`
+works across full history. The working tree is **already checked out at
+the failure commit** (`CHECKED OUT SHA`, passed in the prompt); reading
+files, `git blame`, `git show`, and `git diff` against that commit all
+work because its file contents are present locally.
 
-To inspect a specific commit, check it out normally:
+Do **not** run `git checkout`, and do not try to read file contents at a
+*different* commit. The agent's git credentials cannot fetch from
+`CODE_REPO`, so anything that needs another commit's file contents (a
+checkout, `git show <other-sha>:file`, `git blame` walking into older
+revisions) will fail. The failure-commit checkout is performed for you in
+an earlier workflow step — just analyze the code as checked out.
 
-```bash
-git checkout <sha>
-```
-
-File contents for any reachable commit are fetched on demand, so this
-works even for commits on release branches. If the checkout fails
-because the SHA is not reachable from this remote (rare — only for
-commits exclusive to a fork), proceed with the currently checked-out
-code instead, but add a prominent warning at the very top of
+If `CHECKED OUT SHA` is empty, the failure SHA could not be checked out
+and the working tree is at the default-branch tip instead. Proceed with
+the available code but add a prominent warning at the very top of
 `artifacts/findings.md`:
 
-> **Warning:** Could not check out failure SHA `<sha>`. Analysis is
-> based on the default branch tip, which may differ from the code
-> that produced the failure.
+> **Warning:** Could not check out the failure SHA. Analysis is based on
+> the default branch tip, which may differ from the code that produced
+> the failure.
 
 Failure types include roachtests (`pkg/cmd/roachtest/tests`) and Go
 unit tests. Your goal is to develop hypotheses about the failure and
@@ -47,7 +48,8 @@ to check what's available.
 Key tools at your disposal:
 
 - **Code reading**: Read, Grep, Glob, and common shell text tools
-- **Git**: all git commands (log, diff, show, checkout, etc.)
+- **Git**: read-only git commands (log, diff, show, blame) against the
+  checked-out failure commit; not `git checkout` (see above)
 - **GitHub CLI**: gh issue view/list, gh pr view/list/diff, gh search
 - **Web browsing**: WebFetch tool for reading web pages and JSON APIs
 - **File download**: `fetch-url <url> [output-file]` (GET-only HTTP
@@ -125,16 +127,14 @@ fix is present in the failure SHA's history using `git log`.
 
 ### Step 3: Read the Source Code
 
-After determining the failure SHA from Step 1, check it out:
+The working tree is already checked out at the failure commit
+(`CHECKED OUT SHA`), so explore the source directly. Confirm that
+`CHECKED OUT SHA` matches the failure you are investigating from Step 1;
+if it does not (or it is empty), note that the analysis is pinned to the
+checked-out code — you cannot switch commits (see the checkout
+instructions above).
 
-```bash
-git checkout <failure-sha>
-```
-
-If the checkout fails, fall back to the default branch tip (see the
-warning note in the checkout instructions above).
-
-Then explore the relevant source code:
+Explore the relevant source code:
 - Roachtest code lives in `pkg/cmd/roachtest/tests/`
 - Unit tests live alongside their package
 - Grep for error messages to find their origin

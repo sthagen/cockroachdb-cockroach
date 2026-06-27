@@ -141,8 +141,13 @@ jobs:
           # haves, which GitHub serves reliably for any reachable commit — and
           # import those objects so later reads need no network access.
           #
-          # All git invocations here use the real binary (/usr/bin/git), not
-          # the wrapper installed below, to avoid recursion.
+          # This runs in a workflow step (not inside the agent), while the
+          # actions/checkout credentials are still in place. The agent step
+          # never has working credentials for CODE_REPO: cockroachdb/claude-
+          # code-action's configureGitAuth strips the actions/checkout auth
+          # header and repoints origin at the workflow repo, so any git fetch
+          # the agent attempts hits the wrong repository. That is why the
+          # checkout is done here rather than by the agent.
           cat > /usr/local/bin/snapshot-fetch <<'WRAPPER'
           #!/bin/bash
           set -euo pipefail
@@ -173,59 +178,59 @@ jobs:
           set -euo pipefail
           sha="${1:?Usage: checkout-sha SHA}"
           snapshot-fetch "$sha"
-          /usr/bin/git -c advice.detachedHead=false checkout --force "$sha"
+          git -c advice.detachedHead=false checkout --force "$sha"
           WRAPPER
           chmod +x /usr/local/bin/checkout-sha
 
-          # git wrapper — make a plain `git checkout <sha>` (the reflex the
-          # agent reaches for) work in the blobless clone. Real git handles
-          # everything; only a checkout/switch that fails because the lazy
-          # blob fetch was rejected ("not our ref" / promisor remote) is
-          # retried after snapshot-fetch imports the target commit. This
-          # removes the dependency on the agent remembering to use
-          # checkout-sha, which it reliably forgets.
-          cat > /usr/local/bin/git <<'WRAPPER'
-          #!/bin/bash
+      # Pin the worktree to the failure commit while the actions/checkout
+      # credentials for the checked-out repo are still active. The agent step
+      # cannot do this itself: cockroachdb/claude-code-action's configureGitAuth
+      # strips that auth header and repoints origin at the workflow repo, so any
+      # fetch the agent attempts (e.g. a lazy blob fetch on `git checkout`) hits
+      # the wrong repository and fails with "not our ref". We therefore resolve
+      # and check out the SHA here and pass it to the agent. On any failure we
+      # leave the worktree at the default-branch tip; the agent emits a warning.
+      - name: Check out failure SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
           set -uo pipefail
-          REAL_GIT=/usr/bin/git
 
-          case "${1:-}" in
-            checkout|switch) ;;
-            *) exec "$REAL_GIT" "$@" ;;
-          esac
+          # An explicit SHA in the trigger comment ("/investigate <sha>") wins.
+          sha=""
+          if [[ "$COMMENT_BODY" =~ /investigate[[:space:]]+([0-9a-f]{40}) ]]; then
+            sha="${BASH_REMATCH[1]}"
+          fi
 
-          out=$("$REAL_GIT" "$@" 2>&1); rc=$?
-          if [ "$rc" -eq 0 ]; then
-            [ -n "$out" ] && printf '%s\n' "$out" >&2
+          # Otherwise take the most recent failure SHA. Failures are filed by
+          # cockroach-teamcity (the issue body for the first, a comment for each
+          # subsequent one), each linking to .../commits/<sha>. Prefer the
+          # latest cockroach-teamcity post; fall back to the latest commit link
+          # from any author.
+          if [ -z "$sha" ]; then
+            sha=$(gh issue view "$ISSUE_NUMBER" --repo "${{ github.repository }}" \
+              --json author,body,comments --jq '
+                ([{a: .author.login, b: .body}] + [.comments[] | {a: .author.login, b: .body}]) as $posts
+                | ([ $posts[] | select(.a=="cockroach-teamcity") | .b | [scan("commits?/([0-9a-f]{40})")] | (.[0][0] // empty) ]) as $tc
+                | ([ $posts[] | .b | [scan("commits?/([0-9a-f]{40})")] | (.[0][0] // empty) ]) as $any
+                | (if ($tc|length)>0 then ($tc|last) else ($any|last // empty) end)
+              ' 2>/dev/null) || sha=""
+          fi
+
+          if [ -z "$sha" ]; then
+            echo "::warning::Could not determine a failure SHA from issue $ISSUE_NUMBER; leaving worktree at default-branch tip."
+            echo "FAILURE_SHA=" >> "$GITHUB_ENV"
             exit 0
           fi
-          if ! printf '%s' "$out" | grep -qiE 'promisor|not our ref'; then
-            printf '%s\n' "$out" >&2
-            exit "$rc"
-          fi
 
-          # Find the commit-ish among the arguments: the first non-option
-          # token before a `--` path separator that resolves to a commit.
-          # The full commit graph is present (blobless clone), so rev-parse
-          # resolves offline.
-          sha=""
-          for arg in "${@:2}"; do
-            [ "$arg" = "--" ] && break
-            case "$arg" in -*) continue ;; esac
-            if "$REAL_GIT" rev-parse --verify --quiet "${arg}^{commit}" >/dev/null 2>&1; then
-              sha=$("$REAL_GIT" rev-parse "${arg}^{commit}")
-              break
-            fi
-          done
-          if [ -z "$sha" ]; then
-            printf '%s\n' "$out" >&2
-            exit "$rc"
+          echo "Determined failure SHA: $sha"
+          if checkout-sha "$sha"; then
+            echo "Checked out $sha"
+            echo "FAILURE_SHA=$sha" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Failed to check out failure SHA $sha; leaving worktree at default-branch tip."
+            echo "FAILURE_SHA=" >> "$GITHUB_ENV"
           fi
-
-          snapshot-fetch "$sha"
-          exec "$REAL_GIT" "$@"
-          WRAPPER
-          chmod +x /usr/local/bin/git
 
       # Vertex AI auth for cockroachdb/cockroach. Skipped when an
       # ANTHROPIC_API_KEY secret is set (e.g. on a personal fork).
@@ -274,7 +279,7 @@ jobs:
           # based permissions may work after upgrading the action.
           claude_args: |
             --model ${{ inputs.cheap == true && 'claude-sonnet-4-5' || 'claude-opus-4-6' }}
-            --allowedTools "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(checkout-sha:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
+            --allowedTools "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
           prompt: |
             Read and follow the instructions in the prompt file
             `.github/prompts/${{ inputs.smoke_test == true && 'investigate-smoke' || 'investigate' }}.md`.
@@ -283,10 +288,16 @@ jobs:
             CODE_REPO: ${{ env.HAS_API_KEY == 'true' && github.repository || env.CODE_REPO }}
             ISSUE NUMBER: ${{ env.ISSUE_NUMBER }}
             TRIGGER COMMENT: ${{ env.COMMENT_BODY }}
+            CHECKED OUT SHA: ${{ env.FAILURE_SHA }}
             WORKFLOW RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
             Use ISSUE_REPO for all gh issue/pr/search commands. Use
             CODE_REPO when building source links (blob/permalink URLs).
+
+            The working tree is already checked out at CHECKED OUT SHA (the
+            failure commit). If CHECKED OUT SHA is empty, the working tree is
+            at the default-branch tip instead. Do not run `git checkout` — the
+            agent's git credentials cannot fetch from CODE_REPO.
 
       - name: Upload findings
         if: always()

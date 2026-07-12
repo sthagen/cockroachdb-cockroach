@@ -260,6 +260,7 @@ jobs:
           fi
 
       - name: Investigate
+        id: investigate
         uses: cockroachdb/claude-code-action@v1
         env:
           ANTHROPIC_VERTEX_PROJECT_ID: ${{ env.HAS_API_KEY != 'true' && 'vertex-model-runners' || '' }}
@@ -299,6 +300,48 @@ jobs:
             at the default-branch tip instead. Do not run `git checkout` — the
             agent's git credentials cannot fetch from CODE_REPO.
 
+      # The agent is instructed to write its report to artifacts/findings.md,
+      # which the steps below upload and post. It occasionally finishes a
+      # successful investigation without writing the file — e.g. it tries to
+      # post the comment itself, which the sandbox denies, and gives up. Its
+      # final summary is still captured in the action's execution-output JSON,
+      # so recover it into artifacts/findings.md as a fallback. This keeps a
+      # single source of truth for the upload and post steps, and means a
+      # missing file reflects a genuinely empty investigation rather than the
+      # agent delivering its findings the wrong way.
+      - name: Recover findings from agent output
+        if: always()
+        env:
+          OUTPUT_FILE: ${{ steps.investigate.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+
+          if [ -s artifacts/findings.md ]; then
+            exit 0
+          fi
+          if [ -z "${OUTPUT_FILE:-}" ] || [ ! -s "$OUTPUT_FILE" ]; then
+            echo "No execution output file to recover findings from."
+            exit 0
+          fi
+
+          # The file is a JSON array of turn objects; the agent's final summary
+          # is the `result` field of the terminating `result` turn.
+          summary=$(jq -r '[.[] | select(.type? == "result") | .result? // empty] | last // empty' \
+            "$OUTPUT_FILE" 2>/dev/null || true)
+          if [ -z "$summary" ]; then
+            echo "Execution output contained no result summary to recover."
+            exit 0
+          fi
+
+          mkdir -p artifacts
+          {
+            echo "> **Note:** Recovered from the agent's final message; the"
+            echo "> investigation did not write \`artifacts/findings.md\` directly."
+            echo
+            echo "$summary"
+          } > artifacts/findings.md
+          echo "Recovered findings from execution output."
+
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@v4
@@ -312,14 +355,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -s artifacts/findings.md ]; then
+            # Append the run link and feedback footer here rather than asking
+            # the agent to write them, so the prompt never has to describe the
+            # report as a posted comment (which tempted it to post directly).
+            {
+              cat artifacts/findings.md
+              printf '\n\n---\n\n'
+              printf '[Workflow run](%s) · Was this investigation helpful? Leave a 👍 or 👎 on this comment.\n' "$run_url"
+            } > "${RUNNER_TEMP:-/tmp}/comment_body.md"
             gh issue comment "$ISSUE_NUMBER" \
               --repo ${{ github.repository }} \
-              --body-file artifacts/findings.md
+              --body-file "${RUNNER_TEMP:-/tmp}/comment_body.md"
           else
             gh issue comment "$ISSUE_NUMBER" \
               --repo ${{ github.repository }} \
-              --body "Investigation did not produce findings. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+              --body "Investigation did not produce findings. Check the [workflow run]($run_url) for details."
           fi
 
       - name: Clean up EngFlow certificates

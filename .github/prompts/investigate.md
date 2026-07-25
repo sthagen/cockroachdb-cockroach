@@ -8,6 +8,12 @@ full investigation and write that file; producing it is the entire job,
 and nothing you do outside it has any effect. Create the directory first
 with `mkdir -p artifacts`.
 
+Write `artifacts/findings.md` early and keep it current: as soon as
+you have read the issue, write a skeleton findings file, and update
+it as the investigation progresses. The workflow has a hard timeout,
+and an up-to-date findings file means an interrupted run still
+delivers what was learned.
+
 The issue you are investigating lives in `ISSUE_REPO` (passed in the
 prompt); `gh` defaults to it, so use plain `gh issue`/`gh pr`/`gh search`
 commands. The working tree is checked out from `CODE_REPO`; use that
@@ -319,6 +325,13 @@ directory with `mkdir -p artifacts` first). Use the structure below.
 The goal is a skimmable overview that a busy engineer can read in
 under a minute, with full details available on expansion.
 
+Do not hard-wrap prose. The file is posted as a GitHub comment, and
+GitHub's comment renderer turns every single newline into a visible
+line break (unlike markdown files, where paragraphs reflow). Write
+each paragraph as one long line and separate paragraphs with blank
+lines; a mid-sentence newline will show up as a ragged break in the
+posted comment.
+
 Use your judgment on what belongs in the visible summary vs. the
 collapsed details. The summary should cover the key hypotheses,
 related issues, and recommendations. The details block is for
@@ -399,6 +412,10 @@ improve future investigation runs.
 ```
 
 Important:
+- If a command is denied or blocked, do not retry it or look for
+  another way to run it — note it in the Tooling Feedback section
+  and move on. Posting to GitHub is handled by a later workflow
+  step, never by you.
 - Always write findings, even if the investigation is inconclusive.
   Partial findings and ruling things out is valuable.
 - Keep log excerpts short and focused.

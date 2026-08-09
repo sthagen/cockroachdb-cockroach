@@ -609,3 +609,38 @@ catalog: {}
 error: 'failed to verify keys for Scan: end key /Table/3/1/111/2/1 must be greater than start /Table/3/1/112/2/1'
 trace:
 - Scan Range /Table/3/1/112/2/1 /Table/3/1/111/2/1
+
+# Reset before exercising the per-txn negative name cache.
+reset
+----
+
+# Looking up a name that doesn't exist marks it as known-to-not-exist for
+# the remainder of this txn, so subsequent layers can short-circuit before
+# hitting storage.
+get_by_names name_key=(100,101,does_not_exist)
+----
+catalog: {}
+trace:
+- Get /NamespaceTable/30/1/100/101/"does_not_exist"/4/1
+
+is_name_known_to_not_exist name_key=(100,101,does_not_exist)
+----
+true
+
+# A different absent name we haven't looked up yet is still unknown.
+is_name_known_to_not_exist name_key=(100,101,also_missing)
+----
+false
+
+# A positive cache entry is not a negative one.
+is_name_known_to_not_exist name_key=(0,0,system)
+----
+false
+
+# Resetting wipes the per-txn negative cache.
+reset
+----
+
+is_name_known_to_not_exist name_key=(100,101,does_not_exist)
+----
+false

@@ -1013,3 +1013,36 @@ query ITT
 SELECT * FROM t146637 WHERE (a = 0 OR a = 100) AND b = 'foo' ORDER BY a DESC LIMIT 1;
 ----
 100  foo  bar
+
+# Regression test for #170544. InlineConstVar must cast an inlined constant to
+# the variable's type when the two are equivalent but not identical, so that
+# type-sensitive expressions such as pg_typeof are not changed.
+statement ok
+CREATE TABLE t170544_name (n NAME);
+INSERT INTO t170544_name VALUES ('hello')
+
+# pg_typeof(n) must still observe NAME (not STRING), so the row is returned.
+query T
+SELECT n FROM t170544_name WHERE n = 'hello' AND pg_typeof(n)::TEXT = 'name'
+----
+hello
+
+# The cast added when inlining must not introduce an evaluation error for
+# out-of-range or lossy casts, because the constant only reaches dead rows.
+# INT8 -> INT2 overflow: the query returns zero rows rather than erroring.
+statement ok
+CREATE TABLE t170544_int2 (i2 INT2);
+INSERT INTO t170544_int2 VALUES (5)
+
+query I
+SELECT i2 FROM t170544_int2 WHERE i2 = 40000 AND i2 + 0 = 5
+----
+
+# VARCHAR(n) truncation: the query returns zero rows rather than incorrect rows.
+statement ok
+CREATE TABLE t170544_varchar (s VARCHAR(3));
+INSERT INTO t170544_varchar VALUES ('abc')
+
+query T
+SELECT s FROM t170544_varchar WHERE s = 'abcdef' AND lower(s) = 'abc'
+----

@@ -226,6 +226,66 @@ project
                 │              └── true [as=column14:14]
                 └── false
 
+# Regression test for #170544. InlineConstVar must not replace a variable with a
+# constant whose type is equivalent but not identical to the variable's type
+# without a cast, since that changes the result of type-sensitive expressions
+# such as pg_typeof. Here n is NAME and the constant 'hello' is STRING; the
+# inlined constant is cast back to NAME so pg_typeof(n) still reports 'name' and
+# the row is not incorrectly filtered out.
+exec-ddl
+CREATE TABLE t_name (n NAME)
+----
+
+norm expect=InlineConstVar
+SELECT * FROM t_name WHERE n = 'hello' AND pg_typeof(n)::TEXT = 'name'
+----
+select
+ ├── columns: n:1!null
+ ├── fd: ()-->(1)
+ ├── scan t_name
+ │    └── columns: n:1
+ └── filters
+      └── n:1 = 'hello' [outer=(1), constraints=(/1: [/'hello' - /'hello']; tight), fd=()-->(1)]
+
+# Out-of-range constant (#170544). i2 = 40000 is a contradiction for an INT2
+# column, so no row is ever live. The cast that InlineConstVar adds (40000::INT2,
+# which would overflow) must not be folded eagerly, or the query would error
+# instead of returning zero rows.
+exec-ddl
+CREATE TABLE t_int2 (i2 INT2)
+----
+
+norm
+SELECT * FROM t_int2 WHERE i2 = 40000 AND i2 + 0 = 5
+----
+select
+ ├── columns: i2:1!null
+ ├── immutable
+ ├── fd: ()-->(1)
+ ├── scan t_int2
+ │    └── columns: i2:1
+ └── filters
+      ├── i2:1 = 40000 [outer=(1), constraints=(/1: [/40000 - /40000]; tight), fd=()-->(1)]
+      └── 40000::INT2::INT8 = 5 [immutable]
+
+# Length-limited type (#170544). 'abcdef' truncates to 'abc' when cast to
+# VARCHAR(3), but s = 'abcdef' is a contradiction, so the truncated constant is
+# only ever inlined into dead rows.
+exec-ddl
+CREATE TABLE t_varchar (s VARCHAR(3))
+----
+
+norm
+SELECT * FROM t_varchar WHERE s = 'abcdef' AND lower(s) = 'abc'
+----
+select
+ ├── columns: s:1!null
+ ├── fd: ()-->(1)
+ ├── scan t_varchar
+ │    └── columns: s:1
+ └── filters
+      └── s:1 = 'abcdef' [outer=(1), constraints=(/1: [/'abcdef' - /'abcdef']; tight), fd=()-->(1)]
+
 # --------------------------------------------------
 # InlineProjectConstants
 # --------------------------------------------------

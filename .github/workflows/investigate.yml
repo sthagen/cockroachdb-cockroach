@@ -96,6 +96,20 @@ jobs:
       HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
       # Repository to check out the code from. Issues and comments use github.repository.
       CODE_REPO: ${{ secrets.CODE_REPO }}
+      # Tool permissions, shared by both investigation paths (the Vertex
+      # `roachdev agent` step and the API-key fork action step) so they
+      # never drift. Permissions use the colon format (Bash(cmd:args))
+      # because cockroachdb/claude-code-action@v1 (Claude Code 2.0.1)
+      # ignores permissions set via the `settings` input.
+      #
+      # Posting to GitHub is the Post findings step's job, never the
+      # agent's. The posting commands are explicitly denied — rather than
+      # merely left off the allowlist — because an unlisted command fails
+      # with "requires approval", which the agent treats as retryable; an
+      # explicit deny is terminal and makes it fall back to writing
+      # artifacts/findings.md. gh api is included because it can post too.
+      ALLOWED_TOOLS: "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
+      DISALLOWED_TOOLS: "Bash(gh issue comment:*),Bash(gh pr comment:*),Bash(gh api:*)"
     steps:
       # Authorization cannot live in the job-level `if:` expression because
       # checking effective permissions requires an API call. The
@@ -315,55 +329,144 @@ jobs:
           echo "CLAUDE_MODEL=$model" >> "$GITHUB_ENV"
           echo "CLAUDE_EFFORT=$effort" >> "$GITHUB_ENV"
 
-      # claude-code-action@v1 would install Claude Code 1.0.127
-      # (Sep 2025), which predates the --effort flag (the CLI errors on
-      # unknown options) as well as the Sonnet 5 and Fable 5 models.
-      # Install a pinned recent version instead and hand it to the
-      # action via path_to_claude_code_executable below.
-      - name: Install Claude Code
-        run: |
-          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.209
-          echo "CLAUDE_BIN=$HOME/.local/bin/claude" >> "$GITHUB_ENV"
+      # Install the Claude Code CLI and (on the Vertex path) the roachdev
+      # binary. The Vertex path runs Claude through `roachdev agent`, which
+      # appends the public-repository disclosure policy to Claude's system
+      # prompt on every session — that policy lives in the binary, never in
+      # this public workflow, which is what keeps confidential internals out
+      # of the findings comment.
+      #
+      # roachdev is an internal release in another org, which a public repo
+      # cannot install via `uses: cockroachlabs/roachdev@main` (GitHub blocks
+      # internal-repo actions from public repos). This composite action
+      # downloads the released binary directly, using the cross-org PAT that
+      # already checks out the private code repo. On the personal-fork
+      # API-key path no token is passed, so roachdev is skipped — that path
+      # runs Claude directly and never posts to a public repo.
+      #
+      # This is referenced by full repo path @ref rather than the local `./`
+      # form on purpose: the Checkout step above replaced the workspace with
+      # CODE_REPO, so `./.github/actions/...` (resolved against the workspace)
+      # would not be found. A remote ref is fetched independently of the
+      # workspace. Tracks master so same-repo action edits take effect without
+      # a version bump.
+      - name: Set up roachdev and Claude Code
+        uses: cockroachdb/cockroach/.github/actions/setup-roachdev@master
+        with:
+          # Pinned: claude-code-action@v1 would otherwise install Claude Code
+          # 1.0.127 (Sep 2025), which predates --effort and the Sonnet 5 /
+          # Fable 5 models. The fork path hands this binary to the action via
+          # path_to_claude_code_executable (CLAUDE_BIN).
+          claude_version: 2.1.209
+          roachdev_download_token: ${{ env.HAS_API_KEY != 'true' && secrets.INVESTIGATE_PAT || '' }}
 
-      - name: Investigate
+      # Vertex path (this public repo). Run Claude through `roachdev agent`
+      # (the same entrypoint the Dev Inf AI code-review workflows use), which
+      # appends the public-repository disclosure policy to the system prompt
+      # on every session — the whole point of the migration: the policy
+      # lives in the binary, not in this public workflow, keeping
+      # confidential internals out of the findings comment. roachdev
+      # configures Vertex (project, region, CLAUDE_CODE_USE_VERTEX) in its
+      # generated settings and, in daemonless mode, calls Vertex directly
+      # using the ADC credentials from the Google Cloud auth step.
+      - name: Investigate (Vertex, via roachdev)
+        id: investigate_roachdev
+        if: env.HAS_API_KEY != 'true'
+        env:
+          ROACHDEV_NO_DAEMON: "1"
+          ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
+          CLOUD_ML_REGION: global
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The checkout is a different repo than this one; point the
+          # agent's gh commands at this repo's issue tracker.
+          GH_REPO: ${{ github.repository }}
+          # Same prompt as the API-key action path below; keep the two in
+          # sync. COMMENT_BODY is carried as an env value (never spliced
+          # into the shell command line), so comment content cannot inject
+          # shell — it reaches the agent only as quoted prompt data.
+          PROMPT: |
+            Read and follow the instructions in the prompt file
+            `.github/prompts/${{ inputs.smoke_test == true && 'investigate-smoke' || 'investigate' }}.md`.
+
+            ISSUE_REPO: ${{ github.repository }}
+            CODE_REPO: ${{ env.CODE_REPO }}
+            ISSUE NUMBER: ${{ env.ISSUE_NUMBER }}
+            TRIGGER COMMENT: ${{ env.COMMENT_BODY }}
+            CHECKED OUT SHA: ${{ env.FAILURE_SHA }}
+            WORKFLOW RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Use ISSUE_REPO for all gh issue/pr/search commands. Use
+            CODE_REPO when building source links (blob/permalink URLs).
+
+            The working tree is already checked out at CHECKED OUT SHA (the
+            failure commit). If CHECKED OUT SHA is empty, the working tree is
+            at the default-branch tip instead. Do not run `git checkout` — the
+            agent's git credentials cannot fetch from CODE_REPO.
+
+            Your only deliverable is the file `artifacts/findings.md`; a
+            later workflow step posts it to the issue. Commands that post
+            to GitHub (`gh issue comment`, `gh pr comment`, `gh api`) are
+            denied unconditionally. If any command is denied, do not retry
+            it or look for another way to run it — note it in the Tooling
+            Feedback section of your findings and move on.
+        run: |
+          set -uo pipefail
+
+          # `roachdev agent -B` streams the session to stdout; capture it so
+          # the recovery step can fall back to it if the agent doesn't write
+          # artifacts/findings.md itself.
+          STDOUT_FILE="$RUNNER_TEMP/roachdev_stdout.txt"
+          echo "ROACHDEV_STDOUT=$STDOUT_FILE" >> "$GITHUB_ENV"
+
+          # -B blocks and propagates the exit code; --no-wt runs in the
+          # already-checked-out worktree (pinned to the failure SHA) instead
+          # of creating a fresh one. The prompt is the trailing positional
+          # argument (it is not a named agent, so it is treated as the prompt).
+          set +e
+          roachdev agent -B --no-wt \
+            --model "$CLAUDE_MODEL" \
+            --effort "$CLAUDE_EFFORT" \
+            --allowed-tools "$ALLOWED_TOOLS" \
+            --disallowed-tools "$DISALLOWED_TOOLS" \
+            "$PROMPT" | tee "$STDOUT_FILE"
+          CODE=${PIPESTATUS[0]}
+          set -e
+
+          # Don't fail the job on a non-zero agent exit: the always()-guarded
+          # recovery/upload/post steps still surface whatever the agent
+          # produced, matching the prior action-based behavior.
+          if [ "$CODE" -ne 0 ]; then
+            echo "::warning::roachdev claude exited with code $CODE; downstream steps will still post any findings produced."
+          fi
+
+      # Personal-fork path (Vertex OIDC unavailable). Kept on the action
+      # with a direct ANTHROPIC_API_KEY. This path cannot reach the
+      # internal roachdev release and never posts to a public repo, so it
+      # does not need the disclosure policy and is left unchanged.
+      - name: Investigate (personal fork, API key)
         id: investigate
+        if: env.HAS_API_KEY == 'true'
         uses: cockroachdb/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
         env:
-          ANTHROPIC_VERTEX_PROJECT_ID: ${{ env.HAS_API_KEY != 'true' && 'vertex-model-runners' || '' }}
-          CLOUD_ML_REGION: ${{ env.HAS_API_KEY != 'true' && 'global' || '' }}
           # The checkout is a different repo than this one; point the
           # agent's gh commands at this repo's issue tracker.
           GH_REPO: ${{ github.repository }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          use_vertex: ${{ env.HAS_API_KEY != 'true' && 'true' || 'false' }}
+          use_vertex: 'false'
           path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
-          # Permissions are passed via --allowedTools using the colon
-          # format (Bash(cmd:args)) because cockroachdb/claude-code-action@v1
-          # (Claude Code 2.0.1) ignores permissions set via the `settings`
-          # input — tools end up denied even though settings.json is written
-          # correctly. The newer space format (Bash(cmd args)) and settings-
-          # based permissions may work after upgrading the action.
-          #
-          # Posting to GitHub is the Post findings step's job, never the
-          # agent's. The posting commands are explicitly denied — rather
-          # than merely left off the allowlist — because an unlisted
-          # command fails with "requires approval", which the agent
-          # treats as retryable; an explicit deny is terminal and makes
-          # it fall back to writing artifacts/findings.md. gh api is
-          # included because it can post comments too.
           claude_args: |
             --model ${{ env.CLAUDE_MODEL }}
             --effort ${{ env.CLAUDE_EFFORT }}
-            --allowedTools "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
-            --disallowedTools "Bash(gh issue comment:*),Bash(gh pr comment:*),Bash(gh api:*)"
+            --allowedTools "${{ env.ALLOWED_TOOLS }}"
+            --disallowedTools "${{ env.DISALLOWED_TOOLS }}"
           prompt: |
             Read and follow the instructions in the prompt file
             `.github/prompts/${{ inputs.smoke_test == true && 'investigate-smoke' || 'investigate' }}.md`.
 
             ISSUE_REPO: ${{ github.repository }}
-            CODE_REPO: ${{ env.HAS_API_KEY == 'true' && github.repository || env.CODE_REPO }}
+            CODE_REPO: ${{ github.repository }}
             ISSUE NUMBER: ${{ env.ISSUE_NUMBER }}
             TRIGGER COMMENT: ${{ env.COMMENT_BODY }}
             CHECKED OUT SHA: ${{ env.FAILURE_SHA }}
@@ -388,11 +491,16 @@ jobs:
       # which the steps below upload and post. It occasionally finishes a
       # successful investigation without writing the file — e.g. it tries to
       # post the comment itself, which the sandbox denies, and gives up. Its
-      # final summary is still captured in the action's execution-output JSON,
-      # so recover it into artifacts/findings.md as a fallback. This keeps a
-      # single source of truth for the upload and post steps, and means a
-      # missing file reflects a genuinely empty investigation rather than the
-      # agent delivering its findings the wrong way.
+      # final message is still recoverable, so fall back to it here. This
+      # keeps a single source of truth for the upload and post steps, and
+      # means a missing file reflects a genuinely empty investigation rather
+      # than the agent delivering its findings the wrong way.
+      #
+      # Two recovery sources, one per investigation path:
+      #   - Vertex/roachdev: the streamed agent session captured to
+      #     ROACHDEV_STDOUT (rendered human-readable by `roachdev agent -B`).
+      #   - API-key/action: the `result` field of the action's execution
+      #     JSON (a JSON array of turn objects).
       - name: Recover findings from agent output
         if: always()
         env:
@@ -403,17 +511,20 @@ jobs:
           if [ -s artifacts/findings.md ]; then
             exit 0
           fi
-          if [ -z "${OUTPUT_FILE:-}" ] || [ ! -s "$OUTPUT_FILE" ]; then
-            echo "No execution output file to recover findings from."
-            exit 0
+
+          summary=""
+          # roachdev path: the captured streamed session (best-effort
+          # fallback; the agent normally writes artifacts/findings.md).
+          if [ -n "${ROACHDEV_STDOUT:-}" ] && [ -s "$ROACHDEV_STDOUT" ]; then
+            summary=$(cat "$ROACHDEV_STDOUT")
+          # action path: extract the terminating `result` turn's summary.
+          elif [ -n "${OUTPUT_FILE:-}" ] && [ -s "$OUTPUT_FILE" ]; then
+            summary=$(jq -r '[.[] | select(.type? == "result") | .result? // empty] | last // empty' \
+              "$OUTPUT_FILE" 2>/dev/null || true)
           fi
 
-          # The file is a JSON array of turn objects; the agent's final summary
-          # is the `result` field of the terminating `result` turn.
-          summary=$(jq -r '[.[] | select(.type? == "result") | .result? // empty] | last // empty' \
-            "$OUTPUT_FILE" 2>/dev/null || true)
           if [ -z "$summary" ]; then
-            echo "Execution output contained no result summary to recover."
+            echo "No agent output to recover findings from."
             exit 0
           fi
 
@@ -424,7 +535,7 @@ jobs:
             echo
             echo "$summary"
           } > artifacts/findings.md
-          echo "Recovered findings from execution output."
+          echo "Recovered findings from agent output."
 
       - name: Upload findings
         if: always()

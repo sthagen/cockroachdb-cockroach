@@ -127,6 +127,14 @@ func (c *cachedCatalogReader) IsNameInCache(key descpb.NameInfo) bool {
 	return c.cache.LookupNamespaceEntry(key) != nil
 }
 
+// IsNameKnownToNotExist is part of the CatalogReader interface.
+func (c *cachedCatalogReader) IsNameKnownToNotExist(key descpb.NameInfo) bool {
+	if c.cache.LookupNamespaceEntry(key) != nil {
+		return false
+	}
+	return c.hasScanAll || c.byNameState[key].hasGetNamespaceEntries
+}
+
 // IsDescIDKnownToNotExist is part of the CatalogReader interface.
 func (c *cachedCatalogReader) IsDescIDKnownToNotExist(id, maybeParentID descpb.ID) bool {
 	if c.cache.LookupDescriptor(id) != nil {

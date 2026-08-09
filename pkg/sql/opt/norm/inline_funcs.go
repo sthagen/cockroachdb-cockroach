@@ -388,6 +388,16 @@ func (c *CustomFuncs) InlineConstVar(f memo.FiltersExpr) memo.FiltersExpr {
 	replace = func(nd opt.Expr) opt.Expr {
 		if t, ok := nd.(*memo.VariableExpr); ok {
 			if e, ok := vals[t.Col]; ok {
+				// The constant was matched against the variable using Equivalent
+				// (not Identical) above, so its type may differ from the
+				// variable's (e.g. a STRING constant for a NAME column).
+				// Substituting the constant directly would change the result of
+				// type-sensitive expressions such as pg_typeof, so cast the
+				// constant to the variable's type when the two are not identical.
+				colType := c.mem.Metadata().ColumnMeta(t.Col).Type
+				if !e.DataType().Identical(colType) {
+					return c.f.ConstructCast(e, colType)
+				}
 				return e
 			}
 		}

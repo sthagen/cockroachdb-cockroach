@@ -47,6 +47,10 @@ type CatalogReader interface {
 	// exists no descriptor in storage with that ID.
 	IsDescIDKnownToNotExist(id, maybeParentID descpb.ID) bool
 
+	// IsNameKnownToNotExist returns true when we know that there definitely
+	// exists no namespace entry in storage for this name key.
+	IsNameKnownToNotExist(key descpb.NameInfo) bool
+
 	// Reset resets any state that the CatalogReader may hold.
 	Reset(ctx context.Context)
 
@@ -211,6 +215,11 @@ func (cr catalogReader) IsNameInCache(_ descpb.NameInfo) bool {
 
 // IsDescIDKnownToNotExist is part of the CatalogReader interface.
 func (cr catalogReader) IsDescIDKnownToNotExist(_, _ descpb.ID) bool {
+	return false
+}
+
+// IsNameKnownToNotExist is part of the CatalogReader interface.
+func (cr catalogReader) IsNameKnownToNotExist(_ descpb.NameInfo) bool {
 	return false
 }
 

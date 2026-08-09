@@ -77,10 +77,10 @@ jobs:
 
       - name: Stage 1 - Assess Issue Feasibility
         id: assess
-        uses: cockroachdb/claude-code-action@426380f01bad0a17200865605a85cb28926dccbf # v1
+        uses: cockroachdb/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
         env:
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
-          CLOUD_ML_REGION: us-east5
+          CLOUD_ML_REGION: global
           # Pass user-controlled content via env vars to prevent prompt injection
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
@@ -90,7 +90,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           use_vertex: "true"
           claude_args: |
-            --model claude-opus-4-6
+            --model claude-opus-4-8
             --allowedTools "Read,Grep,Glob,Bash(gh issue view:*)"
           prompt: |
             <system_instruction priority="absolute">
@@ -176,7 +176,7 @@ jobs:
         env:
           CLAUDE_CODE_USE_VERTEX: "1"
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
-          CLOUD_ML_REGION: us-east5
+          CLOUD_ML_REGION: global
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           AUTOMATION: "1"
@@ -265,7 +265,7 @@ jobs:
               # First attempt - start new session
               echo "Starting new Claude session..."
               echo "$PROMPT" | claude --print \
-                --model claude-opus-4-6 \
+                --model claude-opus-4-8 \
                 --output-format json \
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?
@@ -274,7 +274,7 @@ jobs:
               echo "Resuming session $SESSION_ID..."
               echo "The previous attempt did not succeed. Please try again to fix the issue. Remember to end your response with IMPLEMENTATION_RESULT - SUCCESS or IMPLEMENTATION_RESULT - FAILED." | claude --print \
                 --resume "$SESSION_ID" \
-                --model claude-opus-4-6 \
+                --model claude-opus-4-8 \
                 --output-format json \
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?

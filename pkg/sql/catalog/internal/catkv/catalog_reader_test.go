@@ -125,6 +125,17 @@ func TestDataDriven(t *testing.T) {
 					}
 					return fmt.Sprintf("%v", ccr.IsDescIDKnownToNotExist(descpb.ID(id), descpb.ID(maybeParentID)))
 
+				case "is_name_known_to_not_exist":
+					var name string
+					var dbID, scID int
+					d.ScanArgs(t, "name_key", &dbID, &scID, &name)
+					ni := descpb.NameInfo{
+						ParentID:       descpb.ID(dbID),
+						ParentSchemaID: descpb.ID(scID),
+						Name:           name,
+					}
+					return fmt.Sprintf("%v", ccr.IsNameKnownToNotExist(ni))
+
 				case "scan_all":
 					q := func(ctx context.Context, txn *kv.Txn, cr catkv.CatalogReader) (nstree.Catalog, error) {
 						return cr.ScanAll(ctx, txn)

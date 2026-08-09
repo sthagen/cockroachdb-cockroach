@@ -714,6 +714,11 @@ func (tc *Collection) getNonVirtualDescriptorID(
 			}
 			return haltLookups, descpb.InvalidID, nil
 		}
+		// Short-circuit before the leased lookup, which would otherwise re-read
+		// system.namespace on every absent-name reference within the txn.
+		if tc.cr.IsNameKnownToNotExist(ni) {
+			return haltLookups, descpb.InvalidID, nil
+		}
 		return continueLookups, descpb.InvalidID, nil
 	}
 	lookupLeasedID := func() (continueOrHalt, descpb.ID, error) {

@@ -7,9 +7,9 @@
 # Model selection: the first words after `/investigate` pick the model
 # and the reasoning effort:
 #
-#   /investigate                Opus 4.8 at high effort (the default)
+#   /investigate                Opus 5 at high effort (the default)
 #   /investigate sonnet         Sonnet 5 (cheaper)
-#   /investigate fable          Claude Fable 5 (most capable, 2x Opus price)
+#   /investigate fable          Claude Fable 5.1 (most capable, 2x Opus price)
 #   /investigate fable xhigh    ...at raised reasoning effort
 #
 # Effort is one of low, medium, high (default), xhigh, max.
@@ -50,7 +50,7 @@
 #
 #        git push <your-fork-remote> <failure-sha>:refs/heads/investigate-sha
 #
-#   4. Trigger the workflow. Dispatch defaults to Opus 4.8 at high
+#   4. Trigger the workflow. Dispatch defaults to Opus 5 at high
 #      effort; pass a trigger comment to pick another model or effort:
 #
 #        gh workflow run investigate.yml \
@@ -310,7 +310,7 @@ jobs:
       # inject shell.
       - name: Select model
         run: |
-          model='claude-opus-4-8'
+          model='claude-opus-5'
           effort='high'
           # GitHub delivers comment bodies with CRLF line endings; strip the
           # carriage return so the first line's last word matches the case
@@ -321,7 +321,7 @@ jobs:
           for arg in "$arg1" "$arg2"; do
             case "$arg" in
               sonnet|sonnet-5) model='claude-sonnet-5' ;;
-              fable|fable-5)   model='claude-fable-5' ;;
+              fable|fable-5|fable-5-1) model='claude-fable-5-1' ;;
               low|medium|high|xhigh|max) effort="$arg" ;;
             esac
           done
@@ -557,10 +557,10 @@ jobs:
           # Footer identifying the model, plus a pointer at the deeper
           # settings (omitted when this run already used them). The
           # suggested setting is strictly deeper than any run that sees
-          # the hint, since fable-5 at max is excluded above.
+          # the hint, since fable-5-1 at max is excluded above.
           hint=''
-          if [ "$CLAUDE_MODEL" != 'claude-fable-5' ] || [ "$CLAUDE_EFFORT" != 'max' ]; then
-            hint=' Use `/investigate fable-5 max` to go deeper.'
+          if [ "$CLAUDE_MODEL" != 'claude-fable-5-1' ] || [ "$CLAUDE_EFFORT" != 'max' ]; then
+            hint=' Use `/investigate fable-5-1 max` to go deeper.'
           fi
           if [ -s artifacts/findings.md ]; then
             # Append the footers here rather than asking the agent to write

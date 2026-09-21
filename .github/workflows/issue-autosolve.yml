@@ -91,7 +91,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           use_vertex: "true"
           claude_args: |
-            --model claude-opus-4-8
+            --model claude-opus-5
             --allowedTools "Read,Grep,Glob,Bash(gh issue view:*)"
           prompt: |
             <system_instruction priority="absolute">
@@ -288,7 +288,7 @@ jobs:
               # First attempt - start new session
               echo "Starting new Claude session..."
               echo "$PROMPT" | claude --print \
-                --model claude-opus-4-8 \
+                --model claude-opus-5 \
                 --output-format json \
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(./bin/crlfmt:*),Bash(crlfmt:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?
@@ -297,7 +297,7 @@ jobs:
               echo "Resuming session $SESSION_ID..."
               echo "The previous attempt did not succeed. Please try again to fix the issue. Remember to end your response with IMPLEMENTATION_RESULT - SUCCESS or IMPLEMENTATION_RESULT - FAILED." | claude --print \
                 --resume "$SESSION_ID" \
-                --model claude-opus-4-8 \
+                --model claude-opus-5 \
                 --output-format json \
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(./bin/crlfmt:*),Bash(crlfmt:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?

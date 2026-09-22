@@ -62,6 +62,16 @@ jobs:
           token: ${{ secrets.AUTOSOLVER_CREATE_PRS_PAT }}
           fetch-depth: 0
 
+      # Mint the godeps bucket token from the runner's own GCE default service
+      # account, which has storage.objectViewer on cockroach-godeps-private.
+      # This MUST run before "Authenticate to Google Cloud": that step points
+      # Application Default Credentials at the ai-review Vertex service account
+      # (which lacks bucket access), and set-bazel-storage-access-token.sh mints
+      # its token via ADC, so running it afterwards yields a token that 403s on
+      # Go module fetches. The script lives in the checked-out code repository.
+      - name: Mint godeps bucket token (runner SA)
+        run: ./build/github/set-bazel-storage-access-token.sh
+
       - name: Authenticate to Google Cloud
         uses: 'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093' # v3
         with:

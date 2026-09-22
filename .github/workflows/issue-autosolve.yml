@@ -62,6 +62,16 @@ jobs:
           token: ${{ secrets.AUTOSOLVER_CREATE_PRS_PAT }}
           fetch-depth: 0
 
+      # Mint the godeps bucket token from the runner's own GCE default service
+      # account, which has storage.objectViewer on cockroach-godeps-private.
+      # This MUST run before "Authenticate to Google Cloud": that step points
+      # Application Default Credentials at the ai-review Vertex service account
+      # (which lacks bucket access), and set-bazel-storage-access-token.sh mints
+      # its token via ADC, so running it afterwards yields a token that 403s on
+      # Go module fetches. The script lives in the checked-out code repository.
+      - name: Mint godeps bucket token (runner SA)
+        run: ./build/github/set-bazel-storage-access-token.sh
+
       - name: Authenticate to Google Cloud
         uses: 'google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093' # v3
         with:
@@ -79,6 +89,7 @@ jobs:
         id: assess
         uses: cockroachdb/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
         env:
+          CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: "0"  # 0 selects the full system prompt, not the short one
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
           CLOUD_ML_REGION: global
           # Pass user-controlled content via env vars to prevent prompt injection
@@ -90,7 +101,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           use_vertex: "true"
           claude_args: |
-            --model claude-opus-4-8
+            --model claude-opus-5
             --allowedTools "Read,Grep,Glob,Bash(gh issue view:*)"
           prompt: |
             <system_instruction priority="absolute">
@@ -174,6 +185,7 @@ jobs:
         id: implement
         if: steps.assess_result.outputs.assessment == 'PROCEED'
         env:
+          CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: "0"  # 0 selects the full system prompt, not the short one
           CLAUDE_CODE_USE_VERTEX: "1"
           ANTHROPIC_VERTEX_PROJECT_ID: vertex-model-runners
           CLOUD_ML_REGION: global
@@ -286,7 +298,7 @@ jobs:
               # First attempt - start new session
               echo "Starting new Claude session..."
               echo "$PROMPT" | claude --print \
-                --model claude-opus-4-8 \
+                --model claude-opus-5 \
                 --output-format json \
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(./bin/crlfmt:*),Bash(crlfmt:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?
@@ -295,7 +307,7 @@ jobs:
               echo "Resuming session $SESSION_ID..."
               echo "The previous attempt did not succeed. Please try again to fix the issue. Remember to end your response with IMPLEMENTATION_RESULT - SUCCESS or IMPLEMENTATION_RESULT - FAILED." | claude --print \
                 --resume "$SESSION_ID" \
-                --model claude-opus-4-8 \
+                --model claude-opus-5 \
                 --output-format json \
                 --allowedTools "Read,Write,Edit,Grep,Glob,Bash(gh issue view:*),Bash(./dev test:*),Bash(./dev testlogic:*),Bash(./dev build:*),Bash(./dev generate:*),Bash(./bin/crlfmt:*),Bash(crlfmt:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*)" \
                 > "$EXECUTION_FILE" 2> "$STDERR_FILE" || CLAUDE_EXIT_CODE=$?
